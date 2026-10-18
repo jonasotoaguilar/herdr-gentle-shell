@@ -7479,6 +7479,145 @@ function registerCustomizeCommand(pi, toolsRegistered) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// /herdr-gentle:odd (odd-viewer S1-S6): a read-only two-pane viewer of the
+// CURRENT checkout's `odd/tasks/*.md` — the document list on the left, the
+// selected document rendered as styled markdown and scrollable on the
+// right, the same interaction shape as the reference /gentle:changes view.
+//
+// The renderer is this package's own (lib/odd-docs.js + lib/odd-markdown.js
+// + lib/odd-view.js), never an import from gentle-shell, and the TUI helpers
+// arrive through the injectable oddTuiLoader seam exactly like the customize
+// panel's, so no test loader needs a new stub line and a host without
+// `@earendil-works/pi-tui` degrades to the plain ctx.ui.select menu. Nothing
+// on this path writes a file, notifies on close, or asks for /reload.
+// ---------------------------------------------------------------------------
+
+let oddTuiLoader = () => import("@earendil-works/pi-tui");
+
+function setOddTuiLoader(loader) {
+  oddTuiLoader = loader;
+}
+
+// The checkout the session runs in (S2): inside a worktree that is the
+// worktree, never the principal. Anything that cannot resolve to a Git root
+// fails closed instead of guessing a directory.
+function oddCheckoutRoot(cwd) {
+  try {
+    const repo = libRequire("worktree-git.js").repoIdentity(cwd);
+    if (repo && typeof repo.root === "string" && repo.root.length > 0) return repo.root;
+  } catch {
+    // Not a Git checkout, or git is unavailable: fail closed below.
+  }
+  return null;
+}
+
+function oddDocsFor(cwd) {
+  try {
+    const listing = libRequire("odd-docs.js").listOddDocs(oddCheckoutRoot(cwd));
+    if (listing && typeof listing === "object") return listing;
+  } catch {
+    // A missing or broken lib never opens a viewer over nothing.
+  }
+  return { ok: false, reason: "no-checkout", docs: [] };
+}
+
+function oddTerminalRows(hostTui) {
+  try {
+    const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+    if (Number.isFinite(rows) && rows > 0) return rows;
+  } catch {
+    // A hostile host object never breaks the view.
+  }
+  return 24;
+}
+
+async function runOddFallback(ctx, listing) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const select = ctx && ctx.ui ? ctx.ui.select : undefined;
+  if (listing.docs.length === 0) {
+    if (typeof notify === "function") notify("odd: no documents under odd/tasks/ in this checkout", "info");
+    return;
+  }
+  if (typeof select !== "function") {
+    if (typeof notify === "function") {
+      notify(`odd: ${listing.docs.length} document(s) under odd/tasks/ (the viewer needs an interactive session)`, "info");
+    }
+    return;
+  }
+  let picked = null;
+  try {
+    picked = await select("Odd documents", listing.docs.map((doc) => doc.name));
+  } catch {
+    picked = undefined;
+  }
+  if (picked === undefined || picked === null) return;
+  const doc = listing.docs.find((entry) => entry.name === picked);
+  if (!doc) return;
+  if (typeof notify === "function") notify(doc.path, "info");
+}
+
+async function executeOdd(rawArgs, ctx) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const raw = String(rawArgs ?? "").trim();
+  if (raw !== "") {
+    if (typeof notify === "function") notify(`Unknown option "${raw}". Use /herdr-gentle:odd.`, "error");
+    return;
+  }
+  const cwd = toolCwd(ctx);
+  const listing = oddDocsFor(cwd);
+  if (!listing.ok) {
+    if (typeof notify === "function") notify("odd: not inside a Git checkout; there is no odd/tasks/ to read", "info");
+    return;
+  }
+  let helpers = null;
+  try {
+    helpers = await oddTuiLoader();
+  } catch {
+    helpers = null;
+  }
+  if (helpers && ctx && ctx.ui && typeof ctx.ui.custom === "function") {
+    try {
+      await ctx.ui.custom(
+        (hostTui, theme, _keybindings, done) => libRequire("odd-view.js").createOddView({
+          docs: listing.docs,
+          loadDoc: (doc) => libRequire("odd-docs.js").readOddDoc(doc),
+          reloadDocs: () => oddDocsFor(cwd),
+          helpers,
+          theme,
+          rowsAvailable: () => oddTerminalRows(hostTui),
+          requestRender: () => {
+            try {
+              if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+            } catch {
+              // A repaint failure never breaks navigation.
+            }
+          },
+          done,
+        }),
+        // Full screen like the reference Changes view: the point of this
+        // surface is reading a long document.
+        { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 } },
+      );
+    } catch {
+      // A host that rejects the overlay degrades to the menu below.
+      await runOddFallback(ctx, listing);
+    }
+    return;
+  }
+  await runOddFallback(ctx, listing);
+}
+
+function registerOddCommand(pi) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:odd", {
+    description: "Read this checkout's odd documents: list on the left, styled markdown on the right",
+    handler: async (args, ctx) => {
+      await executeOdd(args, ctx);
+    },
+  });
+}
+
 export default function (pi) {
   // The S26 delivery route: watchers started by `worktree_session_open`
   // notify through this host object.
@@ -7497,6 +7636,7 @@ export default function (pi) {
   registerWarpCommand(pi);
   registerWarpMessageRenderer(pi);
   registerCustomizeCommand(pi, toolsRegistered);
+  registerOddCommand(pi);
   if (toolsRegistered) {
     pi.registerTool(worktreeCreateTool);
     pi.registerTool(worktreeListTool);
@@ -7569,4 +7709,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setWorktreeCardHelpers, setWarpCreateNameAsker, setWarpCreateTypeAsker, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreatePicker, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setWorktreeCardHelpers, setWarpCreateNameAsker, setWarpCreateTypeAsker, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreatePicker, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };
