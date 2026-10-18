@@ -45,7 +45,7 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
-| `worktree_create` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the odd `.md` to associate, must exist, exactly like supplied `issues`) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
+| `worktree_upsert` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the odd `.md` to associate, must exist, exactly like supplied `issues`) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
 | `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | Same `ctx.ui.confirm` gate as create (naming pending changes as `Pending changes: N files, +N/-N` when dirty, nothing when clean); a refusal keeps checkout and entry | `removed: <name> · <branch>` / `branch kept` (`branch deleted` when the branch went with it), plus `session warped to principal` when a live session was warped out first, plus `herdr workspace step skipped (…)` when the Herdr workspace step was skipped (see the close sequence) |
 | `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `opened: <worktree> · <session-id>` / `path: <path>` (`resumed` instead of the path line when an existing session is resumed) |
@@ -244,11 +244,11 @@ to a sibling backup named `<registry>.corrupt-<timestamp>-<random>` in the same
 directory (best-effort, never fatal, never clobbering: created exclusively
 with an unpredictable suffix, retrying a new name a bounded number of
 times, and continuing without a backup when none can be written), whose path is reported in the
-upsert result and in the `worktree_create` details as `registryBackup` (or
+upsert result and in the `worktree_upsert` details as `registryBackup` (or
 `registryBackupError` when no backup could be written) so
 the caller can name it. A valid registry is never backed up.
 
-`worktree_create` never unregisters a live checkout (S14): when a row
+`worktree_upsert` never unregisters a live checkout (S14): when a row
 already carries the branch being created but points at a DIFFERENT live
 checkout, that row is not replaced — it keeps its registration, the new
 checkout is recorded alongside it (`appendWorktree`, which always appends
@@ -405,7 +405,7 @@ anything it does not own:
 
 ## Creation path
 
-`worktree_create` validates in order: mode gate, branch, thread identity,
+`worktree_upsert` validates in order: mode gate, branch, thread identity,
 issues, then repository/path refusals. Branch validation is `git
 check-ref-format --branch` as the authority, after up-front rejection of
 empty names, a leading `-`, whitespace, control characters, and Unicode
@@ -428,7 +428,7 @@ listing paths) resolve against the repository root.
 The target path flattens the branch into one component
 (`feat/foo-bar` → `feat-foo-bar`) at
 `<repo-parent>/<repo-name>-worktrees/<slug>` (`slugifyBranch` /
-`worktreePath` in `lib/worktree-git.js`). `worktree_create` is
+`worktreePath` in `lib/worktree-git.js`). `worktree_upsert` is
 create-or-update on the same branch: when the branch owns no live
 checkout the worktree is created in that sibling layout; when it already
 owns a live checkout and the caller supplied `issues` and/or `odd`, the
@@ -626,7 +626,7 @@ exists), deriving
 branch `<type>/<slug>` and checkout `<type>-<slug>` per the branch-pr
 skill's `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`
 before creating through a git-only creation (a plain git checkout plus
-the registry row through the same `worktree_create` validations — never a
+the registry row through the same `worktree_upsert` validations — never a
 Herdr workspace; the checkout lands beside the PRINCIPAL checkout even
 when the wizard runs inside a linked worktree, while the branch HEAD
 still comes from the current checkout) and warping
@@ -850,7 +850,7 @@ publishes, and that leaves three cases worth naming:
 
 One worktree per thread. Thread identity resolves from
 `GENTLE_WORKTREE_THREAD` first, else the Pi host session id via
-`ctx.sessionManager.getSessionId()`; without either, `worktree_create`
+`ctx.sessionManager.getSessionId()`; without either, `worktree_upsert`
 fails closed (`cannot resolve thread identity: …`) and never adopts
 another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — the same two-line shape with `· already exists` on the first line and `created: false` in details — never a second checkout. Still-live is the

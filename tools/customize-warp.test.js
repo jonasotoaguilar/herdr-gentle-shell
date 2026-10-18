@@ -3206,7 +3206,7 @@ describe('S45 warp create: change type first, then change name (T35 RED)', { con
       assert.equal(r.notes.length, 1, 'exactly one refusal');
       assert.equal(
         r.notes[0][0],
-        'warp: the host UI cannot ask for a change name here (no text input); create one with the worktree_create tool first, then /herdr-gentle:warp <name>.',
+        'warp: the host UI cannot ask for a change name here (no text input); create one with the worktree_upsert tool first, then /herdr-gentle:warp <name>.',
       );
       assert.deepEqual(r.calls, [], 'no fork');
       assert.deepEqual(r.switches, [], 'no session switch');
@@ -3276,7 +3276,7 @@ describe('worktree_warp agent tool (T40/S49)', { concurrency: false }, () => {
       const on = await loadExtension();
       assert.deepEqual(
         [...on.tools.keys()].sort(),
-        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'].sort(),
+        ['worktree_close', 'worktree_upsert', 'worktree_list', 'worktree_session_open', 'worktree_warp'].sort(),
         'enabled registers all five tools including the agent warp',
       );
       modeLib().writeMode(false, process.env);

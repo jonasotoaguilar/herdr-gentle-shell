@@ -363,7 +363,7 @@ describe('worktree_list registration', { concurrency: false }, () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
-      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp']);
+      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_upsert', 'worktree_warp']);
       const listParams = tools.get('worktree_list').parameters;
       assert.deepEqual(Object.keys(listParams.properties), ['all']);
       assert.equal(listParams.properties.all.type, 'boolean');
@@ -729,7 +729,7 @@ describe('worktree_close', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
-      const created = await tools.get('worktree_create').execute(
+      const created = await tools.get('worktree_upsert').execute(
         'call-1', { branch: 'feat/clean-close', issues: [35] }, undefined, undefined, ctx,
       );
       assert.equal(created.isError, undefined, `setup create failed: ${resultText(created)}`);

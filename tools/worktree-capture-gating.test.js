@@ -279,8 +279,8 @@ describe('malformed registry backup', { concurrency: false }, () => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, '{"not json');
       const { tools } = await loadExtension();
-      const create = tools.get('worktree_create');
-      assert.ok(create, 'expected worktree_create to be registered');
+      const create = tools.get('worktree_upsert');
+      assert.ok(create, 'expected worktree_upsert to be registered');
       const ctx = ctxFor(root);
       const result = await create.execute('call-1', { branch: 'feat/kept', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `expected success: ${(result.content || []).map((p) => p.text).join('\n')}`);
@@ -321,7 +321,7 @@ describe('malformed registry backup', { concurrency: false }, () => {
       // The valid upsert above must not back anything up either.
       assert.deepEqual(corruptSiblings(root), []);
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_create').execute(
+      const result = await tools.get('worktree_upsert').execute(
         'call-1', { branch: 'feat/fresh', issues: [35] }, undefined, undefined, ctxFor(root),
       );
       assert.equal(result.isError, undefined, `expected success: ${(result.content || []).map((p) => p.text).join('\n')}`);

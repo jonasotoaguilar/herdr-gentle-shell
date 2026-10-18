@@ -801,7 +801,7 @@ list, not silent.
 
 ## 12. Agent worktree tools (`worktree_*`)
 
-Agent-callable worktrees: `worktree_create` / `worktree_list` /
+Agent-callable worktrees: `worktree_upsert` / `worktree_list` /
 `worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
 listed in the Pi package's `pi.extensions`), plus the `Worktree tools`
 rows of `/herdr-gentle:customize` (`Enabled` / `Disabled`, plus read-only
@@ -822,7 +822,7 @@ The registry entry records the owning thread (`thread`, resolved from
 neither exists); `worktree_list` shows which thread owns each checkout;
 `worktree_close` reports the owner instead of refusing, because a
 delivered thread is routinely closed from a later session; and
-`worktree_create` from a thread that already owns a live registered
+`worktree_upsert` from a thread that already owns a live registered
 worktree returns that checkout (`created: false`) instead of creating a
 second. A second thread never adopts another thread's checkout.
 

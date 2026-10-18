@@ -1151,7 +1151,7 @@ describe('customize label-only rows with focused preview', { concurrency: false 
 });
 
 describe('worktree registration under an injected state dir (S15)', { concurrency: false }, () => {
-  const WORKTREE_TOOLS = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+  const WORKTREE_TOOLS = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 
   // A sandbox XDG state home plus an injected (new-id) dir. A stored flag
   // means <sandbox>/herdr/plugins/herdr-gentle-agents holds the mode file.
@@ -1260,7 +1260,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
   // stays the whole story: the copy names the session and warp coverage,
   // enabled registers exactly the five tools, disabled registers none, and
   // every disabled-path refusal keeps its exact bytes.
-  const FOUR = ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
+  const FOUR = ['worktree_close', 'worktree_upsert', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
   const REFUSAL =
     'worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them';
   const ENABLED_DETAIL = 'agents can create, list, close, warp between and open sessions in agent worktrees';
@@ -1330,7 +1330,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
       // refusal is the whole observable effect.
       modeLib().writeMode(false, process.env);
       const calls = [
-        ['worktree_create', { branch: 'feat/off' }],
+        ['worktree_upsert', { branch: 'feat/off' }],
         ['worktree_list', {}],
         ['worktree_close', { branch: 'feat/off' }],
         ['worktree_session_open', { worktree: 'feat-off' }],

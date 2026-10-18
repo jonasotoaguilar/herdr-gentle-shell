@@ -2,7 +2,7 @@
 // gentle-worktree-tools.ts — agent worktree tools (Pi extension, P2-S4,
 // plus the session opener T34/S25 and the agent warp T40/S49).
 //
-// Registers five tools: `worktree_create` (validate + herdr-first
+// Registers five tools: `worktree_upsert` (validate + herdr-first
 // creation with hooks), `worktree_list` (read-only, no approval prompt),
 // `worktree_close` (remove the checkout, keep the branch),
 // `worktree_warp` (move the session to another checkout and continue there) and
@@ -152,7 +152,7 @@ function isLiveGitRecord(entry, repoRoot) {
 }
 
 // Marks a TypeBox property optional. Production `Type` is the full TypeBox
-// export, but older test doubles stub only the constructors `worktree_create`
+// export, but older test doubles stub only the constructors `worktree_upsert`
 // needed; falling back to the bare schema keeps the module loadable there
 // while production still gets true optionals.
 // Older test doubles stub only the constructors the tools needed;
@@ -334,7 +334,7 @@ function withWorktreeCardRenderer(tool) {
   return tool;
 }
 
-// Core of `worktree_create`: validation (S2, S3) then herdr-first creation
+// Core of `worktree_upsert`: validation (S2, S3) then herdr-first creation
 // with a git fallback. Exported for unit tests; the registered tool calls
 // it with the live Pi context.
 async function executeWorktreeCreate(params, ctx, opts) {
@@ -1217,9 +1217,9 @@ async function executeWorktreeCreate(params, ctx, opts) {
 }
 
 const worktreeCreateTool = withWorktreeCardRenderer(defineTool({
-  name: "worktree_create",
-  label: "Worktree Create",
-  description: "Create an agent worktree for a branch at the flattened worktree path, optionally associated with verified GitHub issues. The calling thread owns the checkout.",
+  name: "worktree_upsert",
+  label: "Worktree Upsert",
+  description: "Create or update an agent worktree for a branch at the flattened worktree path, optionally associated with verified GitHub issues. The calling thread owns the checkout.",
   parameters: Type.Object({
     branch: Type.String({ description: "Branch name to create the worktree for" }),
     issues: opt(Type.Array(Type.Number(), { description: "Associated GitHub issue numbers (optional; when given, each must verify to exist)" })),
@@ -1265,7 +1265,7 @@ async function executeWorktreeList(params, ctx) {
   const mode = libRequire("worktree-mode.js");
   const cwd = toolCwd(ctx);
 
-  // Mode gate, exactly like `worktree_create`: missing means enabled,
+  // Mode gate, exactly like `worktree_upsert`: missing means enabled,
   // malformed never enables, disabled names the toggle.
   let modeState;
   try {
@@ -2256,7 +2256,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   const mode = libRequire("worktree-mode.js");
   const cwd = toolCwd(ctx);
 
-  // Mode gate, exactly like `worktree_create`.
+  // Mode gate, exactly like `worktree_upsert`.
   let modeState;
   try {
     modeState = mode.readMode();
@@ -6036,7 +6036,7 @@ async function askWarpCreateName(ctx, previous) {
 // S45 create-then-warp: the selector's final entry. The change TYPE comes
 // first, then the change NAME, and the pair derives branch `<type>/<slug>`
 // and checkout `<type>-<slug>` (the skill's regex). The checkout is created
-// through the SAME creation path the `worktree_create` tool uses
+// through the SAME creation path the `worktree_upsert` tool uses
 // (`executeWorktreeCreate` is called, never reimplemented). The picked
 // type plus the typed name is the human approval, so the create runs
 // with the approval dialog suppressed (`hasUI: false` on a shallow copy
@@ -6385,7 +6385,7 @@ async function warpCreateAndEnter(ctx, git, notify) {
       const typed = await askWarpCreateType(ctx, type);
       if (typed.back === true) return;
       if (!typed.ok) {
-        notify?.("warp: the host UI cannot ask for a change type here; create one with the worktree_create tool first, then /herdr-gentle:warp <name>.", "error");
+        notify?.("warp: the host UI cannot ask for a change type here; create one with the worktree_upsert tool first, then /herdr-gentle:warp <name>.", "error");
         return;
       }
       // Cancelling the type field changes nothing — no name panel, no
@@ -6415,7 +6415,7 @@ async function warpCreateAndEnter(ctx, git, notify) {
         continue;
       }
       if (!asked.ok) {
-        notify?.("warp: the host UI cannot ask for a change name here (no text input); create one with the worktree_create tool first, then /herdr-gentle:warp <name>.", "error");
+        notify?.("warp: the host UI cannot ask for a change name here (no text input); create one with the worktree_upsert tool first, then /herdr-gentle:warp <name>.", "error");
         return;
       }
       // Cancelling the name step changes nothing. Submitting empty

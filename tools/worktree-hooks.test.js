@@ -1,6 +1,6 @@
 'use strict';
 // P2-S3 tests (test-first): creation hooks — lib/worktree-hooks.js plus the
-// `worktree_create` wiring in extensions/gentle-worktree-tools.ts.
+// `worktree_upsert` wiring in extensions/gentle-worktree-tools.ts.
 //
 // Every test builds isolated fixtures under os.tmpdir(): a real principal
 // repository (`git init` + one commit) plus a real linked worktree (`git
@@ -451,7 +451,7 @@ describe('worktree-hooks: idempotency', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Extension wiring: worktree_create reports hook steps in details.
+// Extension wiring: worktree_upsert reports hook steps in details.
 // ---------------------------------------------------------------------------
 
 const TYPE_STUB = [
@@ -550,7 +550,7 @@ async function loadExtension() {
   return tools;
 }
 
-describe('worktree_create hook wiring', { concurrency: false }, () => {
+describe('worktree_upsert hook wiring', { concurrency: false }, () => {
   test('a created worktree keeps the exact success text and reports hook steps in details', async () => {
     const root = makePrincipal('extok');
     // Unversioned file in the principal is copied into the new worktree.
@@ -572,8 +572,8 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
     });
     try {
       const tools = await loadExtension();
-      const tool = tools.get('worktree_create');
-      assert.ok(tool, 'expected worktree_create to be registered');
+      const tool = tools.get('worktree_upsert');
+      assert.ok(tool, 'expected worktree_upsert to be registered');
       const ctx = {
         cwd: root,
         hasUI: false,
@@ -631,7 +631,7 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
     });
     try {
       const tools = await loadExtension();
-      const tool = tools.get('worktree_create');
+      const tool = tools.get('worktree_upsert');
       const ctx = {
         cwd: root,
         hasUI: false,
