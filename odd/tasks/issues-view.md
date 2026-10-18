@@ -3,7 +3,7 @@
 Add `/herdr-gentle:issues`: a full-screen three-page overlay (My issues / Assigned / Involved) that lists the repository's issues with a search box, shows the selected issue in full on the right (body, labels, state, author, dates, reactions, comments), and lets the reader act — assign the issue to the session checkout, edit its labels, comment, close or reopen, open it in the browser.
 
 Branch: `feat/odd-viewer` (same thread). Worktree: `/home/jona/mnt/sv-home/dev/projects/herdr-gentle-shell-worktrees/feat-odd-viewer`. Base: `main` 10aa5f2.
-Delivery: decided when the units land; recorded at the bottom before the last commit. Runner: `node --test tools/*.test.js`. Push, PR and merge stay with the user.
+Delivery: `single-pr`, decided when the units landed and recorded before the last commit: this branch carries three features (odd viewer, worktree tool rename, issues viewer plus the key-consistency retrofit) in a single PR, because they share the same extension file and the same working branch, and because each feature's units are mutually dependent — the renderer has no consumer without the view, the view has no entry point without the command. Expected label: `size:exception` with this rationale; the user may instead ask for a recut chain, which would have to split the shared extension file. Runner: `node --test tools/*.test.js` (what CI runs). Push, PR creation and merge stay with the user.
 
 ## Specs
 

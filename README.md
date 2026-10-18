@@ -424,6 +424,10 @@ and limitations — lives in
   current checkout's `odd/tasks/*.md` — document names on the left, the
   selected document as styled markdown on the right.
   See [docs/odd-viewer.md](docs/odd-viewer.md).
+- Issues viewer (`/herdr-gentle:issues`): three-page overlay over the
+  current checkout's repository issues — the issue list on the left, the
+  selected issue with its comments on the right.
+  See [docs/issues-viewer.md](docs/issues-viewer.md).
 - Optional Moshi replacement (off by default): the `Moshi notifications`
   rows of `/herdr-gentle:customize` (`On` / `Off`, read-only state via
   `customize status`). With it on, this plugin **replaces the Moshi-managed Pi
@@ -473,6 +477,8 @@ and limitations — lives in
 | Customize (`/herdr-gentle:customize`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
 | Agent worktrees (`worktree_*` tools) | [docs/worktree-tools.md](docs/worktree-tools.md) |
 | Odd viewer (`/herdr-gentle:odd`) | [docs/odd-viewer.md](docs/odd-viewer.md) |
+| Key map (all views) | [docs/keys.md](docs/keys.md) |
+| Issues viewer (`/herdr-gentle:issues`) | [docs/issues-viewer.md](docs/issues-viewer.md) |
 
 ## Next Steps
 
