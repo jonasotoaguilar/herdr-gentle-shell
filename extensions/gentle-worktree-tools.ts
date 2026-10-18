@@ -5935,7 +5935,7 @@ function warpFactsForView(entry) {
     ? (entry.branch.detached === true || entry.branch.value === null ? "detached" : entry.branch.value)
     : "unavailable";
   const changes = entry.changes && entry.changes.available === true && entry.changes.value
-    ? { files: entry.changes.value.files }
+    ? { added: entry.changes.value.added, deleted: entry.changes.value.deleted }
     : "unavailable";
   const compared = entry.aheadBehind && entry.aheadBehind.available === true ? entry.aheadBehind.value : null;
   return {

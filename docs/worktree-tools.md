@@ -618,12 +618,20 @@ opens it empty, any other printable opens it with that character, and once
 open every printable — space included — is text), pagination with
 `pgUp`/`pgDn`, and `esc` to step back to the popup. The facts footer is
 honest: branch, the registry's assigned issues and odd documents, the
-uncommitted file count, the commits ahead/behind `main` and both ages
-(`created <age> · modified <age>`, where "created" is the registry row and
-otherwise the directory's birth time, and "modified" is the greater of the
-last commit and the newest uncommitted file), each rendered as
-`unavailable` — never `0` — whenever git or the registry cannot answer
-(S9). Rows are ordered newest activity first by the same "modified" value,
+change size as LINE counts (`changes +A −D` — the tracked diff plus the
+lines each untracked file adds), the commits ahead/behind `main` and both
+ages (`created <age> · modified <age>`, where "created" is the registry row
+and otherwise the directory's birth time, and "modified" is the greater of
+the last commit and the newest uncommitted file). A measured zero is
+omitted from the line for the change size and for each of `↑`/`↓`
+independently — a clean checkout therefore shows neither, and only the
+non-zero direction of ahead/behind appears — while issues and odd always
+show their count, `0` included (never `none`). `unavailable` is not a zero
+and stays on the line, with its reason where one was supplied, whenever git
+or the registry cannot answer (S9) or an untracked file's lines cannot be
+read (S16), so "nothing to report" and "could not read it" never look
+alike. Every label on this line is English (`branch`, `issues`, `odd`,
+`changes`, `created`, `modified`). Rows are ordered newest activity first by the same "modified" value,
 and a checkout whose activity cannot be read sorts last with its reason
 shown (S12); the ordering comes from the facts handed to the view, never
 from a re-sort here.

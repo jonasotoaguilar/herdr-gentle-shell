@@ -1019,6 +1019,404 @@ describe('T12: the popup and its panes keep the SOURCE order (S15)', { concurren
   });
 });
 
+// ---------------------------------------------------------------------------
+// T16: "nothing until confirm" (S17) as CALL COUNTS, not just final state.
+// A write that happens on open and is later overwritten must fail these.
+//
+// Two counters, both wrapped in this suite — no production seam was added:
+// * a registry write is any call into lib/worktree-registry.js's write
+//   ENTRY POINTS (upsert/append/update/remove/addOddDoc/prune/discovery) —
+//   the module object the extension reaches through `libRequire`, so every
+//   atomic file write the extension performs passes through one of these;
+// * a checkout creation is the `git worktree add` argv the create path runs
+//   through the shared lib/worktree-git.js object.
+// Both are recorded in ONE ordered event log, so "the write came before the
+// confirm" and "the checkout came before the row" are the same measurement.
+const gitLib = require('../lib/worktree-git.js');
+
+const REGISTRY_WRITE_ENTRY_POINTS = [
+  'upsertWorktree',
+  'appendWorktree',
+  'updateWorktree',
+  'addOddDoc',
+  'removeWorktree',
+  'removeWorktreeByPath',
+  'removeWorktreeExact',
+  'pruneWorktrees',
+  'registerMissingWorktrees',
+];
+
+function watchMutations() {
+  const events = [];
+  const originals = [];
+  for (const name of REGISTRY_WRITE_ENTRY_POINTS) {
+    const original = registryLib[name];
+    if (typeof original !== 'function') continue;
+    originals.push([registryLib, name, original]);
+    registryLib[name] = function wrapped(...args) {
+      events.push({ kind: 'registry-write', name, key: args[1] });
+      return original.apply(this, args);
+    };
+  }
+  for (const name of ['runArgv', 'runArgvAsync']) {
+    const original = gitLib[name];
+    if (typeof original !== 'function') continue;
+    originals.push([gitLib, name, original]);
+    gitLib[name] = function wrapped(...args) {
+      const argv = Array.isArray(args[1]) ? args[1] : [];
+      if (argv[0] === 'worktree' && argv[1] === 'add') events.push({ kind: 'checkout-create', argv: argv.slice() });
+      return original.apply(this, args);
+    };
+  }
+  return {
+    events,
+    kinds: () => events.map((event) => event.kind),
+    writes: () => events.filter((event) => event.kind === 'registry-write'),
+    creations: () => events.filter((event) => event.kind === 'checkout-create'),
+    restore: () => {
+      for (const [target, name, original] of originals) target[name] = original;
+    },
+  };
+}
+
+// Every created-state this task calls "created": a branch, a checkout and a
+// registry row. Snapshotted whole so Esc that created anything fails.
+function createdState(root) {
+  return {
+    branches: git(root, ['branch', '--format=%(refname:short)']).split('\n').filter(Boolean).sort(),
+    checkouts: git(root, ['worktree', 'list', '--porcelain']).split('\n')
+      .filter((line) => line.startsWith('worktree ')).sort(),
+    rows: registryLib.readRegistry(root).worktrees.map((row) => `${row.branch} ${row.path}`).sort(),
+  };
+}
+
+function manyIssues(count) {
+  return Array.from({ length: count }, (_, index) => ({ number: index + 1, title: `issue ${index + 1}` }));
+}
+
+// One panel driven by a script of labelled key steps; after each step the
+// mutation log must not have grown. Returns the recorded [label, delta] pairs.
+function stepRecorder(view, mutations) {
+  const steps = [];
+  const step = (label, run) => {
+    const before = mutations.events.length;
+    run(view);
+    steps.push([label, mutations.events.length - before]);
+  };
+  step.steps = steps;
+  return step;
+}
+
+function missingSessionFile(tag) {
+  // Never written: an allocated-but-missing session file with nothing in
+  // memory is exactly what `warpCreatePreflight` refuses.
+  return path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-warp-${tag}-`))), 'missing.jsonl');
+}
+
+describe('T16: the panels write nothing until the user confirms (S17)', { concurrency: false }, () => {
+  test('opening the creating panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-write-open-create');
+      addRegisteredWorktree(root, 'feat/one');
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\r'], (view) => {
+          view.render(120); // the frame the user sees
+          assert.equal(watcher.events.length, 0, 'drawing the create panel mutated nothing');
+          view.handleInput('\x1b'); // cancel
+        }]);
+        const built = wiredCtx(root, driver);
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(driver.mounts(), 2, 'the popup then the create panel mounted');
+        assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) created nothing and wrote nothing');
+        assert.equal(watcher.writes().length, 0, 'zero registry writes');
+        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
+        assert.deepEqual(createdState(root), before, 'no branch, no checkout, no registry row');
+        assert.deepEqual(built.notes, [], 'a cancel is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('opening the editing panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-write-open-edit');
+      const target = addRegisteredWorktree(root, 'feat/real-target');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      const before = createdState(root);
+      const registryFile = registryLib.registryPath(root);
+      const registryBytes = fs.readFileSync(registryFile, 'utf8');
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([EDIT_KEYS, (view) => {
+          view.render(160);
+          assert.equal(watcher.events.length, 0, 'drawing the edit panel mutated nothing');
+          view.handleInput('\x1b'); // cancel
+        }, ['\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(driver.mounts(), 3, 'the popup, the edit panel, then the popup again');
+        assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) wrote nothing');
+        assert.equal(watcher.writes().length, 0, 'zero registry writes');
+        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
+        assert.deepEqual(createdState(root), before, 'no created state');
+        assert.equal(fs.readFileSync(registryFile, 'utf8'), registryBytes, 'the registry file is byte for byte unchanged');
+        assert.deepEqual(built.notes, [], 'a cancel is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('inside the creating panel navigating, toggling, filtering, paging and help each add no mutation', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-write-create-keys');
+      addRegisteredWorktree(root, 'feat/one');
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        let cursorAfterPage = null;
+        let oddSelected = null;
+        let query = null;
+        let helpOpen = null;
+        const driver = multiDriver([['\r'], (view) => {
+          const step = stepRecorder(view, watcher);
+          step('move from the type field to the name field', (v) => v.handleInput('\x1b[B'));
+          step('enter the Issues pane', (v) => v.handleInput('\r'));
+          step('navigate rows', (v) => v.handleInput('\x1b[B'));
+          assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
+          step('page the focused list', (v) => v.handleInput(']'));
+          cursorAfterPage = view.state.cursor.issues;
+          assert.ok(cursorAfterPage > 1, 'the page key moved the cursor to the next page');
+          step('toggle an issue', (v) => v.handleInput(' '));
+          assert.equal(view.state.selectedIssues.length, 1, 'the issue toggled');
+          step('switch to the Odd pane', (v) => v.handleInput('\t'));
+          step('toggle an odd document', (v) => v.handleInput(' '));
+          oddSelected = view.state.selectedOdd.length;
+          assert.equal(oddSelected, 1, 'the odd document toggled');
+          step('open the pane filter with a printable key', (v) => v.handleInput('w'));
+          step('type in the filter', (v) => v.handleInput('1'));
+          query = view.state.queries.odd;
+          assert.ok(query.length > 0, 'the filter received the typed text');
+          step('close the filter', (v) => v.handleInput('\x1b'));
+          step('open the help', (v) => v.handleInput('?'));
+          helpOpen = view.state.help;
+          assert.equal(helpOpen, true, 'the help opened');
+          step('close the help', (v) => v.handleInput('\x1b'));
+          step('cancel the panel', (v) => v.handleInput('\x1b'));
+          assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
+          assert.ok(step.steps.length >= 12, 'every scripted interaction was measured');
+        }]);
+        const built = wiredCtx(root, driver);
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: manyIssues(20) }));
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
+        assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
+        assert.deepEqual(createdState(root), before, 'no branch, no checkout, no registry row');
+        assert.deepEqual(built.notes, [], 'a cancel is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('inside the editing panel navigating, toggling, filtering, paging, help and typing in a frozen field each add no mutation', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-write-edit-keys');
+      const target = addRegisteredWorktree(root, 'feat/real-target');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([EDIT_KEYS, (view) => {
+          const step = stepRecorder(view, watcher);
+          step('move from the frozen type to the frozen name', (v) => v.handleInput('\x1b[B'));
+          step('type in the frozen name field', (v) => {
+            for (const char of 'zz') v.handleInput(char);
+          });
+          assert.equal(view.state.name, '', 'the frozen name field accepted no text');
+          step('enter the Issues pane', (v) => v.handleInput('\r'));
+          step('navigate rows', (v) => v.handleInput('\x1b[B'));
+          assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
+          step('page the focused list', (v) => v.handleInput(']'));
+          assert.ok(view.state.cursor.issues > 1, 'the page key moved the cursor to the next page');
+          step('toggle an unassigned issue', (v) => v.handleInput(' '));
+          assert.equal(view.state.selectedIssues.length, 2, 'exactly the toggled issue was added');
+          step('switch to the Odd pane', (v) => v.handleInput('\t'));
+          step('navigate the odd rows to an unassigned document', (v) => v.handleInput('\x1b[B'));
+          step('toggle an odd document', (v) => v.handleInput(' '));
+          assert.equal(view.state.selectedOdd.length, 2, 'exactly the toggled document was added');
+          step('open the pane filter with a printable key', (v) => v.handleInput('w'));
+          step('type in the filter', (v) => v.handleInput('1'));
+          assert.ok(view.state.queries.odd.length > 0, 'the filter received the typed text');
+          step('close the filter', (v) => v.handleInput('\x1b'));
+          step('open the help', (v) => v.handleInput('?'));
+          assert.equal(view.state.help, true, 'the help opened');
+          step('close the help', (v) => v.handleInput('\x1b'));
+          step('cancel the panel', (v) => v.handleInput('\x1b'));
+          assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
+          assert.ok(step.steps.length >= 15, 'every scripted interaction was measured');
+        }, ['\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: manyIssues(20) }));
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
+        assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
+        assert.deepEqual(createdState(root), before, 'the assignments and every created state are untouched');
+        assert.deepEqual(built.notes, [], 'a cancel is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('confirming the edit is the FIRST mutation: exactly one registry write and no creation', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('first-mutation-edit');
+      const target = addRegisteredWorktree(root, 'feat/save-target');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      const watcher = watchMutations();
+      try {
+        let confirmedAt = 0;
+        const driver = multiDriver([EDIT_KEYS, (view) => {
+          view.handleInput('\t');
+          view.handleInput(' '); // toggle #7 on
+          view.handleInput('\t');
+          view.handleInput('\x1b[B');
+          view.handleInput(' '); // toggle the second odd document on
+          assert.deepEqual(watcher.kinds(), [], 'every selection before the confirm wrote nothing');
+          confirmedAt = watcher.events.length;
+          view.handleInput('\x13'); // the explicit confirm
+        }, ['\x1b[B', '\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
+        assert.deepEqual(watcher.kinds(), ['registry-write'], 'confirming is the first and only mutation');
+        assert.equal(watcher.writes().length, 1, 'editing performs exactly ONE registry write');
+        assert.equal(watcher.creations().length, 0, 'editing creates no checkout');
+        assert.equal(watcher.writes()[0].name, 'updateWorktree', 'the write goes through the registry entry point');
+        assert.equal(watcher.writes()[0].key, target, 'and targets the edited checkout');
+        assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
+        assert.deepEqual(built.notes, [], 'a successful save is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('confirming the creation is the FIRST mutation, and the checkout creation precedes the one registry write', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'first-mutation-thread' }));
+    try {
+      const root = makeRepo('first-mutation-create');
+      addRegisteredWorktree(root, 'feat/one');
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        let confirmedAt = 0;
+        const driver = multiDriver([['\r'], (view) => {
+          view.handleInput('\x1b[B');
+          for (const char of 'nothing-yet') view.handleInput(char);
+          assert.deepEqual(watcher.kinds(), [], 'navigating and typing before the confirm wrote nothing');
+          confirmedAt = watcher.events.length;
+          view.handleInput('\x13'); // the explicit confirm
+        }]);
+        const built = wiredCtx(root, driver);
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
+        assert.deepEqual(watcher.kinds(), ['checkout-create', 'registry-write'], 'one creation then one write, in that order');
+        assert.equal(watcher.creations().length, 1, 'creating performs exactly ONE checkout creation');
+        assert.equal(watcher.writes().length, 1, 'creating performs exactly ONE registry write');
+        const after = createdState(root);
+        assert.equal(after.branches.length, before.branches.length + 1, 'the branch was created');
+        assert.ok(after.branches.includes('feat/nothing-yet'), `the derived branch exists (${after.branches})`);
+        assert.equal(after.checkouts.length, before.checkouts.length + 1, 'the checkout was created');
+        assert.ok(after.rows.some((row) => row.startsWith('feat/nothing-yet ')), 'the registry row was created');
+        assert.equal(built.switches.length, 1, 'the session warped into the new checkout');
+        assert.deepEqual(built.notes, [], 'creation then warp is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a refused session preflight performs no mutation at all: no branch, no checkout, no write', async () => {
+    // A resolvable thread identity: without the preflight this fixture WOULD
+    // create, so a preflight that ran after the first mutation is caught.
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'refused-preflight-thread' }));
+    try {
+      const root = makeRepo('refused-preflight');
+      addRegisteredWorktree(root, 'feat/one');
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        const sessionFile = missingSessionFile('refused-sess');
+        let confirmedAt = 0;
+        const driver = multiDriver([['\r'], (view) => {
+          view.handleInput('\x1b[B');
+          for (const char of 'refused-create') view.handleInput(char);
+          confirmedAt = watcher.events.length;
+          view.handleInput('\x13'); // the explicit confirm
+        }]);
+        const built = makeWiredCtx({
+          cwd: root,
+          FakeSM: makeFakeSM([]),
+          sessionFile,
+          sessionDir: path.dirname(sessionFile),
+          calls: [],
+          mount: driver.mount,
+        });
+        const { commands, mod } = await loadExtension();
+        panelSources(mod);
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
+        assert.deepEqual(watcher.kinds(), [], 'a refused preflight mutates nothing');
+        assert.equal(watcher.writes().length, 0, 'zero registry writes');
+        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
+        assert.deepEqual(createdState(root), before, 'no branch, no checkout, no registry row');
+        assert.deepEqual(built.notes, [[
+          'warp: no persisted session for this session and nothing in memory to carry over; open or write the session first and retry',
+          'error',
+        ]], 'the refusal is reported instead of a half-made worktree');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
 // PRESERVE: `r` still reloads in place. It now returns the same
 // activity-carrying rows as the first mount (an async reload the view
 // awaits), so the previous behavior — rows refresh, nothing closes, no

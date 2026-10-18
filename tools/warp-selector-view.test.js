@@ -10,9 +10,11 @@
 // exactly the requested width and the frame fills the requested height;
 // section order is current → create → separator → choose; the list is
 // bounded by the height and gains a final "View all" row only when rows
-// were left out; the facts line carries branch, issues, odd, uncommitted
-// changes, `↑N ↓M` and created-at for the focused checkout and says
-// `unavailable` — never `0` — for each fact it cannot read; the facts are
+// were left out; the facts line carries branch, issues, odd, the change size
+// as LINE COUNTS (`changes +A −D`, S16), `↑N ↓M` and both ages for the
+// focused checkout, omits a measured zero for the change size and for each
+// of `↑`/`↓` (issues and odd keep their `0`), and says `unavailable` — never
+// `0` — for each fact it cannot read; the facts are
 // read for the focused checkout only and cached; S6's printable-key rule
 // holds exactly (`space` toggles while the filter is closed, types once it
 // is open); `esc` steps back one level from the list; no key outside the
@@ -60,7 +62,7 @@ const CHECKOUTS = [
   { name: 'fix-beta', path: '/w/fix-beta', branch: 'fix/beta' },
 ];
 
-const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: 2, ahead: 1, behind: 0, createdAt: '2026-02-01' };
+const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -189,8 +191,8 @@ describe('popup frame (S1)', () => {
 });
 
 describe('focused checkout facts (S2, S9)', () => {
-  const BASE = { branch: 'main', issues: [7], odd: ['w9-x'], changes: 4, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
-  const FULL = 'branch main · issues #7 · odd w9-x · uncommitted 4 files · ↑1 ↓2 · created 1mo ago · modified 1d ago';
+  const BASE = { branch: 'main', issues: [7], odd: ['w9-x'], changes: { added: 12, deleted: 3 }, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
+  const FULL = 'branch main · issues #7 · odd w9-x · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
 
   async function focusSecondCheckout(options) {
     const made = makeView(options);
@@ -205,7 +207,7 @@ describe('focused checkout facts (S2, S9)', () => {
     return { ...made, rows };
   }
 
-  test('the focused checkout reports branch, issues, odd, uncommitted changes, ahead/behind and created-at', async () => {
+  test('the focused checkout reports branch, issues, odd, the change-size line counts, ahead/behind and created-at', async () => {
     const { rows } = await focusSecondCheckout({ facts: () => BASE, width: 200 });
     assert.equal(rows[1], 'current: feat-odd-viewer  /w/feat-odd-viewer');
     assert.match(rows[6], /^▸ main\s+main · use the local project$/, 'the selection moved');
@@ -217,7 +219,7 @@ describe('focused checkout facts (S2, S9)', () => {
     // names both ages too: a fact is never dropped or shortened into a false
     // value.
     const { rows } = await focusSecondCheckout({ facts: () => null, width: 200 });
-    assert.equal(rows[17], 'branch unavailable · issues unavailable · odd unavailable · uncommitted unavailable · ↑unavailable ↓unavailable · created unavailable · modified unavailable');
+    assert.equal(rows[17], 'branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · created unavailable · modified unavailable');
   });
 
   test('each single unavailable fact is reported on its own while the others survive', async () => {
@@ -225,7 +227,7 @@ describe('focused checkout facts (S2, S9)', () => {
       ['branch', 'branch unavailable'],
       ['issues', 'issues unavailable'],
       ['odd', 'odd unavailable'],
-      ['changes', 'uncommitted unavailable'],
+      ['changes', 'changes unavailable'],
       ['ahead', '↑unavailable'],
       ['behind', '↓unavailable'],
       ['createdAt', 'created unavailable'],
@@ -235,13 +237,32 @@ describe('focused checkout facts (S2, S9)', () => {
       const facts = { ...BASE, [field]: field === 'createdAt' ? 'unavailable' : null };
       const { rows } = await focusSecondCheckout({ facts: () => facts, width: 200 });
       assert.ok(rows[17].includes(expected), `${field} renders "${expected}": ${rows[17]}`);
-      assert.ok(!/↑0|↓0|uncommitted 0 file/.test(rows[17]), `a missing number is never 0: ${rows[17]}`);
+      assert.ok(!/↑0|↓0|changes \+0/.test(rows[17]), `a missing number is never 0: ${rows[17]}`);
     }
   });
 
-  test('an available zero stays a zero, so unavailable and zero are distinct', async () => {
-    const { rows } = await focusSecondCheckout({ facts: () => ({ ...BASE, changes: 0, ahead: 0, behind: 0, issues: [], odd: [] }), width: 200 });
-    assert.equal(rows[17], 'branch main · issues none · odd none · uncommitted 0 files · ↑0 ↓0 · created 1mo ago · modified 1d ago');
+  test('a measured zero is omitted for the change size and both arrows, while issues and odd still show 0', async () => {
+    const { rows } = await focusSecondCheckout({ facts: () => ({ ...BASE, changes: { added: 0, deleted: 0 }, ahead: 0, behind: 0, issues: [], odd: [] }), width: 200 });
+    assert.equal(rows[17], 'branch main · issues 0 · odd 0 · created 1mo ago · modified 1d ago');
+  });
+
+  test('a one-sided ahead shows only ↑N, and a one-sided behind only ↓M', async () => {
+    const aheadOnly = await focusSecondCheckout({ facts: () => ({ ...BASE, behind: 0 }), width: 200 });
+    assert.equal(aheadOnly.rows[17], 'branch main · issues #7 · odd w9-x · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
+    const behindOnly = await focusSecondCheckout({ facts: () => ({ ...BASE, ahead: 0 }), width: 200 });
+    assert.equal(behindOnly.rows[17], 'branch main · issues #7 · odd w9-x · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
+  });
+
+  test('the change size is the tracked and untracked LINE counts, never a file count', async () => {
+    const { rows } = await focusSecondCheckout({ facts: () => ({ ...BASE, changes: { added: 4, deleted: 1 } }), width: 200 });
+    assert.ok(rows[17].includes('changes +4 −1'), `the line counts render: ${rows[17]}`);
+    assert.ok(!/files|uncommitted/.test(rows[17]), `no file count survives: ${rows[17]}`);
+  });
+
+  test('an unavailable value still renders where its zero would have been omitted', async () => {
+    const { rows } = await focusSecondCheckout({ facts: () => ({ ...BASE, changes: null, ahead: null, behind: null }), width: 200 });
+    assert.ok(rows[17].includes('changes unavailable'), `the change size stays visible: ${rows[17]}`);
+    assert.ok(rows[17].includes('↑unavailable ↓unavailable'), `both arrows stay visible: ${rows[17]}`);
   });
 
   test('moving the selection refreshes the facts line and reads each checkout only once', async () => {

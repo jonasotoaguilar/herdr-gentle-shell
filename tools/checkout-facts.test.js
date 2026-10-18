@@ -243,6 +243,37 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.equal(got.aheadBehind.value.ahead, 0);
   });
 
+  test('a tracked edit reports its added and deleted line counts', async () => {
+    const root = makeRepo('tracked-counts');
+    const wt = addWorktree(root, 'feat/tracked-counts');
+    writeRow(root, fullRow(wt, 'feat/tracked-counts'));
+    // base.txt 'base\n' -> 'changed\n' is exactly one added and one deleted line.
+    fs.writeFileSync(path.join(wt, 'base.txt'), 'changed\n');
+    const got = await makeFacts(root).facts(wt);
+    assert.equal(got.changes.available, true);
+    assert.deepEqual(
+      { added: got.changes.value.added, deleted: got.changes.value.deleted },
+      { added: 1, deleted: 1 },
+    );
+  });
+
+  test('an untracked file whose lines cannot be read makes the change size unavailable, never zero', async () => {
+    const root = makeRepo('unreadable-untracked');
+    const wt = addWorktree(root, 'feat/unreadable-untracked');
+    writeRow(root, fullRow(wt, 'feat/unreadable-untracked'));
+    const locked = path.join(wt, 'locked.txt');
+    fs.writeFileSync(locked, 'one\ntwo\n');
+    fs.chmodSync(locked, 0o000);
+    try {
+      const got = await makeFacts(root).facts(wt);
+      assert.equal(got.changes.available, false, JSON.stringify(got.changes));
+      assert.equal(got.changes.value, null, 'an unreadable file is not counted as zero');
+      assert.match(got.changes.reason, /locked\.txt/);
+    } finally {
+      fs.chmodSync(locked, 0o600);
+    }
+  });
+
   test('a checkout ahead of the base reports ahead, never behind', async () => {
     const root = makeRepo('ahead');
     const wt = addWorktree(root, 'feat/ahead');
