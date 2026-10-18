@@ -6143,6 +6143,121 @@ function warpDeletableAt(others, index, principal, read, repoRoot) {
   }
 }
 
+// Key-consistency wrappers (K1/K3): the warp checkout selector and the
+// wizard multi-selects share the lib/warp-create-picker.js components,
+// which stay untouched — so the additive keys live in these thin
+// wrappers around the mounted component. Every key the component already
+// binds passes through byte-identical; the wrappers only translate the
+// new aliases and resolve the reload marker.
+function withWarpSelectorKeys(component, { helpers, items, done }) {
+  const innerHandle = component.handleInput.bind(component);
+  const innerRender = component.render.bind(component);
+  function focusedValue() {
+    try {
+      const rows = Array.isArray(items) ? items : [];
+      if (rows.length === 0) return undefined;
+      const cursor = component.state && Number.isInteger(component.state.cursor)
+        ? component.state.cursor
+        : 0;
+      return rows[Math.min(Math.max(0, cursor), rows.length - 1)];
+    } catch {
+      return undefined;
+    }
+  }
+  return {
+    ...component,
+    state: component.state,
+    render(width) {
+      let lines = [];
+      try {
+        lines = innerRender(width);
+      } catch {
+        lines = [];
+      }
+      if (!Array.isArray(lines)) return lines;
+      return lines.map((line) => {
+        if (typeof line !== "string" || !line.includes("Esc cancel")) return line;
+        return line
+          .replace("↑↓ move", "↑↓/jk move")
+          .replace("Esc cancel", "r reload · Esc cancel");
+      });
+    },
+    handleInput(data) {
+      if (customizeIsKeyRelease(helpers, data)) {
+        innerHandle(data);
+        return;
+      }
+      // `j`/`k` move alongside the arrows; `r` resolves a reload marker
+      // the loop re-runs the fresh listing for. The single-select binds
+      // no letters today, so nothing already shipped changes meaning.
+      if (customizeKeyMatches(helpers, data, ["j"])) {
+        innerHandle("down");
+        return;
+      }
+      if (customizeKeyMatches(helpers, data, ["k"])) {
+        innerHandle("up");
+        return;
+      }
+      if (customizeKeyMatches(helpers, data, ["r"])) {
+        try {
+          done({ reload: true, value: focusedValue() });
+        } catch {
+          // The host owns the prompt; a throwing done never breaks keys.
+        }
+        return;
+      }
+      innerHandle(data);
+    },
+  };
+}
+
+function withWizardPageKeys(component, { helpers }) {
+  const innerHandle = component.handleInput.bind(component);
+  const innerRender = component.render.bind(component);
+  return {
+    ...component,
+    state: component.state,
+    render(width) {
+      let lines = [];
+      try {
+        lines = innerRender(width);
+      } catch {
+        lines = [];
+      }
+      if (!Array.isArray(lines)) return lines;
+      return lines.map((line) => (typeof line === "string" && line.includes("←/→ pages")
+        ? line.replace("←/→ pages", "←/→ or [ ] pages")
+        : line));
+    },
+    handleInput(data) {
+      if (customizeIsKeyRelease(helpers, data)) {
+        innerHandle(data);
+        return;
+      }
+      // `[`/`]` page alongside ←/→ and pgUp/pgDn — but only in list
+      // mode: inside the search box they are typed filter text, exactly
+      // like every other printable there.
+      let searching = false;
+      try {
+        searching = !!(component.state && component.state.mode === "search");
+      } catch {
+        searching = false;
+      }
+      if (!searching) {
+        if (customizeKeyMatches(helpers, data, ["["])) {
+          innerHandle("pageup");
+          return;
+        }
+        if (customizeKeyMatches(helpers, data, ["]"])) {
+          innerHandle("pagedown");
+          return;
+        }
+      }
+      innerHandle(data);
+    },
+  };
+}
+
 // Run one multi-select panel. Each panel is STANDALONE (its own title,
 // its own rows, its own footer — never cross-field chips/tabs/counters).
 // Returns `{ cancelled: true }` on Esc, `{ back: true }` on Tab Back
@@ -6199,7 +6314,10 @@ async function runWarpCreatePick(ctx, { kind, title, searchPlaceholder, items, f
     // the transcript. Overlay anchors cannot do this: they only
     // reposition the floating box.
     out = await ctx.ui.custom(
-      (hostTui, theme, _keybindings, done) => pickerLib.createMultiSelect({
+      // `[`/`]` page alongside the arrows (key-consistency K1): the
+      // wrapper translates the aliases and names them in the footer —
+      // the component's own ←/→/pgUp/pgDn and Tab bindings stay exact.
+      (hostTui, theme, _keybindings, done) => withWizardPageKeys(pickerLib.createMultiSelect({
         title,
         items,
         filterFn,
@@ -6221,7 +6339,7 @@ async function runWarpCreatePick(ctx, { kind, title, searchPlaceholder, items, f
           return 24;
         },
         done,
-      }),
+      }), { helpers }),
     );
   } catch (err) {
     // The host offered custom UI but rendering failed: STOP with an
@@ -6569,7 +6687,12 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
   }
   // Stable focus across reopen: the option string to restore, or a
   // pending index clamped into the next listing (deleted rows shift up).
+  // A reload carries its own restore value (reloadFocus): it applies only
+  // when the fresh listing still offers it, and it never trips the
+  // delete flow's silent empty return below — an empty listing after a
+  // reload keeps the honest notice.
   let focusValue;
+  let reloadFocus;
   let pendingFocusIndex = null;
   for (;;) {
     let freshRead;
@@ -6611,11 +6734,19 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       pendingFocusIndex = null;
     }
     if (typeof focusValue === "string" && !freshOptions.includes(focusValue)) focusValue = undefined;
+    if (typeof reloadFocus === "string") {
+      if (freshOptions.includes(reloadFocus)) focusValue = reloadFocus;
+      reloadFocus = undefined;
+    }
     const canDelete = (index) => warpDeletableAt(freshOthers, index, freshPrincipal, freshRead, repo.root);
     let out;
     try {
       out = await ctx.ui.custom(
-        (hostTui, theme, _keybindings, done) => pickerLib.createSingleSelect({
+        // `j`/`k` move and `r` reloads (key-consistency K1/K3): the
+        // wrapper translates the aliases, resolves the reload marker and
+        // names the keys in the footer — the component's own arrows,
+        // Enter, Ctrl+D, Tab and Esc bindings stay exact.
+        (hostTui, theme, _keybindings, done) => withWarpSelectorKeys(pickerLib.createSingleSelect({
           title: freshTitle,
           items: freshOptions,
           helpers,
@@ -6635,13 +6766,21 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
             return 24;
           },
           done,
-        }),
+        }), { helpers, items: freshOptions, done }),
       );
     } catch {
       return "fallback";
     }
     if (out === null || out === undefined) return undefined;
     if (out && typeof out === "object" && out.back === true) return undefined;
+    // `r` reload (key-consistency K3/S5): the wrapper resolves a reload
+    // marker instead of a pick — re-run the loop, which re-reads the
+    // registry and the live git listing fresh before mounting again. An
+    // empty listing after reload keeps the existing honest notice below.
+    if (out && typeof out === "object" && out.reload === true) {
+      if (typeof out.value === "string") reloadFocus = out.value;
+      continue;
+    }
     if (out && typeof out === "object" && out.delete === true) {
       const index = out.index;
       if (typeof index !== "number" || index < 0 || index >= freshOthers.length) {
@@ -7096,6 +7235,14 @@ function customizeSelect(helpers, theme, label, size, focused) {
   return prefix + customizeFit(helpers, safe, Math.max(0, size - 2));
 }
 
+// The `?` key-help overlay lines (key-consistency K3/S5): the same
+// keys the footer names, spelled out once.
+const CUSTOMIZE_HELP_LINES = [
+  "Keys",
+  "←/→ or Tab panes · ↑/↓ or j/k move",
+  "Enter apply · ? help · Esc close",
+];
+
 function customizeCard(helpers, theme, lines, width) {
   const innerWidth = Math.max(1, width - CUSTOMIZE_CARD_PADDING);
   let border = (text) => text;
@@ -7121,6 +7268,10 @@ function customizeCard(helpers, theme, lines, width) {
 function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, done }) {
   const state = {
     pane: "categories",
+    // `?` key-help overlay (key-consistency K3/S5): toggled, never
+    // modal — esc closes the overlay first, every other key is ignored
+    // while it is open.
+    help: false,
     cat: 0,
     row: model.map((category) => {
       const at = category.rows.findIndex((row) => row.id === category.active);
@@ -7173,9 +7324,15 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const showHeading = height >= 6;
     // Right pane: LABELS ONLY (gentle-shell visual-customize-view
     // style) — each choice's S2 detail lives exactly once in the
-    // preview block below, never under the rows. Then the unavailable
-    // note when the provider slot is missing or malformed.
+    // preview block below, never under the rows. The unavailable note
+    // when the provider slot is missing or malformed. The `?` help
+    // overlay replaces the rows with the key list instead.
     const rightLines = [];
+    if (state.help) {
+      for (const row of CUSTOMIZE_HELP_LINES) {
+        rightLines.push({ label: row, focused: false, muted: true });
+      }
+    } else {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       // S2 pins → on the active value; focus adds its own ▸ beside it
@@ -7188,6 +7345,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     }
     if (!category.available) {
       rightLines.push({ label: "(unavailable in this session)", mark: "    ", focused: false, muted: true });
+    }
     }
     const contentHeight = Math.max(1, height - 2 - 1 - (showHeading ? 1 : 0) - previewLines - (showHeading ? 1 : 0));
     const position = navOnly ? state.cat : state.row[state.cat];
@@ -7209,9 +7367,11 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const escGap = Math.max(1, inner - customizeMeasure(helpers, title) - 3);
     lines.push(paint(`${title}${" ".repeat(escGap)}esc`, inner, "accent"));
     if (showHeading) {
-      const heading = navOnly
-        ? "Categories · choose a category →"
-        : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
+      const heading = state.help
+        ? "Help · keys"
+        : navOnly
+          ? "Categories · choose a category →"
+          : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
       lines.push(join(
         leftWidth ? paint("CATEGORIES", leftWidth, "accent") : "",
         paint(heading, rightWidth, "accent"),
@@ -7259,7 +7419,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       lines.push(paint(previewTitle, inner, "muted"));
     }
     if (showHeading) {
-      lines.push(paint("←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close", inner, "muted"));
+      lines.push(paint("←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close", inner, "muted"));
     }
     return customizeCard(helpers, theme, lines.slice(0, Math.max(0, height - 2)), w);
   }
@@ -7272,6 +7432,20 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
   }
   function handleInput(data) {
     if (customizeIsKeyRelease(helpers, data)) return;
+    // Help overlay first (key-consistency K3/S5): `?` toggles, esc
+    // closes the overlay only, and every other key is ignored while it
+    // is open — the same rule the odd and issues viewers use.
+    if (customizeKeyMatches(helpers, data, ["?"])) {
+      state.help = !state.help;
+      requestPaint();
+      return;
+    }
+    if (state.help && customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
+      state.help = false;
+      requestPaint();
+      return;
+    }
+    if (state.help) return;
     if (customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
       done(null);
       return;
@@ -7281,7 +7455,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       requestPaint();
       return;
     }
-    if (customizeKeyMatches(helpers, data, ["up"])) {
+    if (customizeKeyMatches(helpers, data, ["up", "k"])) {
       if (state.pane === "categories") state.cat = (state.cat + model.length - 1) % model.length;
       else {
         const count = model[state.cat].rows.length;
@@ -7290,7 +7464,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       requestPaint();
       return;
     }
-    if (customizeKeyMatches(helpers, data, ["down"])) {
+    if (customizeKeyMatches(helpers, data, ["down", "j"])) {
       if (state.pane === "categories") state.cat = (state.cat + 1) % model.length;
       else {
         const count = model[state.cat].rows.length;
@@ -7567,10 +7741,11 @@ function oddCheckoutBranch(repoRoot, checkoutRoot) {
   return null;
 }
 
-// Persist the viewer's pending set as the checkout's `odd[]` with the
-// registry's own overwrite semantics: an existing row found by path is
-// replaced via updateWorktree (which touches only `odd[]`); a missing row
-// (the principal checkout, or a worktree discovery never registered) is
+// Persist a viewer's pending set as one checkout field (`odd[]` for the
+// odd viewer, `issues[]` for the issues viewer) with the registry's own
+// overwrite semantics: an existing row found by path is replaced via
+// updateWorktree (which touches only that field); a missing row (the
+// principal checkout, or a worktree discovery never registered) is
 // created with the checkout's REAL branch and the REAL thread identity
 // resolved exactly like the create path (resolveThread). A missing branch
 // or an unresolvable thread refuses the save WITHOUT writing — the read
@@ -7579,10 +7754,14 @@ function oddCheckoutBranch(repoRoot, checkoutRoot) {
 // is never replaced: like the create path, the new checkout is appended
 // alongside it. Returns {ok:true} or {ok:false, error}; the view only
 // applies the assignment on {ok:true} and shows error otherwise.
-function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
-  const clean = Array.from(new Set(
-    (Array.isArray(names) ? names : []).filter((name) => typeof name === "string" && name.length > 0),
-  )).sort();
+function saveCheckoutField(repoRoot, checkoutRoot, field, values, ctx) {
+  const clean = field === "issues"
+    ? Array.from(new Set(
+      (Array.isArray(values) ? values : []).filter((n) => typeof n === "number" && Number.isFinite(n)),
+    )).sort((a, b) => a - b)
+    : Array.from(new Set(
+      (Array.isArray(values) ? values : []).filter((name) => typeof name === "string" && name.length > 0),
+    )).sort();
   let registry = null;
   try {
     registry = libRequire("worktree-registry.js");
@@ -7606,7 +7785,7 @@ function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
   }
   if (row) {
     try {
-      const updated = registry.updateWorktree(repoRoot, row.path, { odd: clean });
+      const updated = registry.updateWorktree(repoRoot, row.path, { [field]: clean });
       if (!updated || updated.ok !== true) {
         return { ok: false, error: (updated && updated.error) || "cannot save the assignment" };
       }
@@ -7662,8 +7841,8 @@ function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
       branch,
       path: checkoutRoot,
       thread,
-      issues: [],
-      odd: clean,
+      issues: field === "issues" ? clean : [],
+      odd: field === "odd" ? clean : [],
     };
     const created = useAppend && registry && typeof registry.appendWorktree === "function"
       ? registry.appendWorktree(repoRoot, recorded)
@@ -7675,6 +7854,21 @@ function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
   } catch (err) {
     return { ok: false, error: (err && err.message) || "cannot save the assignment" };
   }
+}
+
+// The odd viewer's saver: the pending set as the checkout's `odd[]`.
+// Thin wrapper over the shared guarded saver above, so both viewers
+// keep byte-identical guards without duplicating them.
+function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
+  return saveCheckoutField(repoRoot, checkoutRoot, "odd", names, ctx);
+}
+
+// The issues viewer's saver: the pending set as the checkout's
+// `issues[]`, with EXACTLY the odd saver's guards (real branch and
+// resolved thread for a created row, refuse without writing, append on
+// a same-branch conflict). Same shared saver, same guarantees.
+function issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx) {
+  return saveCheckoutField(repoRoot, checkoutRoot, "issues", numbers, ctx);
 }
 
 function oddTerminalRows(hostTui) {
@@ -7754,6 +7948,11 @@ async function executeOdd(rawArgs, ctx) {
           assigned,
           checkoutName,
           saveAssignment: (names) => oddSaveAssignment(repoRoot, checkoutRoot, names, ctx),
+          // `o` opens the focused document outside Pi through
+          // $VISUAL/$EDITOR (key-consistency K3): the shared opener
+          // reports honestly, so the view shows the miss or the failure
+          // instead of failing silently.
+          openExternal: (target) => libRequire("open-external.js").openExternal(target),
           loadDoc: (doc) => libRequire("odd-docs.js").readOddDoc(doc),
           reloadDocs: () => oddDocsFor(cwd),
           helpers,
@@ -7779,6 +7978,279 @@ async function executeOdd(rawArgs, ctx) {
     return;
   }
   await runOddFallback(ctx, listing);
+}
+
+// /herdr-gentle:issues (issues-view S1,S2,S5,S9,S10): a full-screen
+// three-page overlay (My issues / Assigned / Involved) over the CURRENT
+// checkout's repository issues, in this package's own frame
+// (lib/gh-issues.js for `gh`, lib/issues-view.js for the pure view).
+//
+// GATED (S9): the command registers only after the session-start `gh`
+// check below reports an authenticated user; without both, one
+// notification per session names what is missing and the command that
+// fixes it. The three pages arrive through listIssues with the S2
+// searches (author:@me, assignee:@me, involves:@me), the detail through
+// getIssue, the repo labels through listLabels, and the `o` key opens
+// `gh issue view <n> --web` through the file's fixed-argv runner (never
+// a shell, never an invented opener). Assignment reads the checkout's
+// stored `issues[]` and saves through the shared guarded saver above.
+// The renderer arrives through the injectable issuesTuiLoader seam
+// exactly like the customize panel's and the odd viewer's, and the
+// overlay uses the odd viewer's full-screen shape.
+// ---------------------------------------------------------------------------
+
+let issuesTuiLoader = () => import("@earendil-works/pi-tui");
+
+function setIssuesTuiLoader(loader) {
+  issuesTuiLoader = loader;
+}
+
+const ISSUES_PAGE_QUERIES = [
+  { id: "mine", label: "My issues", query: "author:@me" },
+  { id: "assigned", label: "Assigned", query: "assignee:@me" },
+  { id: "involved", label: "Involved", query: "involves:@me" },
+];
+const ISSUES_FETCH_STATE = "all";
+const ISSUES_FETCH_PAGE_SIZE = 30;
+
+// Gate state: the command registers once, and a failed gate notifies
+// once per session (module lifetime == session). The flag flips only
+// when an alert is actually handed to notify, so a startup without UI
+// never consumes the session's single alert.
+let issuesCommandRegistered = false;
+let issuesGateNotified = false;
+
+// Stored assignment for the viewer (S5): the checkout's own `issues[]`
+// (issue numbers) read fail-soft — an unreadable or malformed registry
+// leaves the view usable with nothing marked, and the failure surfaces
+// only if a save is attempted.
+function issuesStoredAssignment(repoRoot, checkoutRoot) {
+  try {
+    const registry = libRequire("worktree-registry.js");
+    if (!registry || typeof registry.findByPath !== "function") return [];
+    const row = registry.findByPath(repoRoot, checkoutRoot);
+    if (!row || !Array.isArray(row.issues)) return [];
+    return row.issues.filter((n) => typeof n === "number" && Number.isFinite(n));
+  } catch {
+    return [];
+  }
+}
+
+function issuesListArgs(query) {
+  return { query, state: ISSUES_FETCH_STATE, page: 1, pageSize: ISSUES_FETCH_PAGE_SIZE };
+}
+
+// The `o`-key browser opener: `gh issue view <n> --web` through the
+// file's fixed-argv runner (worktree-git.js runArgv — argv array, never
+// a shell string, never xdg-open). The binary resolves exactly like the
+// gh client (GH_BIN_PATH wins, else `gh` on PATH). Never throws:
+// failures return {ok:false, error} and change nothing.
+function issuesOpenInBrowser(cwd, number) {
+  try {
+    const gh = libRequire("gh-issues.js");
+    const git = libRequire("worktree-git.js");
+    if (!git || typeof git.runArgv !== "function") return { ok: false, error: "cannot open the browser: no fixed-argv runner" };
+    const bin = (gh && typeof gh.ghBinary === "function") ? gh.ghBinary({}) : "gh";
+    const res = git.runArgv(bin, ["issue", "view", String(number), "--web"], { cwd, timeoutMs: 30000 });
+    if (!res) return { ok: false, error: `cannot open issue #${number} in the browser` };
+    if (res.error) return { ok: false, error: res.error };
+    if (typeof res.status === "number" && res.status !== 0) {
+      const stderr = (res.stderr || "").trim().split("\n")[0];
+      return { ok: false, error: stderr || `cannot open issue #${number} in the browser (gh exited with status ${res.status})` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || `cannot open issue #${number} in the browser` };
+  }
+}
+
+function issuesWrapFailure(promise, what) {
+  return Promise.resolve(promise).then((res) => {
+    if (res && typeof res === "object") return res;
+    return { ok: false, error: `${what}: unexpected result` };
+  }).catch((err) => ({ ok: false, error: (err && err.message) || `${what}: failed` }));
+}
+
+async function issuesFetchPages(gh, cwd) {
+  const pages = [];
+  let loadError = null;
+  for (const spec of ISSUES_PAGE_QUERIES) {
+    let res = null;
+    try {
+      res = await gh.listIssues(issuesListArgs(spec.query), { cwd });
+    } catch (err) {
+      res = { ok: false, error: (err && err.message) || "gh issue list failed" };
+    }
+    if (res && res.ok === true) {
+      pages.push({ id: spec.id, label: spec.label, issues: res.issues, total: res.total, truncated: res.truncated === true });
+    } else {
+      if (!loadError) loadError = (res && res.error) || "gh issue list failed";
+      pages.push({ id: spec.id, label: spec.label, issues: [], total: 0, truncated: false });
+    }
+  }
+  return { pages, loadError };
+}
+
+async function executeIssues(rawArgs, ctx) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const raw = String(rawArgs ?? "").trim();
+  if (raw !== "") {
+    if (typeof notify === "function") notify(`Unknown option "${raw}". Use /herdr-gentle:issues.`, "error");
+    return;
+  }
+  const cwd = toolCwd(ctx);
+  // The assignment belongs to the checkout the session runs in: inside
+  // a worktree that is the worktree, never the principal. Anything that
+  // cannot resolve to a Git root fails closed instead of guessing.
+  const checkoutRoot = oddCheckoutRoot(cwd);
+  if (!checkoutRoot) {
+    if (typeof notify === "function") notify("issues: not inside a Git checkout; there are no issues to read", "info");
+    return;
+  }
+  const repoRoot = checkoutRoot;
+  let gh = null;
+  try {
+    gh = libRequire("gh-issues.js");
+  } catch (err) {
+    if (typeof notify === "function") notify(`issues: cannot load the gh client: ${(err && err.message) || err}`, "error");
+    return;
+  }
+  // Fetched with state `all` so the view's `f` key can alternate
+  // between open-only (the default) and closed; the totals line names
+  // the bounded count. A failed page leaves an empty page plus the
+  // error, never fake rows.
+  const { pages, loadError } = await issuesFetchPages(gh, checkoutRoot);
+  // Repo labels load best-effort: an empty list still leaves the label
+  // editor usable (toggle nothing, create-new still applies).
+  let labels = [];
+  try {
+    const listed = await gh.listLabels({ cwd: checkoutRoot });
+    if (listed && listed.ok === true && Array.isArray(listed.labels)) labels = listed.labels;
+  } catch {
+    labels = [];
+  }
+  const assigned = issuesStoredAssignment(repoRoot, checkoutRoot);
+  const checkoutName = path.basename(checkoutRoot);
+  let helpers = null;
+  try {
+    helpers = await issuesTuiLoader();
+  } catch {
+    helpers = null;
+  }
+  if (!helpers || !ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
+    if (typeof notify === "function") {
+      const total = pages.reduce((sum, page) => sum + (Array.isArray(page.issues) ? page.issues.length : 0), 0);
+      notify(`issues: ${total} issue(s) across ${pages.length} pages (the viewer needs an interactive session)`, "info");
+    }
+    return;
+  }
+  const actions = {
+    // Label edit (S3,S10): created names go through `gh label create`
+    // first, then the whole delta through `gh issue edit`. A failure at
+    // either step returns honestly and the view keeps the editor open
+    // with local state unchanged.
+    editLabels: (number, add, remove, created) => issuesWrapFailure((async () => {
+      for (const name of Array.isArray(created) ? created : []) {
+        if (typeof name !== "string" || name === "") continue;
+        const made = await gh.createLabel({ name }, { cwd: checkoutRoot });
+        if (!made || made.ok !== true) return { ok: false, error: (made && made.error) || `cannot create label ${name}` };
+      }
+      return await gh.editLabels(number, { add, remove }, { cwd: checkoutRoot });
+    })(), "cannot edit labels"),
+    postComment: (number, text) => issuesWrapFailure(gh.commentIssue(number, text, { cwd: checkoutRoot }), "cannot comment"),
+    setState: (number, state) => issuesWrapFailure(gh.setIssueState(number, state, { cwd: checkoutRoot }), "cannot change the issue state"),
+    openBrowser: (number) => issuesOpenInBrowser(checkoutRoot, number),
+    reload: async () => {
+      try {
+        const fresh = await issuesFetchPages(gh, checkoutRoot);
+        if (fresh.loadError && fresh.pages.every((page) => !Array.isArray(page.issues) || page.issues.length === 0)) {
+          return { ok: false, error: fresh.loadError };
+        }
+        return { ok: true, pages: fresh.pages };
+      } catch (err) {
+        return { ok: false, error: (err && err.message) || "cannot reload issues" };
+      }
+    },
+  };
+  try {
+    await ctx.ui.custom(
+      (hostTui, theme, _keybindings, done) => libRequire("issues-view.js").createIssuesView({
+        pages,
+        labels,
+        assigned,
+        checkoutName,
+        loadIssue: (number) => gh.getIssue(number, { cwd: checkoutRoot }),
+        saveAssignment: (numbers) => issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx),
+        actions,
+        helpers,
+        theme,
+        rowsAvailable: () => oddTerminalRows(hostTui),
+        requestRender: () => {
+          try {
+            if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+          } catch {
+            // A repaint failure never breaks navigation.
+          }
+        },
+        done,
+        ...(loadError ? { loadError } : {}),
+      }),
+      // Full screen like the odd viewer: the point of this surface is
+      // reading long issues with their comments.
+      { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 } },
+    );
+  } catch {
+    // A host that rejects the overlay degrades to one muted line.
+    if (typeof notify === "function") notify("issues: the viewer could not open in this session", "info");
+  }
+}
+
+// The S9 gate message names what is missing and the command that fixes
+// it: a missing binary needs an install plus login, anything else
+// already carries gh's own `gh auth login` wording.
+function issuesGateMessage(error) {
+  const text = String(error || "gh check failed");
+  if (/ENOENT|not available|not found/i.test(text)) {
+    return "issues: the gh CLI is not available; install it (https://cli.github.com) and run `gh auth login` — /herdr-gentle:issues stays unregistered";
+  }
+  return `issues: ${text} — /herdr-gentle:issues stays unregistered`;
+}
+
+async function checkIssuesGate(pi, ctx) {
+  try {
+    const gh = libRequire("gh-issues.js");
+    const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+    const res = await gh.ghStatus({ cwd });
+    if (res && res.ok === true) {
+      registerIssuesCommand(pi);
+      return { ok: true };
+    }
+    const error = (res && res.error) || "gh check failed";
+    if (!issuesGateNotified && ctx && ctx.ui && typeof ctx.ui.notify === "function") {
+      try {
+        ctx.ui.notify(issuesGateMessage(error), "info");
+        issuesGateNotified = true;
+      } catch {
+        // Notifying never breaks startup.
+      }
+    }
+    return { ok: false, error };
+  } catch (err) {
+    // The gate must never break startup.
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+}
+
+function registerIssuesCommand(pi) {
+  if (issuesCommandRegistered) return;
+  if (typeof pi?.registerCommand !== "function") return;
+  issuesCommandRegistered = true;
+  pi.registerCommand("herdr-gentle:issues", {
+    description: "Read and triage this repository's GitHub issues: three pages, detail pane, labels, comments, close/reopen",
+    handler: async (args, ctx) => {
+      await executeIssues(args, ctx);
+    },
+  });
 }
 
 function registerOddCommand(pi) {
@@ -7879,7 +8351,25 @@ export default function (pi) {
         // The plugin check must never break startup.
       }
     });
+    // issues-view S9: the `/herdr-gentle:issues` gate. `gh` must
+    // resolve AND report an authenticated user; without both the
+    // command stays unregistered and one notification per session names
+    // what is missing and the command that fixes it. Deferred to
+    // session start so the check never blocks the extension load, and
+    // guarded exactly like the Herdr plugin check above: never throws,
+    // never blocks the session, never writes config, never repeats the
+    // alert, and never mentions /reload.
+    pi.on("session_start", (event, ctx) => {
+      try {
+        const out = checkIssuesGate(pi, ctx);
+        if (out && typeof out.then === "function") return out.catch(() => ({ ok: false }));
+        return out;
+      } catch {
+        // The gate must never break startup.
+        return null;
+      }
+    });
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setWorktreeCardHelpers, setWarpCreateNameAsker, setWarpCreateTypeAsker, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreatePicker, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setIssuesTuiLoader, setWorktreeCardHelpers, setWarpCreateNameAsker, setWarpCreateTypeAsker, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreatePicker, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };
