@@ -3,7 +3,7 @@
 Add `/herdr-gentle:odd`: a two-pane overlay that lists the current checkout's `odd/tasks/*.md` on the left and renders the selected document, styled and scrollable, on the right — the same interaction shape as `/gentle:changes`.
 
 Branch: `feat/odd-viewer`. Worktree: `/home/jona/mnt/sv-home/dev/projects/herdr-gentle-shell-worktrees/feat-odd-viewer`. Base: `main` 10aa5f2.
-Delivery: `single-pr`, decided when the work units landed: 1676 authored changed lines in 4 commits, past the review budget. The slice cannot be split into independently landable pieces — the renderer has no consumer without the view, the view has no entry point without the command, and the command is dead without the renderer — so the exception is recorded here instead of hiding the dependency behind an artificial chain. Expected label: `size:exception` with this rationale. Runner: `node --test tools/*.test.js` (what CI runs). Push, PR creation and merge stay with the user.
+Delivery: `single-pr`, decided when the work units landed: the branch carries two features and 2810 authored changed lines in 8 commits, past the review budget. The slice cannot be split into independently landable pieces — the renderer has no consumer without the view, the view has no entry point without the command, and the command is dead without the renderer — so the exception is recorded here instead of hiding the dependency behind an artificial chain. Expected label: `size:exception` with this rationale. Runner: `node --test tools/*.test.js` (what CI runs). Push, PR creation and merge stay with the user.
 
 ## Specs
 
