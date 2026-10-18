@@ -498,3 +498,66 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
     } finally { restoreThread(); }
   });
 });
+
+describe('/herdr-gentle:odd external open (K3)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+
+  async function openOdd(root) {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    let factory = null;
+    const { ctx } = makeCtx({
+      cwd: root,
+      customImpl: async (captured) => { factory = captured; return null; },
+    });
+    await def.handler('', ctx);
+    assert.ok(factory, 'the overlay opens');
+    return openComponent(factory, host);
+  }
+
+  test('o opens the focused document through $VISUAL and stays silent on success', async () => {
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
+    const prevVisual = process.env.VISUAL;
+    const prevEditor = process.env.EDITOR;
+    process.env.VISUAL = 'true';
+    delete process.env.EDITOR;
+    try {
+      const { component, done } = await openOdd(root);
+      component.handleInput('o');
+      await tick();
+      await tick();
+      assert.equal(done(), 'pending', 'a successful open keeps the view open');
+      assert.ok(!clean(component.render(100).join('\n')).includes('open failed'), 'no error on success');
+    } finally {
+      if (prevVisual === undefined) delete process.env.VISUAL;
+      else process.env.VISUAL = prevVisual;
+      if (prevEditor === undefined) delete process.env.EDITOR;
+      else process.env.EDITOR = prevEditor;
+    }
+  });
+
+  test('o with no editor configured reports the honest miss in the view', async () => {
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
+    const prevVisual = process.env.VISUAL;
+    const prevEditor = process.env.EDITOR;
+    delete process.env.VISUAL;
+    delete process.env.EDITOR;
+    try {
+      const { component, done } = await openOdd(root);
+      component.handleInput('o');
+      await tick();
+      await tick();
+      assert.equal(done(), 'pending', 'the miss keeps the view open');
+      assert.match(clean(component.render(100).join('\n')), /no editor configured/, 'the honest miss names itself');
+      assert.match(clean(component.render(100).join('\n')), /\$VISUAL/, 'the miss names the variable to set');
+    } finally {
+      if (prevVisual === undefined) delete process.env.VISUAL;
+      else process.env.VISUAL = prevVisual;
+      if (prevEditor === undefined) delete process.env.EDITOR;
+      else process.env.EDITOR = prevEditor;
+    }
+  });
+});

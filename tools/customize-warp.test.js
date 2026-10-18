@@ -4211,3 +4211,318 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
     }
   });
 });
+describe('warp selector key consistency (K1/K3)', { concurrency: false }, () => {
+  const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+  const hostTui = () => ({ requestRender: () => {}, terminal: { rows: 24 } });
+
+  // The select-path ctx plus a mounted-custom counter: the loop opens the
+  // REAL inline single-select through ctx.ui.custom, so raw keys drive the
+  // same component the host would mount.
+  function makeKeysCtx({ cwd, FakeSM, sessionFile, sessionDir, calls, customImpl, selectImpl }) {
+    const built = makeSelectorCtx({ cwd, FakeSM, sessionFile, sessionDir, calls, selectImpl });
+    const customs = [];
+    built.ctx.ui.custom = async (factory, customOpts) => {
+      customs.push(customOpts);
+      return customImpl(factory, customOpts);
+    };
+    return { ...built, customs };
+  }
+
+  function driveOnce(factory, afterMount) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('warp selector did not settle')), 2000);
+      const view = factory(hostTui(), null, {}, (value) => { clearTimeout(timer); resolve(value); });
+      afterMount(view);
+      // Settle an inert mount: when the driven key does nothing (pre-fix
+      // behaviour) Esc closes it, so the test fails on its assertions
+      // instead of hanging. After the fix the driven key resolves first
+      // and this Esc lands on an already-finished component (a no-op).
+      setImmediate(() => view.handleInput('\x1b'));
+    });
+  }
+
+  test('j and k move the selection alongside the arrows and the footer names them', async () => {
+    const root = makeRepo('warpkeys-move');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/one');
+      addRegistered(root, 'feat/two');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const renders = [];
+      let n = 0;
+      const customImpl = (factory) => driveOnce(factory, (view) => {
+        n += 1;
+        renders.push(clean(view.render(100).join('\n')));
+        if (n === 1) {
+          view.handleInput('j');
+          renders.push(clean(view.render(100).join('\n')));
+          view.handleInput('k');
+          renders.push(clean(view.render(100).join('\n')));
+          view.handleInput('\x1b');
+        } else {
+          view.handleInput('\x1b');
+        }
+      });
+      const built = makeKeysCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        customImpl, selectImpl: undefined,
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+      assert.match(renders[0], /❯.*feat-one/, 'the first row starts focused');
+      assert.match(renders[1], /❯.*feat-two/, 'j moves down one row');
+      assert.match(renders[2], /❯.*feat-one/, 'k moves back up');
+      assert.match(renders[0], /↑↓\/jk move/, 'the footer names the j/k aliases');
+      assert.match(renders[0], /r reload/, 'the footer names the reload key');
+      assert.deepEqual(built.notes, [], 'moving never notifies');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('j then Enter warps to the row j focused', async () => {
+    const root = makeRepo('warpkeys-pick');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/warp-target');
+      const other = addRegistered(root, 'feat/other');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      // Rows from principal: [feat-warp-target, feat-other, Create…] —
+      // one j lands on feat-other; without j the warp would land on
+      // feat-warp-target instead.
+      const customImpl = (factory) => driveOnce(factory, (view) => {
+        view.handleInput('j');
+        view.handleInput('enter');
+      });
+      const built = makeKeysCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        customImpl, selectImpl: undefined,
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+      assert.deepEqual(built.notes, [], 'a real move stays silent; the card is the confirmation');
+      assert.equal(built.switches.length, 1, 'the session really switched');
+      assert.equal(calls[0][0], 'forkFrom', 'the warp forked the session');
+      assert.equal(calls[0][2], other, 'the j move picked feat-other, not the first row');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('r reloads the checkout list: a checkout created after the first listing appears', async () => {
+    const root = makeRepo('warpkeys-reload');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/first');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const renders = [];
+      let n = 0;
+      const customImpl = (factory) => driveOnce(factory, (view) => {
+        n += 1;
+        renders.push(clean(view.render(100).join('\n')));
+        if (n === 1) {
+          addRegistered(root, 'feat/fresh');
+          view.handleInput('r');
+        } else {
+          view.handleInput('\x1b');
+        }
+      });
+      const built = makeKeysCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        customImpl, selectImpl: undefined,
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.customs.length, 2, 'r reopened the selector on the fresh listing');
+      assert.ok(!renders[0].includes('feat-fresh'), 'the first listing predates the new checkout');
+      assert.match(renders[1], /feat-fresh/, 'the reload shows the new checkout');
+      assert.deepEqual(built.notes, [], 'reloading notifies nothing');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('r with an empty checkout list after reload notifies and opens nothing more', async () => {
+    const root = makeRepo('warpkeys-empty');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const gone = addRegistered(root, 'feat/gone');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const customImpl = (factory) => driveOnce(factory, (view) => {
+        git(root, ['worktree', 'remove', '--force', gone]);
+        view.handleInput('r');
+      });
+      const built = makeKeysCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        customImpl, selectImpl: undefined,
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.customs.length, 1, 'no second selector opens on an empty reload');
+      assert.equal(built.notes.length, 1, 'exactly one notification');
+      assert.equal(built.notes[0][0], 'warp: no other checkout to move the session to');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('warp create wizard page keys (K1)', { concurrency: false }, () => {
+  const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+  const hostTui = () => ({ requestRender: () => {}, terminal: { rows: 24 } });
+
+  function fakeIssues(count) {
+    return Array.from({ length: count }, (_, index) => ({ number: index + 1, title: `issue ${index + 1}` }));
+  }
+
+  function fakeOdd(count) {
+    return Array.from({ length: count }, (_, index) => ({ name: `doc-${index + 1}`, abs: `/tmp/odd-fake/doc-${index + 1}.md` }));
+  }
+
+  function pageOf(view) {
+    const found = clean(view.render(100).join('\n')).match(/page \d+\/\d+/);
+    assert.ok(found, 'the picker shows its page count');
+    return found[0];
+  }
+
+  // Drives the full create flow to the multi-select steps with the type
+  // and name answered by seams: the first custom mount is the checkout
+  // selector (one `down` reaches the final create entry), then the
+  // issues and odd panels mount in order. onIssues/onOdd drive their
+  // panel; anything else cancels.
+  async function runWizard({ root, onIssues, onOdd }) {
+    const calls = [];
+    const FakeSM = makeFakeSM(calls);
+    const sessionFile = sessionFileIn();
+    const footers = [];
+    const customImpl = (factory) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('wizard picker did not settle')), 2000);
+      const view = factory(hostTui(), null, {}, (value) => { clearTimeout(timer); resolve(value); });
+      const text = clean(view.render(100).join('\n'));
+      if (text.includes('Warp session')) {
+        view.handleInput('down');
+        view.handleInput('enter');
+      } else if (text.includes('Select issues')) {
+        footers.push(text);
+        onIssues(view);
+      } else if (text.includes('Select odd')) {
+        footers.push(text);
+        onOdd(view);
+      } else {
+        view.handleInput('\x1b');
+      }
+    });
+    const built = makeSelectorCtx({
+      cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, selectImpl: undefined,
+    });
+    built.ctx.ui.custom = async (factory, customOpts) => customImpl(factory, customOpts);
+    const { commands, mod } = await loadExtension();
+    mod.setWarpCreateTypeAsker(async () => 'feat');
+    mod.setWarpCreateNameAsker(async () => 'wtest');
+    mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: fakeIssues(20) }));
+    mod.setWarpCreateOddLister(async () => fakeOdd(12));
+    await warpDef(commands).handler('', built.ctx);
+    return { built, footers };
+  }
+
+  test('] turns the issues page forward alongside right/pgDn', async () => {
+    const root = makeRepo('wizardkeys-issues-next');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/other');
+      const pages = [];
+      const { footers, built } = await runWizard({
+        root,
+        onIssues: (view) => {
+          assert.equal(pageOf(view), 'page 1/3');
+          view.handleInput(']');
+          pages.push(pageOf(view));
+          view.handleInput('enter');
+        },
+        onOdd: (view) => { view.handleInput('\x1b'); },
+      });
+      assert.deepEqual(pages, ['page 2/3'], '] turns the issues page forward');
+      assert.match(footers[0], /or \[ \] pages/, 'the issues footer names the [ ] aliases');
+      assert.deepEqual(built.switches, [], 'cancelling at the odd step moves nothing');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('[ turns the issues page back alongside left/pgUp', async () => {
+    const root = makeRepo('wizardkeys-issues-prev');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/other');
+      const pages = [];
+      await runWizard({
+        root,
+        onIssues: (view) => {
+          view.handleInput(']');
+          assert.equal(pageOf(view), 'page 2/3');
+          view.handleInput('[');
+          pages.push(pageOf(view));
+          view.handleInput('enter');
+        },
+        onOdd: (view) => { view.handleInput('\x1b'); },
+      });
+      assert.deepEqual(pages, ['page 1/3'], '[ turns the issues page back');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('] turns the odd page forward alongside right/pgDn', async () => {
+    const root = makeRepo('wizardkeys-odd-next');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/other');
+      const pages = [];
+      const { footers } = await runWizard({
+        root,
+        onIssues: (view) => { view.handleInput('enter'); },
+        onOdd: (view) => {
+          assert.equal(pageOf(view), 'page 1/2');
+          view.handleInput(']');
+          pages.push(pageOf(view));
+          view.handleInput('\x1b');
+        },
+      });
+      assert.deepEqual(pages, ['page 2/2'], '] turns the odd page forward');
+      assert.match(footers[1], /or \[ \] pages/, 'the odd footer names the [ ] aliases');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('[ turns the odd page back alongside left/pgUp', async () => {
+    const root = makeRepo('wizardkeys-odd-prev');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/other');
+      const pages = [];
+      await runWizard({
+        root,
+        onIssues: (view) => { view.handleInput('enter'); },
+        onOdd: (view) => {
+          view.handleInput(']');
+          assert.equal(pageOf(view), 'page 2/2');
+          view.handleInput('[');
+          pages.push(pageOf(view));
+          view.handleInput('\x1b');
+        },
+      });
+      assert.deepEqual(pages, ['page 1/2'], '[ turns the odd page back');
+    } finally {
+      restoreEnv();
+    }
+  });
+});

@@ -344,3 +344,132 @@ describe('createOddView assignment (S7/S8)', () => {
     assert.deepEqual(calls[0][0], ['odd/tasks/beta.md']);
   });
 });
+
+describe('createOddView key consistency (K3)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function makeKeyView({ docs, openImpl } = {}) {
+    const opened = [];
+    let settled = 'pending';
+    const open = (...args) => {
+      opened.push(args);
+      if (typeof openImpl === 'function') return openImpl(...args);
+      return { ok: true };
+    };
+    const view = createOddView({
+      docs: docs || [doc('alpha'), doc('beta'), doc('gamma')],
+      loadDoc: (entry) => ({ ok: true, text: `# ${entry.name}\n` }),
+      openExternal: open,
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => 20,
+      requestRender: () => {},
+      done: (result) => { settled = result; },
+    });
+    return { view, opened, done: () => settled };
+  }
+
+  test('? toggles a key-help overlay and esc closes the overlay, not the view', async () => {
+    const { view, done } = makeKeyView();
+    await tick();
+    assert.ok(!strip(view.render(80).join('\n')).includes('Keys'), 'no help before ?');
+    view.handleInput('?');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /Keys/, 'the help overlay lists the keys');
+    assert.match(body, /o open/, 'the help names the external-open key');
+    view.handleInput('escape');
+    assert.equal(done(), 'pending', 'esc with help open closes the overlay, never the view');
+    assert.ok(!strip(view.render(80).join('\n')).includes('Keys'), 'the overlay is gone');
+    view.handleInput('escape');
+    assert.equal(done(), null, 'esc with no overlay still closes the view');
+  });
+
+  test('T filters the document list by name, live as you type, and leaving the box keeps the filter', async () => {
+    const { view } = makeKeyView();
+    await tick();
+    view.handleInput('T');
+    view.handleInput('a');
+    view.handleInput('l');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /alpha/, 'the matching document stays');
+    assert.ok(!body.includes('beta') || body.includes('filter'), 'non-matching rows leave the list');
+    const rows = body.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line));
+    assert.ok(rows.every((line) => !line.includes('beta') && !line.includes('gamma')), 'only the match is listed');
+    assert.match(body, /filter/, 'the filter is visible while typing');
+    view.handleInput('enter');
+    const kept = strip(view.render(80).join('\n'));
+    assert.match(kept, /filter "al"/, 'leaving the box keeps the filter');
+    assert.match(kept, /alpha/);
+    const keptRows = kept.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line));
+    assert.ok(keptRows.every((line) => !line.includes('beta') && !line.includes('gamma')), 'the filter still applies after leaving the box');
+  });
+
+  test('/ also opens the filter box', async () => {
+    const { view } = makeKeyView();
+    await tick();
+    view.handleInput('/');
+    view.handleInput('g');
+    view.handleInput('a');
+    view.handleInput('m');
+    view.handleInput('enter');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /filter "gam"/, 'the / filter is kept like the T filter');
+    assert.match(body, /gamma/);
+    assert.ok(!body.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line)).some((line) => line.includes('alpha')), 'alpha is filtered out');
+  });
+
+  test('a filter matching nothing renders its empty state instead of a blank frame', async () => {
+    const { view } = makeKeyView();
+    await tick();
+    view.handleInput('T');
+    view.handleInput('z');
+    view.handleInput('z');
+    view.handleInput('z');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /no matches/, 'the empty filter names itself');
+    assert.match(body, /filter "zzz"/, 'the query stays visible');
+  });
+
+  test('o opens the focused document through the injected opener', async () => {
+    const { view, opened } = makeKeyView();
+    await tick();
+    view.handleInput('down');
+    view.handleInput('o');
+    await tick();
+    assert.equal(opened.length, 1, 'one external open for one o');
+    assert.equal(opened[0][0], '/checkout/odd/tasks/beta.md', 'the opener receives the focused absolute path');
+    const body = strip(view.render(80).join('\n'));
+    assert.ok(!body.includes('open failed'), 'a successful open shows no error');
+    assert.equal(view.state.index, 1, 'the selection is untouched');
+  });
+
+  test('a failing opener reports the error honestly and keeps the selection', async () => {
+    const { view, opened } = makeKeyView({ openImpl: () => ({ ok: false, error: 'spawn ed ENOENT' }) });
+    await tick();
+    view.handleInput('o');
+    await tick();
+    assert.equal(opened.length, 1);
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /open failed: spawn ed ENOENT/, 'the failure is shown, never silent');
+    assert.equal(view.state.index, 0, 'the selection is untouched');
+  });
+
+  test('o with an empty document list does nothing', async () => {
+    const { view, opened } = makeKeyView({ docs: [] });
+    await tick();
+    view.handleInput('o');
+    await tick();
+    assert.deepEqual(opened, [], 'nothing to open, nothing called');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /no odd documents/, 'the empty state survives');
+  });
+
+  test('the footer names every key the view gained', async () => {
+    const { view } = makeKeyView();
+    await tick();
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /T filter/, 'the footer names the filter key');
+    assert.match(body, /o open/, 'the footer names the external-open key');
+    assert.match(body, /\? help/, 'the footer names the help key');
+  });
+});
