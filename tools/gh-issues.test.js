@@ -420,7 +420,9 @@ describe('argv shell safety', () => {
     assert.ok(argv.every((entry) => typeof entry === 'string'));
     const searchAt = argv.indexOf('--search');
     assert.ok(searchAt >= 0);
-    assert.equal(argv[searchAt + 1], hostile);
+    // The whole search string, ordering qualifier included, is still ONE
+    // argv element.
+    assert.equal(argv[searchAt + 1], `${hostile} sort:updated-desc`);
     // No shell join anywhere: the hostile text is one element, and no
     // element contains shell glue joining it with gh syntax.
     assert.equal(argv.filter((entry) => entry.includes('rm -rf')).length, 1);
@@ -442,6 +444,56 @@ describe('argv shell safety', () => {
     assert.ok(!/exec\s*\(/.test(src), 'no child_process.exec with a shell string');
     assert.ok(!/execSync\s*\(/.test(src), 'no child_process.execSync with a shell string');
     assert.ok(!/shell\s*:\s*true/.test(src), 'no shell:true spawn option');
+  });
+});
+
+describe('list ordering: the query carries it (S10)', () => {
+  // Payload rows whose updatedAt rises with the number, so a JavaScript
+  // re-sort by updatedAt desc would visibly change the order.
+  function rowsInOrder(numbers) {
+    return JSON.stringify(numbers.map((n) => ({
+      number: n, title: `issue ${n}`, state: 'OPEN', stateReason: '',
+      author: { login: 'someone' }, labels: [],
+      createdAt: '2026-01-01T00:00:00Z',
+      updatedAt: `2026-01-0${n}T00:00:00Z`,
+      comments: [], reactionGroups: [],
+      url: `https://example.test/issues/${n}`, body: '',
+    })));
+  }
+
+  test('asks gh for last-update ordering through the search query', async () => {
+    const bare = makeRunner(okJson('[]'));
+    ghIssues.setGhRunner(bare.runner);
+    await ghIssues.listIssues({ page: 1, pageSize: 10 });
+    const bareAt = bare.calls[0].argv.indexOf('--search');
+    assert.ok(bareAt >= 0, 'the ordering travels in the search query, not in a JS sort');
+    assert.equal(bare.calls[0].argv[bareAt + 1], 'sort:updated-desc');
+
+    const withQuery = makeRunner(okJson('[]'));
+    ghIssues.setGhRunner(withQuery.runner);
+    await ghIssues.listIssues({ query: 'author:@me', page: 1, pageSize: 10 });
+    const queryAt = withQuery.calls[0].argv.indexOf('--search');
+    assert.equal(withQuery.calls[0].argv[queryAt + 1], 'author:@me sort:updated-desc');
+  });
+
+  test('an explicit caller sort is respected, never doubled', async () => {
+    for (const query of ['sort:created-asc', 'author:@me sort:created-asc']) {
+      const { runner, calls } = makeRunner(okJson('[]'));
+      ghIssues.setGhRunner(runner);
+      await ghIssues.listIssues({ query, page: 1, pageSize: 10 });
+      const searchAt = calls[0].argv.indexOf('--search');
+      const search = calls[0].argv[searchAt + 1];
+      assert.equal(search, query, 'the caller sort survives verbatim');
+      assert.equal((search.match(/sort:/gi) || []).length, 1, 'exactly one sort qualifier');
+    }
+  });
+
+  test('rows keep the order the runner returned: no re-sort in JavaScript', async () => {
+    const { runner } = makeRunner(okJson(rowsInOrder([3, 1, 2])));
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.listIssues({ page: 1, pageSize: 10 });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.issues.map((issue) => issue.number), [3, 1, 2]);
   });
 });
 

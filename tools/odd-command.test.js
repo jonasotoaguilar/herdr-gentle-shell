@@ -76,10 +76,17 @@ function makeRepo({ docs = {}, tag = 'odd' } = {}) {
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
   const root = fs.realpathSync(dir);
+  // Declared oldest first: each later document gets a newer explicit mtime, so
+  // the newest-first rule (S10) yields a deterministic order instead of one that
+  // depends on how fast the filesystem stamps two consecutive writes.
+  const base = Date.now() - 60 * 60 * 1000;
+  let age = 0;
   for (const [name, content] of Object.entries(docs)) {
     const target = path.join(root, 'odd', 'tasks', name);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, content);
+    const stamp = new Date(base + age++ * 60 * 1000);
+    fs.utimesSync(target, stamp, stamp);
   }
   return root;
 }
@@ -161,8 +168,8 @@ describe('/herdr-gentle:odd', () => {
     assert.equal(typeof def.handler, 'function');
     const root = makeRepo({
       docs: {
-        'alpha.md': '# alpha\n\n## Specs\nS1. first rule\n',
         'beta.md': '# beta\n\n## Tasks\nT1 | S1 | done | a row\n',
+        'alpha.md': '# alpha\n\n## Specs\nS1. first rule\n',
       },
     });
     const host = makeHostTui(20);
@@ -204,16 +211,20 @@ describe('/herdr-gentle:odd', () => {
     assert.equal(notes[0][1], 'info');
   });
 
-  test('outside a Git checkout it notifies and opens nothing', async () => {
+  test('outside a Git checkout it notifies the one shared line and opens nothing', async () => {
     const { commands, mod } = await loadExtension();
     const def = commands.get('herdr-gentle:odd');
-    const outside = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-plain-')));
+    const outside = fs.realpathSync(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-plain-'))));
     mod.setOddTuiLoader(async () => stubTui);
-    const { ctx, customs, notes } = makeCtx({ cwd: outside, customImpl: async () => null });
+    const { ctx, customs, selects, notes } = makeCtx({ cwd: outside, customImpl: async () => null });
     await def.handler('', ctx);
     assert.equal(customs.length, 0, 'no overlay outside a checkout');
-    assert.equal(notes.length, 1);
-    assert.match(notes[0][0], /not inside a Git checkout/i);
+    assert.equal(selects.length, 0, 'no fallback selector outside a checkout');
+    assert.deepEqual(
+      notes,
+      [[`not a git repository: ${outside}; run 'git init' first`, 'info']],
+      'exactly the one shared line at info',
+    );
   });
 
   test('without the TUI helpers it falls back to the plain select menu', async () => {
@@ -305,7 +316,7 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
   });
 
   test('ctrl+s persists the whole pending set through the registry', async () => {
-    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
     const file = writeRegistry(root, [{
       branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
     }]);
@@ -348,7 +359,7 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
   });
 
   test('a refusing registry reports the error without writing', async () => {
-    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
     const file = writeRegistry(root, []);
     fs.writeFileSync(file, '{not json');
     const before = readRaw(file);
@@ -438,7 +449,7 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
   });
 
   test('updating one row leaves the other row untouched (no data loss)', async () => {
-    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
     const otherPath = path.join(os.tmpdir(), `wt-odd-other-${process.pid}-${Date.now()}`);
     const stamp = '2026-01-01T00:00:00.000Z';
     const file = writeRegistry(root, [

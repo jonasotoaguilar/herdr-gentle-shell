@@ -72,6 +72,8 @@ P4 | S3,S4,S5,S10 | implement | pending | The four writing actions end to end: l
 P5 | S1,S6 | docs | pending | `docs/issues-viewer.md` plus the README surface row, README feature bullet and the DESIGN command enumeration; record the key map and the `gh` requirement.
 P6 | S1-S10 | verify | pending | Independent verification of the writing paths (labels, comment, state, assignment) and the end-to-end read path over a real repository, plus the full suite.
 
+P7 | S10 | done | see `odd/tasks/odd-viewer.md`, P7: most-recent-first ordering lives in the SOURCES (`lib/odd-docs.js` by mtime descending, `lib/gh-issues.js` by last update through the query), so this view and the warp panel's panes inherit it. Commit: pending.
+
 ## Log
 
 L1. User request, verbatim: "tambien agrega un nuevo comando que sera para ver la issues del proyecto /herdr-gentle:issues. /tmp/gp279byI/pi-clipboard-e527c182-35af-413e-98e8-cd691bd43817.png. que sera similar a changes y las demas con el panel fullscreen basado en el ejemplo de la imagen pero adaptado a nuestro diseno de paneles como el de /changes y /customizatio, la estetica de gentle-shell."

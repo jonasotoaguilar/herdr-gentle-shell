@@ -152,10 +152,12 @@ function makeHostTui(rows = 24) {
 function makeCtx({ cwd, customImpl } = {}) {
   const notes = [];
   const customs = [];
+  const selects = [];
   const ctx = {
     cwd,
     ui: {
       notify: (message, level) => notes.push([message, level]),
+      select: async (title, options) => { selects.push([title, options]); return undefined; },
     },
   };
   if (customImpl !== undefined) {
@@ -164,7 +166,7 @@ function makeCtx({ cwd, customImpl } = {}) {
       return customImpl(factory, options);
     };
   }
-  return { ctx, notes, customs };
+  return { ctx, notes, customs, selects };
 }
 
 function openComponent(factory, host) {
@@ -321,7 +323,13 @@ describe('/herdr-gentle:issues overlay', () => {
     const searches = calls
       .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
       .map((call) => call.argv[call.argv.indexOf('--search') + 1]);
-    assert.deepEqual(searches, ['author:@me', 'assignee:@me', 'involves:@me']);
+    // S10: the source asks gh for last-update ordering, so each page's query
+    // carries the sort and the view never re-sorts the rows itself.
+    assert.deepEqual(searches, [
+      'author:@me sort:updated-desc',
+      'assignee:@me sort:updated-desc',
+      'involves:@me sort:updated-desc',
+    ]);
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues/, 'first page tab');
     assert.match(body, /Assigned/, 'second page tab');
@@ -344,6 +352,28 @@ describe('/herdr-gentle:issues overlay', () => {
     assert.equal(customs.length, 0, 'no overlay for an argument');
     assert.equal(notes.length, 1);
     assert.match(notes[0][0], /Unknown option/, 'the reader gets the usage line');
+  });
+});
+
+describe('/herdr-gentle:issues outside a Git checkout (S11)', () => {
+  test('notifies the one shared line at info and opens nothing', async () => {
+    const { commands, mod, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(makeIssuesRunner().runner);
+    const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+    await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+    const def = commands.get('herdr-gentle:issues');
+    assert.ok(def, 'the gate registers the command');
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const outside = fs.realpathSync(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-plain-'))));
+    const { ctx, customs, selects, notes } = makeCtx({ cwd: outside, customImpl: async () => null });
+    await def.handler('', ctx);
+    assert.equal(customs.length, 0, 'no overlay outside a checkout');
+    assert.equal(selects.length, 0, 'no fallback selector outside a checkout');
+    assert.deepEqual(
+      notes,
+      [[`not a git repository: ${outside}; run 'git init' first`, 'info']],
+      'exactly the one shared line at info',
+    );
   });
 });
 
