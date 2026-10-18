@@ -154,3 +154,193 @@ describe('createOddView states', () => {
     assert.match(body, /gamma/);
   });
 });
+
+describe('createOddView assignment (S7/S8)', () => {
+  function makeAssignView({ docs, assigned, checkoutName, saveImpl, rows = 20 } = {}) {
+    const calls = [];
+    let settled = 'pending';
+    const save = (...args) => {
+      calls.push(args);
+      if (typeof saveImpl === 'function') return saveImpl(...args);
+      return { ok: true };
+    };
+    const view = createOddView({
+      docs,
+      assigned,
+      checkoutName,
+      saveAssignment: save,
+      loadDoc: (entry) => ({ ok: true, text: `# ${entry.name}\n` }),
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => rows,
+      requestRender: () => {},
+      done: (result) => { settled = result; },
+    });
+    return { view, calls, done: () => settled };
+  }
+
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  // List rows carry the row structure `▸|  <mark> <name>`; the title and
+  // the document pane may repeat the name, so match the mark explicitly.
+  const rowFor = (body, name) => body.split('\n').find((line) =>
+    new RegExp(`[▸ ] [✓·✎] ${name}( |$)`).test(line));
+
+  test('stored assignments show ✓, unassigned show ·, and the title names the checkout and the count', async () => {
+    const { view } = makeAssignView({
+      docs: [doc('alpha'), doc('beta')],
+      assigned: ['odd/tasks/alpha.md'],
+      checkoutName: 'demo-checkout',
+    });
+    await tick();
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /✓/, 'the stored row carries ✓');
+    assert.match(rowFor(body, 'beta'), /·/, 'the unassigned row carries ·');
+    assert.match(body, /demo-checkout/, 'the title names the checkout');
+    assert.match(body, /1 assigned/, 'the title carries the assigned count');
+    assert.ok(!body.includes('unsaved'), 'nothing is pending, so no unsaved indicator');
+    assert.match(body, /space/, 'the footer names the toggle key');
+    assert.match(body, /ctrl\+s/, 'the footer names the save key');
+  });
+
+  test('space toggles the focused row locally: ✎ appears and nothing is written', async () => {
+    const { view, calls } = makeAssignView({
+      docs: [doc('alpha'), doc('beta')],
+      assigned: ['odd/tasks/alpha.md'],
+      checkoutName: 'demo-checkout',
+    });
+    await tick();
+    view.handleInput('space');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /✎/, 'the toggled row carries the unsaved mark');
+    assert.match(rowFor(body, 'beta'), /·/, 'the untouched row keeps its mark');
+    assert.match(body, /· unsaved/, 'the title gains the unsaved indicator');
+    assert.match(body, /0 assigned/, 'the count follows the pending set');
+    assert.deepEqual(calls, [], 'toggling alone never calls the save callback');
+  });
+
+  test('toggling the same row twice reverts it and clears the unsaved indicator', async () => {
+    const { view, calls } = makeAssignView({
+      docs: [doc('alpha')],
+      assigned: [],
+      checkoutName: 'demo-checkout',
+    });
+    await tick();
+    view.handleInput('space');
+    assert.match(strip(view.render(80).join('\n')), /✎/);
+    view.handleInput('space');
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /·/, 'the row is back to unassigned');
+    assert.ok(!body.includes('unsaved'), 'no pending change remains');
+    assert.deepEqual(calls, []);
+  });
+
+  test('ctrl+s persists the whole pending set and applies the assignment', async () => {
+    const { view, calls } = makeAssignView({
+      docs: [doc('alpha'), doc('beta')],
+      assigned: ['odd/tasks/alpha.md'],
+      checkoutName: 'demo-checkout',
+    });
+    await tick();
+    view.handleInput('down');
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.equal(calls.length, 1, 'one save for the whole set');
+    assert.deepEqual(calls[0][0], ['odd/tasks/alpha.md', 'odd/tasks/beta.md']);
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /✓/);
+    assert.match(rowFor(body, 'beta'), /✓/, 'the saved toggle is now stored');
+    const rowLines = body.split('\n').filter((line) => /[▸ ] [✓·✎] (alpha|beta)( |$)/.test(line));
+    assert.ok(rowLines.every((line) => !line.includes('✎')), 'no pending mark survives a successful save');
+    assert.ok(!body.includes('unsaved'), 'the indicator clears on success');
+    assert.match(body, /2 assigned/);
+  });
+
+  test('ctrl+s can also remove: untoggling a stored row saves the smaller set', async () => {
+    const { view, calls } = makeAssignView({
+      docs: [doc('alpha'), doc('beta')],
+      assigned: ['odd/tasks/alpha.md', 'odd/tasks/beta.md'],
+    });
+    await tick();
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.deepEqual(calls[0][0], ['odd/tasks/beta.md']);
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /·/, 'removal applies only after save');
+    assert.match(rowFor(body, 'beta'), /✓/);
+  });
+
+  test('a failed save keeps the pending marks and shows the error', async () => {
+    const { view, calls } = makeAssignView({
+      docs: [doc('alpha')],
+      assigned: [],
+      saveImpl: () => ({ ok: false, error: 'disk full' }),
+    });
+    await tick();
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.equal(calls.length, 1);
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /✎/, 'the pending mark survives the failure');
+    assert.match(body, /· unsaved/, 'the indicator survives the failure');
+    assert.match(body, /save failed: disk full/, 'the error is shown, never success');
+  });
+
+  test('a throwing save is reported as a failure and keeps every pending mark', async () => {
+    const { view } = makeAssignView({
+      docs: [doc('alpha')],
+      assigned: [],
+      saveImpl: () => { throw new Error('lock timeout'); },
+    });
+    await tick();
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /✎/);
+    assert.match(body, /save failed: lock timeout/);
+  });
+
+  test('esc closes and discards unsaved toggles without writing', async () => {
+    const { view, calls, done } = makeAssignView({
+      docs: [doc('alpha')],
+      assigned: [],
+    });
+    await tick();
+    view.handleInput('space');
+    assert.match(strip(view.render(80).join('\n')), /✎/);
+    view.handleInput('escape');
+    assert.equal(done(), null, 'esc still closes with a null result');
+    assert.deepEqual(calls, [], 'closing never saves the pending toggles');
+  });
+
+  test('ctrl+s with no pending changes writes nothing', async () => {
+    const { view, calls } = makeAssignView({
+      docs: [doc('alpha')],
+      assigned: ['odd/tasks/alpha.md'],
+    });
+    await tick();
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.deepEqual(calls, [], 'a clean state saves nothing');
+    assert.match(strip(view.render(80).join('\n')), /✓/);
+  });
+
+  test('a missing assignment leaves every row unmarked and the view usable', async () => {
+    const { view, calls } = makeAssignView({ docs: [doc('alpha'), doc('beta')] });
+    await tick();
+    const body = strip(view.render(80).join('\n'));
+    assert.match(rowFor(body, 'alpha'), /·/);
+    assert.match(rowFor(body, 'beta'), /·/);
+    assert.ok(!body.includes('✓'), 'nothing is marked when nothing was assigned');
+    view.handleInput('down');
+    assert.equal(view.state.index, 1, 'navigation still works');
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.equal(calls.length, 1, 'toggling then saving still works from an empty start');
+    assert.deepEqual(calls[0][0], ['odd/tasks/beta.md']);
+  });
+});

@@ -7480,17 +7480,21 @@ function registerCustomizeCommand(pi, toolsRegistered) {
 }
 
 // ---------------------------------------------------------------------------
-// /herdr-gentle:odd (odd-viewer S1-S6): a read-only two-pane viewer of the
+// /herdr-gentle:odd (odd-viewer S1-S8): a two-pane viewer of the
 // CURRENT checkout's `odd/tasks/*.md` — the document list on the left, the
 // selected document rendered as styled markdown and scrollable on the
-// right, the same interaction shape as the reference /gentle:changes view.
+// right, the same interaction shape as the reference /gentle:changes view,
+// plus the S7/S8 assignment field: the list marks which documents are
+// assigned to this checkout, `space` toggles locally, and `ctrl+s`
+// persists the pending set through the worktree registry (`esc` discards).
 //
 // The renderer is this package's own (lib/odd-docs.js + lib/odd-markdown.js
 // + lib/odd-view.js), never an import from gentle-shell, and the TUI helpers
 // arrive through the injectable oddTuiLoader seam exactly like the customize
 // panel's, so no test loader needs a new stub line and a host without
-// `@earendil-works/pi-tui` degrades to the plain ctx.ui.select menu. Nothing
-// on this path writes a file, notifies on close, or asks for /reload.
+// `@earendil-works/pi-tui` degrades to the plain ctx.ui.select menu.
+// Everything else on this path only reads: the listing, the documents, and
+// (fail-soft) the stored assignment.
 // ---------------------------------------------------------------------------
 
 let oddTuiLoader = () => import("@earendil-works/pi-tui");
@@ -7520,6 +7524,157 @@ function oddDocsFor(cwd) {
     // A missing or broken lib never opens a viewer over nothing.
   }
   return { ok: false, reason: "no-checkout", docs: [] };
+}
+
+// Stored assignment for the viewer (S8): the checkout's own `odd[]`
+// (`odd/tasks/<file>` names) read fail-soft — an unreadable or malformed
+// registry leaves the view usable with nothing marked, and the failure
+// surfaces only if a save is attempted.
+function oddStoredAssignment(repoRoot, checkoutRoot) {
+  try {
+    const registry = libRequire("worktree-registry.js");
+    if (!registry || typeof registry.findByPath !== "function") return [];
+    const row = registry.findByPath(repoRoot, checkoutRoot);
+    if (!row || !Array.isArray(row.odd)) return [];
+    return row.odd.filter((name) => typeof name === "string" && name.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+// The live branch checked out at the checkout root, for the on-demand row
+// the first save creates. Null when git cannot name one (a detached HEAD,
+// an unlisted path); the saver refuses instead of inventing a branch, so
+// the registry never records a branch that does not exist.
+function oddCheckoutBranch(repoRoot, checkoutRoot) {
+  try {
+    const git = libRequire("worktree-git.js");
+    if (!git || typeof git.listWorktrees !== "function") return null;
+    for (const entry of git.listWorktrees(repoRoot)) {
+      if (!entry || typeof entry.path !== "string") continue;
+      let same = false;
+      try {
+        same = path.resolve(entry.path) === path.resolve(checkoutRoot);
+      } catch {
+        same = false;
+      }
+      if (same && typeof entry.branch === "string" && entry.branch.length > 0) return entry.branch;
+    }
+  } catch {
+    // Null: git is unavailable or names no branch here. The saver
+    // refuses; it never falls back to a directory name.
+  }
+  return null;
+}
+
+// Persist the viewer's pending set as the checkout's `odd[]` with the
+// registry's own overwrite semantics: an existing row found by path is
+// replaced via updateWorktree (which touches only `odd[]`); a missing row
+// (the principal checkout, or a worktree discovery never registered) is
+// created with the checkout's REAL branch and the REAL thread identity
+// resolved exactly like the create path (resolveThread). A missing branch
+// or an unresolvable thread refuses the save WITHOUT writing — the read
+// probe below tells "no row yet" apart from "unreadable file", which
+// findByPath alone cannot. A same-branch row at a different live checkout
+// is never replaced: like the create path, the new checkout is appended
+// alongside it. Returns {ok:true} or {ok:false, error}; the view only
+// applies the assignment on {ok:true} and shows error otherwise.
+function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
+  const clean = Array.from(new Set(
+    (Array.isArray(names) ? names : []).filter((name) => typeof name === "string" && name.length > 0),
+  )).sort();
+  let registry = null;
+  try {
+    registry = libRequire("worktree-registry.js");
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot load the worktree registry" };
+  }
+  let read = null;
+  try {
+    read = registry.readRegistry(repoRoot);
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot read the worktree registry" };
+  }
+  if (!read || read.ok !== true) {
+    return { ok: false, error: (read && read.error) || "cannot read the worktree registry" };
+  }
+  let row = null;
+  try {
+    row = typeof registry.findByPath === "function" ? registry.findByPath(repoRoot, checkoutRoot) : null;
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot read the worktree registry" };
+  }
+  if (row) {
+    try {
+      const updated = registry.updateWorktree(repoRoot, row.path, { odd: clean });
+      if (!updated || updated.ok !== true) {
+        return { ok: false, error: (updated && updated.error) || "cannot save the assignment" };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || "cannot save the assignment" };
+    }
+  }
+  // The created row carries the checkout's real branch: a null branch
+  // (detached HEAD, unlisted path) refuses the save instead of
+  // inventing a branch the registry would later mis-resolve by.
+  const branch = oddCheckoutBranch(repoRoot, checkoutRoot);
+  if (typeof branch !== "string" || branch.length === 0) {
+    return { ok: false, error: `cannot determine the checkout branch for ${checkoutRoot}: refusing to save without a real branch` };
+  }
+  // The created row carries the real work thread, resolved exactly like
+  // the create path. Without an identity the save refuses closed: it
+  // must never record a placeholder thread.
+  const identity = resolveThread(ctx);
+  if (!identity.thread) {
+    return { ok: false, error: "cannot resolve thread identity: set GENTLE_WORKTREE_THREAD or run inside a Pi session" };
+  }
+  const thread = identity.thread;
+  try {
+    // Same-branch hazard, same criterion as the create path: a row that
+    // carries this branch but points at a DIFFERENT live checkout is
+    // kept, and the new checkout is appended alongside it instead of
+    // replacing the row (upsert matches by branch, so it would destroy
+    // that row's issues/odd/thread/createdAt).
+    let useAppend = false;
+    try {
+      const git = libRequire("worktree-git.js");
+      const listed = git && typeof git.listWorktrees === "function" ? git.listWorktrees(repoRoot) : null;
+      if (Array.isArray(listed)) {
+        const afterIds = liveIdentities(listed, repoRoot);
+        const targetReal = checkoutState(checkoutRoot, repoRoot).real;
+        const rows = read && read.ok === true && Array.isArray(read.worktrees) ? read.worktrees : [];
+        for (const candidate of rows) {
+          if (!candidate || candidate.branch !== branch) continue;
+          if (typeof candidate.path !== "string" || !path.isAbsolute(candidate.path)) continue;
+          const rowState = checkoutState(candidate.path, repoRoot);
+          if (!rowState.exists || !rowState.isDirectory) continue;
+          if (rowState.real === null || !afterIds.has(rowState.real)) continue;
+          if (targetReal !== null && rowState.real === targetReal) continue;
+          useAppend = true;
+          break;
+        }
+      }
+    } catch {
+      useAppend = false;
+    }
+    const recorded = {
+      branch,
+      path: checkoutRoot,
+      thread,
+      issues: [],
+      odd: clean,
+    };
+    const created = useAppend && registry && typeof registry.appendWorktree === "function"
+      ? registry.appendWorktree(repoRoot, recorded)
+      : registry.upsertWorktree(repoRoot, recorded);
+    if (!created || created.ok !== true) {
+      return { ok: false, error: (created && created.error) || "cannot save the assignment" };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot save the assignment" };
+  }
 }
 
 function oddTerminalRows(hostTui) {
@@ -7570,6 +7725,15 @@ async function executeOdd(rawArgs, ctx) {
     if (typeof notify === "function") notify("odd: not inside a Git checkout; there is no odd/tasks/ to read", "info");
     return;
   }
+  // The assignment belongs to the checkout the session runs in
+  // (listing.root); it loads fail-soft so a broken registry never blocks
+  // reading, and saves overwrite that row's `odd[]` exactly.
+  const checkoutRoot = (listing && typeof listing.root === "string" && listing.root.length > 0)
+    ? listing.root
+    : oddCheckoutRoot(cwd);
+  const repoRoot = checkoutRoot || cwd;
+  const assigned = checkoutRoot ? oddStoredAssignment(repoRoot, checkoutRoot) : [];
+  const checkoutName = checkoutRoot ? path.basename(checkoutRoot) : "";
   let helpers = null;
   try {
     helpers = await oddTuiLoader();
@@ -7581,6 +7745,9 @@ async function executeOdd(rawArgs, ctx) {
       await ctx.ui.custom(
         (hostTui, theme, _keybindings, done) => libRequire("odd-view.js").createOddView({
           docs: listing.docs,
+          assigned,
+          checkoutName,
+          saveAssignment: (names) => oddSaveAssignment(repoRoot, checkoutRoot, names, ctx),
           loadDoc: (doc) => libRequire("odd-docs.js").readOddDoc(doc),
           reloadDocs: () => oddDocsFor(cwd),
           helpers,
