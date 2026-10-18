@@ -420,6 +420,10 @@ and limitations — lives in
   verbs: one terse line per switch
   (`customize status: sidebar=gentle moshi=off worktree=enabled`).
   See [docs/sidebar-control.md](docs/sidebar-control.md).
+- Odd viewer (`/herdr-gentle:odd`): read-only two-pane overlay over the
+  current checkout's `odd/tasks/*.md` — document names on the left, the
+  selected document as styled markdown on the right.
+  See [docs/odd-viewer.md](docs/odd-viewer.md).
 - Optional Moshi replacement (off by default): the `Moshi notifications`
   rows of `/herdr-gentle:customize` (`On` / `Off`, read-only state via
   `customize status`). With it on, this plugin **replaces the Moshi-managed Pi
@@ -468,6 +472,7 @@ and limitations — lives in
 | Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
 | Customize (`/herdr-gentle:customize`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
 | Agent worktrees (`worktree_*` tools) | [docs/worktree-tools.md](docs/worktree-tools.md) |
+| Odd viewer (`/herdr-gentle:odd`) | [docs/odd-viewer.md](docs/odd-viewer.md) |
 
 ## Next Steps
 

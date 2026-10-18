@@ -640,7 +640,11 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
 
 `/herdr-gentle:customize` is the single surface for the three switches
 (sidebar, Moshi, worktree tools); `/herdr-gentle:warp <name>` moves the
-session between checkouts. The sidebar and Moshi actions stay inline in
+session between checkouts; `/herdr-gentle:odd` opens a read-only two-pane
+overlay over the current checkout's `odd/tasks/*.md` (name list plus styled
+document), implemented in `lib/odd-docs.js` (discovery/read),
+`lib/odd-markdown.js` (renderer) and `lib/odd-view.js` (view) — it writes
+nothing and never leaves the checkout. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
