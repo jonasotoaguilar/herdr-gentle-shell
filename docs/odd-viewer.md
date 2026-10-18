@@ -65,8 +65,9 @@ the documents are still only read.
 
 ## States
 
-- **Empty checkout:** no `odd/tasks/*.md` renders an empty-list state
-  instead of an empty frame. The view still opens.
+- **Empty checkout:** the command answers with one muted line — `No odd
+  documents under odd/tasks/ in this checkout.` — and opens no overlay,
+  the same way the changes view answers an empty repository.
 - **Unreadable document:** the document's own error line renders in the
   right pane; the list stays usable.
 - **Unreadable registry:** the stored assignment loads fail-soft — the

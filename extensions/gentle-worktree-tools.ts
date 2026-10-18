@@ -7725,6 +7725,12 @@ async function executeOdd(rawArgs, ctx) {
     if (typeof notify === "function") notify("odd: not inside a Git checkout; there is no odd/tasks/ to read", "info");
     return;
   }
+  // S9: with nothing to read there is no overlay at all — one muted line,
+  // exactly like the changes view answers an empty repository.
+  if (listing.docs.length === 0) {
+    if (typeof notify === "function") notify("No odd documents under odd/tasks/ in this checkout.", "info");
+    return;
+  }
   // The assignment belongs to the checkout the session runs in
   // (listing.root); it loads fail-soft so a broken registry never blocks
   // reading, and saves overwrite that row's `odd[]` exactly.

@@ -189,7 +189,7 @@ describe('/herdr-gentle:odd', () => {
     assert.match(body, /S1\. first rule/, 'the right pane shows the selected document');
   });
 
-  test('a checkout without odd documents still opens the view with its empty state', async () => {
+  test('a checkout without odd documents notifies and opens nothing', async () => {
     const { commands, mod } = await loadExtension();
     const def = commands.get('herdr-gentle:odd');
     const root = makeRepo({ docs: {} });
@@ -197,12 +197,11 @@ describe('/herdr-gentle:odd', () => {
     const host = makeHostTui(12);
     const { ctx, customs, notes } = makeCtx({ cwd: root, customImpl: async () => null });
     await def.handler('', ctx);
-    assert.equal(customs.length, 1);
-    const { component } = openComponent(customs[0][0], host);
-    const body = component.render(80).join('\n');
-    assert.match(body, /0 documents/);
-    assert.match(body, /no odd documents/);
-    assert.deepEqual(notes, []);
+    assert.equal(customs.length, 0, 'no overlay when there is nothing to read');
+    assert.equal(notes.length, 1, 'the reader gets one line saying so');
+    assert.match(notes[0][0], /no odd documents/i);
+    assert.match(notes[0][0], /odd\/tasks/);
+    assert.equal(notes[0][1], 'info');
   });
 
   test('outside a Git checkout it notifies and opens nothing', async () => {
