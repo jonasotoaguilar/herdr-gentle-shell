@@ -510,6 +510,13 @@ function fireSessionStart(handlers, { json, exit = '0', notes } = {}) {
   })();
 }
 
+// Only this check's own alerts. `fireSessionStart` runs every registered
+// `session_start` handler, and another one legitimately notifies here: the
+// `/herdr-gentle:issues` gate fires one message when `gh` is missing or
+// unauthenticated, which is the CI case. Counting every startup notification
+// measured that handler instead of this one.
+const pluginAlerts = (notes) => notes.filter(([message]) => String(message).includes(PLUGIN_ID));
+
 describe('herdr-plugin-check wiring at session startup', { concurrency: false }, () => {
   test('a version drift at startup notifies once with the update command', async () => {
     pluginCheck.resetHerdrPluginCheckForTests();
@@ -528,8 +535,8 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
       const json = listDoc([entry({ version: '9.9.9' })]);
       await fireSessionStart(handlers, { json, notes });
       await fireSessionStart(handlers, { json, notes });
-      assert.equal(notes.length, 1, 'exactly one alert per session across two startups');
-      const [message, level] = notes[0];
+      assert.equal(pluginAlerts(notes).length, 1, 'exactly one alert per session across two startups');
+      const [message, level] = pluginAlerts(notes)[0];
       assert.equal(level, 'info');
       assert.ok(message.includes(PLUGIN_ID), `names the plugin id: ${message}`);
       assert.ok(message.includes('9.9.9') && message.includes(shipped), `names both versions: ${message}`);
@@ -553,7 +560,7 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: listDoc([entry({ version: shipped })]), notes });
-      assert.equal(notes.length, 0, 'a healthy install notifies nothing');
+      assert.equal(pluginAlerts(notes).length, 0, 'a healthy install notifies nothing');
     } finally {
       restoreEnv();
     }
@@ -570,7 +577,7 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: '{}', notes });
-      assert.equal(notes.length, 0, 'no alert when Herdr is unavailable');
+      assert.equal(pluginAlerts(notes).length, 0, 'no alert when Herdr is unavailable');
     } finally {
       restoreEnv();
     }
@@ -588,7 +595,7 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: '{}', exit: '1', notes });
-      assert.equal(notes.length, 0, 'no alert when the list call errors');
+      assert.equal(pluginAlerts(notes).length, 0, 'no alert when the list call errors');
     } finally {
       restoreEnv();
     }
