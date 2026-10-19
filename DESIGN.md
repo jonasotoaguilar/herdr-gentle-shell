@@ -874,8 +874,10 @@ registration plus per-execution re-read — and the panel itself always
 stays registered so the mode can be flipped back. Registration changes
 reload the extension runtime automatically when the registration must
 change (`enabled !== toolsRegistered`, i.e. enabling while the runtime
-loaded disabled or vice versa), which `customize status` reports. Create and close
-prompt for approval when the host offers dialog UI; list is read-only
+loaded disabled or vice versa), which `customize status` reports. Create never
+prompts — a create touches no existing data; close prompts when the host
+offers dialog UI, waived under gentle-shell YOLO only for a checkout proven
+clean; list is read-only
 and never prompts.
 
 ### Known limitations (stated, not solved here)

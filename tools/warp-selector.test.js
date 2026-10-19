@@ -91,6 +91,23 @@ function makeRepo(tag) {
   return fs.realpathSync(dir);
 }
 
+// gentle-shell answers YOLO questions on this channel with an adapter whose
+// read() is 'ON' only while the live session holds the grant (upstream
+// lib/yolo-session-policy.ts). `null` stands for a host that never answers.
+let yoloResponder = null;
+
+function answerYolo(display) {
+  yoloResponder = (channel, payload) => {
+    if (channel !== 'gentle:yolo:host-ui') return;
+    if (display === null) return;
+    payload.respond({ read: async () => display, dispose: () => {} });
+  };
+}
+
+function resetYolo() {
+  yoloResponder = null;
+}
+
 async function loadExtension() {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
@@ -102,6 +119,11 @@ async function loadExtension() {
     registerCommand: (name, def) => { commands.set(name, def); },
     registerMessageRenderer: () => {},
     on: () => () => {},
+    events: {
+      emit: (channel, payload) => {
+        if (typeof yoloResponder === 'function') yoloResponder(channel, payload);
+      },
+    },
   };
   process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
   const mod = await import(pathToFileURL(copy).href);
@@ -595,6 +617,65 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes carries force for that row');
     } finally {
       restoreEnv();
+    }
+  });
+
+  test('YOLO active waives the deletion confirmation for a clean row', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('wired-delete-yolo');
+      const target = addRegisteredWorktree(root, 'feat/del');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      // confirmImpl refuses everything: the row must be deleted without ever
+      // consulting it, which is what proves the waiver.
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => false,
+      });
+      answerYolo('ON');
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 0, 'YOLO waives the clean row confirmation');
+      assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once, without force');
+      assert.deepEqual(built.notes, [['removed', 'info']], 'the success text is unchanged');
+    } finally {
+      restoreEnv();
+      resetYolo();
+    }
+  });
+
+  test('YOLO never waives the deletion confirmation of a dirty row', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('wired-delete-yolo-dirty');
+      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
+      git(root, ['add', 'a.txt']);
+      git(root, ['commit', '-m', 'seed']);
+      const target = addRegisteredWorktree(root, 'feat/del');
+      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => true,
+      });
+      answerYolo('ON');
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'a dirty row is confirmed even under YOLO');
+      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes still carries force for that row');
+    } finally {
+      restoreEnv();
+      resetYolo();
     }
   });
 

@@ -814,28 +814,9 @@ async function executeWorktreeCreate(params, ctx, opts) {
     // A failed probe never blocks: the backends report their own error.
   }
 
-  // (f) Approval when the host offers dialog UI; non-interactive modes
-  // proceed without it. A refusal mutates nothing and writes no entry.
-  if (ctx && ctx.hasUI) {
-    const canAsk = ctx.ui && typeof ctx.ui.confirm === "function";
-    let approved = false;
-    if (canAsk) {
-      try {
-        approved = await ctx.ui.confirm(
-          `Create worktree '${branch}'?`,
-          `Create worktree at ${target} for branch '${branch}' (issues: ${issueNumbers.join(", ")})?`,
-        );
-      } catch {
-        approved = false;
-      }
-    }
-    if (!approved) {
-      return errorResult(
-        `worktree create cancelled: approval declined for branch '${branch}'`,
-        { cancelled: true, branch, path: target, issues: issueNumbers },
-      );
-    }
-  }
+  // No approval dialog: a create touches no existing data — the checkout and
+  // its registry row are both new — and the panel's create path never asked
+  // either. The confirmation that matters lives in `worktree_close`.
 
   // (g) Create. S20 branch adoption is resolved BEFORE creating: when
   // `refs/heads/<branch>` already exists (and is not checked out at a
@@ -2247,6 +2228,54 @@ async function closePreRemovalSequence({ git, repo, target, branch, force, ctx, 
   return { ok: true, warp, herdrWorkspace, notices, repoRoot: anchorRoot };
 }
 
+// gentle-shell owns the live session's permission mode, and its YOLO grant is
+// in-memory there: it answers on this host channel with an adapter whose read()
+// is "ON" only while the grant still binds THIS live session (upstream
+// lib/yolo-session-policy.ts, discovered through `pi.events`).
+const YOLO_HOST_CHANNEL = "gentle:yolo:host-ui";
+const YOLO_DISCOVERY_TIMEOUT_MS = 100;
+let hostEvents = null;
+
+// True only on an explicit "ON" answer. Everything else — gentle-shell absent,
+// no `pi.events`, no responder, a malformed answer, a throw or the discovery
+// timeout — reads as "not YOLO", so every caller keeps asking.
+async function yoloActiveFor(ctx) {
+  const events = hostEvents;
+  if (!events || typeof events.emit !== "function" || !ctx) return false;
+  let adapter = null;
+  await new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => { settled = true; resolve(); }, YOLO_DISCOVERY_TIMEOUT_MS);
+    const respond = (value) => {
+      if (!value || typeof value !== "object" || typeof value.read !== "function") return;
+      if (settled) {
+        // A late second answer is disposed rather than read.
+        try { value.dispose?.(); } catch { /* display only */ }
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      adapter = value;
+      resolve();
+    };
+    try {
+      events.emit(YOLO_HOST_CHANNEL, { context: ctx, respond });
+    } catch {
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+  if (!adapter) return false;
+  try {
+    return (await adapter.read()) === "ON";
+  } catch {
+    return false;
+  } finally {
+    try { adapter.dispose?.(); } catch { /* display only */ }
+  }
+}
+
 // Core of `worktree_close` (S7, D6): remove the checkout and its Herdr
 // workspace, keep the branch, drop the registry entry. Exported for unit
 // tests; the registered tool calls it with the live Pi context.
@@ -2441,36 +2470,51 @@ async function executeWorktreeClose(params, ctx, opts) {
 
   // Approval when the host offers dialog UI; non-interactive modes
   // proceed without it. A refusal mutates nothing and keeps the entry.
-  // S61: the confirmation names the checkout's pending changes when it
-  // has any (N files +N/-N read through lib/worktree-changes.js); a
-  // clean checkout omits the dirty warning. A summary failure degrades
-  // to the plain confirmation (never a silent force: force still comes
-  // only from the caller's params).
+  //
+  // S61: the confirmation names the checkout's pending changes when it has
+  // any (N files +N/-N read through lib/worktree-changes.js); a clean checkout
+  // omits the dirty warning.
+  //
+  // gentle-shell YOLO waives this confirmation for a CLEAN checkout only: that
+  // grant is standing human permission for ordinary work. A checkout with
+  // pending changes is never waived, YOLO or not — the branch survives either
+  // way, uncommitted work does not, and in the warp selector's Ctrl+D flow
+  // this same dialog is what authorizes force. Nothing here ever forces:
+  // force still comes only from the caller's params.
   if (ctx && ctx.hasUI) {
     const canAsk = ctx.ui && typeof ctx.ui.confirm === "function";
     let approved = false;
     if (canAsk) {
       let dirtyLine = '';
+      // Only a positive "no pending changes" may waive anything: an unreadable
+      // or failed summary counts as dirty and keeps asking.
+      let dirty = true;
       try {
         const changesLib = libRequire('worktree-changes.js');
         const summary = await changesLib.summarizeChanges(target, { git });
-        if (summary && summary.ok === true && summary.files > 0) {
-          dirtyLine = ` Pending changes: ${summary.files} file${summary.files === 1 ? '' : 's'}, +${summary.added}/-${summary.deleted}.`;
+        if (summary && summary.ok === true) {
+          dirty = summary.files > 0;
+          if (dirty) {
+            dirtyLine = ` Pending changes: ${summary.files} file${summary.files === 1 ? '' : 's'}, +${summary.added}/-${summary.deleted}.`;
+          }
         }
       } catch {
-        dirtyLine = '';
+        dirty = true;
       }
-      try {
-        approved = await ctx.ui.confirm(
-          `Close worktree '${branch}'?`,
-          `Remove the worktree checkout at ${target} for branch '${branch}'? The branch '${branch}' will be kept.`
-            + (owner
-              ? ` This checkout is owned by thread '${owner}'.`
-              : " This checkout has no recorded owning thread.")
-            + dirtyLine,
-        );
-      } catch {
-        approved = false;
+      approved = !dirty && await yoloActiveFor(ctx);
+      if (!approved) {
+        try {
+          approved = await ctx.ui.confirm(
+            `Close worktree '${branch}'?`,
+            `Remove the worktree checkout at ${target} for branch '${branch}'? The branch '${branch}' will be kept.`
+              + (owner
+                ? ` This checkout is owned by thread '${owner}'.`
+                : " This checkout has no recorded owning thread.")
+              + dirtyLine,
+          );
+        } catch {
+          approved = false;
+        }
       }
     }
     if (!approved) {
@@ -5914,12 +5958,12 @@ const WARP_CHANGE_TYPES = [
 const WARP_CREATE_BRANCH_RE = /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$/;
 
 // The create panel is the selector's create completion: ONE component
-// holds type, name, issues and odd, then `executeWorktreeCreate` runs with
-// the approval dialog suppressed (`hasUI: false` on a shallow copy — the
-// type plus the typed name is the human approval) and the session warps
-// into the fresh checkout. Empty selections stay OMITTED on the create
-// call — never empty arrays — so the invalid, duplicate, occupied and
-// principal refusals keep their exact shape.
+// holds type, name, issues and odd, then `executeWorktreeCreate` runs — it
+// never prompts, and the type plus the typed name the panel collected is
+// the human intent — and the session warps into the fresh checkout. Empty
+// selections stay OMITTED on the create call — never empty arrays — so the
+// invalid, duplicate, occupied and principal refusals keep their exact
+// shape.
 
 // Injectable seam for the open-issues fetch the panel renders (tests):
 // production leaves it null and the panel's own default reads them.
@@ -6161,11 +6205,10 @@ function warpPanelSources(ctx, cwd, oddRoot) {
 
 // Create-then-warp: the selector's create completion mounts the SINGLE
 // panel (type, name, issues and odd at once) as an overlay, then runs the
-// SAME creation path `worktree_upsert` uses with the approval dialog
-// suppressed (`hasUI: false` — the type plus the typed name is the human
-// approval) and warps the session into the fresh checkout. Empty
-// selections stay OMITTED on the create call — never empty arrays — so the
-// invalid, duplicate, occupied and principal refusals keep their shape.
+// SAME creation path `worktree_upsert` uses — which never prompts — and
+// warps the session into the fresh checkout. Empty selections stay OMITTED
+// on the create call — never empty arrays — so the invalid, duplicate,
+// occupied and principal refusals keep their shape.
 async function warpCreateAndEnter(ctx, git, notify) {
   if (!ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
     notify?.("warp: the host UI cannot open the create panel here; create one with the worktree_upsert tool first, then /herdr-gentle:warp <name>.", "error");
@@ -6237,14 +6280,13 @@ async function warpCreateAndEnter(ctx, git, notify) {
   const createParams = { branch };
   if (Array.isArray(out.issues) && out.issues.length > 0) createParams.issues = out.issues.slice();
   if (Array.isArray(out.odd) && out.odd.length > 0) createParams.odd = out.odd.slice();
-  const createCtx = ctx && typeof ctx === "object" ? { ...ctx, hasUI: false } : ctx;
   // S53: the git-only route — a plain git checkout plus the registry row,
   // never a Herdr workspace — reusing the same creation path (validations,
-  // refusals, registration) with the approval dialog suppressed. The
-  // layout is principal-anchored (S56): the new checkout lands beside the
-  // PRINCIPAL checkout even when the panel runs inside a linked worktree,
-  // while the branch HEAD still comes from the current checkout.
-  const created = await executeWorktreeCreate(createParams, createCtx, { gitOnly: true, principalLayout: true });
+  // refusals, registration), which never prompts. The layout is
+  // principal-anchored (S56): the new checkout lands beside the PRINCIPAL
+  // checkout even when the panel runs inside a linked worktree, while the
+  // branch HEAD still comes from the current checkout.
+  const created = await executeWorktreeCreate(createParams, ctx, { gitOnly: true, principalLayout: true });
   if (created && created.isError) {
     notify?.(created.text, "error");
     return;
@@ -6511,10 +6553,6 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       // Protected row (principal/current/unregistered) or a stale path:
       // safe no-op, the loop simply re-reads and re-mounts.
       if (!target || !canDelete(out.path)) continue;
-      if (typeof ctx?.ui?.confirm !== "function") {
-        notify?.("warp: the host UI cannot confirm worktree deletion here; nothing was deleted.", "error");
-        continue;
-      }
       // S61: the deletion confirmation always names the checkout's
       // pending changes when it has any (N files +N/-N through
       // lib/worktree-changes.js); a clean checkout omits the dirty
@@ -6523,34 +6561,51 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       // the shared close for exactly that row (never the principal —
       // not deletable here — never protected/foreign, whose refusals
       // inside the close stay intact because they run before any
-      // removal). A summary failure degrades to the plain confirmation.
+      // removal).
       let deleteDirtyLine = '';
-      let deleteIsDirty = false;
+      let deleteIsDirty = false; // positive evidence of pending changes
+      let deleteClean = false; // positive evidence of none
       try {
         const deleteChangesLib = libRequire('worktree-changes.js');
         const deleteSummary = await deleteChangesLib.summarizeChanges(target.path, { git });
-        if (deleteSummary && deleteSummary.ok === true && deleteSummary.files > 0) {
-          deleteIsDirty = true;
-          deleteDirtyLine = ` Pending changes: ${deleteSummary.files} file${deleteSummary.files === 1 ? '' : 's'}, +${deleteSummary.added}/-${deleteSummary.deleted}.`;
+        if (deleteSummary && deleteSummary.ok === true) {
+          deleteIsDirty = deleteSummary.files > 0;
+          deleteClean = !deleteIsDirty;
+          if (deleteIsDirty) {
+            deleteDirtyLine = ` Pending changes: ${deleteSummary.files} file${deleteSummary.files === 1 ? '' : 's'}, +${deleteSummary.added}/-${deleteSummary.deleted}.`;
+          }
         }
       } catch {
         deleteDirtyLine = '';
         deleteIsDirty = false;
+        deleteClean = false;
       }
-      let approved = false;
-      try {
-        approved = await ctx.ui.confirm(
-          `Delete worktree '${target.name}'?`,
-          `Delete worktree checkout at ${target.path} for branch '${target.branch}'? This removes the checkout but keeps the branch.` + deleteDirtyLine,
-        );
-      } catch {
-        approved = false;
+      // gentle-shell YOLO waives this confirmation for a positively clean row
+      // only: a dirty row keeps asking because the Yes below is what authorizes
+      // force, and an unreadable summary is neither dirty nor clean, so it
+      // keeps asking too.
+      const deleteWaived = deleteClean && await yoloActiveFor(ctx);
+      if (!deleteWaived && typeof ctx?.ui?.confirm !== "function") {
+        notify?.("warp: the host UI cannot confirm worktree deletion here; nothing was deleted.", "error");
+        continue;
+      }
+      let approved = deleteWaived;
+      if (!approved) {
+        try {
+          approved = await ctx.ui.confirm(
+            `Delete worktree '${target.name}'?`,
+            `Delete worktree checkout at ${target.path} for branch '${target.branch}'? This removes the checkout but keeps the branch.` + deleteDirtyLine,
+          );
+        } catch {
+          approved = false;
+        }
       }
       if (!approved) continue;
       const closeCtx = ctx && typeof ctx === "object" ? { ...ctx, hasUI: false } : ctx;
       const runner = typeof warpCloseRunner === "function" ? warpCloseRunner : executeWorktreeClose;
-      // The explicit Yes above authorizes this row's pending changes:
-      // force travels ONLY here, for exactly this approved target.
+      // Force travels ONLY here and only on positive evidence of pending
+      // changes, so the approval above — an explicit Yes, never the YOLO
+      // waiver, which requires a row proven clean — is what authorizes it.
       const closeParams = deleteIsDirty ? { path: target.path, force: true } : { path: target.path };
       let closed;
       try {
@@ -8290,6 +8345,9 @@ export default function (pi) {
   // The S26 delivery route: watchers started by `worktree_session_open`
   // notify through this host object.
   sessionNotifyPi = pi;
+  // gentle-shell's YOLO grant is answered on its own host channel through
+  // `pi.events`; this is the only handle this extension needs on it.
+  hostEvents = pi && typeof pi === "object" ? pi.events ?? null : null;
   // Load-time gate (D9): missing means enabled, malformed never enables.
   // The customize panel always stays registered so the mode can be
   // flipped back; the current registration state feeds its worktree rows
