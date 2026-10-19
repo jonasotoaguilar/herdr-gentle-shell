@@ -246,7 +246,8 @@ function scratchModeEnv() {
 
 const savedEnv = { ...process.env };
 function setEnv(vars) {
-  for (const [key, value] of Object.entries(vars)) {
+  const env = 'GENTLE_STATUS_STATE_DIR' in vars ? vars : { ...vars, ...scratchModeEnv() };
+  for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
