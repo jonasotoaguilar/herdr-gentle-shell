@@ -93,7 +93,13 @@ function restoreEnv() {
 }
 
 function scratchStateEnv() {
-  return { GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-state-'))) };
+  // A scratch agent dir too: the performance rows read and write
+  // `<agent-dir>/settings.json`, and no test may touch the real one.
+  return {
+    GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-state-'))),
+    GENTLE_PI_AGENT_HOME: undefined,
+    PI_CODING_AGENT_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-agent-'))),
+  };
 }
 
 function modeLib() {
@@ -347,7 +353,7 @@ describe('customize panel', { concurrency: false }, () => {
         'publishes agent state and SessionChanges from Gentle',
         'Native Herdr',
         'Preview · Gentle (this extension)',
-        '←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close',
+        '←/→ or Tab panes · ↑/↓ move · Enter apply · ? help · Esc close',
       ]) {
         assert.ok(seen().includes(copy), `panel copy missing: ${copy}`);
       }
@@ -1028,7 +1034,7 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
     try {
       const text = component.render(80).map(stripAnsi).join('\n');
       assert.ok(text.includes('Preview · Gentle (this extension)'), 'preview names the focused choice');
-      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close'), 'footer survives inside the card');
+      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ move · Enter apply · ? help · Esc close'), 'footer survives inside the card');
     } finally {
       cleanup();
     }
@@ -1346,6 +1352,265 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
     } finally {
       setSlot(hadSlot);
       restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// customize-perf-rows (perf-switches S2-S6, T1-T4): the three performance rows.
+//
+// Contract under test (observable behavior only — the bytes of
+// `<agent-dir>/settings.json`, the notified text, whether ctx.reload ran, and
+// what the panel renders; never internal function names):
+// - the panel carries a fourth category with three rows, all OFF with no
+//   settings file, and opening it writes nothing;
+// - each row's footer note states what it improves AND what it worsens with
+//   its SYNTHETIC measured numbers, while the full measured detail sits
+//   behind the help key;
+// - row 2 writes the single key `expandRecentToolOutput`, row 3 the single
+//   key `incrementalSearchCorpus`, row 1 both `heightIndex` and
+//   `evictOffscreenLines`;
+// - a fused row whose keys disagree reads PARTIAL and normalizes both keys on
+//   the next toggle, never claiming they were already equal;
+// - an unreadable or malformed settings file is left byte-identical and the
+//   row says nothing changed.
+// ---------------------------------------------------------------------------
+
+function perfLib() {
+  return require('../lib/customize-perf-rows.js');
+}
+
+function perfSettingsFile(env) {
+  return path.join(env.PI_CODING_AGENT_DIR, 'settings.json');
+}
+
+function writePerfSettings(env, doc) {
+  fs.mkdirSync(path.dirname(perfSettingsFile(env)), { recursive: true });
+  fs.writeFileSync(perfSettingsFile(env), `${JSON.stringify(doc, null, 2)}\n`);
+}
+
+function readPerfSettings(env) {
+  return JSON.parse(fs.readFileSync(perfSettingsFile(env), 'utf8'));
+}
+
+// One flattened view of the card: assertions about copy survive the wrapping
+// the panel applies to notes and help lines.
+function flatCard(component, width = 100) {
+  return component.render(width).map((line) => String(line)).join('\n').replace(/\s+/g, ' ');
+}
+
+// Drive the REAL panel through the command: `inputs` are the navigation keys,
+// `inspect` renders the state they reached, and `confirm` is the key that
+// finishes the overlay and reaches the single apply path exactly like a user's
+// Enter would.
+async function runPanel({ env, inputs = [], inspect, confirm = null }) {
+  setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...env });
+  const hadSlot = setSlot(stubSlot().slot);
+  const host = makeHostTui();
+  try {
+    modeLib().writeMode(true, process.env);
+    const { commands, mod } = await loadExtension();
+    installTuiLoader(mod, async () => stubTui);
+    let component = null;
+    const { ctx, notes, seq } = makeCtx({
+      customImpl: async (factory) => {
+        const opened = openComponent(factory, host);
+        component = opened.component;
+        for (const input of inputs) component.handleInput(input);
+        if (typeof inspect === 'function') inspect(component);
+        if (confirm !== null) component.handleInput(confirm);
+        return opened.done() === 'pending' ? null : opened.done();
+      },
+    });
+    await customizeDef(commands).handler('', ctx);
+    return { component, notes, seq, host };
+  } finally {
+    setSlot(hadSlot);
+    restoreEnv();
+  }
+}
+
+// sidebar, moshi, worktree, performance: three downs reach the perf category.
+const TO_PERF = ['down', 'down', 'down'];
+const TO_PERF_ROW_2 = [...TO_PERF, 'right', 'down'];
+const TO_PERF_ROW_3 = [...TO_PERF, 'right', 'down', 'down'];
+
+describe('customize performance rows', { concurrency: false }, () => {
+  test('the three switches read OFF with no settings file, and opening the panel writes nothing', async () => {
+    const env = scratchStateEnv();
+    const { component } = await runPanel({ env, inputs: TO_PERF });
+    const text = flatCard(component);
+    for (const copy of [
+      'Performance switches',
+      'Height index + eviction · OFF',
+      'Recent tool output expansion · OFF',
+      'Incremental search corpus · OFF',
+    ]) {
+      assert.ok(text.includes(copy), `panel copy missing: ${copy}`);
+    }
+    assert.ok(!text.includes('→ Height index'), 'three independent switches claim no single active value');
+    assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'opening the panel writes no settings file');
+  });
+
+  test('the fused row states both what it improves and what it worsens, labelled synthetic', async () => {
+    const env = scratchStateEnv();
+    const { component } = await runPanel({ env, inputs: TO_PERF });
+    const text = flatCard(component);
+    assert.ok(text.includes('3.36 -> 1.84 ms'), 'the improvement carries its measured number');
+    assert.ok(text.includes('32.48 -> 63.52 ms'), 'the regression carries its measured number');
+    assert.ok(text.includes('SYNTHETIC'), 'the note keeps its synthetic label');
+    assert.ok(text.includes('Eviction needs the index'), 'the fused dependency is stated');
+  });
+
+  test('the recent-output row states what it costs: a stub is not searchable and not copyable', async () => {
+    const env = scratchStateEnv();
+    const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
+    const text = flatCard(component);
+    assert.ok(text.includes('Preview · Recent tool output expansion · OFF'));
+    assert.ok(text.includes('3.88 -> 1.44 ms'), 'the improvement carries its measured number');
+    assert.ok(text.includes('87.9 -> 68.0 MB'));
+    assert.ok(
+      text.includes('neither searchable nor copyable until you expand it by hand'),
+      'the cost is the transcript text itself, stated plainly',
+    );
+  });
+
+  test('the help key shows the full measured detail the footer leaves out', async () => {
+    const env = scratchStateEnv();
+    const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
+    const footer = flatCard(component);
+    assert.ok(!footer.includes('load 5.7-6.4'), 'the apparatus stays behind the help key');
+    component.handleInput('?');
+    const help = flatCard(component);
+    assert.ok(help.includes('4 bash rows of 10 lines per turn'), 'the help states the content shape');
+    assert.ok(help.includes('load 5.7-6.4'), 'the help states the box was not idle');
+    assert.ok(help.includes('Ctrl+O toggles that mode for the session'), 'the mode semantics are in the help');
+    assert.ok(help.includes('survives a new prompt'), 'the help states the mode is session state');
+    component.handleInput('?');
+    assert.equal(flatCard(component), footer, 'the help key toggles back to the same footer');
+  });
+
+  test('Enter on the recent-output row writes the single key, keeps other settings and reloads', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { theme: 'gentle', expandRecentToolOutput: false });
+    const { notes, seq } = await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
+    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', expandRecentToolOutput: true });
+    assert.deepEqual(notes, [[
+      'Recent tool output expansion enabled. Reloading now to apply the change.',
+      'info',
+    ]]);
+    assert.deepEqual(seq, [
+      'notify:Recent tool output expansion enabled. Reloading now to apply the change.',
+      'reload',
+    ], 'the panel closes, then the notice, then the reload');
+  });
+
+  test('Enter again turns the mode off and writes nothing else', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { theme: 'gentle', expandRecentToolOutput: true });
+    const { notes } = await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
+    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', expandRecentToolOutput: false });
+    assert.deepEqual(notes, [[
+      'Recent tool output expansion disabled. Reloading now to apply the change.',
+      'info',
+    ]]);
+  });
+
+  test('the search row writes its own single key and no other', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { theme: 'gentle' });
+    await runPanel({ env, inputs: TO_PERF_ROW_3, confirm: 'enter' });
+    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', incrementalSearchCorpus: true });
+  });
+
+  test('the fused row writes both keys and reads PARTIAL while they disagree', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: false });
+    const { notes } = await runPanel({
+      env,
+      inputs: TO_PERF,
+      inspect: (component) => {
+        const text = flatCard(component);
+        assert.ok(text.includes('Height index + eviction · PARTIAL'), 'a mixed state is reported as partial');
+        assert.ok(!text.includes('Height index + eviction · ON'), 'it never claims the keys were already equal');
+      },
+      confirm: 'enter',
+    });
+    assert.deepEqual(readPerfSettings(env), { heightIndex: true, evictOffscreenLines: true }, 'both keys normalize to one value');
+    assert.deepEqual(notes, [[
+      'Height index + eviction enabled. Both keys were out of step and now match. Reloading now to apply the change.',
+      'info',
+    ]]);
+  });
+
+  test('the fused row turns both keys off together', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: true, theme: 'gentle' });
+    await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
+    assert.deepEqual(readPerfSettings(env), { heightIndex: false, evictOffscreenLines: false, theme: 'gentle' });
+  });
+
+  test('a malformed settings file is left byte-identical and the row says nothing changed', async () => {
+    const env = scratchStateEnv();
+    fs.mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true });
+    fs.writeFileSync(perfSettingsFile(env), '{ "heightIndex": tru');
+    const { notes, seq } = await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
+    assert.equal(fs.readFileSync(perfSettingsFile(env), 'utf8'), '{ "heightIndex": tru');
+    assert.equal(notes.length, 1);
+    assert.match(notes[0][0], /^Height index \+ eviction not changed\. /);
+    assert.match(notes[0][0], /invalid JSON/, 'the reason names the real obstacle');
+    assert.ok(!seq.includes('reload'), 'a failed write never reloads');
+  });
+
+  test('the headless fallback menu reaches the same rows and writes the same key', async () => {
+    const env = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...env });
+    const hadSlot = setSlot(stubSlot().slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => null);
+      const picked = [];
+      const { ctx, notes } = makeCtx({
+        selectImpl: (title, options) => {
+          picked.push([title, options]);
+          return title === 'Customize · Herdr Gentle Shell' ? 'Performance switches' : options[1];
+        },
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(picked[0][1][3], 'Performance switches', 'the category keeps its place in the fallback menu');
+      assert.deepEqual(picked[1][1], [
+        'Height index + eviction · OFF',
+        'Recent tool output expansion · OFF',
+        'Incremental search corpus · OFF',
+      ], 'every fallback row carries its own state');
+      assert.deepEqual(readPerfSettings(env), { expandRecentToolOutput: true }, 'the fallback writes the single key');
+      assert.deepEqual(notes, [[
+        'Recent tool output expansion enabled. Reloading now to apply the change.',
+        'info',
+      ]]);
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('the footer note comes from the setting\'s own description when the host exposes one', async () => {
+    const lib = perfLib();
+    const filler = 'Filler sentence that only exists to overflow the footer area. '.repeat(3);
+    lib.setDescriptions({ heightIndex: `Pi's own description first sentence. ${filler}APPENDIX-TAIL.` });
+    try {
+      const env = scratchStateEnv();
+      const { component } = await runPanel({ env, inputs: TO_PERF });
+      const footer = flatCard(component);
+      assert.ok(footer.includes("Pi's own description first sentence."), 'the setting description reaches the footer');
+      assert.ok(!footer.includes('APPENDIX-TAIL'), 'the footer shows the short form only');
+      component.handleInput('?');
+      const help = flatCard(component);
+      assert.ok(help.includes('APPENDIX-TAIL'), 'the help shows the description whole');
+      assert.ok(help.includes("Pi's own description first sentence."));
+    } finally {
+      lib.setDescriptions({});
     }
   });
 });

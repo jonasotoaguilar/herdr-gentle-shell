@@ -594,3 +594,323 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// T1/S2/S5: the startup flow also owns the sidebar option. The extension
+// supplies a `sidebar` handle that drives the panel's own writer; the lib owns
+// the once-per-session message and the install-command source, so a switch-off
+// is never announced as a success it did not achieve.
+// ---------------------------------------------------------------------------
+
+describe('herdr-plugin-check: sidebar enable refusal literal (S3/S4)', { concurrency: false }, () => {
+  test('missing, disabled and inconclusive each name the concrete fix command', () => {
+    const missing = pluginCheck.sidebarEnableRefusal('missing');
+    assert.ok(missing.includes(PLUGIN_ID), `names the plugin: ${missing}`);
+    assert.ok(
+      missing.includes('herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin'),
+      `names the install command: ${missing}`,
+    );
+    assert.ok(missing.includes(ENABLE_COMMAND), `carries the enable step: ${missing}`);
+    assert.ok(missing.includes('cannot be enabled'), `is a refusal, not an alert: ${missing}`);
+    assert.ok(!missing.includes('/reload'), 'never asks for /reload');
+    const disabled = pluginCheck.sidebarEnableRefusal('disabled');
+    assert.ok(disabled.includes(ENABLE_COMMAND), `names the enable command: ${disabled}`);
+    assert.notEqual(missing, disabled, 'the two fixes are distinct strings');
+    const unknown = pluginCheck.sidebarEnableRefusal('unknown');
+    assert.ok(unknown.includes('could not determine'), `reports the inconclusive lookup: ${unknown}`);
+    assert.ok(
+      unknown.includes('herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin'),
+      `still names the install command: ${unknown}`,
+    );
+  });
+});
+
+function sidebarHandle({ side = 'gentle', rows = false, applyResult } = {}) {
+  const calls = { read: 0, applied: [], rowsManaged: 0 };
+  let state = side;
+  return {
+    handle: {
+      read() {
+        calls.read += 1;
+        return state;
+      },
+      async apply(value) {
+        calls.applied.push(value);
+        if (applyResult && applyResult.changed) state = 'native';
+        return applyResult || { changed: false, needsReload: false, text: 'stub' };
+      },
+      rowsManaged() {
+        calls.rowsManaged += 1;
+        return rows;
+      },
+    },
+    calls,
+  };
+}
+
+describe('herdr-plugin-check: startup auto-disable (T1/S2/S5)', { concurrency: false }, () => {
+  test('a missing plugin switches the option OFF through the panel writer in one honest message', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    const manifestPath = writeManifest('0.4.0');
+    const { run } = stubRun({});
+    const notes = [];
+    const { handle, calls } = sidebarHandle({
+      side: 'gentle',
+      rows: true,
+      applyResult: { changed: true, needsReload: true, text: 'Gentle sidebar disabled.' },
+    });
+    const result = await pluginCheck.checkAndHandleHerdrPluginStartup({
+      manifestPath,
+      run,
+      env: {},
+      notify: (message, level) => notes.push([message, level]),
+      sidebar: handle,
+    });
+    assert.deepEqual(calls.applied, ['native'], 'the panel writer runs with the native value');
+    assert.equal(notes.length, 1, 'exactly one message');
+    assert.equal(notes[0][1], 'info');
+    const message = notes[0][0];
+    assert.ok(/switched OFF/.test(message), `says it was switched off: ${message}`);
+    assert.ok(
+      message.includes('herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref herdr-v0.4.0'),
+      `names the install command: ${message}`,
+    );
+    assert.ok(/rows were left as found/.test(message), `notes the deliberately left rows: ${message}`);
+    assert.equal(result.switchedOff, true);
+    assert.equal(result.notified, true);
+  });
+
+  test('a usable plugin leaves the sidebar option untouched and stays quiet', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    const manifestPath = writeManifest('0.4.0');
+    const { run } = stubRun({ [PLUGIN_ID]: [entry()] });
+    const notes = [];
+    const { handle, calls } = sidebarHandle({ side: 'gentle' });
+    await pluginCheck.checkAndHandleHerdrPluginStartup({
+      manifestPath,
+      run,
+      env: {},
+      notify: (message) => notes.push(message),
+      sidebar: handle,
+    });
+    assert.deepEqual(calls.applied, [], 'the sidebar is never touched');
+    assert.equal(notes.length, 0, 'a healthy install stays quiet');
+  });
+
+  test('an option already off is never touched (the existing plugin alert still fires)', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    const manifestPath = writeManifest('0.4.0');
+    const { run } = stubRun({});
+    const notes = [];
+    const { handle, calls } = sidebarHandle({ side: 'native' });
+    await pluginCheck.checkAndHandleHerdrPluginStartup({
+      manifestPath,
+      run,
+      env: {},
+      notify: (message) => notes.push(message),
+      sidebar: handle,
+    });
+    assert.deepEqual(calls.applied, [], 'nothing to switch off');
+    assert.equal(notes.length, 1);
+    assert.ok(notes[0].includes('is not installed'), 'the existing plugin alert, not a sidebar claim');
+    assert.ok(!/switched OFF/.test(notes[0]), 'never claims a switch that did not happen');
+  });
+
+  test('a failing switch-off write reports the truth: still ON, and why', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    const manifestPath = writeManifest('0.4.0');
+    const { run } = stubRun({});
+    const notes = [];
+    const { handle } = sidebarHandle({
+      side: 'gentle',
+      applyResult: {
+        changed: false,
+        needsReload: false,
+        text: 'Could not disable: cannot write /x: EACCES. Mode unchanged.',
+      },
+    });
+    const result = await pluginCheck.checkAndHandleHerdrPluginStartup({
+      manifestPath,
+      run,
+      env: {},
+      notify: (message) => notes.push(message),
+      sidebar: handle,
+    });
+    assert.equal(result.switchedOff, false);
+    assert.equal(notes.length, 1);
+    assert.ok(/could NOT be switched off/.test(notes[0]), `honest outcome: ${notes[0]}`);
+    assert.ok(/still ON/.test(notes[0]), `says it is still on: ${notes[0]}`);
+    assert.ok(notes[0].includes('EACCES'), `carries the reason: ${notes[0]}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T1 end to end: the state extension registers the panel's sidebar writer slot,
+// so the worktree-tools session_start hook switches the option off through the
+// same path the customize panel uses.
+// ---------------------------------------------------------------------------
+
+const STATE_SRC_PATH = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
+const stateSourceText = fs.readFileSync(STATE_SRC_PATH, 'utf8');
+const stateStubbed = stateSourceText.replace(
+  /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
+  'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
+);
+assert.ok(stateStubbed !== stateSourceText, 'expected the state extension package import to be stubbed');
+
+async function loadStateProviders() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-plugin-check-stateext-')));
+  const copy = path.join(dir, 'gentle-herdr-state.mjs');
+  fs.writeFileSync(copy, stateStubbed);
+  const mod = await import(pathToFileURL(copy).href);
+  mod.default({ on: () => {}, events: { on: () => {}, emit: () => {} } });
+  return mod;
+}
+
+function seedSidebarWorld({ mode = 'enabled', nativeHook = true, settings, marker = false, managedRows = false } = {}) {
+  const stateDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-plugin-check-sb-state-')));
+  const agentDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-plugin-check-sb-agent-')));
+  const config = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-plugin-check-sb-cfg-'))), 'config.toml');
+  if (mode === 'enabled') fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":true}\n');
+  if (mode === 'disabled') fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+  fs.mkdirSync(path.join(agentDir, 'extensions'), { recursive: true });
+  if (nativeHook) fs.writeFileSync(path.join(agentDir, 'extensions', 'herdr-agent-state.ts'), '// native\n');
+  const settingsPath = path.join(agentDir, 'settings.json');
+  if (settings !== undefined) fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+  if (marker) {
+    fs.writeFileSync(
+      path.join(stateDir, 'pi-extension-exclusion-owned'),
+      `${JSON.stringify({ version: 1, entry: '-extensions/herdr-agent-state.ts', settings: fs.realpathSync(settingsPath) })}\n`,
+    );
+  }
+  if (managedRows) {
+    fs.writeFileSync(
+      config,
+      '# user\n# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n',
+    );
+  }
+  return { stateDir, agentDir, config, settingsPath };
+}
+
+function setSidebarWorldEnv(fx) {
+  setEnv({
+    GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+    HERDR_BIN_PATH: makeHerdrShim(),
+    GENTLE_STATUS_STATE_DIR: fx.stateDir,
+    PI_CODING_AGENT_DIR: fx.agentDir,
+    GENTLE_PI_AGENT_HOME: undefined,
+    HERDR_PLUGIN_STATE_DIR: undefined,
+    HERDR_CONFIG_PATH: fx.config,
+  });
+}
+
+describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurrency: false }, () => {
+  test('a missing plugin switches the option OFF and converges mode and the owned exclusion', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    await loadStateProviders();
+    const shipped = shippedVersion();
+    const fx = seedSidebarWorld({
+      mode: 'enabled',
+      settings: { extensions: ['-extensions/other-state.ts', '-extensions/herdr-agent-state.ts'], theme: 'x' },
+      marker: true,
+      managedRows: true,
+    });
+    setSidebarWorldEnv(fx);
+    const notes = [];
+    try {
+      const { handlers } = await loadExtension();
+      await fireSessionStart(handlers, { json: listDoc([]), notes });
+      const mode = JSON.parse(fs.readFileSync(path.join(fx.stateDir, 'gentle-sidebar-mode.json'), 'utf8'));
+      assert.equal(mode.enabled, false, 'the option converged OFF through the panel writer');
+      assert.deepEqual(
+        JSON.parse(fs.readFileSync(fx.settingsPath, 'utf8')).extensions,
+        ['-extensions/other-state.ts'],
+        'the owned exclusion was removed',
+      );
+      assert.ok(!fs.existsSync(path.join(fx.stateDir, 'pi-extension-exclusion-owned')), 'the marker was dropped');
+      assert.match(fs.readFileSync(fx.config, 'utf8'), /BEGIN herdr-gentle-agents/, 'managed rows deliberately left as found');
+      assert.equal(notes.length, 1, 'exactly one message');
+      assert.ok(/switched OFF/.test(notes[0][0]), notes[0][0]);
+      assert.ok(notes[0][0].includes(`--ref herdr-v${shipped}`), `names the shipped install ref: ${notes[0][0]}`);
+      assert.ok(/rows were left as found/.test(notes[0][0]), `says the rows were left: ${notes[0][0]}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a usable plugin at startup leaves the option and its files untouched', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    await loadStateProviders();
+    const shipped = shippedVersion();
+    const fx = seedSidebarWorld({
+      mode: 'enabled',
+      settings: { extensions: ['-extensions/other-state.ts', '-extensions/herdr-agent-state.ts'] },
+      marker: true,
+      managedRows: true,
+    });
+    setSidebarWorldEnv(fx);
+    const before = {
+      settings: fs.readFileSync(fx.settingsPath, 'utf8'),
+      config: fs.readFileSync(fx.config, 'utf8'),
+      marker: fs.readFileSync(path.join(fx.stateDir, 'pi-extension-exclusion-owned'), 'utf8'),
+    };
+    const notes = [];
+    try {
+      const { handlers } = await loadExtension();
+      await fireSessionStart(handlers, { json: listDoc([entry({ version: shipped })]), notes });
+      assert.equal(
+        JSON.parse(fs.readFileSync(path.join(fx.stateDir, 'gentle-sidebar-mode.json'), 'utf8')).enabled,
+        true,
+        'the option is untouched',
+      );
+      assert.equal(fs.readFileSync(fx.settingsPath, 'utf8'), before.settings);
+      assert.equal(fs.readFileSync(fx.config, 'utf8'), before.config);
+      assert.equal(fs.readFileSync(path.join(fx.stateDir, 'pi-extension-exclusion-owned'), 'utf8'), before.marker);
+      assert.equal(notes.length, 0, 'a usable plugin stays quiet');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an option already off is never touched (the plugin alert still fires)', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    await loadStateProviders();
+    const fx = seedSidebarWorld({ mode: 'disabled', nativeHook: false, settings: { extensions: ['-extensions/other-state.ts'] } });
+    setSidebarWorldEnv(fx);
+    const before = fs.readFileSync(fx.settingsPath, 'utf8');
+    const notes = [];
+    try {
+      const { handlers } = await loadExtension();
+      await fireSessionStart(handlers, { json: listDoc([]), notes });
+      assert.equal(
+        JSON.parse(fs.readFileSync(path.join(fx.stateDir, 'gentle-sidebar-mode.json'), 'utf8')).enabled,
+        false,
+        'the option stays off',
+      );
+      assert.equal(fs.readFileSync(fx.settingsPath, 'utf8'), before);
+      assert.equal(notes.length, 1);
+      assert.ok(!/switched OFF/.test(notes[0][0]), `no sidebar claim: ${notes[0][0]}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a failing switch-off write reports the truth: still ON, and why', async () => {
+    pluginCheck.resetHerdrPluginCheckForTests();
+    await loadStateProviders();
+    const fx = seedSidebarWorld({ mode: 'missing', nativeHook: true, settings: {} });
+    setSidebarWorldEnv(fx);
+    fs.chmodSync(fx.stateDir, 0o555);
+    const notes = [];
+    try {
+      const { handlers } = await loadExtension();
+      await fireSessionStart(handlers, { json: listDoc([]), notes });
+      assert.equal(notes.length, 1);
+      assert.ok(/could NOT be switched off/.test(notes[0][0]), `honest outcome: ${notes[0][0]}`);
+      assert.ok(/still ON/.test(notes[0][0]), `says it is still on: ${notes[0][0]}`);
+    } finally {
+      fs.chmodSync(fx.stateDir, 0o755);
+      restoreEnv();
+    }
+  });
+});
