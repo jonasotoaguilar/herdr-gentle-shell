@@ -656,7 +656,46 @@ object, or unreadable is NEVER overwritten — the row says `<row> not
 changed. <reason>` and leaves the bytes untouched. A successful change asks
 for a reload so it applies without a restart; a failed one never reloads.
 
+### Reset every option to its defaults (`/herdr-gentle:customize` — `Reset` row)
 
+The panel's `Reset` row returns the user-visible options to the
+defaults their own read sites define — `sidebar` Gentle **when the Herdr plugin
+is installed and usable and OFF when it is not** (see below), `moshi` off,
+`worktree` enabled, and the four performance keys `heightIndex`,
+`evictOffscreenLines`, `expandRecentToolOutput` and
+`incrementalSearchCorpus` OFF — by writing each default THROUGH the same
+writer the corresponding row uses, never by deleting a flag file. The
+performance keys go through `lib/pi-perf-settings.js`, in one atomic merge
+that leaves every other setting alone, and the summary names each of the four
+by its own label; a reset that had nothing to do with them keeps its summary
+unchanged. The moshi reset
+therefore also clears its Pi `settings.json` exclusion, and the sidebar reset
+lets its Herdr `config.toml` managed rows and ownership marker converge
+exactly as choosing `Gentle` would. Per-option outcomes are reported: a full
+run notifies `Defaults saved.`; a failure notifies `Partial reset: <option>
+changed|unchanged, …`, naming the failed option as unchanged together with
+its reason, and a run where nothing succeeds says nothing was changed. When
+every option already matches the default that applies in the current state the row
+notifies `Nothing to reset: the sidebar is already OFF by default, and moshi,
+worktree and performance switches already match their defaults.` and writes
+nothing at all.
+
+The row never depends on the Herdr plugin being installed: the reset is always
+attempted. The sidebar's default is CONDITIONAL — Gentle when the plugin is
+installed and usable, OFF when it is not — because enabling the sidebar is
+refused while the plugin is missing. A sidebar left OFF without the plugin is
+therefore reported as that default APPLYING, never as a change that failed:
+the notice leads with `Defaults saved.` and adds that the Gentle sidebar cannot
+be enabled until `herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin && herdr plugin enable herdr-gentle-shell`
+succeeds. A writer that genuinely FAILS is still reported as
+`Partial reset: <option> changed|unchanged, …`, naming it with its reason, so an
+unreachable default and a real error never read the same way. Because the
+default itself moves with the plugin's presence, "nothing to reset" is judged
+against the default that applies in the current state: without the plugin an OFF
+sidebar is nothing to reset, while with the plugin present an OFF sidebar is
+something to reset. The
+`gentle-sidebar-mode.json`, `gentle-moshi.json` and
+`gentle-worktree-mode.json` files are rewritten, never removed.
 
 ### Warp command (`/herdr-gentle:warp`, S23)
 

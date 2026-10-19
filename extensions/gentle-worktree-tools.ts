@@ -7025,6 +7025,13 @@ const CUSTOMIZE_CATEGORIES = [
     // (perf-switches S2-S6): this file delegates and carries no copy.
     rows: [],
   },
+  {
+    id: "reset",
+    title: "Reset",
+    rows: [
+      { id: "reset", label: "Reset every option to its default", detail: "sidebar Gentle, Moshi notifications off and worktree tools enabled" },
+    ],
+  },
 ];
 
 function customizeReadSlot() {
@@ -7097,6 +7104,9 @@ function customizePanelModel() {
     { ...byId("moshi"), available: moshi.available, active: moshi.active },
     { ...byId("worktree"), available: true, active: worktreeActive },
     { ...byId("perf"), available: perf.available, active: perf.active, rows: perf.rows },
+    // The reset row never depends on the provider slot or the Herdr plugin: it
+    // is always offered, and reports per option whatever it can actually reach.
+    { ...byId("reset"), available: true, active: null },
   ];
 }
 
@@ -7474,6 +7484,203 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
   return { render, handleInput, invalidate, state };
 }
 
+// ---------------------------------------------------------------------------
+// Reset every customize option to its default (customize-reset S2-S5, T1/T2).
+//
+// One routine returns the three user-visible options to the defaults their own
+// read sites define — sidebar `gentle`, moshi `off`, worktree `enabled`. Every
+// default is written THROUGH the same writer the panel's row uses (the slot
+// providers' apply for sidebar and moshi, `worktree-mode writeMode` for
+// worktree), never by deleting a flag file, so the moshi Pi settings exclusion
+// and the sidebar's Herdr managed rows converge exactly like a manual
+// selection. A failed option is named as unchanged with its reason instead of
+// being skipped silently, mirroring the upstream gentle-shell reset; an
+// all-default run writes nothing and says so. The routine never requires the
+// Herdr plugin: the reset is always attempted, and the sidebar's CONDITIONAL
+// default is respected — without the plugin OFF is the default that applies
+// there, so it is reported as that default (with the requirement and the real
+// install command) rather than as a partial failure (S6/T4).
+// ---------------------------------------------------------------------------
+
+const CUSTOMIZE_RESET_OPTIONS = [
+  { id: "sidebar", label: "sidebar", valueId: "gentle" },
+  { id: "moshi", label: "moshi", valueId: "off" },
+  { id: "worktree", label: "worktree", valueId: "enabled" },
+];
+
+function customizeResetSummary(results) {
+  return results.map((entry) => `${entry.label} ${entry.applied ? "changed" : "unchanged"}`).join(", ");
+}
+
+// S6/T4: the sidebar's default is CONDITIONAL on the Herdr plugin — ON when it
+// is installed and usable, OFF when it is missing. Reuse the read-only check
+// the startup alert uses; `missing` is exactly the state in which the enable
+// gate refuses, so OFF is the default that applies there. `disabled` or a
+// version/id mismatch is NOT this state (the plugin exists), so an OFF sidebar
+// there stays a real, possibly failing, reset. Returns null while the plugin
+// is present; otherwise a note carrying the requirement and the same real
+// install command the gate refuses with. Never throws.
+function customizeSidebarConditionalDefault() {
+  try {
+    const check = libRequire("herdr-plugin-check.js");
+    if (typeof check.checkHerdrPlugin !== "function") return null;
+    const verdict = check.checkHerdrPlugin();
+    if (!verdict || verdict.status !== "missing") return null;
+    const refusal = typeof check.sidebarEnableRefusal === "function" ? check.sidebarEnableRefusal("missing") : "";
+    return `The sidebar's default is OFF without the ${check.PLUGIN_ID} Herdr plugin.${refusal ? ` ${refusal}` : ""}`;
+  } catch {
+    return null;
+  }
+}
+
+async function customizeResetAll(ctx, toolsRegistered) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const slot = customizeReadSlot();
+  const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
+  const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
+  const current = {
+    sidebar: { available: sidebar.available, value: sidebar.active },
+    moshi: { available: moshi.available, value: moshi.active },
+    worktree: { available: true, value: customizeWorktreeValue() },
+  };
+  // The four pi performance keys are part of "every option" too, and their
+  // default is OFF. All of it — which keys, what they are called, how they are
+  // written — comes from lib/customize-perf-rows.js, so this file never names
+  // a setting.
+  const perfModule = customizePerfModule();
+  let perfState = { ok: false, allOff: true };
+  if (perfModule && typeof perfModule.defaultsState === "function") {
+    try {
+      perfState = perfModule.defaultsState(process.env);
+    } catch {
+      perfState = { ok: false, allOff: false };
+    }
+  }
+  // S6/T4: judge the sidebar against the default that APPLIES here. Without
+  // the plugin OFF is that default (nothing to reset, nothing to apply); with
+  // it, OFF is something to reset. An ON sidebar needs no probe: it already
+  // proves the plugin is usable, and the common all-defaults run stays free of
+  // any plugin CLI call.
+  const sidebarConditionalDefault = current.sidebar.available && current.sidebar.value === "native"
+    ? customizeSidebarConditionalDefault()
+    : null;
+  const sidebarPluginMissing = sidebarConditionalDefault !== null;
+  // S5: every option already at its applicable default — say so and write nothing.
+  const atDefaults = CUSTOMIZE_RESET_OPTIONS.every((option) => {
+    if (!current[option.id].available) return false;
+    if (option.id === "sidebar" && sidebarPluginMissing) return true;
+    return current[option.id].value === option.valueId;
+  }) && perfState.allOff === true;
+  if (atDefaults) {
+    if (typeof notify === "function") {
+      notify(
+        sidebarPluginMissing
+          ? `Nothing to reset: the sidebar is already OFF by default, and moshi, worktree and performance switches already match their defaults. ${sidebarConditionalDefault}`
+          : "Nothing to reset: sidebar, moshi, worktree and performance switches already match their defaults.",
+        "info",
+      );
+    }
+    return { changed: false, needsReload: false };
+  }
+  const results = [];
+  let firstError = null;
+  let needsReload = false;
+  const fail = (label, reason) => {
+    results.push({ label, applied: false });
+    if (!firstError) firstError = reason;
+  };
+  for (const option of CUSTOMIZE_RESET_OPTIONS) {
+    const before = current[option.id].value;
+    if (!current[option.id].available) {
+      fail(option.label, `${option.label} is unavailable in this session; nothing was changed for it.`);
+      continue;
+    }
+    if (option.id === "worktree") {
+      try {
+        libRequire("worktree-mode.js").writeMode(true, process.env);
+      } catch (err) {
+        fail(option.label, `could not write the worktree mode: ${(err && err.message) || err}`);
+        continue;
+      }
+      const applied = before !== option.valueId;
+      results.push({ label: option.label, applied });
+      if (applied && toolsRegistered !== true) needsReload = true;
+      continue;
+    }
+    const provider = slot ? slot[option.id] : null;
+    if (!provider || typeof provider.apply !== "function") {
+      fail(option.label, `${option.label} is unavailable in this session; nothing was changed for it.`);
+      continue;
+    }
+    // Providers notify through ctx; capture that so their own message becomes
+    // the failure reason instead of a second, out-of-band notification.
+    const seen = [];
+    const capture = ctx && typeof ctx === "object"
+      ? { ...ctx, ui: { ...((ctx.ui) ?? {}), notify: (message) => { seen.push(String(message)); } } }
+      : ctx;
+    let result = null;
+    try {
+      result = await provider.apply(option.valueId, capture);
+    } catch (err) {
+      fail(option.label, `could not reset ${option.label}: ${(err && err.message) || err}`);
+      continue;
+    }
+    if (result && result.changed === true) {
+      results.push({ label: option.label, applied: before !== option.valueId });
+      if (result.needsReload === true) needsReload = true;
+      continue;
+    }
+    // Already at its default: the writer was still asked (S3), and its own
+    // no-op verdict is not a failure to report.
+    if (before === option.valueId) {
+      results.push({ label: option.label, applied: false });
+      continue;
+    }
+    // S6/T4: a refusal because the plugin is MISSING is the conditional
+    // default applying, not a failed reset — the sidebar already sits at the
+    // OFF default this state defines. A genuine failure (unreadable config, a
+    // configure error, disabled plugin) still falls through to fail().
+    if (option.id === "sidebar" && sidebarPluginMissing) continue;
+    const reason = result && typeof result.text === "string" && result.text.length > 0
+      ? result.text
+      : (seen.length > 0 ? seen[seen.length - 1] : `could not reset ${option.label}; nothing was changed.`);
+    fail(option.label, reason);
+  }
+  // Only when something was on: a reset that had nothing to do with the
+  // performance switches keeps its summary unchanged instead of padding it.
+  if (perfModule && typeof perfModule.resetToDefaults === "function" && perfState.allOff !== true) {
+    let perfWrite = null;
+    try {
+      perfWrite = perfModule.resetToDefaults(process.env);
+    } catch (err) {
+      perfWrite = { ok: false, entries: [], error: (err && err.message) || String(err) };
+    }
+    if (perfWrite && Array.isArray(perfWrite.entries)) {
+      for (const entry of perfWrite.entries) {
+        results.push({ label: entry.label, applied: entry.applied === true });
+      }
+    }
+    if (!perfWrite || perfWrite.ok !== true) {
+      if (!firstError) firstError = (perfWrite && perfWrite.error) || "could not reset the performance switches; nothing was changed.";
+    } else if (perfWrite.changed === true) {
+      needsReload = true;
+    }
+  }
+  const changedCount = results.filter((entry) => entry.applied).length;
+  let text;
+  if (!firstError) {
+    text = "Defaults saved.";
+  } else if (changedCount === 0) {
+    text = `Partial reset: ${customizeResetSummary(results)}. Nothing was changed. ${firstError}`;
+  } else {
+    text = `Partial reset: ${customizeResetSummary(results)}. ${firstError}`;
+  }
+  if (sidebarPluginMissing) text += ` ${sidebarConditionalDefault}`;
+  if (typeof notify === "function") notify(text, "info");
+  if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
+  return { changed: changedCount > 0, needsReload };
+}
+
 // One shared apply path for the panel and the fallback menu. Returns the
 // verdict; notifies exactly once (providers run against a capturing ctx
 // so an inline notify never double-posts) and reloads only when the
@@ -7504,6 +7711,9 @@ async function customizeApplyPerfRow(rowId, ctx) {
 }
 
 async function applyCustomizeChoice(categoryId, valueId, ctx, toolsRegistered) {
+  // The reset spans every option, so it never goes through the
+  // per-category provider lookup below.
+  if (categoryId === "reset") return customizeResetAll(ctx, toolsRegistered);
   if (categoryId === "perf") return customizeApplyPerfRow(valueId, ctx);
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const category = CUSTOMIZE_CATEGORIES.find((entry) => entry.id === categoryId);
