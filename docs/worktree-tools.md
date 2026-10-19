@@ -914,6 +914,55 @@ entirely and still converge through the scan. The hook never throws and
 never blocks the pipeline: any failure is swallowed after a best-effort
 attempt.
 
+## Automatic session naming
+
+The same pipeline event also names the session after the ODD task document
+that was **written**: a write to `odd/tasks/<feature>.md` inside a
+registered worktree sets the session name to `<heading> @ <branch>`
+(`lib/session-auto-name.js` derives it, the extension only calls
+`pi.setSessionName`). The heading is the document's own first level-1
+heading — the honest statement of what the work is about — trimmed, with
+inner whitespace collapsed and truncated to 48 characters on a word
+boundary. A document with no readable heading falls back to the filename
+slug (`odd/tasks/pi-fullscreen-perf.md` → `pi-fullscreen-perf`). Reading
+never triggers — an agent reads many ODD documents for context, so a read
+would make the name jump to whatever was opened last. Writing the same
+document again derives the same label and writes nothing, so the hook can
+run on every event without spamming the session record.
+
+The session NAME is the channel because Pi exposes no subject or alias
+write; the extension's event context has no `executeTool`, so gentle-pi's
+private subject cache is unreachable. Never-clobber is therefore decided by
+**pattern**, not by a stored flag: the plugin writes only when the current
+name is empty or is one it can account for as its own. That covers the
+label this session already applied (remembered in the module), a name
+ending in ` @ <this worktree's branch>` (what makes a resume recognizable
+with no memory), the plain filename slug an earlier version wrote, and the
+document's current heading. Any other name was chosen by a human and is
+left alone, and a hand rename after an automatic one sticks. The admitted
+consequence: a session a human names exactly like one of those shapes is
+indistinguishable from the plugin's own label and may be updated.
+
+Collisions are always resolved with the branch suffix rather than only when
+a peer is detected: the host exposes nothing that enumerates the live
+sessions of a clone, and the branch is already unique per worktree, so
+always suffixing is the conservative choice that guarantees two concurrent
+forks of the same feature never share a name. The principal checkout is
+never named — a call whose context is the principal resolves no worktree
+entry and stops before the naming step.
+
+An ODD **phase transition** re-applies the label the session last derived
+from a write. `gentle_odd_phase` names the phase, never the feature, so the
+module remembers the last derived label per session and the phase trigger
+only re-applies it through the same ownership test; a session that never
+wrote an ODD document has nothing to re-apply and is left alone. The
+transition is observed on `tool_result` (that tool is gentle-pi's, not a
+host event). A resumed session carries its name in the session record, so
+the derivation also runs again on the next write and moves the name to the
+document now being edited. Both triggers sit behind the worktree-tools
+toggle: with it off the handler reads the mode first and returns before any
+naming, so neither trigger can fire.
+
 ## Known limitations
 
 - **Closing normally needs `force: true`.** `git worktree remove`

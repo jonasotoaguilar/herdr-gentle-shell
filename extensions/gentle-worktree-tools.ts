@@ -4560,7 +4560,7 @@ function scanOddMarkdowns(oddDir) {
   return rels;
 }
 
-function captureOddFromToolEvent(event, ctx) {
+function captureOddFromToolEvent(event, ctx, pi, allowPhaseTrigger) {
   // M1: the capture is gated by the worktree mode, read fresh on every
   // event. A disabled or malformed mode records nothing.
   let modeState;
@@ -4588,6 +4588,10 @@ function captureOddFromToolEvent(event, ctx) {
   if (!entry) return; // Principal checkout itself associates nothing.
   const key = entry.branch;
   const known = new Set(Array.isArray(entry.odd) ? entry.odd : []);
+  const touched = [];
+  // The absolute path behind each touched rel, so the naming step can read
+  // the document's own heading without re-resolving path logic here.
+  const absByRel = new Map();
   const candidates = [];
   // Per-call capture applies to the read/edit/write tools, which carry a
   // single document path. Every other tool (notably `bash`) carries no
@@ -4596,11 +4600,25 @@ function captureOddFromToolEvent(event, ctx) {
     for (const raw of oddTouchedPaths(oddArgsOf(event))) {
       const abs = path.isAbsolute(raw) ? raw : path.join(cwd, raw);
       const rel = oddRelFor(abs, entry.path, principalRoot);
-      if (rel && !known.has(rel)) {
+      if (!rel) continue;
+      touched.push(rel);
+      if (!absByRel.has(rel)) absByRel.set(rel, abs);
+      if (!known.has(rel)) {
         known.add(rel);
         candidates.push(rel);
       }
     }
+  }
+  // T2/D2-D7: the same touched rels name the session after the ODD task
+  // document being WRITTEN. The naming decision (write-only, own name only,
+  // idempotent) lives in lib/session-auto-name.js; this is the call site.
+  const sessionId = oddSessionId(ctx);
+  autoNameSessionFromWrite(pi, entry, oddToolNameOf(event), touched, absByRel, sessionId);
+  // D3: an ODD phase transition carries no feature of its own, so it only
+  // re-applies the label this session last derived from a write. It is
+  // observed on `tool_result` (a gentle-pi tool, not a host event).
+  if (allowPhaseTrigger === true) {
+    autoNameSessionFromPhase(pi, entry, sessionId, oddToolNameOf(event));
   }
   // Complement: record anything the per-call capture never observed.
   // Runs on every pipeline event so opaque calls (e.g. `bash`) still
@@ -4625,11 +4643,85 @@ function captureOddFromToolEvent(event, ctx) {
   }
 }
 
+// T2/D7: the session NAME is the only session-identity channel Pi exposes
+// (`setSessionName`; there is no subject/alias write). The session owns that
+// name only while it matches the pattern the plugin itself writes — anything
+// else came from a human and is never touched — and the principal checkout
+// never reaches this point, because `oddEntryForCwd` already returned null
+// for it (D6). A host without the name accessors is left alone rather than
+// guessed at: without `getSessionName` the ownership test cannot run.
+function oddSessionId(ctx) {
+  try {
+    const id = ctx && ctx.sessionManager && typeof ctx.sessionManager.getSessionId === "function"
+      ? ctx.sessionManager.getSessionId()
+      : undefined;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// The document text behind a touched rel, or null when it cannot be read
+// (the file may not exist yet on `tool_call`, or the write failed). A null
+// text falls back to the filename slug inside the module.
+function readOddDocumentText(absByRel, rel) {
+  if (!absByRel || typeof absByRel.get !== "function") return null;
+  const abs = absByRel.get(rel);
+  if (typeof abs !== "string" || abs.length === 0) return null;
+  try {
+    return fs.readFileSync(abs, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function autoNameSessionFromWrite(pi, entry, toolName, touched, absByRel, sessionId) {
+  try {
+    if (!pi || typeof pi.getSessionName !== "function" || typeof pi.setSessionName !== "function") return;
+    const auto = libRequire("session-auto-name.js");
+    const label = auto.planSessionRename({
+      rels: touched,
+      isWrite: auto.isWriteToolName(toolName),
+      branch: entry && typeof entry.branch === "string" ? entry.branch : "",
+      currentName: pi.getSessionName(),
+      sessionId,
+      readDocument: (rel) => readOddDocumentText(absByRel, rel),
+    });
+    if (typeof label === "string" && label.length > 0) pi.setSessionName(label);
+  } catch {
+    // Naming is best effort: it never disturbs the capture above nor the
+    // tool pipeline it rides on.
+  }
+}
+
+// D3: a `gentle_odd_phase` transition re-applies the label the session last
+// derived from an ODD write. The phase names no feature, so nothing is
+// invented here; a session that never wrote an ODD document has nothing to
+// re-apply and is left alone.
+function autoNameSessionFromPhase(pi, entry, sessionId, toolName) {
+  try {
+    if (!pi || typeof pi.getSessionName !== "function" || typeof pi.setSessionName !== "function") return;
+    const auto = libRequire("session-auto-name.js");
+    if (toolName !== auto.ODD_PHASE_TOOL_NAME) return;
+    const label = auto.planPhaseSessionRename({
+      sessionId,
+      branch: entry && typeof entry.branch === "string" ? entry.branch : "",
+      currentName: pi.getSessionName(),
+    });
+    if (typeof label === "string" && label.length > 0) pi.setSessionName(label);
+  } catch {
+    // Naming is best effort: it never disturbs the capture above nor the
+    // tool pipeline it rides on.
+  }
+}
+
 // The subscribed pipeline handler: never throws, never blocks, returns
 // nothing (a `tool_call` return value would mutate or block the call).
-function handleWorktreeOddEvent(event, ctx) {
+// `allowPhaseTrigger` is set only on `tool_result`, where an ODD phase
+// transition is observable.
+function handleWorktreeOddEvent(event, ctx, pi, allowPhaseTrigger) {
   try {
-    captureOddFromToolEvent(event, ctx);
+    captureOddFromToolEvent(event, ctx, pi, allowPhaseTrigger);
   } catch {
     // Any failure is swallowed after the best-effort attempt above.
   }
@@ -7508,8 +7600,8 @@ export default function (pi) {
   // read/edit/write tools. Guarded so hosts (and the older unit-test
   // doubles) without `pi.on` still load the tools above.
   if (typeof pi?.on === "function") {
-    pi.on("tool_call", handleWorktreeOddEvent);
-    pi.on("tool_result", handleWorktreeOddEvent);
+    pi.on("tool_call", (event, ctx) => handleWorktreeOddEvent(event, ctx, pi));
+    pi.on("tool_result", (event, ctx) => handleWorktreeOddEvent(event, ctx, pi, true));
     // S28: enumerate EVERY repository worktree through git at startup
     // and register the missing ones — all registered worktrees, not
     // only those under the creation path (that path is only where new
