@@ -585,8 +585,9 @@ describe('/herdr-gentle:odd external open (K3)', () => {
 
 // ---------------------------------------------------------------------------
 // S29: `/herdr-gentle:odd` stays registered while the worktree mode is off or
-// malformed; only the worktree association is disabled. The extension seam is
-// tested directly: the hidden-toggle UI work remains pending for the odd view.
+// malformed; only the worktree association is disabled. This file covers the
+// extension seam (mode read plus refuse-to-save); the view-side hiding of the
+// association marks, hints and keys is asserted in tools/odd-view.test.js.
 // ---------------------------------------------------------------------------
 describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
   const modeLib = require('../lib/worktree-mode.js');

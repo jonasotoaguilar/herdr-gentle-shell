@@ -822,44 +822,6 @@ function multiDriver(steps) {
   return { mount, views, mounts: () => mounts };
 }
 
-// A driver whose FIRST mount waits for the background enrichment before it
-// presses its keys; later mounts drive after a tick like `multiDriver`. S1
-// mounts before the facts, so an activity-order assertion must keep the
-// component alive long enough for the enrichment to apply.
-function activityDriver(keys) {
-  const views = [];
-  let mounts = 0;
-  const mount = async (factory) => {
-    mounts += 1;
-    const index = mounts - 1;
-    const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('component did not settle')), 6000);
-      const done = (value) => { clearTimeout(timer); resolve(value); };
-      let view;
-      try {
-        view = factory(hostTui, plainTheme, {}, done);
-      } catch (err) {
-        clearTimeout(timer);
-        reject(err);
-        return;
-      }
-      views.push(view);
-      const drive = async () => {
-        try {
-          if (index === 0) await waitForActivity(view);
-          for (const key of keys) view.handleInput(key);
-        } catch (err) {
-          reject(err);
-        }
-      };
-      if (index === 0) setTimeout(drive, 0);
-      else flush().then(drive).catch(reject);
-    });
-  };
-  return { mount, views, mounts: () => mounts };
-}
-
 // S1: the popup now mounts before its facts arrive, so a wiring test that
 // asserts activity order must let the background enrichment land. Poll the
 // mounted component's public state until every row carries an activity, or
@@ -873,7 +835,9 @@ async function waitForActivity(view, tries = 400) {
 }
 
 // A driver whose FIRST mount waits for the background enrichment before it
-// presses its keys; later mounts drive after a tick like `multiDriver`.
+// presses its keys; later mounts drive after a tick like `multiDriver`. S1
+// mounts before the facts, so an activity-order assertion must keep the
+// component alive long enough for the enrichment to apply.
 function activityDriver(keys) {
   const views = [];
   let mounts = 0;

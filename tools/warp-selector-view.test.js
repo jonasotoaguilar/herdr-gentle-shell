@@ -69,9 +69,6 @@ const CHECKOUTS = [
 
 const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
 
-// Epoch ms used to pin the checkout's creation for the S8 activity-provenance
-// tests: an activity timestamp before it is inherited, never local.
-
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 function makeView(options = {}) {

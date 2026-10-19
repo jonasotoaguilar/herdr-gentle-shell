@@ -5799,8 +5799,8 @@ function warpOfferedCheckouts(git, read, principal, live, repoRoot) {
   if (principal) {
     offered.push({ name: "principal", path: principal.path, branch: principal.branch });
   }
-  // S10: the principal's own registry row (registered first, idempotently)
-  // is the principal entry already offered above, never a second agent row.
+  // S10: a registry row naming the principal's own path is the principal
+  // entry already offered above, never a second agent row.
   const principalState = principal && typeof principal.path === "string" && principal.path.length > 0
     ? checkoutState(principal.path, repoRoot)
     : null;

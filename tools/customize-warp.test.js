@@ -1053,7 +1053,7 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
 });
 
 describe('S14 startup discovery + unregistered warp (T7 RED)', { concurrency: false }, () => {
-  test('S10: session_start registers the canonical principal first and once, preserving rows and staying idempotent', async () => {
+  test('S10: session_start keeps the canonical principal row first and preserves its seeded associations, staying idempotent', async () => {
     const root = makeRepo('s14-startup');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
