@@ -310,6 +310,23 @@ describe('/herdr-gentle:issues gate (S3)', () => {
     assert.equal(invokeNotes[0][1], 'error');
   });
 
+  test('the gate note never claims the command is unregistered', async () => {
+    const { commands, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(async (bin) => ({
+      status: null, stdout: '', stderr: '', error: `spawn ${bin} ENOENT: gh CLI is not available`,
+    }));
+    const root = makeRepo({ tag: 'gate-wording' });
+    const notes = [];
+    await fireSessionStart(sessionStarts, gateCtx(root, notes));
+    assert.equal(notes.length, 1);
+    assert.ok(
+      !/unregistered/.test(notes[0][0]),
+      'the command is registered eagerly, so the note must never say otherwise',
+    );
+    assert.match(notes[0][0], /cannot open/, 'the note names the real consequence');
+    assert.ok(commands.has('herdr-gentle:issues'), 'the command is discoverable while the gate is closed');
+  });
+
   test('an unauthenticated gh notifies the login fix on invocation and opens nothing', async () => {
     const { commands, mod } = await loadExtension();
     ghIssues.setGhRunner(async () => ({

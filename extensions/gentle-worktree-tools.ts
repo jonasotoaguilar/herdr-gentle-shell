@@ -8124,10 +8124,11 @@ async function executeOdd(rawArgs, ctx) {
 // checkout's repository issues, in this package's own frame
 // (lib/gh-issues.js for `gh`, lib/issues-view.js for the pure view).
 //
-// GATED (S9): the command registers only after the session-start `gh`
-// check below reports an authenticated user; without both, one
-// notification per session names what is missing and the command that
-// fixes it. The three pages arrive through listIssues with the S2
+// GATED INVOCATION (S3/S9): the command is registered eagerly at load so it
+// is always discoverable; the session-start `gh` check only decides whether
+// it may open. Without an authenticated `gh`, one notification per session
+// names what is missing and the command that fixes it, and the handler
+// re-emits it instead of opening. The three pages arrive through listIssues with the S2
 // searches (author:@me, assignee:@me, involves:@me), the detail through
 // getIssue, the repo labels through listLabels, and the `o` key opens
 // `gh issue view <n> --web` through the file's fixed-argv runner (never
@@ -8378,14 +8379,16 @@ async function executeIssues(rawArgs, ctx) {
 }
 
 // The S9 gate message names what is missing and the command that fixes
-// it: a missing binary needs an install plus login, anything else
-// already carries gh's own `gh auth login` wording.
+// it: a missing binary needs an install plus login, anything else already
+// carries gh's own `gh auth login` wording. It says the command cannot
+// OPEN — never that it is unregistered, because the command is registered
+// eagerly at load (S3) and only the invocation is gated.
 function issuesGateMessage(error) {
   const text = String(error || "gh check failed");
   if (/ENOENT|not available|not found/i.test(text)) {
-    return "issues: the gh CLI is not available; install it (https://cli.github.com) and run `gh auth login` — /herdr-gentle:issues stays unregistered";
+    return "issues: the gh CLI is not available; install it (https://cli.github.com) and run `gh auth login` — /herdr-gentle:issues cannot open until then";
   }
-  return `issues: ${text} — /herdr-gentle:issues stays unregistered`;
+  return `issues: ${text} — /herdr-gentle:issues cannot open until then`;
 }
 
 async function checkIssuesGate(pi, ctx) {
@@ -8592,14 +8595,15 @@ export default function (pi) {
         // The plugin check must never break startup.
       }
     });
-    // issues-view S9: the `/herdr-gentle:issues` gate. `gh` must
-    // resolve AND report an authenticated user; without both the
-    // command stays unregistered and one notification per session names
-    // what is missing and the command that fixes it. Deferred to
-    // session start so the check never blocks the extension load, and
-    // guarded exactly like the Herdr plugin check above: never throws,
-    // never blocks the session, never writes config, never repeats the
-    // alert, and never mentions /reload.
+    // issues-view S3/S9: the `/herdr-gentle:issues` INVOCATION gate. The
+    // command is registered eagerly at load so it always appears; this check
+    // only decides whether it may open. `gh` must resolve AND report an
+    // authenticated user; without both, one notification per session names
+    // what is missing and the command that fixes it. Deferred to session
+    // start so the check never blocks the extension load, and guarded like
+    // the Herdr plugin check above: never throws, never blocks the session,
+    // never writes config, never repeats the alert, and never mentions
+    // /reload.
     pi.on("session_start", (event, ctx) => {
       try {
         const out = checkIssuesGate(pi, ctx);

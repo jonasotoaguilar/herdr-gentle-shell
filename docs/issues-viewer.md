@@ -96,14 +96,16 @@ issue pane scrolls independently of the list.
 
 ## The `gh` requirement and the startup gate
 
-The view needs the `gh` CLI plus an authenticated user. Both are checked
-once at session start: only then is `/herdr-gentle:issues` registered.
-Without `gh`, or without a login, the command stays unregistered and one
-notification per session names what is missing and the command that fixes
-it (`install it (https://cli.github.com) and run `gh auth login`` for a
-missing binary, otherwise `gh`'s own `gh auth login` wording). Nothing in
-this view runs `gh` through a shell, echoes a token, or writes user
-config.
+The view needs the `gh` CLI plus an authenticated user. The command itself
+is always registered, so it always appears in the command list; the check
+gates the INVOCATION, not the registration. Both are verified once at
+session start, and again when the command runs: without `gh`, or without a
+login, one notification per session names what is missing and the command
+that fixes it (`install it (https://cli.github.com) and run `gh auth
+login`` for a missing binary, otherwise `gh`'s own `gh auth login` wording)
+and the view does not open. The note says the command cannot open until
+then — never that it is unregistered, because it always is. Nothing in this
+view runs `gh` through a shell, echoes a token, or writes user config.
 
 ## What writes (four actions, each behind its explicit key)
 
@@ -142,8 +144,9 @@ changes nothing; `esc` always discards.
 - **Unreadable assignment:** the stored `issues[]` loads fail-soft — the
   view opens with nothing marked and stays usable; the failure is reported
   only if a save is attempted, and a refusing registry is left untouched.
-- **`gh` unavailable:** the gated command is never registered, and the
-  view's own `gh unavailable` state names the install plus login fix.
+- **`gh` unavailable:** the command stays registered and stays in the
+  command list, but it refuses to open, names the install plus login fix,
+  and the view's own `gh unavailable` state says the same thing.
 - **No TUI overlay:** when the TUI helpers cannot be loaded, the command
   falls back to one muted line naming the issue count across the pages.
 
