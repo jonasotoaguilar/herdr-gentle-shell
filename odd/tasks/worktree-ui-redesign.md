@@ -151,6 +151,18 @@ o sacarlo pues esta el focus. Revisa detalles asi igual en issues comando."
 S14. Changes must carry tests and docs alongside the behavior, and must keep the
 existing suite green.
 
+S16. A `Performance trace` option in the customize panel's Performance section
+turns on a trace log, so a run with the four switches OFF can be compared with a
+run with them ON. Verbatim: "Podrias agregar a performance una opcion de debug o
+algo, que genere logs o una traza o algo. Para activarlo y registrar rendimiento y
+funcionamiento con los performance apagados y luego con los performance
+encedidos."
+
+S16a. The trace records only facts this package can observe: the four-switch
+snapshot at session start, its own views' render durations and sizes, and the
+daemon's poll/frame durations. pi's own renderer is not instrumented, and the
+docs must say so rather than imply otherwise.
+
 S15. Scrolling the preview with `ctrl+j`/`ctrl+k` must work, and a platform
 variant must exist when the terminal does not deliver those keys. Verbatim:
 "el scroll con tecla ctrl jk no sirve, en gentle shell changes lo tenia, revislao.
@@ -171,6 +183,7 @@ T9 — S9/S12. Listing order and relative created/modified. Commit: see Log.
 T10 — S11. `/herdr-gentle:worktree` command. Commit: see Log.
 T11 — S13. Odd/issues duplicated-data cleanup. Commit: see Log.
 T12 — S14. Full suite and docs.
+T14 — S16/S16a. Performance trace option and log.
 T13 — S15. Preview scrolling works with `ctrl+j`/`ctrl+k` plus a platform
 variant. Commit: see Log.
 
@@ -267,3 +280,9 @@ it stays a `ctx.ui.custom()` overlay and only its geometry changes: anchored
 `bottom-center` at full width instead of `center` at 70%. It therefore looks
 like a bottom panel while remaining focusable. Recorded so T3 does not try to
 rebuild it as a widget.
+
+L7. Verbatim request (S16):
+
+"""
+otro punto es que active las optimizaciones, pero nose si estan funcionado en la tui o si son eficaz de verdad. Podrias agregar a performance una opcion de debug o algo, que genere logs o una traza o algo. Para activarlo y registrar rendimiento y funcionamiento con los performance apagados y luego con los performance encedidos.
+"""
