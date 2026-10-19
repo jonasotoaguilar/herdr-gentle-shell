@@ -174,6 +174,26 @@ T12 — S14. Full suite and docs.
 T13 — S15. Preview scrolling works with `ctrl+j`/`ctrl+k` plus a platform
 variant. Commit: see Log.
 
+## Delivery
+
+This feature is far larger than one review slice, so it ships as a chain of
+PR slices on `feat/worktree-ui-redesign`; each slice is a small group of
+tasks, each task is one work-unit commit, and a slice closes when its tests
+and docs are in.
+
+- Slice 1 — T1/S1, T2/S2, T13/S15: key legends, the issues gate message,
+  preview scroll variants. (commits: 04e18de, 4d9c643, 3c023f6, plus T1 and
+  T13)
+- Slice 2 — T3/S3-S4, T4/S5: warp as a bottom panel and the `view all` list.
+- Slice 3 — T5/S6, T10/S11: create by hotkey, `/herdr-gentle:worktree`.
+- Slice 4 — T6/S7-S7b: the full-screen worktree detail with issues/odd tabs.
+- Slice 5 — T7/S7c-S7d, S10: the open-issues cache and assignment
+  revalidation.
+- Slice 6 — T8/S8-S8a, T9/S9, S12: one ODD per worktree, listing order,
+  relative ages.
+- Slice 7 — T11/S13, T12/S14: duplicated data, docs, and the shared
+  `legendText` consolidation.
+
 ## Log
 
 L1. Verbatim request:
