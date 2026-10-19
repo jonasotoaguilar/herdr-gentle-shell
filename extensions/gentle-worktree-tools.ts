@@ -7018,6 +7018,13 @@ const CUSTOMIZE_CATEGORIES = [
       { id: "disabled", label: "Disabled", detail: "the worktree tools are not registered" },
     ],
   },
+  {
+    id: "perf",
+    title: "Performance switches",
+    // Rows, setting names and note text live in lib/customize-perf-rows.js
+    // (perf-switches S2-S6): this file delegates and carries no copy.
+    rows: [],
+  },
 ];
 
 function customizeReadSlot() {
@@ -7053,16 +7060,43 @@ function customizeWorktreeValue() {
   }
 }
 
+// The performance rows are the one part of the panel that is NOT written
+// here: lib/customize-perf-rows.js owns their labels, their setting keys, the
+// fused row's partial state and every note string. This file only asks it for
+// a model and hands it the user's choice, so the standing rule (new logic goes
+// in new modules, not into this 8000-line file) holds.
+function customizePerfModule() {
+  try {
+    return libRequire("customize-perf-rows.js");
+  } catch {
+    return null;
+  }
+}
+
+function customizePerfPanel() {
+  const module = customizePerfModule();
+  if (!module || typeof module.panelModel !== "function") {
+    return { available: false, active: null, rows: [] };
+  }
+  try {
+    return module.panelModel(process.env);
+  } catch {
+    return { available: false, active: null, rows: [] };
+  }
+}
+
 function customizePanelModel() {
   const slot = customizeReadSlot();
   const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
   const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
   const worktreeActive = customizeWorktreeValue();
+  const perf = customizePerfPanel();
   const byId = (id) => CUSTOMIZE_CATEGORIES.find((entry) => entry.id === id);
   return [
     { ...byId("sidebar"), available: sidebar.available, active: sidebar.active },
     { ...byId("moshi"), available: moshi.available, active: moshi.active },
     { ...byId("worktree"), available: true, active: worktreeActive },
+    { ...byId("perf"), available: perf.available, active: perf.active, rows: perf.rows },
   ];
 }
 
@@ -7213,6 +7247,7 @@ function customizeCard(helpers, theme, lines, width) {
 function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, done }) {
   const state = {
     pane: "categories",
+    help: false,
     cat: 0,
     row: model.map((category) => {
       const at = category.rows.findIndex((row) => row.id === category.active);
@@ -7309,11 +7344,24 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
         paint(heading, rightWidth, "accent"),
       ));
     }
+    // Help detail (perf-switches S4/S12): the focused row's full measured note
+    // takes over the list area, so the footer line stays short and the numbers
+    // sit one key away. Rows without help keep the ordinary pane.
+    const current = focused();
+    const helpLines = state.help && current.row && typeof current.row.helpLines === "function"
+      ? current.row.helpLines(inner)
+      : null;
     for (let i = 0; i < contentHeight; i += 1) {
       const nav = model[navStart + i];
       const left = nav
         ? customizeSelect(helpers, theme, nav.title, leftWidth, navOnly || (navStart + i === state.cat && state.pane === "categories"))
         : "";
+      if (helpLines) {
+        // The help view takes the whole card width: the detail is the point
+        // here, and the category column is already named one row above.
+        lines.push(helpLines[i] ? paint(helpLines[i], inner, "text") : "");
+        continue;
+      }
       const item = navOnly ? (model[start + i] || null) : (rightLines[start + i] || null);
       let right = "";
       if (item) {
@@ -7340,18 +7388,32 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     // Bottom block (gentle-shell style): the FOCUSED choice's label in
     // the title plus its S2 description on the next line — exactly
     // once. The redundant Active: repeat is gone on purpose.
-    const current = focused();
     const previewTitle = `Preview · ${current.row ? current.row.label : current.category.title}`;
     const previewSample = current.row ? current.row.detail : "unavailable";
-    if (previewLines === 3) {
-      lines.push("");
-      lines.push(paint(previewTitle, inner, "accent"));
-      lines.push(paint(previewSample, inner, "muted"));
+    if (helpLines) {
+      if (showHeading) {
+        lines.push(paint("↑/↓ moves · ? closes help · Esc closes the panel", inner, "muted"));
+      }
+    } else if (previewLines === 3) {
+      const wrapped = current.row && typeof current.row.noteLines === "function"
+        ? current.row.noteLines(inner)
+        : null;
+      // Two wrapped note lines fit the height the preview block already
+      // budgets; with one, the blank separator and the old single line stand
+      // so every other category's card is byte-identical.
+      if (wrapped && wrapped.length > 1) {
+        lines.push(paint(previewTitle, inner, "accent"));
+        for (const line of wrapped.slice(0, previewLines - 1)) lines.push(paint(line, inner, "muted"));
+      } else {
+        lines.push("");
+        lines.push(paint(previewTitle, inner, "accent"));
+        lines.push(paint(wrapped && wrapped.length === 1 ? wrapped[0] : previewSample, inner, "muted"));
+      }
     } else if (previewLines === 1) {
       lines.push(paint(previewTitle, inner, "muted"));
     }
-    if (showHeading) {
-      lines.push(paint("←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close", inner, "muted"));
+    if (showHeading && !helpLines) {
+      lines.push(paint("←/→ or Tab panes · ↑/↓ move · Enter apply · ? help · Esc close", inner, "muted"));
     }
     return customizeCard(helpers, theme, lines.slice(0, Math.max(0, height - 2)), w);
   }
@@ -7368,12 +7430,22 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       done(null);
       return;
     }
+    // perf-switches S4/S12: the footer note is short on purpose, so the full
+    // measured detail sits behind one key and never costs the list its rows.
+    if (customizeKeyMatches(helpers, data, ["?", "shift+?"])) {
+      const focusedRow = focused().row;
+      state.help = !state.help && Boolean(focusedRow && typeof focusedRow.helpLines === "function");
+      requestPaint();
+      return;
+    }
     if (customizeKeyMatches(helpers, data, ["left", "right", "tab"])) {
       state.pane = state.pane === "categories" ? "values" : "categories";
+      state.help = false;
       requestPaint();
       return;
     }
     if (customizeKeyMatches(helpers, data, ["up"])) {
+      state.help = false;
       if (state.pane === "categories") state.cat = (state.cat + model.length - 1) % model.length;
       else {
         const count = model[state.cat].rows.length;
@@ -7383,6 +7455,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       return;
     }
     if (customizeKeyMatches(helpers, data, ["down"])) {
+      state.help = false;
       if (state.pane === "categories") state.cat = (state.cat + 1) % model.length;
       else {
         const count = model[state.cat].rows.length;
@@ -7405,7 +7478,33 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
 // verdict; notifies exactly once (providers run against a capturing ctx
 // so an inline notify never double-posts) and reloads only when the
 // change reported needsReload.
+// One performance row toggle. The verdict, the sentence and the reload
+// decision all come from lib/customize-perf-rows.js; a module that cannot load
+// reports the row as unchanged instead of pretending it landed.
+async function customizeApplyPerfRow(rowId, ctx) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const module = customizePerfModule();
+  let result = null;
+  if (module && typeof module.applyRow === "function") {
+    try {
+      result = module.applyRow(String(rowId ?? ""), process.env);
+    } catch (err) {
+      result = { ok: false, changed: false, needsReload: false, label: String(rowId ?? ""), error: (err && err.message) || String(err) };
+    }
+  }
+  const text = module && typeof module.applyRowMessage === "function"
+    ? module.applyRowMessage(result)
+    : `${String(rowId ?? "the performance row")} not changed. the performance rows are unavailable in this session.`;
+  const needsReload = Boolean(result && result.ok === true && result.needsReload === true);
+  if (typeof notify === "function") {
+    notify(`${text}${needsReload ? " Reloading now to apply the change." : ""}`, result && result.ok === true ? "info" : "error");
+  }
+  if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
+  return { changed: Boolean(result && result.changed === true), needsReload };
+}
+
 async function applyCustomizeChoice(categoryId, valueId, ctx, toolsRegistered) {
+  if (categoryId === "perf") return customizeApplyPerfRow(valueId, ctx);
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const category = CUSTOMIZE_CATEGORIES.find((entry) => entry.id === categoryId);
   const title = category ? category.title : String(categoryId);
@@ -7585,6 +7684,18 @@ export default function (pi) {
     toolsRegistered = libRequire("worktree-mode.js").readMode().enabled === true;
   } catch {
     toolsRegistered = false;
+  }
+  // perf-switches S4: the panel's performance notes read pi's own setting
+  // descriptions, so `/settings` and this footer cannot drift apart. A host
+  // that exposes none keeps the pinned measured text; the load is
+  // fire-and-forget and never blocks startup.
+  try {
+    const perfRows = libRequire("customize-perf-rows.js");
+    if (perfRows && typeof perfRows.primeDescriptions === "function") {
+      void perfRows.primeDescriptions(() => import("@earendil-works/pi-coding-agent"));
+    }
+  } catch {
+    // No rows module: the performance category reports itself unavailable.
   }
   registerWarpCommand(pi);
   registerWarpMessageRenderer(pi);

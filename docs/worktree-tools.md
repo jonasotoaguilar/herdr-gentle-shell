@@ -623,6 +623,39 @@ same message, which names the concrete install command (without an explicit
 Disabling never runs
 this gate — a missing prerequisite may block turning a feature ON, never OFF.
 
+### Performance switches (`/herdr-gentle:customize` — `Performance switches` rows)
+
+Three rows, each shipped OFF, each turning on one pi render optimisation for
+long fullscreen sessions. pi itself keeps four individual settings; row 1
+writes two of them because eviction has no effect without the index it lives
+inside. A user who changes nothing keeps today's behaviour exactly.
+
+- **Height index + eviction** writes `heightIndex` and `evictOffscreenLines`.
+  A mixed state reached through pi's own `/settings` (one key on, the other
+  off) is shown as `PARTIAL` and the next toggle normalizes both keys to one
+  value — the row never claims they were already equal.
+- **Recent tool output expansion** writes `expandRecentToolOutput`, one key.
+  ON is a mode: the last 10 turns of tool output render in full and older
+  turns collapse to a one-line stub; Ctrl+O toggles that mode for the session
+  and it survives a new prompt. With the mode OFF, Ctrl+O behaves exactly as
+  it does today.
+- **Incremental search corpus** writes `incrementalSearchCorpus`, one key.
+
+Each row's note states what it improves AND what it worsens, with its
+measured numbers and the `SYNTHETIC` label; the full measured detail sits
+behind the `?` help key, which replaces the list area with the whole note and
+the apparatus it was measured on. The note text is taken from the setting's
+own `description` when the host exposes one, so pi's `/settings` and this
+footer cannot drift apart; a host that exposes none falls back to the pinned
+text in `lib/customize-perf-rows.js`, which carries the same numbers.
+
+Writes go through `lib/pi-perf-settings.js`: the four keys are merged into
+`<agent-dir>/settings.json` without disturbing any other key, atomically and
+with the previous mode preserved. A settings file that is malformed, not an
+object, or unreadable is NEVER overwritten — the row says `<row> not
+changed. <reason>` and leaves the bytes untouched. A successful change asks
+for a reload so it applies without a restart; a failed one never reloads.
+
 
 
 ### Warp command (`/herdr-gentle:warp`, S23)
