@@ -47,6 +47,10 @@ const stubbed = srcText.replace(
 );
 assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
 
+// The refusal literal this suite pins byte-identical with the inline mirror in
+// the extension (S3/S4).
+const pluginCheckLib = require('../lib/herdr-plugin-check.js');
+
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-sidebar-toggle-'));
 const copy = path.join(root, 'gentle-herdr-state.mjs');
 fs.writeFileSync(copy, stubbed);
@@ -88,7 +92,11 @@ fs.writeFileSync(
     '    exit 0',
     '  fi',
     '  if [ "$hit" = "1" ]; then',
-    '    printf \'{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s"}]}}\\n\' "$want" "$HERDR_SHIM_PLUGIN_ROOT"',
+    '    if [ "${HERDR_SHIM_LIST_DISABLED:-0}" = "1" ]; then',
+    '      printf \'{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s","enabled":false}]}}\\n\' "$want" "$HERDR_SHIM_PLUGIN_ROOT"',
+    '    else',
+    '      printf \'{"id":"cli:plugin","result":{"plugins":[{"plugin_id":"%s","plugin_root":"%s"}]}}\\n\' "$want" "$HERDR_SHIM_PLUGIN_ROOT"',
+    '    fi',
     '  else',
     '    printf \'{"id":"cli:plugin","result":{"plugins":[]}}\n\'',
     '  fi',
@@ -185,6 +193,8 @@ function resetState() {
   delete process.env.HERDR_SHIM_EXIT;
   delete process.env.HERDR_SHIM_RELOAD_EXIT;
   delete process.env.HERDR_SHIM_LIST_EXIT;
+  delete process.env.HERDR_SHIM_LIST_IDS;
+  delete process.env.HERDR_SHIM_LIST_DISABLED;
 }
 
 function readMode() {
@@ -328,7 +338,7 @@ test('apply refuses when the installed plugin root cannot be resolved', async ()
   const result = await slot.sidebar.apply('gentle', h.ctx);
   delete process.env.HERDR_SHIM_LIST_EXIT;
   assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
-  assert.match(result.text, /plugin root|resolve/i);
+  assert.equal(result.text, pluginCheckLib.sidebarEnableRefusal('unknown'), 'the gate refuses the inconclusive lookup');
   assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode never committed without completion proof');
   assert.equal(settingsRaw(), before, 'settings untouched');
   assert.equal(configRaw(), null, 'config untouched');
@@ -543,26 +553,30 @@ test('invalid settings.json fails closed with no mode write and no herdr invoke'
   assert.deepEqual(shimCalls(), [], 'configure is never invoked after a settings failure');
 });
 
-test('configure failure leaves mode, settings, and config untouched', async () => {
+test('configure failure leaves mode and settings untouched and rolls the rows back', async () => {
   const { default: factory } = await factoryPromise;
   resetState();
   resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
   const before = settingsRaw();
+  // The list query must SUCCEED so the enable gate passes and the failure is
+  // actually the configure run (a failing list would now be refused earlier).
   process.env.HERDR_SHIM_EXIT = '1';
+  process.env.HERDR_SHIM_LIST_EXIT = '0';
   const h = harness();
   factory(h.pi);
   const slot = slotOf();
 
   const result = await slot.sidebar.apply('gentle', h.ctx);
   delete process.env.HERDR_SHIM_EXIT;
+  delete process.env.HERDR_SHIM_LIST_EXIT;
   assert.deepEqual({ changed: result.changed, needsReload: result.needsReload }, { changed: false, needsReload: false });
   assert.match(result.text, /customize|converge/i, 'explicit recoverable state');
   assert.deepEqual(readMode(), { version: 1, enabled: false }, 'mode never committed without completion proof');
   assert.equal(settingsRaw(), before, 'settings untouched when completion fails first');
   assert.ok(!fs.existsSync(markerFile), 'no orphaned ownership record');
-  assert.equal(configRaw(), null, 'config untouched');
+  assert.ok(!(configRaw() ?? '').includes(MANAGED_BEGIN), 'no managed rows survive the failed configure');
 });
 
 test('package enable reload failure restores mode, exclusion, and rows', async () => {
@@ -1042,6 +1056,144 @@ test('explicit empty GENTLE keeps provider writes stored (S15)', async () => {
     if (savedXdg === undefined) delete process.env.XDG_STATE_HOME;
     else process.env.XDG_STATE_HOME = savedXdg;
   }
+});
+
+// ---------------------------------------------------------------------------
+// customize-command T2/S3/S4: enabling the Gentle sidebar consults the
+// installed Herdr plugin BEFORE any write and refuses fail-closed when it is
+// missing or disabled; the refusal is byte-identical with
+// lib/herdr-plugin-check.js and re-emitted on every retry. Disabling never
+// consults the gate: a missing prerequisite may block turning the sidebar ON,
+// never OFF, so it converges with the plugin missing.
+// ---------------------------------------------------------------------------
+
+test('S3: enable without the plugin refuses before any write and names the install command', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  const beforeSettings = settingsRaw();
+  process.env.HERDR_SHIM_LIST_IDS = 'none';
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const result = await slot.sidebar.apply('gentle', h.ctx);
+  delete process.env.HERDR_SHIM_LIST_IDS;
+  assert.deepEqual(
+    { changed: result.changed, needsReload: result.needsReload },
+    { changed: false, needsReload: false },
+    'a refusal changes nothing and never reloads',
+  );
+  assert.equal(
+    result.text,
+    pluginCheckLib.sidebarEnableRefusal('missing'),
+    'byte-identical refusal literal, install command included',
+  );
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'the switch stays off');
+  assert.equal(settingsRaw(), beforeSettings, 'settings.json bytes are unchanged');
+  assert.equal(configRaw(), null, 'config.toml is untouched');
+  assert.ok(!fs.existsSync(markerFile), 'no ownership marker is written');
+  const calls = shimCalls();
+  assert.equal(calls.length, 2, 'only the two read-only plugin lookups ran (active, then legacy)');
+  assert.ok(calls.every((c) => c.includes('plugin list')), 'never runs configure or an action invoke');
+});
+
+test('S3: a retry re-emits the identical refusal and still writes nothing', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  const beforeSettings = settingsRaw();
+  process.env.HERDR_SHIM_LIST_IDS = 'none';
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const first = await slot.sidebar.apply('gentle', h.ctx);
+  const second = await slot.sidebar.apply('gentle', h.ctx);
+  delete process.env.HERDR_SHIM_LIST_IDS;
+  assert.equal(second.text, first.text, 'identical message on every retry');
+  assert.equal(first.text, pluginCheckLib.sidebarEnableRefusal('missing'));
+  assert.deepEqual(readMode(), { version: 1, enabled: false });
+  assert.equal(settingsRaw(), beforeSettings);
+  assert.equal(configRaw(), null);
+  assert.ok(!fs.existsSync(markerFile));
+});
+
+test('S3: enable refuses when the plugin is installed but disabled, naming the enable command', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  const beforeSettings = settingsRaw();
+  process.env.HERDR_SHIM_LIST_DISABLED = '1';
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const result = await slot.sidebar.apply('gentle', h.ctx);
+  delete process.env.HERDR_SHIM_LIST_DISABLED;
+  assert.equal(result.text, pluginCheckLib.sidebarEnableRefusal('disabled'));
+  assert.ok(result.text.includes('herdr plugin enable herdr-gentle-shell'), 'names the enable command');
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'the switch stays off');
+  assert.equal(settingsRaw(), beforeSettings, 'settings.json bytes are unchanged');
+  assert.equal(configRaw(), null, 'config.toml is untouched');
+  assert.ok(!fs.existsSync(markerFile), 'no ownership marker is written');
+  const calls = shimCalls();
+  assert.equal(calls.length, 1, 'only the active-id lookup ran');
+  assert.ok(calls.every((c) => c.includes('plugin list')));
+});
+
+test('S3: disabling never consults the plugin gate — it converges with the plugin missing', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY], model: 'm' } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const staged = await slot.sidebar.apply('gentle', h.ctx);
+  assert.equal(staged.changed, true, 'stages the owned exclusion and managed rows with the plugin present');
+  assert.ok(fs.existsSync(markerFile), 'ownership record staged');
+  assert.ok((configRaw() ?? '').includes(MANAGED_BEGIN), 'managed rows staged');
+
+  process.env.HERDR_SHIM_LIST_IDS = 'none';
+  const result = await slot.sidebar.apply('native', h.ctx);
+  delete process.env.HERDR_SHIM_LIST_IDS;
+  assert.equal(result.changed, true, 'disabling stays unconditional');
+  assert.ok(!/cannot be enabled/.test(result.text), 'the enable gate never ran');
+  assert.deepEqual(readMode(), { version: 1, enabled: false }, 'the switch converged off');
+  assert.deepEqual(readSettings().extensions, [OTHER_ENTRY], 'the owned exclusion was removed');
+  assert.equal(readSettings().model, 'm', 'unrelated keys are preserved');
+  assert.ok(!fs.existsSync(markerFile), 'the owned marker was dropped');
+  assert.ok(
+    (configRaw() ?? '').includes(MANAGED_BEGIN),
+    'managed rows left as found (the absent plugin is the only thing that converges them)',
+  );
+});
+
+test('PRESERVE: enable with the plugin installed still converges (the gate passes)', async () => {
+  const { default: factory } = await factoryPromise;
+  resetState();
+  resetAgentDir({ settings: { extensions: [OTHER_ENTRY] } });
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(modeFile, '{"version":1,"enabled":false}\n');
+  const h = harness();
+  factory(h.pi);
+  const slot = slotOf();
+
+  const result = await slot.sidebar.apply('gentle', h.ctx);
+  assert.equal(result.changed, true);
+  assert.deepEqual(readMode(), { version: 1, enabled: true });
+  assert.deepEqual(readSettings().extensions, [OTHER_ENTRY, NATIVE_ENTRY]);
+  assert.ok(fs.existsSync(markerFile), 'ownership taken');
+  assert.ok((configRaw() ?? '').includes(MANAGED_BEGIN), 'managed rows written and verified');
 });
 
 test('omitted GENTLE still reads an injected flag (S15)', async () => {

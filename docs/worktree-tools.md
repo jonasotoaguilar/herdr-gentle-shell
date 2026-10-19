@@ -586,20 +586,116 @@ status: sidebar=gentle moshi=off worktree=enabled`.
 At session startup the extension compares the installed Herdr plugin for
 id `herdr-gentle-shell` against the version this package ships in
 `herdr-plugin/herdr-plugin.toml` (read-only `herdr plugin list --json`, the
-same lookup the sidebar wiring uses). When the plugin is missing, installed
-only under the retired id `herdr-gentle-agents`, disabled, or at another
-version, one short alert names the mismatch and the real command — the
-remote install plus enable (`herdr plugin install
-jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref herdr-vX.Y.Z` then
-`herdr plugin enable herdr-gentle-shell`), the update (`herdr plugin update
-herdr-gentle-shell`), or the enable for a disabled install. A locally
-linked plugin counts as installed and is reported as linked, never as
-missing. An absent or erroring Herdr CLI, or unreadable metadata, fails
-silent and harmless: the check never throws, never blocks loading, never
-writes user config, never repeats the alert within the session, and never
-mentions `/reload`. The logic lives in `lib/herdr-plugin-check.js` and is
-pinned in `tools/herdr-plugin-check.test.js` with every external call
-stubbed.
+same lookup the sidebar wiring uses). The check never throws, never blocks
+loading, never repeats its message within the session, and never mentions
+`/reload`; the logic lives in `lib/herdr-plugin-check.js` and is pinned in
+`tools/herdr-plugin-check.test.js` with every external call stubbed.
+
+When the verdict is `missing` or `disabled` **and** the sidebar option still
+reads `gentle`, startup no longer merely alerts: it switches the sidebar
+OFF through the same writer the customize panel uses — the owned Pi
+`settings.json` exclusion is removed and the mode is written native — so a
+missing prerequisite never leaves a dead option on. The plugin-owned managed
+`config.toml` rows are LEFT AS FOUND (the absent plugin is the only thing
+that converges them, and nothing reads them while it is absent) and the one
+message says so, names the fix
+(`herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref
+herdr-vX.Y.Z`, then `herdr plugin enable herdr-gentle-shell` — the enable
+command alone for a disabled install) and states plainly that the sidebar
+was switched off because the plugin is not installed. If that switch-off
+write fails, the message reports the true outcome — still on, and why —
+never a false success. When the plugin is present and usable the check is
+quiet; when it is unusable but the sidebar is already native, the plain
+once-per-session plugin alert still fires and the sidebar option is left
+untouched. The other verdicts
+(installed under the retired id, or at another version) keep the alert shape
+and name the update (`herdr plugin update herdr-gentle-shell`) or enable.
+A locally linked plugin counts as installed and is reported as linked, never
+as missing; an absent or erroring Herdr CLI, or unreadable metadata, fails
+silent and harmless.
+
+Turning the sidebar ON is gated symmetrically. Enabling `Gentle` without the
+installed, enabled plugin is refused BEFORE any write: no mode flag, no
+settings exclusion, no `config.toml` rows, no ownership marker, and the
+switch stays native. Retrying while the plugin is still absent re-emits the
+same message, which names the concrete install command (without an explicit
+`--ref`, so `install.sh` resolves the newest `herdr-vX.Y.Z` release tag).
+Disabling never runs
+this gate — a missing prerequisite may block turning a feature ON, never OFF.
+
+### Performance switches (`/herdr-gentle:customize` — `Performance switches` rows)
+
+Three rows, each shipped OFF, each turning on one pi render optimisation for
+long fullscreen sessions. pi itself keeps four individual settings; row 1
+writes two of them because eviction has no effect without the index it lives
+inside. A user who changes nothing keeps today's behaviour exactly.
+
+- **Height index + eviction** writes `heightIndex` and `evictOffscreenLines`.
+  A mixed state reached through pi's own `/settings` (one key on, the other
+  off) is shown as `PARTIAL` and the next toggle normalizes both keys to one
+  value — the row never claims they were already equal.
+- **Recent tool output expansion** writes `expandRecentToolOutput`, one key.
+  ON is a mode: the last 10 turns of tool output render in full and older
+  turns collapse to a one-line stub; Ctrl+O toggles that mode for the session
+  and it survives a new prompt. With the mode OFF, Ctrl+O behaves exactly as
+  it does today.
+- **Incremental search corpus** writes `incrementalSearchCorpus`, one key.
+
+Each row's note states what it improves AND what it worsens, with its
+measured numbers and the `SYNTHETIC` label; the full measured detail sits
+behind the `?` help key, which replaces the list area with the whole note and
+the apparatus it was measured on. The note text is taken from the setting's
+own `description` when the host exposes one, so pi's `/settings` and this
+footer cannot drift apart; a host that exposes none falls back to the pinned
+text in `lib/customize-perf-rows.js`, which carries the same numbers.
+
+Writes go through `lib/pi-perf-settings.js`: the four keys are merged into
+`<agent-dir>/settings.json` without disturbing any other key, atomically and
+with the previous mode preserved. A settings file that is malformed, not an
+object, or unreadable is NEVER overwritten — the row says `<row> not
+changed. <reason>` and leaves the bytes untouched. A successful change asks
+for a reload so it applies without a restart; a failed one never reloads.
+
+### Reset every option to its defaults (`/herdr-gentle:customize` — `Reset` row)
+
+The panel's `Reset` row returns the user-visible options to the
+defaults their own read sites define — `sidebar` Gentle **when the Herdr plugin
+is installed and usable and OFF when it is not** (see below), `moshi` off,
+`worktree` enabled, and the four performance keys `heightIndex`,
+`evictOffscreenLines`, `expandRecentToolOutput` and
+`incrementalSearchCorpus` OFF — by writing each default THROUGH the same
+writer the corresponding row uses, never by deleting a flag file. The
+performance keys go through `lib/pi-perf-settings.js`, in one atomic merge
+that leaves every other setting alone, and the summary names each of the four
+by its own label; a reset that had nothing to do with them keeps its summary
+unchanged. The moshi reset
+therefore also clears its Pi `settings.json` exclusion, and the sidebar reset
+lets its Herdr `config.toml` managed rows and ownership marker converge
+exactly as choosing `Gentle` would. Per-option outcomes are reported: a full
+run notifies `Defaults saved.`; a failure notifies `Partial reset: <option>
+changed|unchanged, …`, naming the failed option as unchanged together with
+its reason, and a run where nothing succeeds says nothing was changed. When
+every option already matches the default that applies in the current state the row
+notifies `Nothing to reset: the sidebar is already OFF by default, and moshi,
+worktree and performance switches already match their defaults.` and writes
+nothing at all.
+
+The row never depends on the Herdr plugin being installed: the reset is always
+attempted. The sidebar's default is CONDITIONAL — Gentle when the plugin is
+installed and usable, OFF when it is not — because enabling the sidebar is
+refused while the plugin is missing. A sidebar left OFF without the plugin is
+therefore reported as that default APPLYING, never as a change that failed:
+the notice leads with `Defaults saved.` and adds that the Gentle sidebar cannot
+be enabled until `herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin && herdr plugin enable herdr-gentle-shell`
+succeeds. A writer that genuinely FAILS is still reported as
+`Partial reset: <option> changed|unchanged, …`, naming it with its reason, so an
+unreachable default and a real error never read the same way. Because the
+default itself moves with the plugin's presence, "nothing to reset" is judged
+against the default that applies in the current state: without the plugin an OFF
+sidebar is nothing to reset, while with the plugin present an OFF sidebar is
+something to reset. The
+`gentle-sidebar-mode.json`, `gentle-moshi.json` and
+`gentle-worktree-mode.json` files are rewritten, never removed.
 
 ### Warp command (`/herdr-gentle:warp`, S23)
 
@@ -931,6 +1027,55 @@ pipeline event — including `bash` calls, which skip the per-call leg
 entirely and still converge through the scan. The hook never throws and
 never blocks the pipeline: any failure is swallowed after a best-effort
 attempt.
+
+## Automatic session naming
+
+The same pipeline event also names the session after the ODD task document
+that was **written**: a write to `odd/tasks/<feature>.md` inside a
+registered worktree sets the session name to `<heading> @ <branch>`
+(`lib/session-auto-name.js` derives it, the extension only calls
+`pi.setSessionName`). The heading is the document's own first level-1
+heading — the honest statement of what the work is about — trimmed, with
+inner whitespace collapsed and truncated to 48 characters on a word
+boundary. A document with no readable heading falls back to the filename
+slug (`odd/tasks/pi-fullscreen-perf.md` → `pi-fullscreen-perf`). Reading
+never triggers — an agent reads many ODD documents for context, so a read
+would make the name jump to whatever was opened last. Writing the same
+document again derives the same label and writes nothing, so the hook can
+run on every event without spamming the session record.
+
+The session NAME is the channel because Pi exposes no subject or alias
+write; the extension's event context has no `executeTool`, so gentle-pi's
+private subject cache is unreachable. Never-clobber is therefore decided by
+**pattern**, not by a stored flag: the plugin writes only when the current
+name is empty or is one it can account for as its own. That covers the
+label this session already applied (remembered in the module), a name
+ending in ` @ <this worktree's branch>` (what makes a resume recognizable
+with no memory), the plain filename slug an earlier version wrote, and the
+document's current heading. Any other name was chosen by a human and is
+left alone, and a hand rename after an automatic one sticks. The admitted
+consequence: a session a human names exactly like one of those shapes is
+indistinguishable from the plugin's own label and may be updated.
+
+Collisions are always resolved with the branch suffix rather than only when
+a peer is detected: the host exposes nothing that enumerates the live
+sessions of a clone, and the branch is already unique per worktree, so
+always suffixing is the conservative choice that guarantees two concurrent
+forks of the same feature never share a name. The principal checkout is
+never named — a call whose context is the principal resolves no worktree
+entry and stops before the naming step.
+
+An ODD **phase transition** re-applies the label the session last derived
+from a write. `gentle_odd_phase` names the phase, never the feature, so the
+module remembers the last derived label per session and the phase trigger
+only re-applies it through the same ownership test; a session that never
+wrote an ODD document has nothing to re-apply and is left alone. The
+transition is observed on `tool_result` (that tool is gentle-pi's, not a
+host event). A resumed session carries its name in the session record, so
+the derivation also runs again on the next write and moves the name to the
+document now being edited. Both triggers sit behind the worktree-tools
+toggle: with it off the handler reads the mode first and returns before any
+naming, so neither trigger can fire.
 
 ## Known limitations
 
