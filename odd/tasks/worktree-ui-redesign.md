@@ -248,3 +248,14 @@ L4. Evidence for S15: with the real `matchesKey` from `@earendil-works/pi-tui`
 Kitty CSI-u forms (`\x1b[106;5u`, `\x1b[107;5u`). The view is therefore not the
 defect; the delivery of those bytes is terminal-specific, which is why S15 asks
 for a variant rather than a repair.
+
+L5. Baseline facts recorded before T3. Full suite on this branch: 1707 tests, 1704
+pass, 3 fail. Two of those failures reproduce identically on `main` (b8d4910) and
+are therefore pre-existing, not caused by this thread:
+- `tools/worktree-hooks.test.js` "copies present+untracked candidates, refuses
+  tracked / missing-source / existing-target"
+- `tools/worktree-close.test.js` "a dirty checkout without force is refused with
+  the repository reason"
+The third (S15 scroll test) is T13's in-flight RED and clears when T13 lands.
+T12's S14 verdict must report these two as pre-existing rather than green, or this
+thread must fix them explicitly.
