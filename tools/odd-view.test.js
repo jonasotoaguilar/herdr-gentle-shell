@@ -703,6 +703,26 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     assert.match(body.split('\n')[1], /3\/3 documents/, 'the counts return with the list');
   });
 
+  test('the raw DEL byte edits the kept query even with no host helpers injected', () => {
+    const { view } = build({ helpers: null, docs: [doc('alpha'), doc('beta'), doc('gamma')] });
+    view.handleInput('T');
+    view.handleInput('G');
+    view.handleInput('a');
+    view.handleInput('enter');
+    view.handleInput('down');
+    view.handleInput('/');
+    let body = strip(view.render(80).join('\n'));
+    assert.match(body.split('\n')[1], /1\/3 documents/, 'the kept query still filters to the single match');
+    view.handleInput('\x7f');
+    body = strip(view.render(80).join('\n'));
+    assert.match(body.split('\n')[1], /1\/3 documents/, 'DEL edits the kept query without host helpers');
+    assert.ok(!/\x7f/i.test(body), 'the raw DEL byte never becomes visible query text');
+    view.handleInput('\x7f');
+    view.handleInput('\x7f');
+    body = strip(view.render(80).join('\n'));
+    assert.match(body.split('\n')[1], /3\/3 documents/, 'emptying the query restores every document');
+  });
+
   test('S29: assignmentEnabled false hides marks/hints/unsaved and refuses Space and ctrl+s bytes', async () => {
     const calls = [];
     const opened = [];
