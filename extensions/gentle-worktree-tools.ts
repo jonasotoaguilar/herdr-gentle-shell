@@ -1219,6 +1219,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
 const worktreeCreateTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_create",
   label: "Worktree Create",
+  exposure: "codemode",
   description: "Create an agent worktree for a branch at the flattened worktree path, optionally associated with verified GitHub issues. The calling thread owns the checkout.",
   parameters: Type.Object({
     branch: Type.String({ description: "Branch name to create the worktree for" }),
@@ -2638,6 +2639,7 @@ const worktreeListTool = withWorktreeCardRenderer(defineTool({
 const worktreeCloseTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_close",
   label: "Worktree Close",
+  exposure: "codemode",
   description: "Remove a registered agent worktree checkout and its Herdr workspace while keeping the branch. Pass the worktree name, path, or branch (only one), plus force:true to close a dirty checkout.",
   parameters: Type.Object({
     name: opt(Type.String({ description: "Name of the registered worktree to close (the flattened branch slug, or principal)" })),
@@ -3595,6 +3597,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
 const worktreeSessionOpenTool = withWorktreeCardRenderer(defineTool({
   name: "worktree_session_open",
   label: "Worktree Session Open",
+  exposure: "codemode",
   description: "Open a Pi session inside a registered agent worktree via Herdr (workspace only, never a path): pass the worktree NAME 'worktree list' prints (or a branch name) and optionally a session id to resume. A new session id is minted when resuming is not asked. Unless notify:false is passed, the creator is notified when that session really finishes.",
   parameters: Type.Object({
     worktree: Type.String({ description: "Name of the registered worktree to open the session in (the flattened branch slug, or a branch name)" }),
