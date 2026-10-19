@@ -297,3 +297,10 @@ faster. T14 must therefore record what is actually checkable — the four-key
 snapshot, whether the installed Pi bundle references each key at all, and this
 package's own view/daemon timings — and the docs must say plainly that the
 switches only take effect on a Pi build that implements them.
+
+L9. User decision on T14, verbatim: "aaa, adelante con las 3". Read as the union:
+the trace of (a) plus the honest row of (b), which subsumes (c) because the log
+exists either way. The row's new state reports what is verifiable — "this build
+does not declare these settings", never "these optimizations do not work" —
+because a minified bundle could rename a setting internally while still reading
+it.
