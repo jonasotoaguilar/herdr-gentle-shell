@@ -286,3 +286,14 @@ L7. Verbatim request (S16):
 """
 otro punto es que active las optimizaciones, pero nose si estan funcionado en la tui o si son eficaz de verdad. Podrias agregar a performance una opcion de debug o algo, que genere logs o una traza o algo. Para activarlo y registrar rendimiento y funcionamiento con los performance apagados y luego con los performance encedidos.
 """
+
+L8. Evidence for S16, measured before designing T14. The four performance keys
+this package writes (`heightIndex`, `evictOffscreenLines`,
+`expandRecentToolOutput`, `incrementalSearchCorpus`) appear in NO file of the
+installed Pi 1.3.0 (`grep -rl` over `node_modules/@earendil-works` → 0 files) and
+in no CHANGELOG entry. So on this build the switches are inert: they write
+`settings.json` keys that Pi never reads, and no trace of our own can make Pi
+faster. T14 must therefore record what is actually checkable — the four-key
+snapshot, whether the installed Pi bundle references each key at all, and this
+package's own view/daemon timings — and the docs must say plainly that the
+switches only take effect on a Pi build that implements them.
