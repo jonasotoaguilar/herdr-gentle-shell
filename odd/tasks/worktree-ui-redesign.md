@@ -259,3 +259,11 @@ are therefore pre-existing, not caused by this thread:
 The third (S15 scroll test) is T13's in-flight RED and clears when T13 lands.
 T12's S14 verdict must report these two as pre-existing rather than green, or this
 thread must fix them explicitly.
+
+L6. S3 implementation decision. gentle-shell's YOLO option renders through
+`ctx.ui.setWidget()`, which is persistent display-only content and cannot
+receive keys; the warp must take keys (`↑↓`, `enter`, `c`, `e`, `v`, `esc`), so
+it stays a `ctx.ui.custom()` overlay and only its geometry changes: anchored
+`bottom-center` at full width instead of `center` at 70%. It therefore looks
+like a bottom panel while remaining focusable. Recorded so T3 does not try to
+rebuild it as a widget.
