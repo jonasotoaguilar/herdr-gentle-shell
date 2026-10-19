@@ -371,7 +371,7 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 
 ### Agent worktrees
 
-An agent thread owns one checkout, created with `worktree_create` (branch
+An agent thread owns one checkout, created with `worktree_upsert` (branch
 plus at least one verified GitHub issue — success answers `worktree
 create: <path>`), inspected with `worktree_list`, and removed with
 `worktree_close` (the branch is kept). Creation copies untracked env
@@ -420,6 +420,14 @@ and limitations — lives in
   verbs: one terse line per switch
   (`customize status: sidebar=gentle moshi=off worktree=enabled`).
   See [docs/sidebar-control.md](docs/sidebar-control.md).
+- Odd viewer (`/herdr-gentle:odd`): read-only two-pane overlay over the
+  current checkout's `odd/tasks/*.md` — document names on the left, the
+  selected document as styled markdown on the right.
+  See [docs/odd-viewer.md](docs/odd-viewer.md).
+- Issues viewer (`/herdr-gentle:issues`): three-page overlay over the
+  current checkout's repository issues — the issue list on the left, the
+  selected issue with its comments on the right.
+  See [docs/issues-viewer.md](docs/issues-viewer.md).
 - Optional Moshi replacement (off by default): the `Moshi notifications`
   rows of `/herdr-gentle:customize` (`On` / `Off`, read-only state via
   `customize status`). With it on, this plugin **replaces the Moshi-managed Pi
@@ -450,7 +458,7 @@ and limitations — lives in
   publications never appear and still depend on chat delivery, and
   absence-driven completion records `completed` without latching an error.
 - TTL-bounded tokens: stale panes fall back to native `idle`.
-- Agent worktrees (`worktree_create` / `worktree_list` / `worktree_close`,
+- Agent worktrees (`worktree_upsert` / `worktree_list` / `worktree_close`,
   plus the `Worktree tools` rows of `/herdr-gentle:customize`): one checkout per
   thread at the flattened worktree path, issue-associated and verified
   through `gh`, with creation hooks (untracked env copies, lockfile-detected
@@ -468,6 +476,9 @@ and limitations — lives in
 | Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
 | Customize (`/herdr-gentle:customize`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
 | Agent worktrees (`worktree_*` tools) | [docs/worktree-tools.md](docs/worktree-tools.md) |
+| Odd viewer (`/herdr-gentle:odd`) | [docs/odd-viewer.md](docs/odd-viewer.md) |
+| Key map (all views) | [docs/keys.md](docs/keys.md) |
+| Issues viewer (`/herdr-gentle:issues`) | [docs/issues-viewer.md](docs/issues-viewer.md) |
 
 ## Next Steps
 

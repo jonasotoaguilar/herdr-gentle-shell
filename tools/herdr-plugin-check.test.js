@@ -510,6 +510,19 @@ function fireSessionStart(handlers, { json, exit = '0', notes } = {}) {
   })();
 }
 
+// Only this check's own alerts, for every describe that drives a real startup.
+// `fireSessionStart` runs EVERY registered `session_start` handler, and another
+// one legitimately notifies too: the `/herdr-gentle:issues` gate sends one
+// message when `gh` is missing or unauthenticated, which is exactly the CI
+// runner's state and never this checkout's. Counting every startup
+// notification measured that handler instead of this one.
+//
+// The predicate is sound and complete for this check: every message it can
+// emit names the plugin id — the drift and disabled/local-link alerts, and the
+// sidebar switch-off notices whose cause and command both carry it — while the
+// gate's message names `/herdr-gentle:issues` instead.
+const pluginAlerts = (notes) => notes.filter(([message]) => String(message).includes(PLUGIN_ID));
+
 describe('herdr-plugin-check wiring at session startup', { concurrency: false }, () => {
   test('a version drift at startup notifies once with the update command', async () => {
     pluginCheck.resetHerdrPluginCheckForTests();
@@ -528,8 +541,8 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
       const json = listDoc([entry({ version: '9.9.9' })]);
       await fireSessionStart(handlers, { json, notes });
       await fireSessionStart(handlers, { json, notes });
-      assert.equal(notes.length, 1, 'exactly one alert per session across two startups');
-      const [message, level] = notes[0];
+      assert.equal(pluginAlerts(notes).length, 1, 'exactly one alert per session across two startups');
+      const [message, level] = pluginAlerts(notes)[0];
       assert.equal(level, 'info');
       assert.ok(message.includes(PLUGIN_ID), `names the plugin id: ${message}`);
       assert.ok(message.includes('9.9.9') && message.includes(shipped), `names both versions: ${message}`);
@@ -553,7 +566,7 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: listDoc([entry({ version: shipped })]), notes });
-      assert.equal(notes.length, 0, 'a healthy install notifies nothing');
+      assert.equal(pluginAlerts(notes).length, 0, 'a healthy install notifies nothing');
     } finally {
       restoreEnv();
     }
@@ -570,7 +583,7 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: '{}', notes });
-      assert.equal(notes.length, 0, 'no alert when Herdr is unavailable');
+      assert.equal(pluginAlerts(notes).length, 0, 'no alert when Herdr is unavailable');
     } finally {
       restoreEnv();
     }
@@ -588,7 +601,7 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: '{}', exit: '1', notes });
-      assert.equal(notes.length, 0, 'no alert when the list call errors');
+      assert.equal(pluginAlerts(notes).length, 0, 'no alert when the list call errors');
     } finally {
       restoreEnv();
     }
@@ -829,10 +842,10 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
       );
       assert.ok(!fs.existsSync(path.join(fx.stateDir, 'pi-extension-exclusion-owned')), 'the marker was dropped');
       assert.match(fs.readFileSync(fx.config, 'utf8'), /BEGIN herdr-gentle-agents/, 'managed rows deliberately left as found');
-      assert.equal(notes.length, 1, 'exactly one message');
-      assert.ok(/switched OFF/.test(notes[0][0]), notes[0][0]);
-      assert.ok(notes[0][0].includes(`--ref herdr-v${shipped}`), `names the shipped install ref: ${notes[0][0]}`);
-      assert.ok(/rows were left as found/.test(notes[0][0]), `says the rows were left: ${notes[0][0]}`);
+      assert.equal(pluginAlerts(notes).length, 1, 'exactly one message');
+      assert.ok(/switched OFF/.test(pluginAlerts(notes)[0][0]), pluginAlerts(notes)[0][0]);
+      assert.ok(pluginAlerts(notes)[0][0].includes(`--ref herdr-v${shipped}`), `names the shipped install ref: ${pluginAlerts(notes)[0][0]}`);
+      assert.ok(/rows were left as found/.test(pluginAlerts(notes)[0][0]), `says the rows were left: ${pluginAlerts(notes)[0][0]}`);
     } finally {
       restoreEnv();
     }
@@ -866,7 +879,7 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
       assert.equal(fs.readFileSync(fx.settingsPath, 'utf8'), before.settings);
       assert.equal(fs.readFileSync(fx.config, 'utf8'), before.config);
       assert.equal(fs.readFileSync(path.join(fx.stateDir, 'pi-extension-exclusion-owned'), 'utf8'), before.marker);
-      assert.equal(notes.length, 0, 'a usable plugin stays quiet');
+      assert.equal(pluginAlerts(notes).length, 0, 'a usable plugin stays quiet');
     } finally {
       restoreEnv();
     }
@@ -888,8 +901,8 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
         'the option stays off',
       );
       assert.equal(fs.readFileSync(fx.settingsPath, 'utf8'), before);
-      assert.equal(notes.length, 1);
-      assert.ok(!/switched OFF/.test(notes[0][0]), `no sidebar claim: ${notes[0][0]}`);
+      assert.equal(pluginAlerts(notes).length, 1);
+      assert.ok(!/switched OFF/.test(pluginAlerts(notes)[0][0]), `no sidebar claim: ${pluginAlerts(notes)[0][0]}`);
     } finally {
       restoreEnv();
     }
@@ -905,9 +918,9 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
     try {
       const { handlers } = await loadExtension();
       await fireSessionStart(handlers, { json: listDoc([]), notes });
-      assert.equal(notes.length, 1);
-      assert.ok(/could NOT be switched off/.test(notes[0][0]), `honest outcome: ${notes[0][0]}`);
-      assert.ok(/still ON/.test(notes[0][0]), `says it is still on: ${notes[0][0]}`);
+      assert.equal(pluginAlerts(notes).length, 1);
+      assert.ok(/could NOT be switched off/.test(pluginAlerts(notes)[0][0]), `honest outcome: ${pluginAlerts(notes)[0][0]}`);
+      assert.ok(/still ON/.test(pluginAlerts(notes)[0][0]), `says it is still on: ${pluginAlerts(notes)[0][0]}`);
     } finally {
       fs.chmodSync(fx.stateDir, 0o755);
       restoreEnv();

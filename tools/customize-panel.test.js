@@ -353,7 +353,7 @@ describe('customize panel', { concurrency: false }, () => {
         'publishes agent state and SessionChanges from Gentle',
         'Native Herdr',
         'Preview · Gentle (this extension)',
-        '←/→ or Tab panes · ↑/↓ move · Enter apply · ? help · Esc close',
+        '←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close',
       ]) {
         assert.ok(seen().includes(copy), `panel copy missing: ${copy}`);
       }
@@ -1034,7 +1034,7 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
     try {
       const text = component.render(80).map(stripAnsi).join('\n');
       assert.ok(text.includes('Preview · Gentle (this extension)'), 'preview names the focused choice');
-      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ move · Enter apply · ? help · Esc close'), 'footer survives inside the card');
+      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close'), 'footer survives inside the card');
     } finally {
       cleanup();
     }
@@ -1157,7 +1157,7 @@ describe('customize label-only rows with focused preview', { concurrency: false 
 });
 
 describe('worktree registration under an injected state dir (S15)', { concurrency: false }, () => {
-  const WORKTREE_TOOLS = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+  const WORKTREE_TOOLS = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 
   // A sandbox XDG state home plus an injected (new-id) dir. A stored flag
   // means <sandbox>/herdr/plugins/herdr-gentle-agents holds the mode file.
@@ -1266,7 +1266,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
   // stays the whole story: the copy names the session and warp coverage,
   // enabled registers exactly the five tools, disabled registers none, and
   // every disabled-path refusal keeps its exact bytes.
-  const FOUR = ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
+  const FOUR = ['worktree_close', 'worktree_upsert', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
   const REFUSAL =
     'worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them';
   const ENABLED_DETAIL = 'agents can create, list, close, warp between and open sessions in agent worktrees';
@@ -1336,7 +1336,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
       // refusal is the whole observable effect.
       modeLib().writeMode(false, process.env);
       const calls = [
-        ['worktree_create', { branch: 'feat/off' }],
+        ['worktree_upsert', { branch: 'feat/off' }],
         ['worktree_list', {}],
         ['worktree_close', { branch: 'feat/off' }],
         ['worktree_session_open', { worktree: 'feat-off' }],
@@ -1352,6 +1352,93 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
     } finally {
       setSlot(hadSlot);
       restoreEnv();
+    }
+  });
+});
+
+describe('customize key consistency (K1/K3)', { concurrency: false }, () => {
+  function stripAnsi(line) {
+    return String(line).replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\]8;;.*?\x07/g, '');
+  }
+
+  async function openPanel() {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot({ sidebarRead: 'gentle', moshiRead: 'off' });
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const { ctx, customs } = makeCtx({ customImpl: async () => {} });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(customs.length, 1, 'expected exactly one custom() call');
+      const opened = openComponent(customs[0][0], makeHostTui());
+      return { ...opened, cleanup: () => { setSlot(hadSlot); restoreEnv(); } };
+    } catch (err) {
+      setSlot(hadSlot);
+      restoreEnv();
+      throw err;
+    }
+  }
+
+  test('j moves the selection down alongside the down arrow', async () => {
+    const { component, done, cleanup } = await openPanel();
+    try {
+      component.handleInput('right');
+      assert.equal(component.state.pane, 'values');
+      const before = component.state.row[component.state.cat];
+      component.handleInput('j');
+      assert.equal(component.state.row[component.state.cat], (before + 1) % 2, 'j moves down one row');
+      assert.equal(done(), 'pending', 'movement never finishes the overlay');
+      const text = component.render(80).map(stripAnsi).join('\n');
+      assert.match(text, /Preview · Native Herdr/, 'the preview follows the j move');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('k moves the selection up alongside the up arrow', async () => {
+    const { component, done, cleanup } = await openPanel();
+    try {
+      component.handleInput('right');
+      component.handleInput('j');
+      const moved = component.state.row[component.state.cat];
+      assert.equal(moved, 1);
+      component.handleInput('k');
+      assert.equal(component.state.row[component.state.cat], 0, 'k moves back up');
+      assert.equal(done(), 'pending', 'movement never finishes the overlay');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('? toggles a key-help overlay and esc closes the overlay, not the panel', async () => {
+    const { component, done, cleanup } = await openPanel();
+    try {
+      assert.ok(!component.render(80).map(stripAnsi).join('\n').includes('Keys'), 'no help before ?');
+      component.handleInput('?');
+      const body = component.render(80).map(stripAnsi).join('\n');
+      assert.match(body, /Keys/, 'the help overlay lists the keys');
+      assert.match(body, /Enter apply/, 'the help names the apply key');
+      component.handleInput('escape');
+      assert.equal(done(), 'pending', 'esc with help open closes the overlay, never the panel');
+      assert.ok(!component.render(80).map(stripAnsi).join('\n').includes('Keys'), 'the overlay is gone');
+      component.handleInput('escape');
+      assert.equal(done(), null, 'esc with no overlay still closes the panel');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('the footer names every key the panel gained', async () => {
+    const { component, cleanup } = await openPanel();
+    try {
+      const text = component.render(80).map(stripAnsi).join('\n');
+      assert.match(text, /↑\/↓ or j\/k move/, 'the footer names the j/k aliases');
+      assert.match(text, /\? help/, 'the footer names the help key');
+    } finally {
+      cleanup();
     }
   });
 });

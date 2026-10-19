@@ -640,7 +640,19 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
 
 `/herdr-gentle:customize` is the single surface for the three switches
 (sidebar, Moshi, worktree tools); `/herdr-gentle:warp <name>` moves the
-session between checkouts. The sidebar and Moshi actions stay inline in
+session between checkouts; `/herdr-gentle:odd` opens a read-only two-pane
+overlay over the current checkout's `odd/tasks/*.md` (name list plus styled
+document), implemented in `lib/odd-docs.js` (discovery/read),
+`lib/odd-markdown.js` (renderer) and `lib/odd-view.js` (view) — it writes
+nothing and never leaves the checkout; `/herdr-gentle:issues` opens a
+three-page overlay (My issues / Assigned / Involved) over the current
+checkout's repository GitHub issues (issue list plus the selected issue
+with its comments), implemented in `lib/gh-issues.js` (the only place
+that runs `gh`), `lib/issues-view.js` (the pure view) and the command in
+`extensions/gentle-worktree-tools.ts` next to `/herdr-gentle:odd` —
+listing, search, paging, filtering, scrolling and help never write; only
+the assignment save, the label edit, the comment and the close/reopen
+write. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
@@ -797,7 +809,7 @@ list, not silent.
 
 ## 12. Agent worktree tools (`worktree_*`)
 
-Agent-callable worktrees: `worktree_create` / `worktree_list` /
+Agent-callable worktrees: `worktree_upsert` / `worktree_list` /
 `worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
 listed in the Pi package's `pi.extensions`), plus the `Worktree tools`
 rows of `/herdr-gentle:customize` (`Enabled` / `Disabled`, plus read-only
@@ -818,7 +830,7 @@ The registry entry records the owning thread (`thread`, resolved from
 neither exists); `worktree_list` shows which thread owns each checkout;
 `worktree_close` reports the owner instead of refusing, because a
 delivered thread is routinely closed from a later session; and
-`worktree_create` from a thread that already owns a live registered
+`worktree_upsert` from a thread that already owns a live registered
 worktree returns that checkout (`created: false`) instead of creating a
 second. A second thread never adopts another thread's checkout.
 

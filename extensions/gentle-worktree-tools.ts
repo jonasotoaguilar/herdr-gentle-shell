@@ -2,7 +2,7 @@
 // gentle-worktree-tools.ts — agent worktree tools (Pi extension, P2-S4,
 // plus the session opener T34/S25 and the agent warp T40/S49).
 //
-// Registers five tools: `worktree_create` (validate + herdr-first
+// Registers five tools: `worktree_upsert` (validate + herdr-first
 // creation with hooks), `worktree_list` (read-only, no approval prompt),
 // `worktree_close` (remove the checkout, keep the branch),
 // `worktree_warp` (move the session to another checkout and continue there) and
@@ -63,6 +63,14 @@ function herdrBinary() {
 function toolCwd(ctx) {
   if (ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0) return ctx.cwd;
   return process.cwd();
+}
+
+// S11: ONE wording for every surface that needs a checkout. The human
+// command and the agent tool both answer a directory outside a Git
+// repository with this exact sentence, so neither reads a different
+// story about the same condition.
+function notGitRepositoryLine(cwd) {
+  return `not a git repository: ${cwd}; run 'git init' first`;
 }
 
 // Consolidated liveness predicate: the ONE definition of "is this path a
@@ -152,7 +160,7 @@ function isLiveGitRecord(entry, repoRoot) {
 }
 
 // Marks a TypeBox property optional. Production `Type` is the full TypeBox
-// export, but older test doubles stub only the constructors `worktree_create`
+// export, but older test doubles stub only the constructors `worktree_upsert`
 // needed; falling back to the bare schema keeps the module loadable there
 // while production still gets true optionals.
 // Older test doubles stub only the constructors the tools needed;
@@ -334,7 +342,7 @@ function withWorktreeCardRenderer(tool) {
   return tool;
 }
 
-// Core of `worktree_create`: validation (S2, S3) then herdr-first creation
+// Core of `worktree_upsert`: validation (S2, S3) then herdr-first creation
 // with a git fallback. Exported for unit tests; the registered tool calls
 // it with the live Pi context.
 async function executeWorktreeCreate(params, ctx, opts) {
@@ -1217,9 +1225,9 @@ async function executeWorktreeCreate(params, ctx, opts) {
 }
 
 const worktreeCreateTool = withWorktreeCardRenderer(defineTool({
-  name: "worktree_create",
-  label: "Worktree Create",
-  description: "Create an agent worktree for a branch at the flattened worktree path, optionally associated with verified GitHub issues. The calling thread owns the checkout.",
+  name: "worktree_upsert",
+  label: "Worktree Upsert",
+  description: "Create or update an agent worktree for a branch at the flattened worktree path, optionally associated with verified GitHub issues. The calling thread owns the checkout.",
   parameters: Type.Object({
     branch: Type.String({ description: "Branch name to create the worktree for" }),
     issues: opt(Type.Array(Type.Number(), { description: "Associated GitHub issue numbers (optional; when given, each must verify to exist)" })),
@@ -1265,7 +1273,7 @@ async function executeWorktreeList(params, ctx) {
   const mode = libRequire("worktree-mode.js");
   const cwd = toolCwd(ctx);
 
-  // Mode gate, exactly like `worktree_create`: missing means enabled,
+  // Mode gate, exactly like `worktree_upsert`: missing means enabled,
   // malformed never enables, disabled names the toggle.
   let modeState;
   try {
@@ -2256,7 +2264,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   const mode = libRequire("worktree-mode.js");
   const cwd = toolCwd(ctx);
 
-  // Mode gate, exactly like `worktree_create`.
+  // Mode gate, exactly like `worktree_upsert`.
   let modeState;
   try {
     modeState = mode.readMode();
@@ -3800,7 +3808,7 @@ async function executeWorktreeWarpTool(params, ctx, opts) {
   try {
     repo = git.repoIdentity(fromCwd);
   } catch (err) {
-    return errorResult(`worktree warp: not a git repository: ${fromCwd}`, { tool: "worktree_warp" });
+    return errorResult(notGitRepositoryLine(fromCwd), { tool: "worktree_warp" });
   }
   const read = registry.readRegistry(repo.root);
   if (!read.ok) {
@@ -5899,294 +5907,46 @@ const WARP_CHANGE_TYPES = [
   { id: "ci", label: "CI" },
   { id: "revert", label: "Revert" },
 ];
-const WARP_CHANGE_TYPE_OPTIONS = WARP_CHANGE_TYPES.map((t) => `${t.label} (${t.id})`);
-// No selectable Back or Confirm row on the type panel: eleven data rows
-// only. Tab alone goes back (quiet return to the checkout selector —
-// the first field has nowhere earlier to go), Enter confirms, Esc
-// cancels. The built-in `ctx.ui.select` cannot return a Tab Back (it
-// only resolves picked strings), so the inline custom single-select
-// below carries the Tab handling; the host select stays as the fallback
-// where no custom UI exists (there Esc cancels, documented, never a
-// phantom row).
-const WARP_CREATE_TYPE_TITLE = "New worktree change type";
 // Branch names MUST match the skill's shape: `<type>/<slug>`.
 const WARP_CREATE_BRANCH_RE = /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$/;
 
-// Resolve a type answer to its id: the seam returns the id, the real
-// selector returns the picked option string — both land here, anything
-// else fails closed.
-function resolveWarpChangeType(value) {
-  if (typeof value !== "string") return null;
-  const byId = WARP_CHANGE_TYPES.find((t) => t.id === value);
-  if (byId) return byId.id;
-  const byOption = WARP_CHANGE_TYPES.find((t) => `${t.label} (${t.id})` === value);
-  return byOption ? byOption.id : null;
-}
+// The create panel is the selector's create completion: ONE component
+// holds type, name, issues and odd, then `executeWorktreeCreate` runs with
+// the approval dialog suppressed (`hasUI: false` on a shallow copy — the
+// type plus the typed name is the human approval) and the session warps
+// into the fresh checkout. Empty selections stay OMITTED on the create
+// call — never empty arrays — so the invalid, duplicate, occupied and
+// principal refusals keep their exact shape.
 
-// Injectable seam for the type prompt: tests inject a stub so no test
-// ever opens a real selector. Production leaves it null and the helper
-// below calls the real `ctx.ui.select` exactly.
-let warpCreateTypeAsker = null;
-
-function setWarpCreateTypeAsker(asker) {
-  warpCreateTypeAsker = asker;
-}
-
-// Ask for the change type as a STANDALONE panel: only its own title,
-// its eleven data rows and its own key footer — never cross-field
-// chips/tabs/counters. Returns `{ ok: true, value }` (value undefined
-// on cancel), `{ back: true }` on Tab Back (the caller exits quietly to
-// the checkout selector: the first field has nowhere earlier to go),
-// or `{ ok: false }` when the host truly has no selector — then the
-// caller fails with a clear actionable message instead of inventing
-// one. `previous` (a type id) restores the cursor on the return trip.
-async function askWarpCreateType(ctx, previous) {
-  if (typeof warpCreateTypeAsker === "function") {
-    try {
-      const value = await warpCreateTypeAsker(ctx, previous);
-      if (value !== null && typeof value === "object" && value.back === true) return { back: true };
-      return { ok: true, value };
-    } catch {
-      return { ok: true, value: undefined };
-    }
-  }
-  if (ctx && ctx.ui && typeof ctx.ui.custom === "function") {
-    let helpers = null;
-    try {
-      helpers = await customizeTuiLoader();
-    } catch {
-      helpers = null;
-    }
-    let pickerLib = null;
-    try {
-      pickerLib = libRequire("warp-create-picker.js");
-    } catch {
-      pickerLib = null;
-    }
-    if (pickerLib && typeof pickerLib.createSingleSelect === "function") {
-      let out;
-      try {
-        // Inline, no overlay options — the same bottom-anchored dock
-        // region as the other panels. One mount at a time: this await
-        // resolves before the next panel opens.
-        out = await ctx.ui.custom(
-          (hostTui, theme, _keybindings, done) => pickerLib.createSingleSelect({
-            title: WARP_CREATE_TYPE_TITLE,
-            items: WARP_CHANGE_TYPE_OPTIONS,
-            helpers,
-            hostTui,
-            theme,
-            // The panel rows are option strings while the wizard keeps
-            // the type id: map the kept id back to its row so the
-            // cursor restores on the return trip.
-            initialSelected: typeof previous === "string"
-              ? (WARP_CHANGE_TYPES.find((t) => t.id === previous) ? `${WARP_CHANGE_TYPES.find((t) => t.id === previous).label} (${previous})` : undefined)
-              : undefined,
-            rowsAvailable: () => {
-              try {
-                const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
-                if (Number.isFinite(rows) && rows > 0) return rows;
-              } catch {
-                // A hostile host object never breaks the selector.
-              }
-              return 24;
-            },
-            done,
-          }),
-        );
-      } catch {
-        return { ok: true, value: undefined };
-      }
-      if (out === null || out === undefined) return { ok: true, value: undefined };
-      if (typeof out === "object" && out.back === true) return { back: true };
-      if (typeof out === "string") return { ok: true, value: out };
-      return { ok: true, value: undefined };
-    }
-  }
-  if (ctx && ctx.ui && typeof ctx.ui.select === "function") {
-    let picked;
-    try {
-      picked = await ctx.ui.select(WARP_CREATE_TYPE_TITLE, WARP_CHANGE_TYPE_OPTIONS);
-    } catch {
-      return { ok: true, value: undefined };
-    }
-    return { ok: true, value: picked };
-  }
-  return { ok: false, value: undefined };
-}
-
-// The type was picked first, so the title asks for the CHANGE name
-// (a bare name like `name-change`, never a branch) and the placeholder
-// shows one. The real Pi text prompt (verified against this Pi version's
-// own API: `ctx.ui.input(title, placeholder)` — the `input` dialog method
-// beside `select`/`confirm`/`editor`, see docs/tui.md +
-// docs/rpc-extension-ui.md and
-// examples/extensions/{project-trust,rpc-demo}.ts).
-const WARP_CREATE_NAME_TITLE = "New worktree change name";
-const WARP_CREATE_NAME_PLACEHOLDER = "name-change";
-
-// Injectable seam for the name prompt: tests inject a stub so no test
-// ever opens a real prompt. Production leaves it null and the helper
-// below calls the real `ctx.ui.input` exactly.
-let warpCreateNameAsker = null;
-
-function setWarpCreateNameAsker(asker) {
-  warpCreateNameAsker = asker;
-}
-
-// Ask for the new worktree's name, exactly once per create-entry choice.
-// Returns `{ ok: true, value }` (value undefined on cancel), or
-// `{ ok: false }` when the host truly has no text prompt — then the
-// caller fails with a clear actionable message instead of inventing one.
-// Ask for the new worktree's name as a STANDALONE panel: only its own
-// title, its own value line and its own key footer — never cross-field
-// chips/tabs/counters. Returns `{ ok: true, value }` (value undefined
-// on cancel), `{ back: true }` on Tab Back (the caller returns to the
-// type field with every kept value), or `{ ok: false }` when the host
-// truly has no text prompt — then the caller fails with a clear
-// actionable message instead of inventing one. The inline custom text
-// input (same dock region as the pickers, questionnaire style) carries
-// the Back affordance the host `input` primitive lacks; the host input
-// stays as the fallback where no custom UI exists. `previous` pre-fills
-// the field when returning from a later step.
-async function askWarpCreateName(ctx, previous) {
-  if (typeof warpCreateNameAsker === "function") {
-    try {
-      const value = await warpCreateNameAsker(ctx, previous);
-      if (value !== null && typeof value === "object" && value.back === true) return { back: true };
-      return { ok: true, value };
-    } catch {
-      return { ok: true, value: undefined };
-    }
-  }
-  if (ctx && ctx.ui && typeof ctx.ui.custom === "function") {
-    let helpers = null;
-    try {
-      helpers = await customizeTuiLoader();
-    } catch {
-      helpers = null;
-    }
-    let pickerLib = null;
-    try {
-      pickerLib = libRequire("warp-create-picker.js");
-    } catch {
-      pickerLib = null;
-    }
-    if (pickerLib && typeof pickerLib.createTextInput === "function") {
-      let out;
-      try {
-        // Inline, no overlay options — the same bottom-anchored dock
-        // region as the type/name prompts and the pickers (S48).
-        out = await ctx.ui.custom(
-          (hostTui, theme, _keybindings, done) => pickerLib.createTextInput({
-            title: WARP_CREATE_NAME_TITLE,
-            placeholder: WARP_CREATE_NAME_PLACEHOLDER,
-            initial: typeof previous === "string" ? previous : "",
-            helpers,
-            hostTui,
-            theme,
-            rowsAvailable: () => {
-              try {
-                const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
-                if (Number.isFinite(rows) && rows > 0) return rows;
-              } catch {
-                // A hostile host object never breaks the input.
-              }
-              return 24;
-            },
-            done,
-          }),
-        );
-      } catch {
-        return { ok: true, value: undefined };
-      }
-      if (out === null || out === undefined) return { ok: true, value: undefined };
-      // Tab Back carries the actually typed value: the wizard keeps
-      // exactly what the user typed, not just the last confirmation.
-      if (typeof out === "object" && out.back === true) {
-        return { back: true, value: typeof out.value === "string" ? out.value : undefined };
-      }
-      if (typeof out === "string") return { ok: true, value: out };
-      return { ok: true, value: undefined };
-    }
-  }
-  if (ctx && ctx.ui && typeof ctx.ui.input === "function") {
-    // Returning from a later step shows the kept name as the
-    // placeholder; submitting empty keeps it. The host input has no
-    // prefill, so this placeholder is the preservation.
-    const placeholder = typeof previous === "string" && previous.length > 0 ? previous : WARP_CREATE_NAME_PLACEHOLDER;
-    try {
-      return { ok: true, value: await ctx.ui.input(WARP_CREATE_NAME_TITLE, placeholder) };
-    } catch {
-      return { ok: true, value: undefined };
-    }
-  }
-  return { ok: false, value: undefined };
-}
-
-
-// S45 create-then-warp: the selector's final entry. The change TYPE comes
-// first, then the change NAME, and the pair derives branch `<type>/<slug>`
-// and checkout `<type>-<slug>` (the skill's regex). The checkout is created
-// through the SAME creation path the `worktree_create` tool uses
-// (`executeWorktreeCreate` is called, never reimplemented). The picked
-// type plus the typed name is the human approval, so the create runs
-// with the approval dialog suppressed (`hasUI: false` on a shallow copy
-// — the same function, one call); forwarding the command context
-// unchanged would double-prompt. A fresh checkout has no recorded session,
-// so the warp that follows forks, and that fork's card is the only
-// confirmation.
-//
-// S46: between the NAME step and the creation run two OPTIONAL
-// multi-select steps — ISSUES, then ODD — through the ONE reusable
-// component in lib/warp-create-picker.js (search box, pagination,
-// multi-select, confirm; rendered through `ctx.ui.custom` with NO overlay
-// options, so the host shows it inline in the editor container — the same
-// bottom-anchored region as the `select`/`input` dialogs — instead of
-// floating above the transcript (S48; an `anchor: "bottom-*"` overlay
-// option would only reposition the floating box, never unfloat it).
-// Confirming with nothing selected proceeds with empty values, and empty
-// means OMITTED on the create call — not empty arrays — on purpose: a
-// supplied `issues: []` would take the S27/S31 update paths and rewrite a
-// live checkout's record, while omitted keeps the invalid, duplicate,
-// occupied and principal refusals byte-identical with no state change.
-// Either step is SKIPPED silently (never blocking the creation) when its
-// source is empty or unavailable — no open issues, `gh` missing or
-// erroring, no odd documents, or a host with no custom UI — and Esc in
-// either step keeps its existing meaning: it cancels the whole
-// creation and changes nothing.
-const WARP_CREATE_ISSUES_TITLE = "Select issues (optional)";
-const WARP_CREATE_ODD_TITLE = "Select odd documents (optional)";
-
-// Injectable seam for the open-issues fetch: tests inject a stub so no
-// test ever spawns `gh`. Production leaves it null and the default
-// below calls lib/warp-create-picker.js `fetchOpenIssues` exactly.
+// Injectable seam for the open-issues fetch the panel renders (tests):
+// production leaves it null and the panel's own default reads them.
 let warpCreateIssuesFetcher = null;
 
 function setWarpCreateIssuesFetcher(fetcher) {
   warpCreateIssuesFetcher = fetcher;
 }
 
-// Injectable seam for the odd/tasks listing: tests inject a stub so no
-// test ever touches the filesystem for this. Production leaves it null
-// and the default below lists the CURRENT checkout's `odd/tasks/*.md`
-// exactly (the branch the worktree will be born from).
+// Injectable seam for the odd/tasks listing the panel renders (tests):
+// production leaves it null and the panel lists the CURRENT checkout.
 let warpCreateOddLister = null;
 
 function setWarpCreateOddLister(lister) {
   warpCreateOddLister = lister;
 }
 
-// Injectable seam for the multi-select interaction itself: tests inject
-// a stub so no test ever opens a real prompt. Production leaves it null
-// and the default below renders the shared component through the real
-// `ctx.ui.custom` inline (no overlay options — S48). A seam answer of
-// null/undefined (or `{ cancelled: true }`) is Esc: cancel the whole
-// creation.
-let warpCreatePicker = null;
+// Injectable seams for the panel's read-only previews (tests): production
+// leaves them null and the panel reads an issue body through `gh` and an
+// odd document from disk. Tests inject stubs so a suite never spawns `gh`.
+let warpCreateIssuePreviewReader = null;
 
-function setWarpCreatePicker(picker) {
-  warpCreatePicker = picker;
+function setWarpCreateIssuePreviewReader(reader) {
+  warpCreateIssuePreviewReader = reader;
+}
+
+let warpCreateOddPreviewReader = null;
+
+function setWarpCreateOddPreviewReader(reader) {
+  warpCreateOddPreviewReader = reader;
 }
 
 // Injectable seam for the warp-selector delete path (tests): production
@@ -6235,37 +5995,189 @@ function warpDeletableAt(others, index, principal, read, repoRoot) {
   }
 }
 
-// Run one multi-select panel. Each panel is STANDALONE (its own title,
-// its own rows, its own footer — never cross-field chips/tabs/counters).
-// Returns `{ cancelled: true }` on Esc, `{ back: true }` on Tab Back
-// (the caller returns to the previous field with the kept values),
-// `{ cancelled: false, selected }` on the explicit Confirm action
-// (empty is valid), `{ cancelled: false, skipped: true, selected: [] }`
-// when the host cannot render the step or its source is legitimately
-// empty — then the caller proceeds with empty values instead of
-// blocking the creation — or `{ failed: true, error }` when the picker
-// itself cannot render (a broken import or a throwing host). A broken
-// picker STOPS the creation with an actionable message: silently
-// skipping it would create a checkout the user never confirmed the
-// contents of. `initialSelected` restores the ids of an earlier pass so
-// Back preserves them; `initialUiState` ({ query, page, cursor })
-// restores the kept filter and position, and every resolution echoes
-// the live `uiState` back for the next revisit.
-async function runWarpCreatePick(ctx, { kind, title, searchPlaceholder, items, filterFn, initialSelected, initialUiState }) {
-  if (typeof warpCreatePicker === "function") {
-    try {
-      const out = await warpCreatePicker(ctx, { kind, title, items, initialSelected, initialUiState });
-      if (out === null || out === undefined) return { cancelled: true };
-      if (out && out.cancelled === true) return { cancelled: true };
-      if (out && out.back === true) return { back: true, selected: out.selected, uiState: out.uiState };
-      if (out && Array.isArray(out.selected)) return { cancelled: false, selected: out.selected, uiState: out.uiState };
-      return { failed: true, error: `warp: the ${kind} picker returned nothing usable; nothing was created.` };
-    } catch (err) {
-      return { failed: true, error: `warp: the ${kind} picker failed (${(err && err.message) || err}); nothing was created.` };
-    }
+// The warp surface's overlay geometry (W5): the popup needs 10 rows and
+// the extended list 8, so the overlay is anchored centre and capped at
+// enough rows that the frame always fits; `rowsAvailable` never reports
+// more than the overlay can show, so the view's frame fills it exactly.
+const WARP_OVERLAY_MAX_ROWS = 24;
+const WARP_SELECTOR_OVERLAY = Object.freeze({
+  overlay: true,
+  overlayOptions: Object.freeze({ anchor: "center", width: "70%", minWidth: 60, maxHeight: WARP_OVERLAY_MAX_ROWS }),
+});
+
+function warpOverlayRows(hostTui) {
+  let rows = WARP_OVERLAY_MAX_ROWS;
+  try {
+    const value = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+    if (Number.isFinite(value) && value > 0) rows = value;
+  } catch {
+    // A hostile host object never breaks the view.
   }
+  return Math.min(rows, WARP_OVERLAY_MAX_ROWS);
+}
+
+// Map lib/checkout-facts.js's per-fact envelopes to the flat shape
+// lib/warp-selector-view.js renders. Each fact stays independently
+// honest (S9): an unavailable read is the literal `unavailable`, never
+// zero and never an empty list, so the popup can say so.
+function warpFactsForView(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const value = (fact) => (fact && fact.available === true ? fact.value : "unavailable");
+  const branch = entry.branch && entry.branch.available === true
+    ? (entry.branch.detached === true || entry.branch.value === null ? "detached" : entry.branch.value)
+    : "unavailable";
+  const changes = entry.changes && entry.changes.available === true && entry.changes.value
+    ? { added: entry.changes.value.added, deleted: entry.changes.value.deleted }
+    : "unavailable";
+  const compared = entry.aheadBehind && entry.aheadBehind.available === true ? entry.aheadBehind.value : null;
+  return {
+    branch,
+    issues: value(entry.issues),
+    odd: value(entry.odd),
+    changes,
+    ahead: compared ? compared.ahead : "unavailable",
+    behind: compared ? compared.behind : "unavailable",
+    createdAt: value(entry.createdAt),
+    // S12: the footer names both ages, so the activity fact travels with
+    // its reason instead of being dropped here.
+    lastActivity: value(entry.lastActivity),
+    lastActivityReason: entry.lastActivity && entry.lastActivity.available === false
+      && typeof entry.lastActivity.reason === "string"
+      ? entry.lastActivity.reason
+      : undefined,
+  };
+}
+
+// The checkouts the popup hands its view: every row carries its own
+// lastActivity and createdAt, so the VIEW orders the list newest-first and
+// no caller re-sorts (S12, S15). The reads share lib/checkout-facts.js's
+// cache, and a checkout whose value cannot be read keeps no timestamp and
+// sorts last with its reason attached (S9).
+async function warpCheckoutsWithActivity(checkoutFacts, entries) {
+  const rows = Array.isArray(entries) ? entries : [];
+  if (!checkoutFacts || typeof checkoutFacts.facts !== "function") return rows;
+  return Promise.all(rows.map(async (entry) => {
+    if (!entry || typeof entry.path !== "string" || entry.path.length === 0) return entry;
+    let facts = null;
+    try {
+      facts = await checkoutFacts.facts(entry.path);
+    } catch {
+      facts = null;
+    }
+    if (!facts) return entry;
+    const activity = facts.lastActivity;
+    return {
+      ...entry,
+      lastActivity: activity,
+      createdAt: facts.createdAt,
+      lastActivityReason: activity && activity.available === false && typeof activity.reason === "string"
+        ? activity.reason
+        : undefined,
+    };
+  }));
+}
+
+// The focused row of the extended list. The view keeps its list in
+// `state.checkouts` ordered as mounted and clamps `state.listCursor` into
+// the FILTERED rows; mirroring that same name/branch/path substring rule
+// lets Ctrl+D resolve exactly the row the user sees.
+function warpSelectorFocusedListCheckout(state) {
+  try {
+    const rows = Array.isArray(state && state.checkouts) ? state.checkouts : [];
+    const needle = String((state && state.filter) || "").trim().toLowerCase();
+    const visible = needle === ""
+      ? rows
+      : rows.filter((entry) => [entry.name, entry.branch || "", entry.path]
+        .some((field) => String(field).toLowerCase().includes(needle)));
+    if (visible.length === 0) return null;
+    const cursor = Number.isInteger(state.listCursor) ? state.listCursor : 0;
+    return visible[Math.min(Math.max(0, cursor), visible.length - 1)] || null;
+  } catch {
+    return null;
+  }
+}
+
+// Ctrl+D on a DELETABLE extended-list row closes the overlay with a
+// delete marker the loop below drives (confirm, then the shared close).
+// Any other key — including Ctrl+D on the principal, the current checkout
+// or an unregistered row — passes through to the view byte-identical, so
+// the guard is a safe no-op that never opens a confirmation.
+function withWarpDeleteKeys(view, { helpers, done, canDelete }) {
+  const innerHandle = view.handleInput.bind(view);
+  return {
+    state: view.state,
+    render: (width) => view.render(width),
+    invalidate: () => view.invalidate(),
+    handleInput(data) {
+      let deleteKey = typeof data === "string" && data === "\x04";
+      if (!deleteKey) {
+        try {
+          deleteKey = customizeKeyMatches(helpers, data, ["ctrl+d"]);
+        } catch {
+          deleteKey = false;
+        }
+      }
+      if (deleteKey) {
+        if (view.state && view.state.view === "list") {
+          const focused = warpSelectorFocusedListCheckout(view.state);
+          if (focused && canDelete(focused.path)) {
+            done({ delete: true, path: focused.path });
+          }
+        }
+        return;
+      }
+      innerHandle(data);
+    },
+  };
+}
+
+// The panel's injectable sources, shared by the create and the editing
+// mounts so both list and preview the same way. Production leaves every
+// seam null and the panel reads the real sources itself.
+function warpPanelSources(ctx, cwd, oddRoot) {
+  const sources = {};
+  if (typeof warpCreateIssuesFetcher === "function") {
+    sources.fetchIssues = () => Promise.resolve(warpCreateIssuesFetcher(ctx, { cwd }));
+  }
+  if (typeof warpCreateOddLister === "function") {
+    sources.listOdd = () => {
+      const listed = warpCreateOddLister(oddRoot, ctx);
+      if (Array.isArray(listed)) return { ok: true, docs: listed };
+      if (listed && listed.ok === true && Array.isArray(listed.docs)) return listed;
+      return { ok: false, error: "cannot list odd documents" };
+    };
+  }
+  if (typeof warpCreateIssuePreviewReader === "function") {
+    sources.readIssuePreview = (number) => warpCreateIssuePreviewReader(number, { cwd, ctx });
+  }
+  if (typeof warpCreateOddPreviewReader === "function") {
+    sources.readOddPreview = (doc) => warpCreateOddPreviewReader(doc, { cwd, ctx });
+  }
+  return sources;
+}
+
+// Create-then-warp: the selector's create completion mounts the SINGLE
+// panel (type, name, issues and odd at once) as an overlay, then runs the
+// SAME creation path `worktree_upsert` uses with the approval dialog
+// suppressed (`hasUI: false` — the type plus the typed name is the human
+// approval) and warps the session into the fresh checkout. Empty
+// selections stay OMITTED on the create call — never empty arrays — so the
+// invalid, duplicate, occupied and principal refusals keep their shape.
+async function warpCreateAndEnter(ctx, git, notify) {
   if (!ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
-    return { cancelled: false, skipped: true, selected: [] };
+    notify?.("warp: the host UI cannot open the create panel here; create one with the worktree_upsert tool first, then /herdr-gentle:warp <name>.", "error");
+    return;
+  }
+  let panelLib = null;
+  try {
+    panelLib = libRequire("warp-create-panel.js");
+  } catch (err) {
+    notify?.(`warp: the create panel cannot load (${(err && err.message) || err}); nothing was created.`, "error");
+    return;
+  }
+  if (!panelLib || typeof panelLib.createWarpCreatePanel !== "function") {
+    notify?.("warp: the create panel cannot load; nothing was created.", "error");
+    return;
   }
   let helpers = null;
   try {
@@ -6273,345 +6185,62 @@ async function runWarpCreatePick(ctx, { kind, title, searchPlaceholder, items, f
   } catch {
     helpers = null;
   }
-  let pickerLib = null;
+  const panelCwd = toolCwd(ctx);
+  let panelRoot = panelCwd;
   try {
-    pickerLib = libRequire("warp-create-picker.js");
-  } catch (err) {
-    return { failed: true, error: `warp: the ${kind} picker cannot load (${(err && err.message) || err}); nothing was created.` };
-  }
-  if (!pickerLib || typeof pickerLib.createMultiSelect !== "function") {
-    return { failed: true, error: `warp: the ${kind} picker cannot load; nothing was created.` };
+    panelRoot = git.repoIdentity(panelCwd).root;
+  } catch {
+    panelRoot = panelCwd;
   }
   let out;
   try {
-    // S48: a single argument — NO `overlay: true`. Without it the host
-    // takes the non-overlay path (editorContainer.clear + addChild +
-    // focus, the exact container the `select`/`input` dialogs use), so
-    // the picker sits inline above the editor instead of floating over
-    // the transcript. Overlay anchors cannot do this: they only
-    // reposition the floating box.
     out = await ctx.ui.custom(
-      (hostTui, theme, _keybindings, done) => pickerLib.createMultiSelect({
-        title,
-        items,
-        filterFn,
-        searchPlaceholder,
+      (hostTui, theme, _keybindings, done) => panelLib.createWarpCreatePanel({
+        cwd: panelCwd,
+        changeTypes: WARP_CHANGE_TYPES,
+        git,
         helpers,
         hostTui,
         theme,
-        initialSelected,
-        initialQuery: initialUiState && typeof initialUiState.query === "string" ? initialUiState.query : undefined,
-        initialPage: initialUiState && Number.isInteger(initialUiState.page) ? initialUiState.page : undefined,
-        initialCursor: initialUiState && Number.isInteger(initialUiState.cursor) ? initialUiState.cursor : undefined,
-        rowsAvailable: () => {
-          try {
-            const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
-            if (Number.isFinite(rows) && rows > 0) return rows;
-          } catch {
-            // A hostile host object never breaks the picker.
-          }
-          return 24;
-        },
+        principalLayout: true,
+        rowsAvailable: () => warpOverlayRows(hostTui),
+        ...warpPanelSources(ctx, panelCwd, panelRoot),
         done,
       }),
+      WARP_SELECTOR_OVERLAY,
     );
   } catch (err) {
-    // The host offered custom UI but rendering failed: STOP with an
-    // actionable message, never silently skip a confirmation.
-    return { failed: true, error: `warp: the ${kind} picker failed (${(err && err.message) || err}); nothing was created.` };
+    notify?.(`warp: the create panel failed (${(err && err.message) || err}); nothing was created.`, "error");
+    return;
   }
-  if (out === null || out === undefined) return { cancelled: true };
-  if (out && out.back === true) return { back: true, selected: out.selected, uiState: out.uiState };
-  if (out && Array.isArray(out.selected)) return { cancelled: false, selected: out.selected, uiState: out.uiState };
-  return { failed: true, error: `warp: the ${kind} picker returned nothing usable; nothing was created.` };
-}
-
-// The S46 association panels fetched ONCE per wizard invocation (see the
-// prefetch in warpCreateAndEnter): every revisit awaits the same cached
-// promise, so going Back never refetches `gh` or relists the checkout.
-
-// The S46 association panels, one function per panel so the wizard can
-// walk Back iteratively: the issues panel (open issues through `gh`,
-// fetched asynchronously with a bounded timeout so the wizard never
-// blocks on the network) then the odd step (`odd/tasks/*.md` of the
-// CURRENT checkout — the branch the worktree will be born from). Each
-// returns `{ cancelled }` (Esc: the whole creation ends),
-// `{ back: true }` (Tab Back: the caller re-opens the previous field
-// with the kept values), `{ failed, error }` (the picker broke:
-// STOP, never silently skip), `{ skipped: true, selected: [] }` (a
-// legitimate silent skip: no open issues, `gh` missing or erroring, no
-// odd documents, or a host with no custom UI), or
-// `{ cancelled: false, selected }` on Confirm. `initialSelected`
-// restores the ids of an earlier pass.
-async function pickWarpCreateIssues(ctx, { initialSelected, initialUiState, issuesResult } = {}) {
-  let pickerLib = null;
-  try {
-    pickerLib = libRequire("warp-create-picker.js");
-  } catch (err) {
-    return { failed: true, error: `warp: the issues picker cannot load (${(err && err.message) || err}); nothing was created.` };
-  }
-  // The prefetched result (one fetch per wizard invocation): skipped
-  // silently when `gh` is missing, unauthenticated, errors, times out,
-  // or reports no open issues.
-  const fetched = issuesResult;
-  if (!fetched || fetched.ok !== true || !Array.isArray(fetched.issues) || fetched.issues.length === 0) {
-    return { cancelled: false, skipped: true, selected: [] };
-  }
-  const picked = await runWarpCreatePick(ctx, {
-    kind: "issues",
-    title: WARP_CREATE_ISSUES_TITLE,
-    searchPlaceholder: "number or title",
-    items: pickerLib.issuePickItems(fetched.issues),
-    filterFn: pickerLib.filterIssueItems,
-    initialSelected,
-    initialUiState,
-  });
-  if (picked.cancelled) return { cancelled: true };
-  if (picked.back) return { back: true, selected: picked.selected, uiState: picked.uiState };
-  if (picked.failed) return { failed: true, error: picked.error };
-  if (picked.skipped) return { cancelled: false, skipped: true, selected: [] };
-  return { cancelled: false, selected: picked.selected.filter((n) => Number.isInteger(n)), uiState: picked.uiState };
-}
-
-async function pickWarpCreateOdd(ctx, { initialSelected, initialUiState, oddDocs } = {}) {
-  let pickerLib = null;
-  try {
-    pickerLib = libRequire("warp-create-picker.js");
-  } catch (err) {
-    return { failed: true, error: `warp: the odd picker cannot load (${(err && err.message) || err}); nothing was created.` };
-  }
-  // The prefetched listing (one list per wizard invocation) of the
-  // CURRENT checkout's documents; skipped silently when none.
-  const docs = oddDocs;
-  if (!Array.isArray(docs) || docs.length === 0) {
-    return { cancelled: false, skipped: true, selected: [] };
-  }
-  const picked = await runWarpCreatePick(ctx, {
-    kind: "odd",
-    title: WARP_CREATE_ODD_TITLE,
-    searchPlaceholder: "name",
-    items: pickerLib.oddPickItems(docs),
-    filterFn: pickerLib.filterOddItems,
-    initialSelected,
-    initialUiState,
-  });
-  if (picked.cancelled) return { cancelled: true };
-  if (picked.back) return { back: true, selected: picked.selected, uiState: picked.uiState };
-  if (picked.failed) return { failed: true, error: picked.error };
-  if (picked.skipped) return { cancelled: false, skipped: true, selected: [] };
-  return { cancelled: false, selected: picked.selected.filter((s) => typeof s === "string" && s.length > 0), uiState: picked.uiState };
-}
-
-async function warpCreateAndEnter(ctx, git, notify) {
-  // The sequential wizard: type -> name -> issues -> odd -> creation.
-  // Each field is a STANDALONE panel (its own title, its own rows, its
-  // own footer — never shared chips/tabs/counters): one panel mounted
-  // at a time, each ui call resolving before the next opens, the
-  // previous panel disposed first. Tab Back returns to the previous
-  // field with every kept value, while Esc at any field ends the whole
-  // creation quietly. The loop is bounded by construction: Back always
-  // moves to an earlier field and Confirm always moves forward. Nothing
-  // mutates until the odd panel confirms: the creation (git checkout,
-  // registry row) and the warp run exactly once, after all
-  // confirmations — and after the session preflight below, so an
-  // unavailable session refuses before any branch, checkout or registry
-  // write.
-  let type = null;
-  let rawName = null;
-  let issues = [];
-  let odd = [];
-  // Last-known per-panel state across revisits: confirmed AND
-  // back-echoed selections plus the echoed filter/page/cursor, so a
-  // return trip restores the exact pass the user left.
-  let issuesSelected = null;
-  let oddSelected = null;
-  let issuesUi = null;
-  let oddUi = null;
-  // Prefetch ONCE per wizard invocation, while the type/name panels
-  // hold the user: both promises start now, every revisit awaits the
-  // same cached ones — going Back never refetches `gh` or relists the
-  // checkout. Failures resolve to null and skip silently, exactly like
-  // the per-open fetch did.
-  const wizardCwd = toolCwd(ctx);
-  let wizardRoot = wizardCwd;
-  try {
-    wizardRoot = git.repoIdentity(wizardCwd).root;
-  } catch {
-    wizardRoot = wizardCwd;
-  }
-  const issuesPromise = (async () => {
-    try {
-      if (typeof warpCreateIssuesFetcher === "function") {
-        return await warpCreateIssuesFetcher(ctx, { cwd: wizardCwd });
-      }
-      let pickerLib = null;
-      try {
-        pickerLib = libRequire("warp-create-picker.js");
-      } catch {
-        return null;
-      }
-      return await pickerLib.fetchOpenIssuesAsync({ cwd: wizardCwd });
-    } catch {
-      return null;
-    }
-  })();
-  const oddPromise = (async () => {
-    try {
-      if (typeof warpCreateOddLister === "function") {
-        return await warpCreateOddLister(wizardRoot, ctx);
-      }
-      let pickerLib = null;
-      try {
-        pickerLib = libRequire("warp-create-picker.js");
-      } catch {
-        return null;
-      }
-      return pickerLib.listOddTaskDocs(wizardRoot);
-    } catch {
-      return null;
-    }
-  })();
-  let step = "type";
-  for (;;) {
-    if (step === "type") {
-      const typed = await askWarpCreateType(ctx, type);
-      if (typed.back === true) return;
-      if (!typed.ok) {
-        notify?.("warp: the host UI cannot ask for a change type here; create one with the worktree_create tool first, then /herdr-gentle:warp <name>.", "error");
-        return;
-      }
-      // Cancelling the type field changes nothing — no name panel, no
-      // creation, no registry write, no notice, no warp. Tab Back is
-      // the same quiet exit: the first field has nowhere earlier to go,
-      // so Back there returns to the checkout selector.
-      if (typed.value === undefined) return;
-      const resolved = resolveWarpChangeType(typed.value);
-      if (resolved === null) {
-        notify?.(`warp: unknown change type ${JSON.stringify(typed.value)}; nothing was created.`, "error");
-        return;
-      }
-      type = resolved;
-      step = "name";
-      continue;
-    }
-    if (step === "name") {
-      const asked = await askWarpCreateName(ctx, rawName);
-      if (asked.back === true) {
-        // Tab Back from the name re-opens the type field; the kept name
-        // stays for the next pass — including what the user had typed
-        // but not yet confirmed — and the kept type restores the
-        // cursor on the inline panel (the host-select fallback cannot
-        // preserve a highlight — stated, not hidden).
-        if (typeof asked.value === "string") rawName = asked.value;
-        step = "type";
-        continue;
-      }
-      if (!asked.ok) {
-        notify?.("warp: the host UI cannot ask for a change name here (no text input); create one with the worktree_create tool first, then /herdr-gentle:warp <name>.", "error");
-        return;
-      }
-      // Cancelling the name step changes nothing. Submitting empty
-      // keeps the kept name when returning from a later step; on the
-      // first pass an empty name refuses instead: the derived `<type>/`
-      // branch could never satisfy the branch regex, and the create path
-      // would never see the raw name, so the refusal names the name.
-      if (asked.value === undefined) return;
-      const trimmed = typeof asked.value === "string" ? asked.value.trim() : "";
-      if (trimmed === "") {
-        if (rawName !== null) {
-          step = "issues";
-          continue;
-        }
-        notify?.(`warp: invalid change name ${JSON.stringify(asked.value)}: use at least one letter or digit (for example "name-change"); nothing was created.`, "error");
-        return;
-      }
-      // A name with no letter or digit slugs to nothing (the lib's
-      // slugifier would silently fall back to `worktree`): refuse with
-      // the same actionable message before the create path ever runs.
-      if (!/[a-z0-9]/i.test(trimmed)) {
-        notify?.(`warp: invalid change name ${JSON.stringify(trimmed)}: use at least one letter or digit (for example "name-change"); nothing was created.`, "error");
-        return;
-      }
-      rawName = trimmed;
-      step = "issues";
-      continue;
-    }
-    if (step === "issues") {
-      const branch = `${type}/${git.slugifyBranch(rawName)}`;
-      if (!WARP_CREATE_BRANCH_RE.test(branch)) {
-        notify?.(`warp: invalid change name ${JSON.stringify(rawName)}: use at least one letter or digit (for example "name-change"); nothing was created.`, "error");
-        return;
-      }
-      const picked = await pickWarpCreateIssues(ctx, {
-        initialSelected: issuesSelected !== null ? issuesSelected : issues,
-        initialUiState: issuesUi,
-        issuesResult: await issuesPromise,
-      });
-      if (picked.cancelled) return;
-      if (picked.failed) {
-        notify?.(picked.error, "error");
-        return;
-      }
-      // Echoes (confirmed or backed-out selections, filter, page,
-      // cursor) become the next revisit restore; only a confirmation
-      // moves the creation payload forward.
-      if (Array.isArray(picked.selected)) issuesSelected = picked.selected.slice();
-      if (picked.uiState) issuesUi = picked.uiState;
-      if (picked.back) {
-        step = "name";
-        continue;
-      }
-      if (!picked.skipped) issues = picked.selected;
-      step = "odd";
-      continue;
-    }
-    // field === "odd": Confirm leaves the loop into the deferred
-    // creation below; Tab Back re-opens the issues panel with the kept
-    // selections; empty confirmations stay omitted, so the create
-    // path's refusals keep their exact shape.
-    const picked = await pickWarpCreateOdd(ctx, {
-      initialSelected: oddSelected !== null ? oddSelected : odd,
-      initialUiState: oddUi,
-      oddDocs: await oddPromise,
-    });
-    if (picked.cancelled) return;
-    if (picked.failed) {
-      notify?.(picked.error, "error");
-      return;
-    }
-    if (Array.isArray(picked.selected)) oddSelected = picked.selected.slice();
-    if (picked.uiState) oddUi = picked.uiState;
-    if (picked.back) {
-      step = "issues";
-      continue;
-    }
-    if (!picked.skipped) odd = picked.selected;
-    break;
-  }
+  // Esc cancels quietly: no branch, no checkout, no registry row.
+  if (!out || out.ok !== true) return;
   // Session preflight BEFORE any mutation: an allocated-but-missing
-  // session file with nothing in memory refuses here — before any
-  // branch, checkout or registry write — instead of failing after the
-  // worktree was created. A usable file, or valid in-memory entries
-  // the carry path can clone, proceeds.
+  // session file with nothing in memory refuses here — before any branch,
+  // checkout or registry write — instead of failing after the worktree was
+  // created. A usable file, or valid in-memory entries the carry path can
+  // clone, proceeds.
   const flight = warpCreatePreflight(ctx);
   if (!flight.ok) {
     notify?.(flight.reason, "error");
     return;
   }
-  const branch = `${type}/${git.slugifyBranch(rawName)}`;
+  const rawName = typeof out.name === "string" ? out.name.trim() : "";
+  const branch = `${out.type}/${git.slugifyBranch(rawName)}`;
+  if (!WARP_CREATE_BRANCH_RE.test(branch)) {
+    notify?.(`warp: invalid change name ${JSON.stringify(out.name)}: use at least one letter or digit (for example "name-change"); nothing was created.`, "error");
+    return;
+  }
   const createParams = { branch };
-  if (issues.length > 0) createParams.issues = issues.slice();
-  if (odd.length > 0) createParams.odd = odd.slice();
+  if (Array.isArray(out.issues) && out.issues.length > 0) createParams.issues = out.issues.slice();
+  if (Array.isArray(out.odd) && out.odd.length > 0) createParams.odd = out.odd.slice();
   const createCtx = ctx && typeof ctx === "object" ? { ...ctx, hasUI: false } : ctx;
-  // S53: the wizard creates through the git-only route — a plain git
-  // checkout plus the registry row, never a Herdr workspace — reusing
-  // the same creation path (validations, refusals, registration) with
-  // the approval dialog suppressed (the type plus the typed name is
-  // the human approval; forwarding the command context unchanged would
-  // double-prompt). The layout is principal-anchored (S56): the new
-  // checkout lands beside the PRINCIPAL checkout even when the wizard
-  // runs inside a linked worktree, while the branch HEAD still comes
-  // from the current checkout.
+  // S53: the git-only route — a plain git checkout plus the registry row,
+  // never a Herdr workspace — reusing the same creation path (validations,
+  // refusals, registration) with the approval dialog suppressed. The
+  // layout is principal-anchored (S56): the new checkout lands beside the
+  // PRINCIPAL checkout even when the panel runs inside a linked worktree,
+  // while the branch HEAD still comes from the current checkout.
   const created = await executeWorktreeCreate(createParams, createCtx, { gitOnly: true, principalLayout: true });
   if (created && created.isError) {
     notify?.(created.text, "error");
@@ -6623,46 +6252,136 @@ async function warpCreateAndEnter(ctx, git, notify) {
   // Warp by the slug the selector shows and `warp <name>` accepts (the
   // stored branch when the create returned an owned checkout instead).
   const warpName = slugOf(git, storedBranch) || branch;
-  const out = await executeWorktreeWarp(warpName, ctx);
+  const out2 = await executeWorktreeWarp(warpName, ctx);
   // Same single-confirmation rule as every other warp path: success stays
   // silent (the card is the confirmation), only failures notify.
-  if (out && out.isError) {
-    notify?.(out.text, "error");
+  if (out2 && out2.isError) {
+    notify?.(out2.text, "error");
   }
 }
 
-// Warp selector loop with Ctrl+D delete (human selector). Returns
-// undefined when the interaction resolved (warp, create, delete flow, or
-// cancel) and "fallback" when the host custom UI is unusable so the
-// caller falls through to the plain select path (no delete). Each
-// iteration re-reads the registry and the live git listing fresh, so a
-// delete never leaves a stale row on screen. The selector closes FIRST
-// (ctx.ui.custom resolves) and only then does one explicit
-// ctx.ui.confirm name the target and its absolute path; a refused
-// confirmation reopens the selector with stable focus and zero
-// git/fs/registry/workspace mutations, while acceptance reuses the
-// shared executeWorktreeClose exactly once with hasUI:false (the Ctrl+D
-// confirmation IS the approval, so no second prompt — tool semantics for
-// dirty/unmerged/protected/foreign checkouts stay intact). Never touches
-// the principal checkout or the create row.
-async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
-  let pickerLib = null;
-  try {
-    pickerLib = libRequire("warp-create-picker.js");
-  } catch {
-    return "fallback";
+// S13 editing mode: `e` on a checkout row opens the SAME single panel with
+// the type and the name FROZEN and the Issues/Odd panes pre-selected from
+// the registry, then persists both fields in ONE registry write through the
+// viewers' guarded saver. `esc` completes with null and writes nothing; a
+// refusing registry keeps the error and leaves what the selector shows
+// untouched (the popup's loop re-reads both the registry and the listing).
+async function warpEditCheckout(ctx, git, registry, repoRoot, target, checkoutFacts, notify) {
+  if (!ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
+    notify?.("warp: the host UI cannot open the edit panel here; nothing was changed.", "error");
+    return;
   }
-  if (!pickerLib || typeof pickerLib.createSingleSelect !== "function") return "fallback";
+  let panelLib = null;
+  try {
+    panelLib = libRequire("warp-create-panel.js");
+  } catch (err) {
+    notify?.(`warp: the edit panel cannot load (${(err && err.message) || err}); nothing was changed.`, "error");
+    return;
+  }
+  if (!panelLib || typeof panelLib.createWarpCreatePanel !== "function") {
+    notify?.("warp: the edit panel cannot load; nothing was changed.", "error");
+    return;
+  }
   let helpers = null;
   try {
     helpers = await customizeTuiLoader();
   } catch {
     helpers = null;
   }
-  // Stable focus across reopen: the option string to restore, or a
-  // pending index clamped into the next listing (deleted rows shift up).
-  let focusValue;
-  let pendingFocusIndex = null;
+  // The panes open on this checkout's CURRENT assignments. An unreadable
+  // registry is reported here instead of opening a panel that would let the
+  // user believe the assignments were empty.
+  let row = null;
+  try {
+    row = typeof registry.findByPath === "function" ? registry.findByPath(repoRoot, target.path) : null;
+  } catch (err) {
+    notify?.(`warp: cannot read worktree registry: ${(err && err.message) || err}`, "error");
+    return;
+  }
+  const initialIssues = row && Array.isArray(row.issues) ? row.issues.slice() : [];
+  const initialOdd = row && Array.isArray(row.odd) ? row.odd.slice() : [];
+  let out;
+  try {
+    out = await ctx.ui.custom(
+      (hostTui, theme, _keybindings, done) => panelLib.createWarpCreatePanel({
+        cwd: target.path,
+        // The checkout already exists: its OWN branch and path are facts,
+        // rendered verbatim and never re-derived from the frozen fields
+        // (re-deriving them invented a branch once — S13's defect note).
+        mode: "edit",
+        branch: target.branch,
+        path: target.path,
+        changeTypes: WARP_CHANGE_TYPES,
+        git,
+        helpers,
+        hostTui,
+        theme,
+        principalLayout: true,
+        initialIssues,
+        initialOdd,
+        rowsAvailable: () => warpOverlayRows(hostTui),
+        ...warpPanelSources(ctx, target.path, target.path),
+        done,
+      }),
+      WARP_SELECTOR_OVERLAY,
+    );
+  } catch (err) {
+    notify?.(`warp: the edit panel failed (${(err && err.message) || err}); nothing was changed.`, "error");
+    return;
+  }
+  // Esc cancels quietly: nothing is written.
+  if (!out || out.ok !== true || out.mode !== "edit") return;
+  // S13: BOTH assignment fields in ONE registry write, through the same
+  // guarded saver the odd and issues viewers use (real branch and resolved
+  // thread for a created row, refusal without writing, append on a
+  // same-branch conflict). A refusal changes nothing on screen.
+  const saved = saveCheckoutFields(repoRoot, target.path, { issues: out.issues, odd: out.odd }, ctx);
+  if (!saved || saved.ok !== true) {
+    notify?.(`warp: cannot save the assignment: ${(saved && saved.error) || "unknown error"}`, "error");
+    return;
+  }
+  if (checkoutFacts && typeof checkoutFacts.invalidate === "function") checkoutFacts.invalidate(target.path);
+}
+
+// Warp selector loop (human selector): the popup and its extended list
+// from lib/warp-selector-view.js, mounted through `ctx.ui.custom` as an
+// overlay sized so the view always has its rows. Returns undefined when
+// the interaction resolved (warp, create, delete flow, or cancel) and
+// "fallback" when the host custom UI or the overlay is unusable, so the
+// caller falls through to the plain select path. Each iteration re-reads
+// the registry and the live git listing fresh, so a delete never leaves a
+// stale row on screen. The selector closes FIRST (ctx.ui.custom resolves)
+// and only then does one explicit ctx.ui.confirm name the target and its
+// absolute path; a refused confirmation reopens the selector with zero
+// git/fs/registry/workspace mutations, while acceptance reuses the shared
+// executeWorktreeClose exactly once with hasUI:false (the Ctrl+D
+// confirmation IS the approval, so no second prompt — tool semantics for
+// dirty/unmerged/protected/foreign checkouts stay intact). The delete is
+// reachable from the EXTENDED list (`v`, then Ctrl+D) and never touches
+// the principal checkout, the current checkout or an unregistered row.
+async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
+  let viewLib = null;
+  try {
+    viewLib = libRequire("warp-selector-view.js");
+  } catch {
+    return "fallback";
+  }
+  if (!viewLib || typeof viewLib.createWarpSelectorView !== "function") return "fallback";
+  let factsLib = null;
+  try {
+    factsLib = libRequire("checkout-facts.js");
+  } catch {
+    factsLib = null;
+  }
+  const checkoutFacts = factsLib && typeof factsLib.createCheckoutFacts === "function"
+    ? factsLib.createCheckoutFacts({ repoRoot: repo.root })
+    : null;
+  let helpers = null;
+  try {
+    helpers = await customizeTuiLoader();
+  } catch {
+    helpers = null;
+  }
   for (;;) {
     let freshRead;
     try {
@@ -6686,70 +6405,111 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
     const freshPrincipal = principalForName(git, repo.root, repo, freshLive);
     const freshOffered = warpOfferedCheckouts(git, freshRead, freshPrincipal, freshLive, repo.root);
     const freshActive = warpActiveIdentity(freshLive, repo.root, freshPrincipal, fromCwd);
-    const freshOthers = freshOffered.filter((entry) => entry.path !== freshActive);
-    if (freshOthers.length === 0) {
-      // After a delete the last row may be gone: no further choices, no
-      // extra notice — the delete success already notified.
-      if (pendingFocusIndex !== null || focusValue !== undefined) return undefined;
-      notify?.("warp: no other checkout to move the session to", "info");
-      return undefined;
-    }
     const freshCurrent = warpTitleEntry(git, freshOffered, freshLive, repo.root, freshActive, fromCwd);
-    const freshTitle = `Warp session \u00B7 current: ${freshCurrent.name} ${freshCurrent.path}`;
-    const freshOptions = [...freshOthers.map((entry) => `${entry.name} — ${entry.path}`), WARP_CREATE_ENTRY];
-    if (pendingFocusIndex !== null) {
-      const at = Math.min(Math.max(0, pendingFocusIndex), freshOthers.length - 1);
-      focusValue = `${freshOthers[at].name} — ${freshOthers[at].path}`;
-      pendingFocusIndex = null;
-    }
-    if (typeof focusValue === "string" && !freshOptions.includes(focusValue)) focusValue = undefined;
-    const canDelete = (index) => warpDeletableAt(freshOthers, index, freshPrincipal, freshRead, repo.root);
+    // The delete eligibility and target are computed against the LAST
+    // listing the loop loaded: reload() refreshes these in place, so a
+    // Ctrl+D after `r` still guards the current world.
+    let guardRead = freshRead;
+    let guardPrincipal = freshPrincipal;
+    let guardOthers = freshOffered.filter((entry) => entry.path !== freshActive);
+    const withPrincipalFlag = (principal, offered) => offered.map((entry) => ({
+      ...entry,
+      isPrincipal: !!(principal && entry.path === principal.path),
+    }));
+    const reload = () => {
+      try {
+        const read = registry.readRegistry(repo.root);
+        const live = git.listWorktrees(repo.root);
+        if (!read || read.ok !== true) return null;
+        noteWarpDiscovery(repo.root, live);
+        const principal = principalForName(git, repo.root, repo, live);
+        const offered = warpOfferedCheckouts(git, read, principal, live, repo.root);
+        const active = warpActiveIdentity(live, repo.root, principal, fromCwd);
+        guardRead = read;
+        guardPrincipal = principal;
+        guardOthers = offered.filter((entry) => entry.path !== active);
+        return warpCheckoutsWithActivity(checkoutFacts, withPrincipalFlag(principal, offered));
+      } catch {
+        return null;
+      }
+    };
+    const canDelete = (checkoutPath) => {
+      const index = guardOthers.findIndex((entry) => entry.path === checkoutPath);
+      if (index < 0) return false;
+      return warpDeletableAt(guardOthers, index, guardPrincipal, guardRead, repo.root);
+    };
+    // S12: the rows carry their own activity/creation values, so the view
+    // orders them newest-first and the footer names both ages; nothing here
+    // re-sorts.
+    const mountedCheckouts = await warpCheckoutsWithActivity(
+      checkoutFacts,
+      withPrincipalFlag(freshPrincipal, freshOffered),
+    );
     let out;
     try {
       out = await ctx.ui.custom(
-        (hostTui, theme, _keybindings, done) => pickerLib.createSingleSelect({
-          title: freshTitle,
-          items: freshOptions,
-          helpers,
-          hostTui,
-          theme,
-          initialSelected: focusValue,
-          confirmLabel: "warp",
-          showTab: false,
-          canDelete,
-          rowsAvailable: () => {
-            try {
-              const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
-              if (Number.isFinite(rows) && rows > 0) return rows;
-            } catch {
-              // A hostile host object never breaks the selector.
-            }
-            return 24;
-          },
-          done,
-        }),
+        (hostTui, theme, _keybindings, done) => {
+          const view = viewLib.createWarpSelectorView({
+            checkouts: mountedCheckouts,
+            current: { name: freshCurrent.name, path: freshCurrent.path },
+            facts: checkoutFacts ? (checkoutPath) => checkoutFacts.facts(checkoutPath).then(warpFactsForView) : undefined,
+            reload,
+            helpers,
+            theme,
+            hostTui,
+            rowsAvailable: () => warpOverlayRows(hostTui),
+            requestRender: () => {
+              try {
+                if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+              } catch {
+                // A repaint failure never breaks navigation.
+              }
+            },
+            done,
+          });
+          return withWarpDeleteKeys(view, { helpers, done, canDelete });
+        },
+        WARP_SELECTOR_OVERLAY,
       );
     } catch {
       return "fallback";
     }
     if (out === null || out === undefined) return undefined;
-    if (out && typeof out === "object" && out.back === true) return undefined;
+    if (out && typeof out === "object" && out.warp) {
+      // The extended list also shows the current checkout: selecting it
+      // resolves to an already-there warp, which stays silent.
+      const chosen = freshOffered.find((entry) => entry.path === out.warp);
+      if (!chosen) {
+        notify?.(`warp: unknown checkout selection ${JSON.stringify(out.warp)}; nothing was moved.`, "error");
+        return undefined;
+      }
+      const warpOut = await executeWorktreeWarp(chosen.name, ctx);
+      if (warpOut.isError) notify?.(warpOut.text, "error");
+      return undefined;
+    }
+    if (out && typeof out === "object" && out.create === true) {
+      await warpCreateAndEnter(ctx, git, notify);
+      return undefined;
+    }
+    if (out && typeof out === "object" && out.edit) {
+      const target = freshOffered.find((entry) => entry.path === out.edit);
+      if (!target) {
+        notify?.(`warp: unknown checkout selection ${JSON.stringify(out.edit)}; nothing was changed.`, "error");
+        continue;
+      }
+      await warpEditCheckout(ctx, git, registry, repo.root, target, checkoutFacts, notify);
+      // The popup's loop (S13): a save reopens the selector with fresh data
+      // and a cancel reopens it unchanged — `continue` re-reads the registry
+      // and the listing exactly like the view's own `reload`.
+      continue;
+    }
     if (out && typeof out === "object" && out.delete === true) {
-      const index = out.index;
-      if (typeof index !== "number" || index < 0 || index >= freshOthers.length) {
-        // Protected row (principal/create) or invalid: safe no-op, keep
-        // focus where it is.
-        focusValue = typeof out.value === "string" && freshOptions.includes(out.value) ? out.value : focusValue;
-        continue;
-      }
-      if (!warpDeletableAt(freshOthers, index, freshPrincipal, freshRead, repo.root)) {
-        focusValue = `${freshOthers[index].name} — ${freshOthers[index].path}`;
-        continue;
-      }
-      const target = freshOthers[index];
+      const target = guardOthers.find((entry) => entry.path === out.path);
+      // Protected row (principal/current/unregistered) or a stale path:
+      // safe no-op, the loop simply re-reads and re-mounts.
+      if (!target || !canDelete(out.path)) continue;
       if (typeof ctx?.ui?.confirm !== "function") {
         notify?.("warp: the host UI cannot confirm worktree deletion here; nothing was deleted.", "error");
-        focusValue = `${target.name} — ${target.path}`;
         continue;
       }
       // S61: the deletion confirmation always names the checkout's
@@ -6783,10 +6543,7 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       } catch {
         approved = false;
       }
-      if (!approved) {
-        focusValue = `${target.name} — ${target.path}`;
-        continue;
-      }
+      if (!approved) continue;
       const closeCtx = ctx && typeof ctx === "object" ? { ...ctx, hasUI: false } : ctx;
       const runner = typeof warpCloseRunner === "function" ? warpCloseRunner : executeWorktreeClose;
       // The explicit Yes above authorizes this row's pending changes:
@@ -6797,32 +6554,15 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
         closed = await runner(closeParams, closeCtx);
       } catch (err) {
         notify?.(`warp: cannot delete worktree ${target.name}: ${(err && err.message) || err}`, "error");
-        focusValue = `${target.name} — ${target.path}`;
         continue;
       }
       if (closed && closed.isError) {
         notify?.(closed.text, "error");
-        focusValue = `${target.name} — ${target.path}`;
         continue;
       }
       if (closed && typeof closed.text === "string" && closed.text.length > 0) notify?.(closed.text, "info");
-      pendingFocusIndex = Math.min(index, freshOthers.length - 2 >= 0 ? index : 0);
-      focusValue = undefined;
+      if (checkoutFacts) checkoutFacts.invalidate(target.path);
       continue;
-    }
-    if (typeof out === "string") {
-      if (out === WARP_CREATE_ENTRY) {
-        await warpCreateAndEnter(ctx, git, notify);
-        return undefined;
-      }
-      const chosen = freshOthers.find((entry) => `${entry.name} — ${entry.path}` === out);
-      if (!chosen) {
-        notify?.(`warp: unknown checkout selection ${JSON.stringify(out)}; nothing was moved.`, "error");
-        return undefined;
-      }
-      const warpOut = await executeWorktreeWarp(chosen.name, ctx);
-      if (warpOut.isError) notify?.(warpOut.text, "error");
-      return undefined;
     }
     notify?.(`warp: unknown checkout selection ${JSON.stringify(out)}; nothing was moved.`, "error");
     return undefined;
@@ -6872,7 +6612,7 @@ function registerWarpCommand(pi) {
       try {
         repo = git.repoIdentity(fromCwd);
       } catch (err) {
-        notify?.(`warp: not a git repository: ${fromCwd}`, "error");
+        notify?.(notGitRepositoryLine(fromCwd), "info");
         return;
       }
       const read = registry.readRegistry(repo.root);
@@ -6889,18 +6629,16 @@ function registerWarpCommand(pi) {
       }
       // S14: this fresh scan is the warp-time discovery refresh.
       noteWarpDiscovery(repo.root, live);
-      // Ctrl+D delete: the inline custom selector (the same standalone
-      // single-select pattern as the create wizard, smallest extension)
-      // supports Ctrl+D on a focused ELIGIBLE worktree row when the host
-      // offers ctx.ui.custom. The selector closes FIRST, then one explicit
-      // ctx.ui.confirm names the target and its absolute path; cancel/Esc
-      // reopens the selector with stable focus and zero mutations, while
-      // acceptance reuses the shared executeWorktreeClose exactly once
-      // (second approval suppressed deliberately — the Ctrl+D confirmation
-      // IS the human approval — never globally disabled). Principal and
-      // create rows are never deletable (safe no-op). Enter still warps,
-      // Esc still cancels, create stays last, and the listing refreshes
-      // before further choices so no stale row survives.
+      // The popup: `runWarpSelectorLoop` mounts the redesigned overlay
+      // (popup + extended list) when the host offers ctx.ui.custom, and
+      // the extended list keeps Ctrl+D on an ELIGIBLE agent worktree —
+      // never the principal, the current checkout or an unregistered row.
+      // The selector closes FIRST, then one explicit ctx.ui.confirm names
+      // the target and its absolute path; cancel/Esc reopens the selector
+      // with zero mutations, while acceptance reuses the shared
+      // executeWorktreeClose exactly once (second approval suppressed
+      // deliberately — the Ctrl+D confirmation IS the human approval —
+      // never globally disabled).
       const useCustomWarp = ctx && ctx.ui && typeof ctx.ui.custom === "function";
       if (useCustomWarp) {
         const handled = await runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify);
@@ -6920,9 +6658,9 @@ function registerWarpCommand(pi) {
       }
       // The host `select` primitive has no non-selectable rows, so the
       // active checkout travels in the title and `Esc`/undefined is the
-      // cancel path. S44/S45 appends the create entry last: it is visually
-      // distinct from the checkout rows and never collides with one;
-      // S45 asks the change type first, then the change name.
+      // cancel path. The create entry stays last: it is visually distinct
+      // from the checkout rows and never collides with one; it opens the
+      // single create panel.
       const current = warpTitleEntry(git, offered, live, repo.root, active, fromCwd);
       const title = `Warp session · current: ${current.name} ${current.path}`;
       const options = [...others.map((entry) => `${entry.name} — ${entry.path}`), WARP_CREATE_ENTRY];
@@ -6938,9 +6676,9 @@ function registerWarpCommand(pi) {
       }
       // `Esc` cancels silently: no notification, no write, no switch.
       if (picked === undefined) return;
-      // S45: the final entry runs the two-step create (type, then name)
-      // through the existing create path, then warps the session into
-      // the new checkout.
+      // The final entry opens the single create panel through the
+      // existing create path, then warps the session into the new
+      // checkout.
       if (picked === WARP_CREATE_ENTRY) {
         await warpCreateAndEnter(ctx, git, notify);
         return;
@@ -7232,6 +6970,14 @@ function customizeSelect(helpers, theme, label, size, focused) {
   return prefix + customizeFit(helpers, safe, Math.max(0, size - 2));
 }
 
+// The `?` key-help overlay lines (key-consistency K3/S5): the same
+// keys the footer names, spelled out once.
+const CUSTOMIZE_HELP_LINES = [
+  "Keys",
+  "←/→ or Tab panes · ↑/↓ or j/k move",
+  "Enter apply · ? help · Esc close",
+];
+
 function customizeCard(helpers, theme, lines, width) {
   const innerWidth = Math.max(1, width - CUSTOMIZE_CARD_PADDING);
   let border = (text) => text;
@@ -7257,6 +7003,9 @@ function customizeCard(helpers, theme, lines, width) {
 function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, done }) {
   const state = {
     pane: "categories",
+    // `?` key-help overlay (key-consistency K3/S5): toggled, never
+    // modal — esc closes the overlay first, every other key is ignored
+    // while it is open.
     help: false,
     cat: 0,
     row: model.map((category) => {
@@ -7310,9 +7059,15 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const showHeading = height >= 6;
     // Right pane: LABELS ONLY (gentle-shell visual-customize-view
     // style) — each choice's S2 detail lives exactly once in the
-    // preview block below, never under the rows. Then the unavailable
-    // note when the provider slot is missing or malformed.
+    // preview block below, never under the rows. The unavailable note
+    // when the provider slot is missing or malformed. The `?` help
+    // overlay replaces the rows with the key list instead.
     const rightLines = [];
+    if (state.help) {
+      for (const row of CUSTOMIZE_HELP_LINES) {
+        rightLines.push({ label: row, focused: false, muted: true });
+      }
+    } else {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       // S2 pins → on the active value; focus adds its own ▸ beside it
@@ -7325,6 +7080,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     }
     if (!category.available) {
       rightLines.push({ label: "(unavailable in this session)", mark: "    ", focused: false, muted: true });
+    }
     }
     const contentHeight = Math.max(1, height - 2 - 1 - (showHeading ? 1 : 0) - previewLines - (showHeading ? 1 : 0));
     const position = navOnly ? state.cat : state.row[state.cat];
@@ -7346,9 +7102,11 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const escGap = Math.max(1, inner - customizeMeasure(helpers, title) - 3);
     lines.push(paint(`${title}${" ".repeat(escGap)}esc`, inner, "accent"));
     if (showHeading) {
-      const heading = navOnly
-        ? "Categories · choose a category →"
-        : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
+      const heading = state.help
+        ? "Help · keys"
+        : navOnly
+          ? "Categories · choose a category →"
+          : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
       lines.push(join(
         leftWidth ? paint("CATEGORIES", leftWidth, "accent") : "",
         paint(heading, rightWidth, "accent"),
@@ -7402,7 +7160,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const previewSample = current.row ? current.row.detail : "unavailable";
     if (helpLines) {
       if (showHeading) {
-        lines.push(paint("↑/↓ moves · ? closes help · Esc closes the panel", inner, "muted"));
+        lines.push(paint("? closes help · Esc closes the panel", inner, "muted"));
       }
     } else if (previewLines === 3) {
       const wrapped = current.row && typeof current.row.noteLines === "function"
@@ -7422,8 +7180,10 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     } else if (previewLines === 1) {
       lines.push(paint(previewTitle, inner, "muted"));
     }
+    // The help view carries its own key hint, so the generic footer stands
+    // down while the focused row's measured detail fills the card.
     if (showHeading && !helpLines) {
-      lines.push(paint("←/→ or Tab panes · ↑/↓ move · Enter apply · ? help · Esc close", inner, "muted"));
+      lines.push(paint("←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close", inner, "muted"));
     }
     return customizeCard(helpers, theme, lines.slice(0, Math.max(0, height - 2)), w);
   }
@@ -7436,25 +7196,35 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
   }
   function handleInput(data) {
     if (customizeIsKeyRelease(helpers, data)) return;
+    // Help overlay first (key-consistency K3/S5): `?` toggles, esc
+    // closes the overlay only, and every other key is ignored while it
+    // is open — the same rule the odd and issues viewers use.
+    if (customizeKeyMatches(helpers, data, ["?"])) {
+      state.help = !state.help;
+      requestPaint();
+      return;
+    }
+    if (state.help && customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
+      state.help = false;
+      requestPaint();
+      return;
+    }
+    if (state.help) return;
     if (customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
       done(null);
       return;
     }
-    // perf-switches S4/S12: the footer note is short on purpose, so the full
-    // measured detail sits behind one key and never costs the list its rows.
-    if (customizeKeyMatches(helpers, data, ["?", "shift+?"])) {
-      const focusedRow = focused().row;
-      state.help = !state.help && Boolean(focusedRow && typeof focusedRow.helpLines === "function");
-      requestPaint();
-      return;
-    }
+    // perf-switches S4/S12: the footer note stays short on purpose, so the
+    // full measured detail sits behind the help key and never costs the list
+    // its rows. The `?` handler above owns that toggle for every row: one
+    // with `helpLines` shows that detail, one without shows the key list.
     if (customizeKeyMatches(helpers, data, ["left", "right", "tab"])) {
       state.pane = state.pane === "categories" ? "values" : "categories";
       state.help = false;
       requestPaint();
       return;
     }
-    if (customizeKeyMatches(helpers, data, ["up"])) {
+    if (customizeKeyMatches(helpers, data, ["up", "k"])) {
       state.help = false;
       if (state.pane === "categories") state.cat = (state.cat + model.length - 1) % model.length;
       else {
@@ -7464,7 +7234,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       requestPaint();
       return;
     }
-    if (customizeKeyMatches(helpers, data, ["down"])) {
+    if (customizeKeyMatches(helpers, data, ["down", "j"])) {
       state.help = false;
       if (state.pane === "categories") state.cat = (state.cat + 1) % model.length;
       else {
@@ -7880,6 +7650,639 @@ function registerCustomizeCommand(pi, toolsRegistered) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// /herdr-gentle:odd (odd-viewer S1-S8): a two-pane viewer of the
+// CURRENT checkout's `odd/tasks/*.md` — the document list on the left, the
+// selected document rendered as styled markdown and scrollable on the
+// right, the same interaction shape as the reference /gentle:changes view,
+// plus the S7/S8 assignment field: the list marks which documents are
+// assigned to this checkout, `space` toggles locally, and `ctrl+s`
+// persists the pending set through the worktree registry (`esc` discards).
+//
+// The renderer is this package's own (lib/odd-docs.js + lib/odd-markdown.js
+// + lib/odd-view.js), never an import from gentle-shell, and the TUI helpers
+// arrive through the injectable oddTuiLoader seam exactly like the customize
+// panel's, so no test loader needs a new stub line and a host without
+// `@earendil-works/pi-tui` degrades to the plain ctx.ui.select menu.
+// Everything else on this path only reads: the listing, the documents, and
+// (fail-soft) the stored assignment.
+// ---------------------------------------------------------------------------
+
+let oddTuiLoader = () => import("@earendil-works/pi-tui");
+
+function setOddTuiLoader(loader) {
+  oddTuiLoader = loader;
+}
+
+// The checkout the session runs in (S2): inside a worktree that is the
+// worktree, never the principal. Anything that cannot resolve to a Git root
+// fails closed instead of guessing a directory.
+function oddCheckoutRoot(cwd) {
+  try {
+    const repo = libRequire("worktree-git.js").repoIdentity(cwd);
+    if (repo && typeof repo.root === "string" && repo.root.length > 0) return repo.root;
+  } catch {
+    // Not a Git checkout, or git is unavailable: fail closed below.
+  }
+  return null;
+}
+
+function oddDocsFor(cwd) {
+  try {
+    const listing = libRequire("odd-docs.js").listOddDocs(oddCheckoutRoot(cwd));
+    if (listing && typeof listing === "object") return listing;
+  } catch {
+    // A missing or broken lib never opens a viewer over nothing.
+  }
+  return { ok: false, reason: "no-checkout", docs: [] };
+}
+
+// Stored assignment for the viewer (S8): the checkout's own `odd[]`
+// (`odd/tasks/<file>` names) read fail-soft — an unreadable or malformed
+// registry leaves the view usable with nothing marked, and the failure
+// surfaces only if a save is attempted.
+function oddStoredAssignment(repoRoot, checkoutRoot) {
+  try {
+    const registry = libRequire("worktree-registry.js");
+    if (!registry || typeof registry.findByPath !== "function") return [];
+    const row = registry.findByPath(repoRoot, checkoutRoot);
+    if (!row || !Array.isArray(row.odd)) return [];
+    return row.odd.filter((name) => typeof name === "string" && name.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+// The live branch checked out at the checkout root, for the on-demand row
+// the first save creates. Null when git cannot name one (a detached HEAD,
+// an unlisted path); the saver refuses instead of inventing a branch, so
+// the registry never records a branch that does not exist.
+function oddCheckoutBranch(repoRoot, checkoutRoot) {
+  try {
+    const git = libRequire("worktree-git.js");
+    if (!git || typeof git.listWorktrees !== "function") return null;
+    for (const entry of git.listWorktrees(repoRoot)) {
+      if (!entry || typeof entry.path !== "string") continue;
+      let same = false;
+      try {
+        same = path.resolve(entry.path) === path.resolve(checkoutRoot);
+      } catch {
+        same = false;
+      }
+      if (same && typeof entry.branch === "string" && entry.branch.length > 0) return entry.branch;
+    }
+  } catch {
+    // Null: git is unavailable or names no branch here. The saver
+    // refuses; it never falls back to a directory name.
+  }
+  return null;
+}
+
+// The registry values for one assignment field, normalized exactly as the
+// registry stores them: issue numbers ascending and deduplicated, odd
+// document names sorted and deduplicated.
+function normalizeCheckoutFieldValues(field, values) {
+  if (field === "issues") {
+    return Array.from(new Set(
+      (Array.isArray(values) ? values : []).filter((n) => typeof n === "number" && Number.isFinite(n)),
+    )).sort((a, b) => a - b);
+  }
+  return Array.from(new Set(
+    (Array.isArray(values) ? values : []).filter((name) => typeof name === "string" && name.length > 0),
+  )).sort();
+}
+
+// Persist a viewer's pending set as one or more checkout fields (`odd[]`,
+// `issues[]`) in ONE registry write: the odd viewer, the issues viewer and
+// the warp editing mode (S13) all come through here, so the guards can
+// never drift. The registry's own overwrite semantics apply: an existing
+// row found by path is replaced via updateWorktree (which touches only the
+// fields in the patch); a missing row (the principal checkout, or a
+// worktree discovery never registered) is created with the checkout's REAL
+// branch and the REAL thread identity resolved exactly like the create path
+// (resolveThread). A missing branch or an unresolvable thread refuses the
+// save WITHOUT writing — the read probe below tells "no row yet" apart from
+// "unreadable file", which findByPath alone cannot. A same-branch row at a
+// different live checkout is never replaced: like the create path, the new
+// checkout is appended alongside it. Returns {ok:true} or {ok:false,
+// error}; the view only applies the assignment on {ok:true} and shows error
+// otherwise.
+function saveCheckoutFields(repoRoot, checkoutRoot, patch, ctx) {
+  const clean = {};
+  if (patch && Object.prototype.hasOwnProperty.call(patch, "issues")) {
+    clean.issues = normalizeCheckoutFieldValues("issues", patch.issues);
+  }
+  if (patch && Object.prototype.hasOwnProperty.call(patch, "odd")) {
+    clean.odd = normalizeCheckoutFieldValues("odd", patch.odd);
+  }
+  let registry = null;
+  try {
+    registry = libRequire("worktree-registry.js");
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot load the worktree registry" };
+  }
+  let read = null;
+  try {
+    read = registry.readRegistry(repoRoot);
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot read the worktree registry" };
+  }
+  if (!read || read.ok !== true) {
+    return { ok: false, error: (read && read.error) || "cannot read the worktree registry" };
+  }
+  let row = null;
+  try {
+    row = typeof registry.findByPath === "function" ? registry.findByPath(repoRoot, checkoutRoot) : null;
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot read the worktree registry" };
+  }
+  if (row) {
+    try {
+      const updated = registry.updateWorktree(repoRoot, row.path, clean);
+      if (!updated || updated.ok !== true) {
+        return { ok: false, error: (updated && updated.error) || "cannot save the assignment" };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || "cannot save the assignment" };
+    }
+  }
+  // The created row carries the checkout's real branch: a null branch
+  // (detached HEAD, unlisted path) refuses the save instead of
+  // inventing a branch the registry would later mis-resolve by.
+  const branch = oddCheckoutBranch(repoRoot, checkoutRoot);
+  if (typeof branch !== "string" || branch.length === 0) {
+    return { ok: false, error: `cannot determine the checkout branch for ${checkoutRoot}: refusing to save without a real branch` };
+  }
+  // The created row carries the real work thread, resolved exactly like
+  // the create path. Without an identity the save refuses closed: it
+  // must never record a placeholder thread.
+  const identity = resolveThread(ctx);
+  if (!identity.thread) {
+    return { ok: false, error: "cannot resolve thread identity: set GENTLE_WORKTREE_THREAD or run inside a Pi session" };
+  }
+  const thread = identity.thread;
+  try {
+    // Same-branch hazard, same criterion as the create path: a row that
+    // carries this branch but points at a DIFFERENT live checkout is
+    // kept, and the new checkout is appended alongside it instead of
+    // replacing the row (upsert matches by branch, so it would destroy
+    // that row's issues/odd/thread/createdAt).
+    let useAppend = false;
+    try {
+      const git = libRequire("worktree-git.js");
+      const listed = git && typeof git.listWorktrees === "function" ? git.listWorktrees(repoRoot) : null;
+      if (Array.isArray(listed)) {
+        const afterIds = liveIdentities(listed, repoRoot);
+        const targetReal = checkoutState(checkoutRoot, repoRoot).real;
+        const rows = read && read.ok === true && Array.isArray(read.worktrees) ? read.worktrees : [];
+        for (const candidate of rows) {
+          if (!candidate || candidate.branch !== branch) continue;
+          if (typeof candidate.path !== "string" || !path.isAbsolute(candidate.path)) continue;
+          const rowState = checkoutState(candidate.path, repoRoot);
+          if (!rowState.exists || !rowState.isDirectory) continue;
+          if (rowState.real === null || !afterIds.has(rowState.real)) continue;
+          if (targetReal !== null && rowState.real === targetReal) continue;
+          useAppend = true;
+          break;
+        }
+      }
+    } catch {
+      useAppend = false;
+    }
+    const recorded = {
+      branch,
+      path: checkoutRoot,
+      thread,
+      issues: Array.isArray(clean.issues) ? clean.issues : [],
+      odd: Array.isArray(clean.odd) ? clean.odd : [],
+    };
+    const created = useAppend && registry && typeof registry.appendWorktree === "function"
+      ? registry.appendWorktree(repoRoot, recorded)
+      : registry.upsertWorktree(repoRoot, recorded);
+    if (!created || created.ok !== true) {
+      return { ok: false, error: (created && created.error) || "cannot save the assignment" };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || "cannot save the assignment" };
+  }
+}
+
+// The odd viewer's saver: the pending set as the checkout's `odd[]`.
+// Thin wrapper over the shared guarded saver above, so both viewers
+// keep byte-identical guards without duplicating them.
+// The odd viewer's saver: the pending set as the checkout's `odd[]`.
+// Thin wrapper over the shared guarded saver above, so both viewers
+// keep byte-identical guards without duplicating them.
+function saveCheckoutField(repoRoot, checkoutRoot, field, values, ctx) {
+  return saveCheckoutFields(repoRoot, checkoutRoot, { [field]: values }, ctx);
+}
+
+function oddSaveAssignment(repoRoot, checkoutRoot, names, ctx) {
+  return saveCheckoutField(repoRoot, checkoutRoot, "odd", names, ctx);
+}
+
+// The issues viewer's saver: the pending set as the checkout's
+// `issues[]`, with EXACTLY the odd saver's guards (real branch and
+// resolved thread for a created row, refuse without writing, append on
+// a same-branch conflict). Same shared saver, same guarantees.
+function issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx) {
+  return saveCheckoutField(repoRoot, checkoutRoot, "issues", numbers, ctx);
+}
+
+function oddTerminalRows(hostTui) {
+  try {
+    const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+    if (Number.isFinite(rows) && rows > 0) return rows;
+  } catch {
+    // A hostile host object never breaks the view.
+  }
+  return 24;
+}
+
+async function runOddFallback(ctx, listing) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const select = ctx && ctx.ui ? ctx.ui.select : undefined;
+  if (listing.docs.length === 0) {
+    if (typeof notify === "function") notify("odd: no documents under odd/tasks/ in this checkout", "info");
+    return;
+  }
+  if (typeof select !== "function") {
+    if (typeof notify === "function") {
+      notify(`odd: ${listing.docs.length} document(s) under odd/tasks/ (the viewer needs an interactive session)`, "info");
+    }
+    return;
+  }
+  let picked = null;
+  try {
+    picked = await select("Odd documents", listing.docs.map((doc) => doc.name));
+  } catch {
+    picked = undefined;
+  }
+  if (picked === undefined || picked === null) return;
+  const doc = listing.docs.find((entry) => entry.name === picked);
+  if (!doc) return;
+  if (typeof notify === "function") notify(doc.path, "info");
+}
+
+async function executeOdd(rawArgs, ctx) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const raw = String(rawArgs ?? "").trim();
+  if (raw !== "") {
+    if (typeof notify === "function") notify(`Unknown option "${raw}". Use /herdr-gentle:odd.`, "error");
+    return;
+  }
+  const cwd = toolCwd(ctx);
+  const listing = oddDocsFor(cwd);
+  if (!listing.ok) {
+    if (typeof notify === "function") notify(notGitRepositoryLine(cwd), "info");
+    return;
+  }
+  // S9: with nothing to read there is no overlay at all — one muted line,
+  // exactly like the changes view answers an empty repository.
+  if (listing.docs.length === 0) {
+    if (typeof notify === "function") notify("No odd documents under odd/tasks/ in this checkout.", "info");
+    return;
+  }
+  // The assignment belongs to the checkout the session runs in
+  // (listing.root); it loads fail-soft so a broken registry never blocks
+  // reading, and saves overwrite that row's `odd[]` exactly.
+  const checkoutRoot = (listing && typeof listing.root === "string" && listing.root.length > 0)
+    ? listing.root
+    : oddCheckoutRoot(cwd);
+  const repoRoot = checkoutRoot || cwd;
+  const assigned = checkoutRoot ? oddStoredAssignment(repoRoot, checkoutRoot) : [];
+  const checkoutName = checkoutRoot ? path.basename(checkoutRoot) : "";
+  let helpers = null;
+  try {
+    helpers = await oddTuiLoader();
+  } catch {
+    helpers = null;
+  }
+  if (helpers && ctx && ctx.ui && typeof ctx.ui.custom === "function") {
+    try {
+      await ctx.ui.custom(
+        (hostTui, theme, _keybindings, done) => libRequire("odd-view.js").createOddView({
+          docs: listing.docs,
+          assigned,
+          checkoutName,
+          saveAssignment: (names) => oddSaveAssignment(repoRoot, checkoutRoot, names, ctx),
+          // `o` opens the focused document outside Pi through
+          // $VISUAL/$EDITOR (key-consistency K3): the shared opener
+          // reports honestly, so the view shows the miss or the failure
+          // instead of failing silently.
+          openExternal: (target) => libRequire("open-external.js").openExternal(target),
+          loadDoc: (doc) => libRequire("odd-docs.js").readOddDoc(doc),
+          reloadDocs: () => oddDocsFor(cwd),
+          helpers,
+          theme,
+          rowsAvailable: () => oddTerminalRows(hostTui),
+          requestRender: () => {
+            try {
+              if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+            } catch {
+              // A repaint failure never breaks navigation.
+            }
+          },
+          done,
+        }),
+        // Full screen like the reference Changes view: the point of this
+        // surface is reading a long document.
+        { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 } },
+      );
+    } catch {
+      // A host that rejects the overlay degrades to the menu below.
+      await runOddFallback(ctx, listing);
+    }
+    return;
+  }
+  await runOddFallback(ctx, listing);
+}
+
+// /herdr-gentle:issues (issues-view S1,S2,S5,S9,S10): a full-screen
+// three-page overlay (My issues / Assigned / Involved) over the CURRENT
+// checkout's repository issues, in this package's own frame
+// (lib/gh-issues.js for `gh`, lib/issues-view.js for the pure view).
+//
+// GATED (S9): the command registers only after the session-start `gh`
+// check below reports an authenticated user; without both, one
+// notification per session names what is missing and the command that
+// fixes it. The three pages arrive through listIssues with the S2
+// searches (author:@me, assignee:@me, involves:@me), the detail through
+// getIssue, the repo labels through listLabels, and the `o` key opens
+// `gh issue view <n> --web` through the file's fixed-argv runner (never
+// a shell, never an invented opener). Assignment reads the checkout's
+// stored `issues[]` and saves through the shared guarded saver above.
+// The renderer arrives through the injectable issuesTuiLoader seam
+// exactly like the customize panel's and the odd viewer's, and the
+// overlay uses the odd viewer's full-screen shape.
+// ---------------------------------------------------------------------------
+
+let issuesTuiLoader = () => import("@earendil-works/pi-tui");
+
+function setIssuesTuiLoader(loader) {
+  issuesTuiLoader = loader;
+}
+
+const ISSUES_PAGE_QUERIES = [
+  { id: "mine", label: "My issues", query: "author:@me" },
+  { id: "assigned", label: "Assigned", query: "assignee:@me" },
+  { id: "involved", label: "Involved", query: "involves:@me" },
+];
+const ISSUES_FETCH_STATE = "all";
+const ISSUES_FETCH_PAGE_SIZE = 30;
+
+// Gate state: the command registers once, and a failed gate notifies
+// once per session (module lifetime == session). The flag flips only
+// when an alert is actually handed to notify, so a startup without UI
+// never consumes the session's single alert.
+let issuesCommandRegistered = false;
+let issuesGateNotified = false;
+
+// Stored assignment for the viewer (S5): the checkout's own `issues[]`
+// (issue numbers) read fail-soft — an unreadable or malformed registry
+// leaves the view usable with nothing marked, and the failure surfaces
+// only if a save is attempted.
+function issuesStoredAssignment(repoRoot, checkoutRoot) {
+  try {
+    const registry = libRequire("worktree-registry.js");
+    if (!registry || typeof registry.findByPath !== "function") return [];
+    const row = registry.findByPath(repoRoot, checkoutRoot);
+    if (!row || !Array.isArray(row.issues)) return [];
+    return row.issues.filter((n) => typeof n === "number" && Number.isFinite(n));
+  } catch {
+    return [];
+  }
+}
+
+function issuesListArgs(query) {
+  return { query, state: ISSUES_FETCH_STATE, page: 1, pageSize: ISSUES_FETCH_PAGE_SIZE };
+}
+
+// The `o`-key browser opener: `gh issue view <n> --web` through the
+// file's fixed-argv runner (worktree-git.js runArgv — argv array, never
+// a shell string, never xdg-open). The binary resolves exactly like the
+// gh client (GH_BIN_PATH wins, else `gh` on PATH). Never throws:
+// failures return {ok:false, error} and change nothing.
+function issuesOpenInBrowser(cwd, number) {
+  try {
+    const gh = libRequire("gh-issues.js");
+    const git = libRequire("worktree-git.js");
+    if (!git || typeof git.runArgv !== "function") return { ok: false, error: "cannot open the browser: no fixed-argv runner" };
+    const bin = (gh && typeof gh.ghBinary === "function") ? gh.ghBinary({}) : "gh";
+    const res = git.runArgv(bin, ["issue", "view", String(number), "--web"], { cwd, timeoutMs: 30000 });
+    if (!res) return { ok: false, error: `cannot open issue #${number} in the browser` };
+    if (res.error) return { ok: false, error: res.error };
+    if (typeof res.status === "number" && res.status !== 0) {
+      const stderr = (res.stderr || "").trim().split("\n")[0];
+      return { ok: false, error: stderr || `cannot open issue #${number} in the browser (gh exited with status ${res.status})` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || `cannot open issue #${number} in the browser` };
+  }
+}
+
+function issuesWrapFailure(promise, what) {
+  return Promise.resolve(promise).then((res) => {
+    if (res && typeof res === "object") return res;
+    return { ok: false, error: `${what}: unexpected result` };
+  }).catch((err) => ({ ok: false, error: (err && err.message) || `${what}: failed` }));
+}
+
+async function issuesFetchPages(gh, cwd) {
+  const pages = [];
+  let loadError = null;
+  for (const spec of ISSUES_PAGE_QUERIES) {
+    let res = null;
+    try {
+      res = await gh.listIssues(issuesListArgs(spec.query), { cwd });
+    } catch (err) {
+      res = { ok: false, error: (err && err.message) || "gh issue list failed" };
+    }
+    if (res && res.ok === true) {
+      pages.push({ id: spec.id, label: spec.label, issues: res.issues, total: res.total, truncated: res.truncated === true });
+    } else {
+      if (!loadError) loadError = (res && res.error) || "gh issue list failed";
+      pages.push({ id: spec.id, label: spec.label, issues: [], total: 0, truncated: false });
+    }
+  }
+  return { pages, loadError };
+}
+
+async function executeIssues(rawArgs, ctx) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const raw = String(rawArgs ?? "").trim();
+  if (raw !== "") {
+    if (typeof notify === "function") notify(`Unknown option "${raw}". Use /herdr-gentle:issues.`, "error");
+    return;
+  }
+  const cwd = toolCwd(ctx);
+  // The assignment belongs to the checkout the session runs in: inside
+  // a worktree that is the worktree, never the principal. Anything that
+  // cannot resolve to a Git root fails closed instead of guessing.
+  const checkoutRoot = oddCheckoutRoot(cwd);
+  if (!checkoutRoot) {
+    if (typeof notify === "function") notify(notGitRepositoryLine(cwd), "info");
+    return;
+  }
+  const repoRoot = checkoutRoot;
+  let gh = null;
+  try {
+    gh = libRequire("gh-issues.js");
+  } catch (err) {
+    if (typeof notify === "function") notify(`issues: cannot load the gh client: ${(err && err.message) || err}`, "error");
+    return;
+  }
+  // Fetched with state `all` so the view's `f` key can alternate
+  // between open-only (the default) and closed; the totals line names
+  // the bounded count. A failed page leaves an empty page plus the
+  // error, never fake rows.
+  const { pages, loadError } = await issuesFetchPages(gh, checkoutRoot);
+  // Repo labels load best-effort: an empty list still leaves the label
+  // editor usable (toggle nothing, create-new still applies).
+  let labels = [];
+  try {
+    const listed = await gh.listLabels({ cwd: checkoutRoot });
+    if (listed && listed.ok === true && Array.isArray(listed.labels)) labels = listed.labels;
+  } catch {
+    labels = [];
+  }
+  const assigned = issuesStoredAssignment(repoRoot, checkoutRoot);
+  const checkoutName = path.basename(checkoutRoot);
+  let helpers = null;
+  try {
+    helpers = await issuesTuiLoader();
+  } catch {
+    helpers = null;
+  }
+  if (!helpers || !ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
+    if (typeof notify === "function") {
+      const total = pages.reduce((sum, page) => sum + (Array.isArray(page.issues) ? page.issues.length : 0), 0);
+      notify(`issues: ${total} issue(s) across ${pages.length} pages (the viewer needs an interactive session)`, "info");
+    }
+    return;
+  }
+  const actions = {
+    // Label edit (S3,S10): created names go through `gh label create`
+    // first, then the whole delta through `gh issue edit`. A failure at
+    // either step returns honestly and the view keeps the editor open
+    // with local state unchanged.
+    editLabels: (number, add, remove, created) => issuesWrapFailure((async () => {
+      for (const name of Array.isArray(created) ? created : []) {
+        if (typeof name !== "string" || name === "") continue;
+        const made = await gh.createLabel({ name }, { cwd: checkoutRoot });
+        if (!made || made.ok !== true) return { ok: false, error: (made && made.error) || `cannot create label ${name}` };
+      }
+      return await gh.editLabels(number, { add, remove }, { cwd: checkoutRoot });
+    })(), "cannot edit labels"),
+    postComment: (number, text) => issuesWrapFailure(gh.commentIssue(number, text, { cwd: checkoutRoot }), "cannot comment"),
+    setState: (number, state) => issuesWrapFailure(gh.setIssueState(number, state, { cwd: checkoutRoot }), "cannot change the issue state"),
+    openBrowser: (number) => issuesOpenInBrowser(checkoutRoot, number),
+    reload: async () => {
+      try {
+        const fresh = await issuesFetchPages(gh, checkoutRoot);
+        if (fresh.loadError && fresh.pages.every((page) => !Array.isArray(page.issues) || page.issues.length === 0)) {
+          return { ok: false, error: fresh.loadError };
+        }
+        return { ok: true, pages: fresh.pages };
+      } catch (err) {
+        return { ok: false, error: (err && err.message) || "cannot reload issues" };
+      }
+    },
+  };
+  try {
+    await ctx.ui.custom(
+      (hostTui, theme, _keybindings, done) => libRequire("issues-view.js").createIssuesView({
+        pages,
+        labels,
+        assigned,
+        checkoutName,
+        loadIssue: (number) => gh.getIssue(number, { cwd: checkoutRoot }),
+        saveAssignment: (numbers) => issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx),
+        actions,
+        helpers,
+        theme,
+        rowsAvailable: () => oddTerminalRows(hostTui),
+        requestRender: () => {
+          try {
+            if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+          } catch {
+            // A repaint failure never breaks navigation.
+          }
+        },
+        done,
+        ...(loadError ? { loadError } : {}),
+      }),
+      // Full screen like the odd viewer: the point of this surface is
+      // reading long issues with their comments.
+      { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 } },
+    );
+  } catch {
+    // A host that rejects the overlay degrades to one muted line.
+    if (typeof notify === "function") notify("issues: the viewer could not open in this session", "info");
+  }
+}
+
+// The S9 gate message names what is missing and the command that fixes
+// it: a missing binary needs an install plus login, anything else
+// already carries gh's own `gh auth login` wording.
+function issuesGateMessage(error) {
+  const text = String(error || "gh check failed");
+  if (/ENOENT|not available|not found/i.test(text)) {
+    return "issues: the gh CLI is not available; install it (https://cli.github.com) and run `gh auth login` — /herdr-gentle:issues stays unregistered";
+  }
+  return `issues: ${text} — /herdr-gentle:issues stays unregistered`;
+}
+
+async function checkIssuesGate(pi, ctx) {
+  try {
+    const gh = libRequire("gh-issues.js");
+    const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+    const res = await gh.ghStatus({ cwd });
+    if (res && res.ok === true) {
+      registerIssuesCommand(pi);
+      return { ok: true };
+    }
+    const error = (res && res.error) || "gh check failed";
+    if (!issuesGateNotified && ctx && ctx.ui && typeof ctx.ui.notify === "function") {
+      try {
+        ctx.ui.notify(issuesGateMessage(error), "info");
+        issuesGateNotified = true;
+      } catch {
+        // Notifying never breaks startup.
+      }
+    }
+    return { ok: false, error };
+  } catch (err) {
+    // The gate must never break startup.
+    return { ok: false, error: (err && err.message) || String(err) };
+  }
+}
+
+function registerIssuesCommand(pi) {
+  if (issuesCommandRegistered) return;
+  if (typeof pi?.registerCommand !== "function") return;
+  issuesCommandRegistered = true;
+  pi.registerCommand("herdr-gentle:issues", {
+    description: "Read and triage this repository's GitHub issues: three pages, detail pane, labels, comments, close/reopen",
+    handler: async (args, ctx) => {
+      await executeIssues(args, ctx);
+    },
+  });
+}
+
+function registerOddCommand(pi) {
+  if (typeof pi?.registerCommand !== "function") return;
+  pi.registerCommand("herdr-gentle:odd", {
+    description: "Read this checkout's odd documents: list on the left, styled markdown on the right",
+    handler: async (args, ctx) => {
+      await executeOdd(args, ctx);
+    },
+  });
+}
+
 export default function (pi) {
   // The S26 delivery route: watchers started by `worktree_session_open`
   // notify through this host object.
@@ -7910,6 +8313,7 @@ export default function (pi) {
   registerWarpCommand(pi);
   registerWarpMessageRenderer(pi);
   registerCustomizeCommand(pi, toolsRegistered);
+  registerOddCommand(pi);
   if (toolsRegistered) {
     pi.registerTool(worktreeCreateTool);
     pi.registerTool(worktreeListTool);
@@ -8006,7 +8410,25 @@ export default function (pi) {
         // The plugin check must never break startup.
       }
     });
+    // issues-view S9: the `/herdr-gentle:issues` gate. `gh` must
+    // resolve AND report an authenticated user; without both the
+    // command stays unregistered and one notification per session names
+    // what is missing and the command that fixes it. Deferred to
+    // session start so the check never blocks the extension load, and
+    // guarded exactly like the Herdr plugin check above: never throws,
+    // never blocks the session, never writes config, never repeats the
+    // alert, and never mentions /reload.
+    pi.on("session_start", (event, ctx) => {
+      try {
+        const out = checkIssuesGate(pi, ctx);
+        if (out && typeof out.then === "function") return out.catch(() => ({ ok: false }));
+        return out;
+      } catch {
+        // The gate must never break startup.
+        return null;
+      }
+    });
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setWorktreeCardHelpers, setWarpCreateNameAsker, setWarpCreateTypeAsker, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreatePicker, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setIssuesTuiLoader, setWorktreeCardHelpers, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreateIssuePreviewReader, setWarpCreateOddPreviewReader, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };

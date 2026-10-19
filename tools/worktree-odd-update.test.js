@@ -191,7 +191,7 @@ describe('T19/S26: create accepts an optional validated odd path', { concurrency
       const doc = path.join(root, 'odd-doc.md');
       fs.writeFileSync(doc, '# doc\n');
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_create').execute(
+      const result = await tools.get('worktree_upsert').execute(
         'c1', { branch: 'feat/with-odd', odd: doc }, undefined, undefined, makeCtx(root, 'thread-odd-1'),
       );
       const text = resultText(result);
@@ -211,7 +211,7 @@ describe('T19/S26: create accepts an optional validated odd path', { concurrency
     try {
       const missing = path.join(root, 'no-such-odd.md');
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_create').execute(
+      const result = await tools.get('worktree_upsert').execute(
         'c1', { branch: 'feat/bad-odd', odd: missing }, undefined, undefined, makeCtx(root, 'thread-odd-2'),
       );
       assert.equal(result.isError, true, 'missing odd is refused');
@@ -244,7 +244,7 @@ describe('T19/S27+S31: create updates an existing worktree instead of duplicatin
       fs.writeFileSync(doc, '# u\n');
       const { tools } = await loadExtension();
       // Omit issues, supply odd: issues stay, odd is set.
-      const first = await tools.get('worktree_create').execute(
+      const first = await tools.get('worktree_upsert').execute(
         'c1', { branch, odd: doc }, undefined, undefined, makeCtx(root, 'thread-other'),
       );
       assert.equal(first.isError, undefined, `update succeeds, got: ${resultText(first)}`);
@@ -256,7 +256,7 @@ describe('T19/S27+S31: create updates an existing worktree instead of duplicatin
       assert.ok(entry.odd.length > 0, 'supplied odd stored');
       assert.equal(entry.path, realTarget, 'the path is never rewritten');
       // Supply empty issues: removal is the same operation as replacement.
-      const second = await tools.get('worktree_create').execute(
+      const second = await tools.get('worktree_upsert').execute(
         'c2', { branch, issues: [] }, undefined, undefined, makeCtx(root, 'thread-other'),
       );
       assert.equal(second.isError, undefined, `empty update succeeds, got: ${resultText(second)}`);
@@ -391,7 +391,7 @@ describe('T23/S31: the principal is editable but never created or removed', { co
       const doc = path.join(root, 'p-odd.md');
       fs.writeFileSync(doc, '# p\n');
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_create').execute(
+      const result = await tools.get('worktree_upsert').execute(
         'c1', { branch, odd: doc }, undefined, undefined, makeCtx(root, 'thread-p'),
       );
       assert.equal(result.isError, undefined, `principal update succeeds, got: ${resultText(result)}`);

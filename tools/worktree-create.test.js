@@ -1,5 +1,5 @@
 'use strict';
-// P2-S2 tests (test-first): `worktree_create` validation + creation WITHOUT
+// P2-S2 tests (test-first): `worktree_upsert` validation + creation WITHOUT
 // hooks, plus lib/worktree-issues.js issue verification.
 //
 // Loading pattern mirrors tools/gentle-sidebar-toggle.test.js: the
@@ -220,18 +220,18 @@ function makeCtx({ repoRoot, thread = 'thread-1', hasUI = false, confirm = true 
 }
 
 async function callCreate(tools, params, ctx) {
-  const tool = tools.get('worktree_create');
-  assert.ok(tool, 'expected worktree_create to be registered');
+  const tool = tools.get('worktree_upsert');
+  assert.ok(tool, 'expected worktree_upsert to be registered');
   return tool.execute('call-1', params, undefined, undefined, ctx);
 }
 
-describe('worktree_create', { concurrency: false }, () => {
+describe('worktree_upsert', { concurrency: false }, () => {
   test('registers exactly one tool with branch + issues + odd parameters', async () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
-      assert.deepEqual([...tools.keys()], ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp']);
-      const params = tools.get('worktree_create').parameters;
+      assert.deepEqual([...tools.keys()], ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp']);
+      const params = tools.get('worktree_upsert').parameters;
       assert.deepEqual(Object.keys(params.properties).sort(), ['branch', 'issues', 'odd']);
       assert.equal(params.properties.branch.type, 'string');
       assert.equal(params.properties.issues.type, 'array');
@@ -905,7 +905,7 @@ describe('worktree-issues: verifyIssuesAsync (wizard/gitOnly path)', { concurren
   });
 });
 
-describe('worktree_create never unregisters a live checkout (S14)', { concurrency: false }, () => {
+describe('worktree_upsert never unregisters a live checkout (S14)', { concurrency: false }, () => {
   test('a hand-written row carrying the created branch keeps its live checkout registered', async () => {
     const root = makeRepo('dupbranch');
     // A live checkout owned by another thread, registered under the branch

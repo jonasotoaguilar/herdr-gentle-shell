@@ -21,7 +21,7 @@ const {
   safeText,
 } = require('../lib/worktree-card.js');
 
-const TOOLS = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+const TOOLS = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 const WIDTHS = [30, 60, 100];
 
 // Identity theme: adds no ANSI of its own, so any escape left in a line is
@@ -68,7 +68,7 @@ function assertFrame(lines) {
 
 function callFor(tool) {
   switch (tool) {
-    case 'worktree_create': return { branch: 'feat/cards', issues: [12] };
+    case 'worktree_upsert': return { branch: 'feat/cards', issues: [12] };
     case 'worktree_list': return { all: true };
     case 'worktree_close': return { name: 'feat-cards' };
     case 'worktree_session_open': return { worktree: 'feat-cards' };
@@ -79,7 +79,7 @@ function callFor(tool) {
 
 function resultFor(tool) {
   switch (tool) {
-    case 'worktree_create':
+    case 'worktree_upsert':
       return {
         content: [{ type: 'text', text: 'worktree create: /repo/../feat-cards' }],
         details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [12], created: true, warnings: [] },
@@ -157,7 +157,7 @@ describe('renderCall geometry', () => {
   }
 
   test('narrow widths truncate, zero width renders nothing', () => {
-    const card = createWorktreeCardRenderer('worktree_create');
+    const card = createWorktreeCardRenderer('worktree_upsert');
     const narrow = renderLines(
       card.renderCall({ branch: 'feat/a-very-long-branch-name-that-keeps-going', issues: [1] }, THEME, {}),
       10,
@@ -168,7 +168,7 @@ describe('renderCall geometry', () => {
   });
 
   test('ANSI in args is stripped: no raw escape leaks with an identity theme', () => {
-    const card = createWorktreeCardRenderer('worktree_create');
+    const card = createWorktreeCardRenderer('worktree_upsert');
     const lines = renderLines(
       card.renderCall({ branch: '\x1b[31mfeat/evil\x1b[0m', issues: [1] }, THEME, {}),
       60,
@@ -253,8 +253,8 @@ describe('renderResult geometry and states', () => {
   });
 
   test('warnings travel in the expanded body', () => {
-    const card = createWorktreeCardRenderer('worktree_create');
-    const result = resultFor('worktree_create');
+    const card = createWorktreeCardRenderer('worktree_upsert');
+    const result = resultFor('worktree_upsert');
     result.details.warnings = ['pruned 1 stale worktree record(s)'];
     const expanded = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 100);
     assert.ok(expanded.join('\n').includes('pruned 1 stale'), 'warning survives expansion');
@@ -275,7 +275,7 @@ describe('renderResult geometry and states', () => {
 
 describe('semantic summaries', () => {
   test('create names the branch', () => {
-    assert.ok(summarizeWorktreeResult('worktree_create', resultFor('worktree_create')).includes('feat/cards'));
+    assert.ok(summarizeWorktreeResult('worktree_upsert', resultFor('worktree_upsert')).includes('feat/cards'));
   });
 
   test('list reports the checkout count', () => {
@@ -303,7 +303,7 @@ describe('semantic summaries', () => {
   });
 
   test('error results summarize as errors without hiding the message', () => {
-    const summary = summarizeWorktreeResult('worktree_create', {
+    const summary = summarizeWorktreeResult('worktree_upsert', {
       content: [{ type: 'text', text: 'invalid branch name "a..b": bad pattern' }],
       details: { branch: 'a..b' },
       isError: true,
@@ -323,18 +323,18 @@ describe('call/result pair coherence', () => {
   // the call drops to the top rule and the result body closes the frame.
   // Two independent full cards stacked is the defect this pins.
   test('call drops its closing rule once the shared row state carries a result', () => {
-    const card = createWorktreeCardRenderer('worktree_create');
+    const card = createWorktreeCardRenderer('worktree_upsert');
     const state = {};
     const callArgs = { branch: 'feat/cards', issues: [12] };
     const theme = { bold: (s) => s, fg: (_c, s) => s };
     const lone = card.renderCall(callArgs, theme, { state }).render(60);
     assert.ok(lone.some((line) => line.includes('─')), 'awaiting call closes its own frame');
     const loneRows = lone.length;
-    card.renderResult(resultFor('worktree_create'), { expanded: false }, theme, { state });
+    card.renderResult(resultFor('worktree_upsert'), { expanded: false }, theme, { state });
     const paired = card.renderCall(callArgs, theme, { state }).render(60);
     assert.ok(paired.length < loneRows, 'paired call drops to the top rule');
     assert.ok(!paired.some((line) => line.includes('─')), 'paired call leaves the closing rule to the result');
-    const body = card.renderResult(resultFor('worktree_create'), { expanded: false }, theme, { state }).render(60);
+    const body = card.renderResult(resultFor('worktree_upsert'), { expanded: false }, theme, { state }).render(60);
     assert.ok(body.some((line) => line.includes('─')), 'the result closes the shared frame');
   });
 
@@ -389,7 +389,7 @@ describe('extension wiring', () => {
     }
   }
 
-  const WIRED = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+  const WIRED = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 
   test('all five tools expose renderShell self with renderCall/renderResult hooks', async () => {
     const { tools } = await loadWiredExtension();
@@ -408,7 +408,7 @@ describe('extension wiring', () => {
     const { tools } = await loadWiredExtension();
     const theme = { bold: (s) => s, fg: (_c, s) => s };
     const argsFor = {
-      worktree_create: { branch: 'feat/cards', issues: [12] },
+      worktree_upsert: { branch: 'feat/cards', issues: [12] },
       worktree_list: { all: true },
       worktree_close: { name: 'feat-cards' },
       worktree_session_open: { worktree: 'feat-cards' },
@@ -454,7 +454,7 @@ describe('extension wiring', () => {
     });
     try {
       const theme = { bold: (s) => s, fg: (_c, s) => s };
-      const tool = tools.get('worktree_create');
+      const tool = tools.get('worktree_upsert');
       const lines = tool.renderCall({ branch: 'feat/👍👍', issues: [1] }, theme, {}).render(30);
       assert.ok(measured > 0, 'the hook measures through the injected helpers');
       for (const line of lines) {
@@ -496,7 +496,7 @@ describe('outputPad contract', () => {
   const theme = { bold: (s) => s, fg: (_c, s) => s };
 
   test('nonzero outputPad pads both sides and keeps content inside width-2', () => {
-    for (const tool of ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open']) {
+    for (const tool of ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open']) {
       const card = createWorktreeCardRenderer(tool);
       const ctx = { outputPad: 1, state: {} };
       for (const width of [30, 60]) {
@@ -529,7 +529,7 @@ describe('outputPad contract', () => {
 
   for (const width of [0, 1, 2, 3]) {
     test(`width ${width} never exceeds the viewport`, () => {
-      const card = createWorktreeCardRenderer('worktree_create');
+      const card = createWorktreeCardRenderer('worktree_upsert');
       const theme = { bold: (s) => s, fg: (_c, s) => s };
       const sets = [
         card.renderCall({ branch: 'feat/cards' }, theme, {}).render(width),
@@ -563,7 +563,7 @@ describe('outputPad contract', () => {
     if (!real || typeof real.visibleWidth !== 'function' || typeof real.truncateToWidth !== 'function') {
       return;
     }
-    const card = createWorktreeCardRenderer('worktree_create', {
+    const card = createWorktreeCardRenderer('worktree_upsert', {
       visibleWidth: real.visibleWidth,
       truncateToWidth: (text, width, ellipsis) => real.truncateToWidth(text, width, ellipsis),
     });
@@ -615,7 +615,7 @@ describe('lifecycle coherence', () => {
   }
 
   test('call → result → call re-render forms one frame with no stale running line', () => {
-    const card = createWorktreeCardRenderer('worktree_create');
+    const card = createWorktreeCardRenderer('worktree_upsert');
     const state = {};
     const args = { branch: 'feat/cards', issues: [12] };
     const ok = {
@@ -638,7 +638,7 @@ describe('lifecycle coherence', () => {
     assert.strictEqual(closers(pairedCall), 0, 'paired call leaves the closing rule to the result');
     const combined = [...pairedCall, ...body].map(stripAnsi).join('\n');
     assert.strictEqual(closers([...pairedCall, ...body]), 1, 'one frame, one closing rule across the pair');
-    assert.ok(combined.includes('worktree create'), 'header survives on the call side');
+    assert.ok(combined.includes('worktree upsert'), 'header survives on the call side');
     assert.ok(combined.includes('feat/cards'), 'summary survives on the result side');
   });
 });
@@ -702,7 +702,7 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
 
   test('collapsed bodies are ordered short lines per tool', () => {
     const cases = [
-      ['worktree_create', ['created: feat-cards · feat/cards', 'path: /repo/../feat-cards', 'issues: 12']],
+      ['worktree_upsert', ['created: feat-cards · feat/cards', 'path: /repo/../feat-cards', 'issues: 12']],
       ['worktree_list', ['current: feat-cards', '1 checkout']],
       ['worktree_close', ['removed: feat-cards · feat/cards', 'branch kept']],
       ['worktree_session_open', ['opened: feat-cards · abc123', 'path: /repo/../feat-cards']],
@@ -790,7 +790,7 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
   });
 
   test('result rows strip ANSI smuggled through branch names and paths', () => {
-    const card = createWorktreeCardRenderer('worktree_create');
+    const card = createWorktreeCardRenderer('worktree_upsert');
     const evil = {
       content: [{ type: 'text', text: 'worktree create: /repo/x' }],
       details: { path: '/repo/\x1b[31mx', branch: 'feat/\x1b[31mevil', issues: [] },
@@ -809,7 +809,7 @@ describe('S19: bounded compact per tool plus card parity', () => {
 
   function freshResult(tool) {
     switch (tool) {
-      case 'worktree_create':
+      case 'worktree_upsert':
         return {
           content: [{ type: 'text', text: 'created: feat-cards · feat/cards\npath: /repo/../feat-cards\nissues: 12' }],
           details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [12], created: true },
@@ -831,7 +831,7 @@ describe('S19: bounded compact per tool plus card parity', () => {
 
   test('collapsed bodies are the ordered short lines of the new contract', () => {
     const cases = [
-      ['worktree_create', ['created: feat-cards · feat/cards', 'path: /repo/../feat-cards', 'issues: 12']],
+      ['worktree_upsert', ['created: feat-cards · feat/cards', 'path: /repo/../feat-cards', 'issues: 12']],
       ['worktree_close', ['removed: feat-cards · feat/cards', 'branch kept']],
       ['worktree_session_open', ['opened: feat-cards · abc123', 'path: /repo/../feat-cards']],
     ];
@@ -853,7 +853,7 @@ describe('S19: bounded compact per tool plus card parity', () => {
   });
 
   test('already-exists create, deleted branch, and resume keep the same ordered shape', () => {
-    const createCard = createWorktreeCardRenderer('worktree_create');
+    const createCard = createWorktreeCardRenderer('worktree_upsert');
     const owned = {
       content: [{ type: 'text', text: 'created: feat-cards · feat/cards · already exists\npath: /repo/../feat-cards' }],
       details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: false },

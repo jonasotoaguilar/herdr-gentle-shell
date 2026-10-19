@@ -45,7 +45,7 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
-| `worktree_create` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the odd `.md` to associate, must exist, exactly like supplied `issues`) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
+| `worktree_upsert` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the odd `.md` to associate, must exist, exactly like supplied `issues`) | Prompts via `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`); non-interactive sessions proceed without it, and a refusal mutates nothing | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
 | `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | Same `ctx.ui.confirm` gate as create (naming pending changes as `Pending changes: N files, +N/-N` when dirty, nothing when clean); a refusal keeps checkout and entry | `removed: <name> · <branch>` / `branch kept` (`branch deleted` when the branch went with it), plus `session warped to principal` when a live session was warped out first, plus `herdr workspace step skipped (…)` when the Herdr workspace step was skipped (see the close sequence) |
 | `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `opened: <worktree> · <session-id>` / `path: <path>` (`resumed` instead of the path line when an existing session is resumed) |
@@ -244,11 +244,11 @@ to a sibling backup named `<registry>.corrupt-<timestamp>-<random>` in the same
 directory (best-effort, never fatal, never clobbering: created exclusively
 with an unpredictable suffix, retrying a new name a bounded number of
 times, and continuing without a backup when none can be written), whose path is reported in the
-upsert result and in the `worktree_create` details as `registryBackup` (or
+upsert result and in the `worktree_upsert` details as `registryBackup` (or
 `registryBackupError` when no backup could be written) so
 the caller can name it. A valid registry is never backed up.
 
-`worktree_create` never unregisters a live checkout (S14): when a row
+`worktree_upsert` never unregisters a live checkout (S14): when a row
 already carries the branch being created but points at a DIFFERENT live
 checkout, that row is not replaced — it keeps its registration, the new
 checkout is recorded alongside it (`appendWorktree`, which always appends
@@ -405,7 +405,7 @@ anything it does not own:
 
 ## Creation path
 
-`worktree_create` validates in order: mode gate, branch, thread identity,
+`worktree_upsert` validates in order: mode gate, branch, thread identity,
 issues, then repository/path refusals. Branch validation is `git
 check-ref-format --branch` as the authority, after up-front rejection of
 empty names, a leading `-`, whitespace, control characters, and Unicode
@@ -428,7 +428,7 @@ listing paths) resolve against the repository root.
 The target path flattens the branch into one component
 (`feat/foo-bar` → `feat-foo-bar`) at
 `<repo-parent>/<repo-name>-worktrees/<slug>` (`slugifyBranch` /
-`worktreePath` in `lib/worktree-git.js`). `worktree_create` is
+`worktreePath` in `lib/worktree-git.js`). `worktree_upsert` is
 create-or-update on the same branch: when the branch owns no live
 checkout the worktree is created in that sibling layout; when it already
 owns a live checkout and the caller supplied `issues` and/or `odd`, the
@@ -702,73 +702,91 @@ something to reset. The
 `/herdr-gentle:warp <name>` moves the session to the named
 checkout, where `<name>` is the flattened branch slug the listing prints
 (`feat/worktree-warp` → `feat-worktree-warp`), or `principal`. With no
-argument it opens a selector of the project's other live checkouts — the
+argument it opens the redesigned selector as a framed OVERLAY (S1): the
+popup titles itself `Warp`, names the current checkout, offers a
+`create a worktree` row, then a bounded `Choose worktree` list — the
 principal first, then the registry rows, then the live checkouts the
-registry does not own — with the active checkout travelling in the title as
-text, never as an option; a final `Create new worktree…` entry (always
-last, plain action text with no `+` prefix and no separator row above it —
-the host selector has no non-selectable row, so every option is a real pick) first asks for the change
-type through an inline custom single-select — feat, fix, chore, docs,
-style, refactor, perf, test, build, ci, revert with their human labels,
-feat first, eleven data rows only with no selectable Back or Confirm row
-(Tab alone returns quietly to the checkout selector; the host `select`
-remains the fallback where no custom UI exists, there Esc cancels) — then
-for the change name through an inline custom text input in the same dock
-starting truly empty (no example text renders inside the input; only the
-actually typed value ever shows, with the Pi cursor marker after it; Tab
-goes Back to the type field with the kept name and the kept type restores
-the cursor; the host `input` remains the fallback where no custom UI
-exists), deriving
-branch `<type>/<slug>` and checkout `<type>-<slug>` per the branch-pr
-skill's `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`
-before creating through a git-only creation (a plain git checkout plus
-the registry row through the same `worktree_create` validations — never a
+registry does not own — whose last row is `View all` whenever more
+checkouts exist than the panel can show, and a footer with the focused
+checkout's facts. `v` (or the `View all` row) opens the extended list of
+every checkout of the project, with an always-active filter (`T` or `/`
+opens it empty, any other printable opens it with that character, and once
+open every printable — space included — is text), pagination with
+`pgUp`/`pgDn`, and `esc` to step back to the popup. The facts footer is
+honest: branch, the registry's assigned issues and odd documents, the
+change size as LINE counts (`changes +A −D` — the tracked diff plus the
+lines each untracked file adds), the commits ahead/behind `main` and both
+ages (`created <age> · modified <age>`, where "created" is the registry row
+and otherwise the directory's birth time, and "modified" is the greater of
+the last commit and the newest uncommitted file). A measured zero is
+omitted from the line for the change size and for each of `↑`/`↓`
+independently — a clean checkout therefore shows neither, and only the
+non-zero direction of ahead/behind appears — while issues and odd always
+show their count, `0` included (never `none`). `unavailable` is not a zero
+and stays on the line, with its reason where one was supplied, whenever git
+or the registry cannot answer (S9) or an untracked file's lines cannot be
+read (S16), so "nothing to report" and "could not read it" never look
+alike. Every label on this line is English (`branch`, `issues`, `odd`,
+`changes`, `created`, `modified`). Rows are ordered newest activity first by the same "modified" value,
+and a checkout whose activity cannot be read sorts last with its reason
+shown (S12); the ordering comes from the facts handed to the view, never
+from a re-sort here.
+
+The focused checkout is editable with `e` (S13): the SAME single panel
+opens in editing mode with the type and the name FROZEN — it renders the
+checkout's own branch and path verbatim, never a re-derived one — and the
+Issues and Odd panes open with the checkout's currently assigned values
+pre-selected. `tab`, `space`, the filters and the previews behave exactly
+as in the create panel; `enter`/`ctrl+s` persists BOTH assigned fields in
+ONE registry write through the same guarded saver the odd and issues
+viewers use (a created row takes the checkout's real branch and thread, a
+refusal writes nothing), and `esc` cancels with nothing written. The
+selector then reopens — with the fresh values after a save, unchanged
+after a cancel — and a refusing registry shows its error without changing
+what the popup displays. Both panes are handed their SOURCE order
+verbatim (issues from `sort:updated-desc`, odd documents from
+`lib/odd-docs.js`'s modification ordering) and the extension never
+re-sorts them (S15). The Issues pane therefore renders newest first; the
+Odd pane still re-sorts its rows by name inside `lib/warp-create-panel.js`,
+a known gap against S15 tracked as W11 and not fixable from the wiring.
+
+The create completion is ONE panel (S3/S7), never a sequence of steps: the
+change type (its own sub-panel, because this host has no native dropdown —
+`enter` on the Type field opens the list, `←`/`→` cycles it as a
+shortcut), the change name with the derived branch and checkout path shown
+live, and the `Issues` and `Odd` panes side by side with the focused row's
+complete, read-only preview. `tab` switches the Issues and Odd panes;
+`space` toggles the focused row; `pgUp`/`pgDn` and `[`/`]` page; `T` or a
+printable opens the focused pane's filter with the same always-active rule;
+`enter` confirms the focused field and creates on the last one; `ctrl+s`
+creates from any field; `esc` cancels. An empty pane stays visible and
+says so (`no open issues`, `no odd documents in this checkout`), and an
+unavailable `gh` says so in the Issues pane without blocking creation.
+The type plus the typed name derives branch `<type>/<slug>` and checkout
+`<type>-<slug>` per the branch-pr skill's
+`^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`,
+then creates through a git-only creation (a plain git checkout plus the
+registry row through the same `worktree_upsert` validations — never a
 Herdr workspace; the checkout lands beside the PRINCIPAL checkout even
-when the wizard runs inside a linked worktree, while the branch HEAD
-still comes from the current checkout) and warping
-into it — between the name field and the creation run two optional
-multi-select panels sharing one component in the gentle-shell ask/choice
-questionnaire style (thin accent rules, the panel's own prompt, aligned
-`[ ]`/`[x]` data rows with a focused chevron, a `page n/m · k selected`
-count of the current list, dim key footer): first the open issues fetched
-through
-the `gh` CLI asynchronously with a bounded timeout (`gh issue list --state open --json number,title`, searched
-by number or title), then the `.md` files under `odd/tasks/` of the
-current checkout (the branch the worktree will be born from, searched by
-name), both rendered inline through `ctx.ui.custom` with no overlay
-options — the same bottom-anchored region as the type/name prompts — instead of a floating overlay (S48). Each field is a standalone panel
-(its own title, its own rows, its own footer — never shared chips, tabs
-or step counters across fields; the `page n/m` count paginates the
-current list only). Keys per panel: Up/Down move,
-Left/Right turn pages, T opens the dedicated top search field (typing
-filters live, Enter/Esc leaves it keeping the filter without confirming
-or cancelling), Space toggles the focused checkbox, Enter confirms the
-field (empty is valid, so there is no Confirm row and no phantom row
-after the last data item), Tab returns to the previous field with every
-value kept (there is no selectable Back row anywhere, even on an empty
-filter), Esc cancels the whole creation.
-Confirming with nothing selected proceeds with empty values; the
-issues step is skipped silently when `gh` is missing, unauthenticated,
-erroring, timing out, or reports no open issues, and the odd step when there are no
-documents — neither ever blocks the creation. A picker that cannot load
-or render STOPS the creation loudly instead of silently skipping it.
-The wizard is sequential (type, name, issues, odd — one standalone panel
-at a time, never nested, the previous panel disposed first): Tab Back
-re-opens the previous field with the kept type, name,
-issues and odd values, and the creation plus the warp run exactly once
-after the odd field confirms — and after a session preflight, so an
+when the panel runs inside a linked worktree, while the branch HEAD still
+comes from the current checkout) and warps the session into it. The
+creation plus the warp run exactly once, after a session preflight, so an
 allocated-but-missing session file with nothing in memory refuses before
-any branch, checkout or registry write (a usable file, or valid
-in-memory entries the carry path clones, proceeds). The issues and odd
-sources fetch once per wizard invocation (prefetched while the type/name
-panels hold the user; revisits reuse the cache, never refetch), and each
-revisit restores the exact pass left behind — kept selections, filter
-text, page and cursor — through the echoed revisit state. Cancelling at any field
-(Esc) changes nothing, an empty or unrepresentable name refuses with an
-actionable message, and a duplicate branch refuses with the create tool's
-own message; an
+any branch, checkout or registry write (a usable file, or valid in-memory
+entries the carry path clones, proceeds). Empty selections stay OMITTED on
+the create call, so the invalid, duplicate, occupied and principal
+refusals keep their exact shape; an empty or unrepresentable name refuses
+with an actionable message, and a duplicate branch refuses with the create
+tool's own message; an
 explicit `<name>` skips the selector and also resolves a lone unregistered
-checkout. The project's live checkouts are discovered at session startup
+checkout. Deleting a checkout from the selector lives in the extended
+list: `Ctrl+D` on a focused row opens the same explicit confirmation the
+close tool uses (naming the target, its absolute path and, when dirty,
+`Pending changes: N files, +N/-N`), and an explicit Yes then reuses the
+shared close exactly once with `force: true` for exactly that approved row.
+Only a REGISTERED agent worktree is deletable — the principal checkout,
+the current checkout and an unregistered live checkout are safe no-ops,
+and the create row is not a checkout. The project's live checkouts are discovered at session startup
 (S28: every repository worktree through git is registered when missing —
 the creation path is only where new ones are born) and freshly on every
 warp invocation. The agent tool (`worktree_warp`) resolves the same way — a required name-or-path, name first then path, unknown/foreign/ambiguous failing closed with the available checkouts listed — but never awaits `waitForIdle` (a self-deadlock from inside a tool) and never opens a selector. The command keeps the idle-slot wait (`await ctx.waitForIdle()` before forking); the tool switches through `withSession` from the tool context, emitting the S42 card from the fresh session and starting the continuation turn (`triggerTurn: true`, `deliverAs: "followUp"`). Session control
@@ -946,7 +964,7 @@ publishes, and that leaves three cases worth naming:
 
 One worktree per thread. Thread identity resolves from
 `GENTLE_WORKTREE_THREAD` first, else the Pi host session id via
-`ctx.sessionManager.getSessionId()`; without either, `worktree_create`
+`ctx.sessionManager.getSessionId()`; without either, `worktree_upsert`
 fails closed (`cannot resolve thread identity: …`) and never adopts
 another thread's checkout. A thread that already owns a registered,
 still-live worktree gets that checkout back — the same two-line shape with `· already exists` on the first line and `created: false` in details — never a second checkout. Still-live is the

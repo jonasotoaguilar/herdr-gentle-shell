@@ -673,7 +673,7 @@ describe('R4-4: stale cleanup drops exactly the thread-owned row', { concurrency
       try {
         const tools = await loadExtension();
         const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionId: () => 'creator' }, ui: { confirm: async () => true, notify: () => {} } };
-        const result = await tools.get('worktree_create').execute('c1', { branch: 'feat-new-' + arm, issues: [7] }, undefined, undefined, ctx);
+        const result = await tools.get('worktree_upsert').execute('c1', { branch: 'feat-new-' + arm, issues: [7] }, undefined, undefined, ctx);
         const text = resultText(result);
         assert.equal(result.isError, undefined, `[${arm}] expected creation success, got: ${text}`);
         const after = reg.readRegistry(root);
