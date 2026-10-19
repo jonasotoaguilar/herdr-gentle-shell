@@ -1878,14 +1878,11 @@ function removeSidebarExclusion() {
 // config and must match (present for enable, absent for disable) before
 // the mode or exclusion changes. An accepted-but-incomplete run therefore
 // never commits state and never claims success.
-// Resolve the installed plugin root via read-only `herdr plugin list
-// --json` (verified shape: result.plugins[] with plugin_id/plugin_root).
-// The active (renamed) id is queried first; a zero match falls through to
-// one explicit lookup by the retired id so pre-rename installs keep
-// working. Ambiguous roots fail closed on either id — the legacy lookup
-// is never a silent weak fallback. Other failures (spawn, exit, parse)
-// fail closed on the id that produced them.
-function querySidebarPluginRoots(id) {
+// One read-only entry query per plugin id, sharing the exact lookup shape and
+// failure notes with the root resolver below. `enabled` is kept because the
+// enable gate needs it (a missing enabled field means enabled, like the
+// startup check).
+function querySidebarPluginEntries(id) {
   let result;
   try {
     result = spawnSync(
@@ -1894,24 +1891,40 @@ function querySidebarPluginRoots(id) {
       { encoding: "utf8", timeout: 15000, windowsHide: true },
     );
   } catch (error) {
-    return { ok: false, note: `could not resolve the installed plugin root: ${error?.message ?? error}.` };
+    return { ok: false, entries: [], note: `could not resolve the installed plugin root: ${error?.message ?? error}.` };
   }
   if (result.error) {
-    return { ok: false, note: `could not resolve the installed plugin root: ${result.error.message}.` };
+    return { ok: false, entries: [], note: `could not resolve the installed plugin root: ${result.error.message}.` };
   }
   if (result.status !== 0) {
-    return { ok: false, note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
+    return { ok: false, entries: [], note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
   }
   try {
     const doc = JSON.parse(result.stdout || "");
     const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
     if (!Array.isArray(arr)) throw new Error("no plugins array");
-    const hits = arr.filter((p) => p && (p.plugin_id === id || p.id === id));
-    const roots = [...new Set(hits.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
-    return { ok: true, roots };
+    return {
+      ok: true,
+      entries: arr.filter((p) => p && (p.plugin_id === id || p.id === id)),
+      note: null,
+    };
   } catch (error) {
-    return { ok: false, note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
+    return { ok: false, entries: [], note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
   }
+}
+
+// Resolve the installed plugin root via read-only `herdr plugin list
+// --json` (verified shape: result.plugins[] with plugin_id/plugin_root).
+// The active (renamed) id is queried first; a zero match falls through to
+// one explicit lookup by the retired id so pre-rename installs keep
+// working. Ambiguous roots fail closed on either id — the legacy lookup
+// is never a silent weak fallback. Other failures (spawn, exit, parse)
+// fail closed on the id that produced them.
+function querySidebarPluginRoots(id) {
+  const queried = querySidebarPluginEntries(id);
+  if (!queried.ok) return { ok: false, note: queried.note };
+  const roots = [...new Set(queried.entries.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
+  return { ok: true, roots };
 }
 
 function checkSidebarPluginRoot(root) {
@@ -1938,6 +1951,62 @@ function resolveSidebarPluginRoot() {
     return { ok: false, note: `could not resolve the installed plugin root (ambiguous for retired id ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
   }
   return { ok: false, note: `could not resolve the installed plugin root (no match for ${SIDEBAR_PLUGIN_ID} or ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
+}
+
+/* -------------------------------------------------- sidebar enable gate */
+
+// Sidebar enable prerequisite (S3/S4), modelled on the Moshi gate: the Gentle
+// sidebar cannot be enabled without the installed, enabled Herdr plugin,
+// because enabling converges the plugin-owned config.toml rows through the
+// plugin's own bin/configure.js. Fail-closed: missing, disabled, or an
+// inconclusive lookup all refuse BEFORE any write, so nothing changes and the
+// switch stays native; a retry re-emits the same message; DISABLING never
+// consults this (a missing prerequisite may block turning the sidebar ON,
+// never OFF). The install command is the versionless shape the README and
+// install.sh document (install.sh resolves the newest herdr-vX.Y.Z tag when
+// --ref is omitted), and the refusal literal is kept byte-identical with
+// lib/herdr-plugin-check.js (a test pins both).
+const SIDEBAR_PLUGIN_REPO_PATH = "jonasotoaguilar/herdr-gentle-agents/herdr-plugin";
+const SIDEBAR_PLUGIN_INSTALL_COMMAND =
+  `herdr plugin install ${SIDEBAR_PLUGIN_REPO_PATH} && herdr plugin enable ${SIDEBAR_PLUGIN_ID}`;
+
+function sidebarEnableRefusalText(status) {
+  if (status === "disabled") {
+    return `The Gentle sidebar cannot be enabled: the ${SIDEBAR_PLUGIN_ID} Herdr plugin is installed but disabled; enable it with: herdr plugin enable ${SIDEBAR_PLUGIN_ID}`;
+  }
+  if (status === "unknown") {
+    return `The Gentle sidebar cannot be enabled: could not determine whether the ${SIDEBAR_PLUGIN_ID} Herdr plugin is installed; make sure it is installed with: ${SIDEBAR_PLUGIN_INSTALL_COMMAND}`;
+  }
+  return `The Gentle sidebar cannot be enabled: the ${SIDEBAR_PLUGIN_ID} Herdr plugin is not installed; install it with: ${SIDEBAR_PLUGIN_INSTALL_COMMAND}`;
+}
+
+// Verdict for the enable gate. Never throws. The active (renamed) id is read
+// first; only when it has no entry is the retired id read, so a pre-rename
+// install still counts as installed. Any read failure is inconclusive and
+// refuses fail-closed.
+function sidebarPluginPrereq() {
+  let queried;
+  try {
+    queried = querySidebarPluginEntries(SIDEBAR_PLUGIN_ID);
+  } catch {
+    return { ok: false, status: "unknown" };
+  }
+  if (!queried.ok) return { ok: false, status: "unknown" };
+  let entries = queried.entries;
+  if (entries.length === 0) {
+    let legacy;
+    try {
+      legacy = querySidebarPluginEntries(SIDEBAR_LEGACY_PLUGIN_ID);
+    } catch {
+      return { ok: false, status: "unknown" };
+    }
+    if (!legacy.ok) return { ok: false, status: "unknown" };
+    entries = legacy.entries;
+  }
+  if (entries.length === 0) return { ok: false, status: "missing" };
+  const entry = entries[0];
+  if (entry && entry.enabled === false) return { ok: false, status: "disabled" };
+  return { ok: true, status: "ok" };
 }
 
 // Run the installed configure script synchronously (fixed argv, no
@@ -1976,7 +2045,8 @@ async function sidebarEnable(ctx) {
   const notify = ctx?.ui?.notify;
   const reRun = "Retry via /herdr-gentle:customize to converge.";
   // Preflight before any mutation: unreadable settings or a
-  // foreign/misbound record fails closed with nothing touched.
+  // foreign/misbound record fails closed with nothing touched. Read-only, so
+  // the plugin gate below still runs before every write.
   if (fs.existsSync(sidebarNativePath())) {
     if (readSettingsDoc(piSettingsPath()) === null) {
       notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
@@ -1987,6 +2057,14 @@ async function sidebarEnable(ctx) {
       notify?.(`Could not enable: ${binding.note} Re-run after resolving it.`, "error");
       return;
     }
+  }
+  // S3/S4: consult the plugin BEFORE any write. A missing, disabled, or
+  // inconclusive install refuses fail-closed with the install command; nothing
+  // is written and the switch stays native. The disable path never reaches here.
+  const prereq = sidebarPluginPrereq();
+  if (!prereq.ok) {
+    notify?.(sidebarEnableRefusalText(prereq.status), "error");
+    return;
   }
   // Completion proof before any local state changes: resolve the
   // installed root, run its configure synchronously, and re-read the
@@ -2057,16 +2135,42 @@ async function sidebarDisable(ctx) {
     }
   }
   const resolved = resolveSidebarPluginRoot();
-  if (!resolved.ok) {
-    notify?.(`Could not disable: ${resolved.note} ${reRun}`, "error");
-    return;
-  }
   const before = readSidebarConfig();
   if (!before.ok) {
     notify?.(`Could not disable: ${before.note} ${reRun}`, "error");
     return;
   }
   const hadManaged = sidebarRowsManaged(before.text);
+  // S2: a missing prerequisite may block turning the sidebar ON, never OFF.
+  // A DEFINITE no-match (the plugin is absent) no longer aborts the disable:
+  // without a plugin root there is no configure.js to run, so the plugin-owned
+  // managed rows are left as found (the absent plugin is the only thing that
+  // converges them) while the owned exclusion and the mode still converge. An
+  // INCONCLUSIVE lookup (no Herdr CLI, spawn/parse error) keeps the historical
+  // fail-closed refusal: we cannot tell whether rows still need the plugin.
+  if (!resolved.ok) {
+    if (sidebarPluginPrereq().status !== "missing") {
+      notify?.(`Could not disable: ${resolved.note} ${reRun}`, "error");
+      return;
+    }
+    const exclusion = removeSidebarExclusion();
+    if (!exclusion.ok) {
+      notify?.(`Could not disable: ${exclusion.note} Mode unchanged. ${reRun}`, "error");
+      return;
+    }
+    try {
+      writeSidebarMode(false);
+    } catch (error) {
+      if (exclusion.changed) ensureSidebarExclusion();
+      notify?.(`Could not disable: cannot write ${sidebarModePath()}: ${error?.message ?? error}. Mode unchanged. ${reRun}`, "error");
+      return;
+    }
+    notify?.(
+      `Gentle sidebar disabled (native renders again). ${exclusion.note} Managed rows left as found (the plugin that converges them is not resolvable).`,
+      "info",
+    );
+    return;
+  }
   const ran = runSidebarConfigure(resolved.root, "--uninstall", true);
   const after = readSidebarConfig();
   const nowAbsent = after.ok && !sidebarRowsManaged(after.text);
@@ -2364,6 +2468,18 @@ function customizeSidebarRead() {
   }
 }
 
+// Read-only convergence probe for the startup auto-disable message: whether the
+// plugin-owned managed rows are still present in the Herdr config after a
+// disable that could not run configure.js (T1). Never throws.
+function customizeSidebarRowsManaged() {
+  try {
+    const config = readSidebarConfig();
+    return config.ok && sidebarRowsManaged(config.text);
+  } catch {
+    return false;
+  }
+}
+
 async function customizeSidebarApply(value, ctx) {
   if (value !== "gentle" && value !== "native") {
     return { changed: false, needsReload: false, text: `Unknown sidebar value ${JSON.stringify(value)}; nothing was changed.` };
@@ -2628,7 +2744,7 @@ async function customizeMoshiApply(value, ctx) {
 function registerCustomizeProviders() {
   try {
     globalThis[Symbol.for("herdr-gentle.customize.v1")] = {
-      sidebar: { read: customizeSidebarRead, apply: customizeSidebarApply },
+      sidebar: { read: customizeSidebarRead, apply: customizeSidebarApply, rowsManaged: customizeSidebarRowsManaged },
       moshi: { read: customizeMoshiRead, apply: customizeMoshiApply },
     };
   } catch {

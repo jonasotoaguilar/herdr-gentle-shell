@@ -450,3 +450,17 @@ test('S38: disabling never runs the prerequisite check', async () => {
   assert.equal(slot.moshi.read(), 'off');
   await happyGate();
 });
+
+// S4: the sidebar enable refusal and the Moshi refusals are DISTINCT strings
+// with distinct purposes, and each names its own concrete fix. The two gates
+// live in the same extension, so this pins the separation.
+test('S4: the sidebar enable refusal is distinct from the Moshi refusals', () => {
+  const sidebar = require('../lib/herdr-plugin-check.js').sidebarEnableRefusal('missing');
+  const missingCli = require('../lib/moshi-prereq.js').missingCliMessage();
+  assert.notEqual(sidebar, missingCli, 'two distinct strings');
+  assert.ok(sidebar.includes('herdr-gentle-shell'), `names the plugin: ${sidebar}`);
+  assert.ok(!sidebar.includes('moshi'), 'the sidebar refusal never mentions Moshi');
+  assert.ok(!missingCli.includes('herdr-gentle-shell'), 'the Moshi refusal never mentions the sidebar');
+  assert.ok(sidebar.includes('herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin'));
+  assert.ok(missingCli.includes('moshi-hook'), `the Moshi refusal names its CLI: ${missingCli}`);
+});

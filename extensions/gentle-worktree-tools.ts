@@ -7641,19 +7641,46 @@ export default function (pi) {
         // Discovery must never break startup.
       }
     });
-    // S22: compare the installed `herdr-gentle-shell` Herdr plugin
-    // against the version this package ships, once per session.
-    // Best-effort and read-only: an absent Herdr CLI or unreadable
-    // metadata fails silent inside the check itself — never throws,
-    // never blocks the session, never writes config, never repeats
-    // the alert, and never mentions /reload.
-    pi.on("session_start", (event, ctx) => {
+    // S22 + T1: compare the installed `herdr-gentle-shell` Herdr plugin
+    // against the version this package ships, once per session. When the
+    // verdict is `missing` or `disabled` and the sidebar option currently
+    // reads `gentle`, the option is switched OFF through the customize
+    // panel's own writer (mode + the owned marker converge; the plugin-owned
+    // rows are left as found because the absent plugin is the only thing that
+    // converges them) and the user gets one honest message naming the fix. A
+    // write that fails is reported as still ON, never as a false success. The
+    // check itself never throws, never blocks the session, never repeats the
+    // message, and never mentions /reload.
+    pi.on("session_start", async (event, ctx) => {
       try {
         const check = libRequire("herdr-plugin-check.js");
         const notify = ctx && ctx.ui && typeof ctx.ui.notify === "function"
           ? (text) => ctx.ui.notify(text, "info")
           : null;
-        check.checkAndNotifyHerdrPlugin({ env: process.env, notify });
+        // The panel registers its sidebar provider on a shared slot; the
+        // handle below is the same path a user selection uses, so the
+        // sidecar's convergence (marker, mode, rows attempt) is reused rather
+        // than duplicated here.
+        let sidebar = null;
+        try {
+          const slot = globalThis[Symbol.for("herdr-gentle.customize.v1")];
+          const provider = slot && slot.sidebar;
+          if (provider && typeof provider.read === "function" && typeof provider.apply === "function") {
+            sidebar = {
+              read: () => provider.read(),
+              apply: (value) => provider.apply(value, ctx),
+              rowsManaged: () => (typeof provider.rowsManaged === "function" ? provider.rowsManaged() : false),
+            };
+          }
+        } catch {
+          sidebar = null;
+        }
+        if (typeof check.checkAndHandleHerdrPluginStartup === "function") {
+          await check.checkAndHandleHerdrPluginStartup({ env: process.env, notify, sidebar });
+        } else {
+          // An older installed lib copy: keep the alert-only behaviour.
+          check.checkAndNotifyHerdrPlugin({ env: process.env, notify });
+        }
       } catch {
         // The plugin check must never break startup.
       }

@@ -586,20 +586,44 @@ status: sidebar=gentle moshi=off worktree=enabled`.
 At session startup the extension compares the installed Herdr plugin for
 id `herdr-gentle-shell` against the version this package ships in
 `herdr-plugin/herdr-plugin.toml` (read-only `herdr plugin list --json`, the
-same lookup the sidebar wiring uses). When the plugin is missing, installed
-only under the retired id `herdr-gentle-agents`, disabled, or at another
-version, one short alert names the mismatch and the real command — the
-remote install plus enable (`herdr plugin install
-jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref herdr-vX.Y.Z` then
-`herdr plugin enable herdr-gentle-shell`), the update (`herdr plugin update
-herdr-gentle-shell`), or the enable for a disabled install. A locally
-linked plugin counts as installed and is reported as linked, never as
-missing. An absent or erroring Herdr CLI, or unreadable metadata, fails
-silent and harmless: the check never throws, never blocks loading, never
-writes user config, never repeats the alert within the session, and never
-mentions `/reload`. The logic lives in `lib/herdr-plugin-check.js` and is
-pinned in `tools/herdr-plugin-check.test.js` with every external call
-stubbed.
+same lookup the sidebar wiring uses). The check never throws, never blocks
+loading, never repeats its message within the session, and never mentions
+`/reload`; the logic lives in `lib/herdr-plugin-check.js` and is pinned in
+`tools/herdr-plugin-check.test.js` with every external call stubbed.
+
+When the verdict is `missing` or `disabled` **and** the sidebar option still
+reads `gentle`, startup no longer merely alerts: it switches the sidebar
+OFF through the same writer the customize panel uses — the owned Pi
+`settings.json` exclusion is removed and the mode is written native — so a
+missing prerequisite never leaves a dead option on. The plugin-owned managed
+`config.toml` rows are LEFT AS FOUND (the absent plugin is the only thing
+that converges them, and nothing reads them while it is absent) and the one
+message says so, names the fix
+(`herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin --ref
+herdr-vX.Y.Z`, then `herdr plugin enable herdr-gentle-shell` — the enable
+command alone for a disabled install) and states plainly that the sidebar
+was switched off because the plugin is not installed. If that switch-off
+write fails, the message reports the true outcome — still on, and why —
+never a false success. When the plugin is present and usable the check is
+quiet; when it is unusable but the sidebar is already native, the plain
+once-per-session plugin alert still fires and the sidebar option is left
+untouched. The other verdicts
+(installed under the retired id, or at another version) keep the alert shape
+and name the update (`herdr plugin update herdr-gentle-shell`) or enable.
+A locally linked plugin counts as installed and is reported as linked, never
+as missing; an absent or erroring Herdr CLI, or unreadable metadata, fails
+silent and harmless.
+
+Turning the sidebar ON is gated symmetrically. Enabling `Gentle` without the
+installed, enabled plugin is refused BEFORE any write: no mode flag, no
+settings exclusion, no `config.toml` rows, no ownership marker, and the
+switch stays native. Retrying while the plugin is still absent re-emits the
+same message, which names the concrete install command (without an explicit
+`--ref`, so `install.sh` resolves the newest `herdr-vX.Y.Z` release tag).
+Disabling never runs
+this gate — a missing prerequisite may block turning a feature ON, never OFF.
+
+
 
 ### Warp command (`/herdr-gentle:warp`, S23)
 
