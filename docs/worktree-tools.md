@@ -103,8 +103,8 @@ Structured `details` on success:
   when it exists and belongs to this project's worktrees). An unknown name fails
   closed like an unknown path, naming the closest names, and two registry
   rows flattening to one name are ambiguous and fail closed naming both,
-  never picking one. `principal` cannot be closed — it is not a registered
-  agent worktree: a name or path resolving to it is refused before any
+  never picking one. `principal` cannot be closed, even though it has a
+  metadata row: a name or path resolving to it is refused before any
   approval, removal or registry write, with checkout and registry left
   untouched (S32). When the close warped a live session out first,
   `details.warp` carries `{name: 'principal', path, branch, sessionFile}`
@@ -224,8 +224,15 @@ git still records cannot reappear as `unregistered` on the next call, and
 'pi-worktrees.json'` in `lib/worktree-registry.js`, resolved through `git
 rev-parse --git-common-dir`). That is inside `.git`: it never lives in a
 working tree, is never committed, and is shared by every checkout of the
-repository. Entries carry `{branch, path, thread, issues[], odd[],
-createdAt, updatedAt}`.
+repository. Entries carry `{branch, path, thread, issues[], odd[], updatedAt}`
+and an optional creation timestamp `createdAt` or discovery timestamp
+`registeredAt`. Discovery time is not checkout creation time.
+
+Discovery registers the canonical principal once and places its row first.
+Repeated discovery preserves its associations and leaves unchanged registry
+bytes alone. Tool listing shows the current checkout first, then principal
+when distinct; the warp destination list pins principal first. A principal
+metadata row never grants permission to remove that checkout.
 
 Reads tolerate damage: a missing file reads as empty, malformed content is
 reported (`{ok: false, error}`) instead of thrown, and the file is left
@@ -567,9 +574,12 @@ plugin state directory — `GENTLE_STATUS_STATE_DIR`, else
 `$XDG_STATE_HOME/herdr/plugins/herdr-gentle-agents` — exactly like the
 sidebar's. Missing means **enabled**; malformed never enables.
 
-Gating is two-level: at load, the tools register only when the mode reads
-enabled (the panel itself always registers, so the mode can be flipped
-back); at execution, each tool re-reads the mode and fails with
+Gating is two-level: at load, the tools and `/herdr-gentle:warp` register
+only when the mode reads enabled. Customize stays registered so the mode can
+be flipped back. ODD and Issues stay available for reading, but their
+worktree-assignment controls and shortcuts are hidden and disabled while the
+mode is disabled or malformed; their save callbacks re-read the mode before
+writing. At execution, each worktree tool re-reads the mode and fails with
 `worktree tools are disabled; open /herdr-gentle:customize and apply the
 Worktree tools Enabled row to enable them` when disabled. One switch covers
 all five tools — create, list, close, warp, and session open share the same gate
@@ -623,7 +633,7 @@ same message, which names the concrete install command (without an explicit
 Disabling never runs
 this gate — a missing prerequisite may block turning a feature ON, never OFF.
 
-### Performance switches (`/herdr-gentle:customize` — `Performance switches` rows)
+### Performance (`/herdr-gentle:customize` — `Performance` rows)
 
 Three rows, each shipped OFF, each turning on one pi render optimisation for
 long fullscreen sessions. pi itself keeps four individual settings; row 1
@@ -641,13 +651,15 @@ inside. A user who changes nothing keeps today's behaviour exactly.
   it does today.
 - **Incremental search corpus** writes `incrementalSearchCorpus`, one key.
 
-Each row's note states what it improves AND what it worsens, with its
-measured numbers and the `SYNTHETIC` label; the full measured detail sits
-behind the `?` help key, which replaces the list area with the whole note and
-the apparatus it was measured on. The note text is taken from the setting's
-own `description` when the host exposes one, so pi's `/settings` and this
-footer cannot drift apart; a host that exposes none falls back to the pinned
-text in `lib/customize-perf-rows.js`, which carries the same numbers.
+Each row explains what it activates, what improves, and what the user gives
+up in plain language. The panel has no benchmark figures or `?` detail view;
+host setting descriptions cannot replace that concise copy with raw benchmark
+text. The settings behavior is unchanged.
+
+Benchmark evidence remains in `odd/tasks/pi-fullscreen-perf.md` and the
+pi-side `packages/tui/test/perf/RESULTS.md` referenced there. Those measurements
+use synthetic transcripts; they are not a promise for the current session.
+The switches require a Pi build implementing the corresponding settings.
 
 Writes go through `lib/pi-perf-settings.js`: the four keys are merged into
 `<agent-dir>/settings.json` without disturbing any other key, atomically and
@@ -708,7 +720,9 @@ popup titles itself `Warp`, names the current checkout, offers a
 principal first, then the registry rows, then the live checkouts the
 registry does not own — whose last row is `View all` whenever more
 checkouts exist than the panel can show, and a footer with the focused
-checkout's facts. `v` (or the `View all` row) opens the extended list of
+checkout's facts. Rows show checkout names only; the selected branch appears
+in the footer, not in a redundant second column. The selector mounts before
+slow facts complete and refreshes the visible data asynchronously. `v` (or the `View all` row) opens the extended list of
 every checkout of the project, with an always-active filter (`T` or `/`
 opens it empty, any other printable opens it with that character, and once
 open every printable — space included — is text), pagination with
@@ -716,9 +730,12 @@ open every printable — space included — is text), pagination with
 honest: branch, the registry's assigned issues and odd documents, the
 change size as LINE counts (`changes +A −D` — the tracked diff plus the
 lines each untracked file adds), the commits ahead/behind `main` and both
-ages (`created <age> · modified <age>`, where "created" is the registry row
-and otherwise the directory's birth time, and "modified" is the greater of
-the last commit and the newest uncommitted file). A measured zero is
+ages (`created <age> · modified <age>`). Creation uses an actual recorded
+creation timestamp or filesystem birth time, never the time a checkout was
+merely discovered or registered. With a known creation time, an inherited
+older commit is not checkout-local modification; without newer local evidence,
+activity is unavailable rather than dated before creation. Otherwise activity
+uses the newer readable commit or dirty-file timestamp. A measured zero is
 omitted from the line for the change size and for each of `↑`/`↓`
 independently — a clean checkout therefore shows neither, and only the
 non-zero direction of ahead/behind appears — while issues and odd always
@@ -727,10 +744,11 @@ and stays on the line, with its reason where one was supplied, whenever git
 or the registry cannot answer (S9) or an untracked file's lines cannot be
 read (S16), so "nothing to report" and "could not read it" never look
 alike. Every label on this line is English (`branch`, `issues`, `odd`,
-`changes`, `created`, `modified`). Rows are ordered newest activity first by the same "modified" value,
-and a checkout whose activity cannot be read sorts last with its reason
-shown (S12); the ordering comes from the facts handed to the view, never
-from a re-sort here.
+`changes`, `created`, `modified`). The principal checkout comes first among destinations when it is not current.
+Other rows are ordered by readable activity, newest first; unavailable activity
+sorts after known activity. Counts for issues and ODD remain numeric (including
+zero); the footer never lists their IDs or document paths. Detail/edit retains
+the full associations.
 
 The focused checkout is editable with `e` (S13): the SAME single panel
 opens in editing mode with the type and the name FROZEN — it renders the
@@ -746,20 +764,23 @@ after a cancel — and a refusing registry shows its error without changing
 what the popup displays. Both panes are handed their SOURCE order
 verbatim (issues from `sort:updated-desc`, odd documents from
 `lib/odd-docs.js`'s modification ordering) and the extension never
-re-sorts them (S15). The Issues pane therefore renders newest first; the
-Odd pane still re-sorts its rows by name inside `lib/warp-create-panel.js`,
-a known gap against S15 tracked as W11 and not fixable from the wiring.
+re-sorts them (S15). Both datasets render their handed source order unchanged; switching datasets
+preserves each cursor, filter and selection.
 
-The create completion is ONE panel (S3/S7), never a sequence of steps: the
-change type (its own sub-panel, because this host has no native dropdown —
-`enter` on the Type field opens the list, `←`/`→` cycles it as a
-shortcut), the change name with the derived branch and checkout path shown
-live, and the `Issues` and `Odd` panes side by side with the focused row's
-complete, read-only preview. `tab` switches the Issues and Odd panes;
-`space` toggles the focused row; `pgUp`/`pgDn` and `[`/`]` page; `T` or a
-printable opens the focused pane's filter with the same always-active rule;
-`enter` confirms the focused field and creates on the last one; `ctrl+s`
-creates from any field; `esc` cancels. An empty pane stays visible and
+The create completion is ONE panel, never a sequence of steps. A dedicated
+`Search Issues:` / `Search Odd:` row sits under the title. The header stacks
+Type above Name, followed by the derived branch, checkout path and selected
+Issues/ODD counts. The content has two panes: the active dataset's list on
+the left and that row's complete read-only preview on the right. There is no
+third list column or `?` help overlay.
+
+In the list, `←` selects Issues and `→` selects Odd; `tab` also alternates
+datasets. `↑` on the first row returns to Name, then Type; `↓` walks Type →
+Name → list. On Type, `←`/`→` cycle the type and `enter` opens its list.
+Name retains text editing. `space` toggles the focused association;
+`pgUp`/`pgDn` and `[`/`]` page; `T` or a printable opens the active dataset's
+filter. `enter` confirms the focused field and creates on the last one;
+`ctrl+s` creates from any field; `esc` cancels. An empty pane stays visible and
 says so (`no open issues`, `no odd documents in this checkout`), and an
 unavailable `gh` says so in the Issues pane without blocking creation.
 The type plus the typed name derives branch `<type>/<slug>` and checkout

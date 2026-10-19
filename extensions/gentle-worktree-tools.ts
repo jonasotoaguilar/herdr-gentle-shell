@@ -1371,6 +1371,12 @@ async function executeWorktreeList(params, ctx) {
       deadPaths.push(entry.path);
       continue;
     }
+    // S10: the principal's own registry row is printed as the principal
+    // line above, never repeated as an agent row.
+    if (principalPath !== null && st && st.absolute !== null) {
+      const rowIdentity = st.real !== null ? st.real : st.absolute;
+      if (rowIdentity === principalPath) continue;
+    }
     // A FILE is never live even when git names its path, and a symlink
     // spelling of a live checkout IS live: liveness is exists AND
     // is-a-directory AND resolved-identity membership, the one predicate.
@@ -8388,13 +8394,13 @@ export default function (pi) {
   if (typeof pi?.on === "function") {
     pi.on("tool_call", (event, ctx) => handleWorktreeOddEvent(event, ctx, pi));
     pi.on("tool_result", (event, ctx) => handleWorktreeOddEvent(event, ctx, pi, true));
-    // S28: enumerate EVERY repository worktree through git at startup
+    // S28/S10: enumerate EVERY repository worktree through git at startup
     // and register the missing ones — all registered worktrees, not
     // only those under the creation path (that path is only where new
-    // ones are born). Best-effort: never writes user config, never
-    // throws, never blocks the session; the principal checkout is never
-    // registered here (S31: its record is created on demand by an
-    // explicit edit).
+    // ones are born). The canonical principal is registered FIRST and
+    // once by the shared registry helper, with registration provenance
+    // (never a filesystem birth date). Best-effort: never writes user
+    // config, never throws, never blocks the session.
     pi.on("session_start", (event, ctx) => {
       try {
         const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd
@@ -8492,4 +8498,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setIssuesTuiLoader, setWorktreeCardHelpers, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreateIssuePreviewReader, setWarpCreateOddPreviewReader, setWarpCloseRunner, setWarpDirtyAsker, warpCreatePreflight, warpForkSourceUsable };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setIssuesTuiLoader, setWorktreeCardHelpers, setWarpCreateIssuesFetcher, setWarpCreateOddLister, setWarpCreateIssuePreviewReader, setWarpCreateOddPreviewReader, setWarpCloseRunner, setWarpDirtyAsker, setWarpFactsFactory, warpCreatePreflight, warpForkSourceUsable };
