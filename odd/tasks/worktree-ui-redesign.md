@@ -151,6 +151,12 @@ o sacarlo pues esta el focus. Revisa detalles asi igual en issues comando."
 S14. Changes must carry tests and docs alongside the behavior, and must keep the
 existing suite green.
 
+S15. Scrolling the preview with `ctrl+j`/`ctrl+k` must work, and a platform
+variant must exist when the terminal does not deliver those keys. Verbatim:
+"el scroll con tecla ctrl jk no sirve, en gentle shell changes lo tenia, revislao.
+Podria ser por linux igual quizas, podriamos como con ctrl f y ctrl shift f,
+quizas revisarlo y si es eso agregar variante para linux".
+
 ## Tasks
 
 T1 — S1. Reproduce and fix the `/herdr-gentle:issues` failure. Commit: see Log.
@@ -165,6 +171,8 @@ T9 — S9/S12. Listing order and relative created/modified. Commit: see Log.
 T10 — S11. `/herdr-gentle:worktree` command. Commit: see Log.
 T11 — S13. Odd/issues duplicated-data cleanup. Commit: see Log.
 T12 — S14. Full suite and docs.
+T13 — S15. Preview scrolling works with `ctrl+j`/`ctrl+k` plus a platform
+variant. Commit: see Log.
 
 ## Log
 
@@ -208,3 +216,15 @@ En vista odd igual /tmp/gpuAirSF/pi-clipboard-8fe3ca6a-f46d-4b78-8d3e-153392d5ce
 L2. Interpretation decision: S4c's two thresholds ("mas de 6" / "5 o menos") are
 reconciled as one rule — the `view all` row appears if and only if at least one
 worktree is not shown in the list (current = 1 row + list = 5 rows = 6 shown).
+
+L3. Verbatim request (S15):
+
+"""
+otro detalle que me falto mencionar es que el scroll con tecla ctrl jk no sirve, en gentle shell changes lo tenia, revislao. Podria ser por linux igual quizas, podriamos como con ctrl f y ctrl shift f, quizas revisarlo y si es eso agregar variante para linux
+"""
+
+L4. Evidence for S15: with the real `matchesKey` from `@earendil-works/pi-tui`
+1.3.0, `lib/odd-view.js` does scroll for `\n` (ctrl+j), `\x0b` (ctrl+k) and the
+Kitty CSI-u forms (`\x1b[106;5u`, `\x1b[107;5u`). The view is therefore not the
+defect; the delivery of those bytes is terminal-specific, which is why S15 asks
+for a variant rather than a repair.
