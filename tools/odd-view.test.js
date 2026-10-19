@@ -29,6 +29,19 @@ const helpers = {
   isKeyRelease: (key) => key === 'release',
 };
 
+// Optional real host helpers: the extension injects the pi-tui module
+// namespace. CI installs no dependencies, so the byte-level assertions run
+// only when it resolves; every raw-byte assertion works without it.
+let realTui = null;
+try {
+  realTui = require('@earendil-works/pi-tui');
+} catch {
+  realTui = null;
+}
+const cellWidth = (line) => (realTui && typeof realTui.visibleWidth === 'function'
+  ? realTui.visibleWidth(line)
+  : [...strip(line)].length);
+
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text) };
 
 function doc(name) {
@@ -195,8 +208,8 @@ describe('createOddView assignment (S7/S8)', () => {
     const body = strip(view.render(80).join('\n'));
     assert.match(rowFor(body, 'alpha'), /✓/, 'the stored row carries ✓');
     assert.match(rowFor(body, 'beta'), /·/, 'the unassigned row carries ·');
-    assert.match(body, /demo-checkout/, 'the title names the checkout');
-    assert.match(body, /1 assigned/, 'the title carries the assigned count');
+    assert.match(body, /alpha · \d+-\d+\/\d+ · 1 assigned/, 'the status row names the selected document next to its scroll position and the assigned count');
+    assert.ok(!body.includes('demo-checkout'), 'the concise title no longer repeats the checkout name');
     assert.ok(!body.includes('unsaved'), 'nothing is pending, so no unsaved indicator');
     assert.match(body, /space/, 'the footer names the toggle key');
     assert.match(body, /ctrl\+s/, 'the footer names the save key');
@@ -369,19 +382,16 @@ describe('createOddView key consistency (K3)', () => {
     return { view, opened, done: () => settled };
   }
 
-  test('? toggles a key-help overlay and esc closes the overlay, not the view', async () => {
+  test('? is inert: no key-help overlay, and esc closes the view directly', async () => {
     const { view, done } = makeKeyView();
     await tick();
     assert.ok(!strip(view.render(80).join('\n')).includes('Keys'), 'no help before ?');
     view.handleInput('?');
     const body = strip(view.render(80).join('\n'));
-    assert.match(body, /Keys/, 'the help overlay lists the keys');
-    assert.match(body, /o open/, 'the help names the external-open key');
+    assert.ok(!body.includes('Keys'), '? does not open a help overlay');
+    assert.ok(!body.includes('? help'), 'the footer does not hint a help key');
     view.handleInput('escape');
-    assert.equal(done(), 'pending', 'esc with help open closes the overlay, never the view');
-    assert.ok(!strip(view.render(80).join('\n')).includes('Keys'), 'the overlay is gone');
-    view.handleInput('escape');
-    assert.equal(done(), null, 'esc with no overlay still closes the view');
+    assert.equal(done(), null, 'esc with no overlay closes the view');
   });
 
   test('T filters the document list by name, live as you type, and leaving the box keeps the filter', async () => {
@@ -395,10 +405,10 @@ describe('createOddView key consistency (K3)', () => {
     assert.ok(!body.includes('beta') || body.includes('filter'), 'non-matching rows leave the list');
     const rows = body.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line));
     assert.ok(rows.every((line) => !line.includes('beta') && !line.includes('gamma')), 'only the match is listed');
-    assert.match(body, /filter/, 'the filter is visible while typing');
+    assert.match(body, / › al/, 'the filter is visible while typing');
     view.handleInput('enter');
     const kept = strip(view.render(80).join('\n'));
-    assert.match(kept, /filter "al"/, 'leaving the box keeps the filter');
+    assert.match(kept, /› al \(T to edit\)/, 'leaving the box keeps the filter');
     assert.match(kept, /alpha/);
     const keptRows = kept.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line));
     assert.ok(keptRows.every((line) => !line.includes('beta') && !line.includes('gamma')), 'the filter still applies after leaving the box');
@@ -413,7 +423,7 @@ describe('createOddView key consistency (K3)', () => {
     view.handleInput('m');
     view.handleInput('enter');
     const body = strip(view.render(80).join('\n'));
-    assert.match(body, /filter "gam"/, 'the / filter is kept like the T filter');
+    assert.match(body, /› gam \(T to edit\)/, 'the / filter is kept like the T filter');
     assert.match(body, /gamma/);
     assert.ok(!body.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line)).some((line) => line.includes('alpha')), 'alpha is filtered out');
   });
@@ -427,7 +437,7 @@ describe('createOddView key consistency (K3)', () => {
     view.handleInput('z');
     const body = strip(view.render(80).join('\n'));
     assert.match(body, /no matches/, 'the empty filter names itself');
-    assert.match(body, /filter "zzz"/, 'the query stays visible');
+    assert.match(body, /› zzz/, 'the query stays visible');
   });
 
   test('o opens the focused document through the injected opener', async () => {
@@ -470,6 +480,281 @@ describe('createOddView key consistency (K3)', () => {
     const body = strip(view.render(80).join('\n'));
     assert.match(body, /T filter/, 'the footer names the filter key');
     assert.match(body, /o open/, 'the footer names the external-open key');
-    assert.match(body, /\? help/, 'the footer names the help key');
+    assert.ok(!body.includes('? help'), 'the footer no longer hints the removed help key');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// warp-usability T4: S13 (scroll), S14 (no help), S23-S27 (search row,
+// concise title, frame cells, no top-right esc) and S29 (assignment gate).
+// These feed the public render/handleInput/handleMouse surface with the raw
+// terminal bytes and wheel events the host emits.
+// ---------------------------------------------------------------------------
+describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const skipReal = realTui ? false : 'requires @earendil-works/pi-tui';
+  const body200 = longDoc(200);
+
+  function build({ docs = [doc('alpha'), doc('beta')], rows = 20, load, ...rest } = {}) {
+    const paints = [];
+    let settled = 'pending';
+    const view = createOddView({
+      docs,
+      loadDoc: load || (() => ({ ok: true, text: body200 })),
+      helpers: realTui || helpers,
+      theme: plainTheme,
+      rowsAvailable: () => rows,
+      requestRender: () => { paints.push(true); },
+      done: (result) => { settled = result; },
+      ...rest,
+    });
+    return { view, paints, done: () => settled };
+  }
+
+  test('the mouse wheel scrolls the preview without touching the selection', { skip: skipReal }, async () => {
+    const { view } = build();
+    view.render(80);
+    assert.equal(typeof view.handleMouse, 'function', 'the view accepts host mouse events');
+    assert.equal(view.state.scroll, 0);
+    view.handleMouse({ type: 'wheel', button: 'none', x: 60, y: 10, screenX: 60, screenY: 10, width: 80, height: 20, shift: false, alt: false, ctrl: false, wheelDelta: 4 });
+    assert.equal(view.state.scroll, 4, 'a down wheel moves the preview down');
+    assert.equal(view.state.index, 0, 'the wheel never moves the list selection');
+    view.handleMouse({ type: 'wheel', wheelDelta: -2 });
+    assert.equal(view.state.scroll, 2, 'an up wheel moves the preview back up');
+    view.handleMouse({ type: 'wheel', wheelDelta: -50 });
+    assert.equal(view.state.scroll, 0, 'the top bound clamps');
+    view.handleMouse({ type: 'wheel', wheelDelta: 1e6 });
+    const bottom = view.state.scroll;
+    assert.ok(bottom > 0, 'a huge down wheel reaches the bottom page');
+    view.handleMouse({ type: 'wheel', wheelDelta: 1e6 });
+    assert.equal(view.state.scroll, bottom, 'the bottom bound clamps');
+    view.handleMouse({ type: 'wheel', wheelDelta: -1 });
+    assert.equal(view.state.scroll, bottom - 1, 'the preview scrolls back from the bottom');
+  });
+
+  test('SGR wheel bytes scroll the preview through handleInput', () => {
+    const { view } = build();
+    view.render(80);
+    view.handleInput('\x1b[<65;60;10M');
+    assert.equal(view.state.scroll, 1, 'SGR wheel down scrolls the preview');
+    view.handleInput('\x1b[<65;60;10M');
+    assert.equal(view.state.scroll, 2);
+    view.handleInput('\x1b[<64;60;10M');
+    assert.equal(view.state.scroll, 1, 'SGR wheel up scrolls back');
+    assert.equal(view.state.index, 0, 'wheel bytes never move the list selection');
+  });
+
+  test('raw scroll bytes drive the preview with no helpers (never a dead preview)', () => {
+    const { view } = build({ helpers: null });
+    view.render(80);
+    view.handleInput('\n');            // ctrl+j
+    assert.ok(view.state.scroll > 0, 'raw ctrl+j scrolls down');
+    view.handleInput('\x0b');          // ctrl+k
+    assert.equal(view.state.scroll, 0, 'raw ctrl+k scrolls up');
+    view.handleInput('\x1b[6~');       // PageDown
+    const paged = view.state.scroll;
+    assert.ok(paged > 1, 'raw PageDown scrolls a page');
+    view.handleInput('\x1b[5~');       // PageUp
+    assert.equal(view.state.scroll, 0, 'raw PageUp scrolls the page back');
+    view.handleInput('\x1b[F');        // End
+    assert.ok(view.state.scroll > 0, 'raw End reaches the bottom');
+    view.handleInput('\x1b[H');        // Home
+    assert.equal(view.state.scroll, 0, 'raw Home returns to the top');
+    assert.equal(view.state.index, 0, 'scroll keys never move the list selection');
+    view.handleInput('\x1b[B');        // Down moves the list, not the preview
+    assert.equal(view.state.index, 1, 'raw Down moves the selection');
+    assert.equal(view.state.scroll, 0, 'the scroll resets on the new document');
+  });
+
+  test('the real host keyboard bytes scroll the preview and keep the selection separate', { skip: skipReal }, () => {
+    const { view } = build();
+    view.render(80);
+    view.handleInput('\n');     // ctrl+j (a newline, never Enter)
+    assert.ok(view.state.scroll > 0, 'ctrl+j scrolls');
+    view.handleInput('\x1b[6~'); // PageDown
+    const paged = view.state.scroll;
+    assert.ok(paged > 1, 'PageDown scrolls a page');
+    view.handleInput('\x1b[5~'); // PageUp
+    assert.ok(view.state.scroll < paged, 'PageUp scrolls the page back');
+    view.handleInput('\x1b[F');  // End
+    assert.ok(view.state.scroll > 0, 'End reaches the bottom');
+    view.handleInput('\x1b[H');  // Home
+    assert.equal(view.state.scroll, 0, 'Home returns to the top');
+    view.handleInput('\x0b');    // ctrl+k at the top stays at the top
+    assert.equal(view.state.scroll, 0, 'ctrl+k clamps at the top');
+    assert.equal(view.state.index, 0, 'no scroll key moved the list selection');
+    view.handleInput('\x1b[B');
+    assert.equal(view.state.index, 1, 'Down still moves the list selection');
+  });
+
+  test('the scroll keys repaint without writing anything', { skip: skipReal }, async () => {
+    const calls = [];
+    const { view, paints } = build({ saveAssignment: (...args) => { calls.push(args); return { ok: true }; } });
+    view.render(80);
+    const before = paints.length;
+    view.handleInput('\n');
+    assert.ok(paints.length > before, 'scrolling requests a repaint');
+    assert.deepEqual(calls, [], 'scrolling never calls the save callback');
+  });
+
+  test('? no longer opens a key-help overlay and the footer never hints it', () => {
+    const { view } = build();
+    view.handleInput('?');
+    const body = strip(view.render(80).join('\n'));
+    assert.ok(!body.includes('Keys'), 'no help overlay');
+    assert.ok(!body.includes('? help'), 'no ? hint in the footer');
+    assert.ok(!/\?/.test(body), 'no bare ? anywhere in the frame');
+  });
+
+  test('the title carries only the viewer name and the document count', () => {
+    const { view } = build({ docs: [doc('alpha'), doc('beta')], checkoutName: 'demo-checkout' });
+    const lines = strip(view.render(80).join('\n')).split('\n');
+    assert.match(strip(lines[0]), /✎ Odd · 2 documents/);
+    assert.ok(!lines[0].includes('demo-checkout'), 'no checkout/worktree name in the title');
+    assert.ok(!lines[0].includes('alpha'), 'no selected document in the title');
+    assert.ok(!lines[0].includes('esc'), 'no top-right esc in the frame');
+    assert.ok(!strip(lines.join('\n')).includes('demo-checkout'), 'the checkout name is gone from the whole frame');
+  });
+
+  test('the search row sits directly below the title with the query and the visible/total count', () => {
+    const { view } = build();
+    view.handleInput('T');
+    view.handleInput('a');
+    view.handleInput('l');
+    let lines = strip(view.render(80).join('\n')).split('\n');
+    assert.match(strip(lines[1]), /› al█ \(enter\/esc keep\) · 1\/2 documents/, 'typing shows the live query and counts on its own row');
+    assert.ok(!strip(lines[0]).includes('1/2'), 'the count is not buried in the title');
+    view.handleInput('enter');
+    lines = strip(view.render(80).join('\n')).split('\n');
+    assert.match(strip(lines[1]), /› al \(T to edit\) · 1\/2 documents/, 'leaving the box keeps the query and counts visible');
+    view.handleInput('/');
+    lines = strip(view.render(80).join('\n')).split('\n');
+    assert.match(strip(lines[1]), /› al█/, '/ edits the same row');
+  });
+
+  test('the frame fills every cell with aligned corners and no top-right esc at 80x24 and 160x40', () => {
+    for (const [width, rows] of [[80, 24], [160, 40]]) {
+      const { view } = build({ rows });
+      const lines = view.render(width);
+      assert.equal(lines.length, rows, `${width}x${rows}: the view fills the rows`);
+      lines.forEach((line, at) => {
+        assert.equal(cellWidth(line), width, `${width}x${rows} row ${at} is ${width} cells: "${line}"`);
+      });
+      const plain = strip(lines.join('\n')).split('\n');
+      assert.equal(plain[0][0], '╭', 'top-left corner');
+      assert.equal(plain[0][width - 1], '╮', 'top-right corner in the last cell');
+      assert.equal(plain[rows - 1][0], '╰', 'bottom-left corner');
+      assert.equal(plain[rows - 1][width - 1], '╯', 'bottom-right corner in the last cell');
+      for (let at = 1; at < rows - 1; at += 1) {
+        assert.equal(plain[at][0], '│', `row ${at} left border`);
+        assert.equal(plain[at][width - 1], '│', `row ${at} right border in the last cell`);
+      }
+      assert.ok(!plain.slice(0, 4).join('').includes('esc'), 'no top-right esc text');
+    }
+  });
+
+  test('the preview shows the start, a middle page and the end at 80x24 and 160x40 with the query row visible', () => {
+    for (const [width, rows] of [[80, 24], [160, 40]]) {
+      const { view } = build({ rows });
+      let body = strip(view.render(width).join('\n'));
+      assert.equal(view.state.scroll, 0, `${width}x${rows}: the start is the top`);
+      assert.match(body, /line 1\b/, `${width}x${rows}: the first source line is visible at the start`);
+      assert.match(body.split('\n')[1], /› Search \(T\) · 2\/2 documents/, `${width}x${rows}: the query row is visible`);
+      view.handleInput('\x1b[6~');
+      body = strip(view.render(width).join('\n'));
+      assert.ok(view.state.scroll > 0, `${width}x${rows}: PageDown reaches a middle window`);
+      assert.ok(!/\bline 1\b/.test(body), `${width}x${rows}: the start left the middle window`);
+      assert.ok(!/\bline 200\b/.test(body), `${width}x${rows}: the end is not yet visible in the middle window`);
+      view.handleInput('\x1b[F');
+      body = strip(view.render(width).join('\n'));
+      assert.match(body, /\bline 200\b/, `${width}x${rows}: End reaches the last source line`);
+      assert.ok(!/\bline 1\b/.test(body), `${width}x${rows}: the start left the end window`);
+      view.handleInput('\x1b[H');
+      body = strip(view.render(width).join('\n'));
+      assert.equal(view.state.scroll, 0, `${width}x${rows}: Home returns to the top`);
+      assert.match(body, /line 1\b/, `${width}x${rows}: the start is visible again`);
+    }
+  });
+
+  test('the inherited name filter stays case-insensitive and keeps the selection inside the visible list', () => {
+    const { view } = build({ docs: [doc('alpha'), doc('beta'), doc('gamma')] });
+    view.handleInput('T');
+    view.handleInput('G');
+    view.handleInput('a');
+    let body = strip(view.render(80).join('\n'));
+    const filterRows = (text) => text.split('\n').filter((line) => /[▸ ] [✓·✎] (alpha|beta|gamma)( |$)/.test(line));
+    const rows = filterRows(body);
+    assert.equal(rows.length, 1, 'an uppercase query still matches the lowercase name');
+    assert.match(rows[0], /gamma/, 'only the case-insensitive match is listed');
+    assert.match(body.split('\n')[1], /1\/3 documents/, 'the visible/total count follows the filter');
+    assert.match(body.split('\n')[2], /gamma · /, 'the selected document follows the filtered list');
+    view.handleInput('enter');
+    view.handleInput('down');
+    assert.equal(view.state.index, 0, 'one match has nowhere to move');
+    view.handleInput('/');
+    view.handleInput('\x7f');
+    body = strip(view.render(80).join('\n'));
+    assert.match(body.split('\n')[1], /1\/3 documents/, 'Backspace edits the kept query');
+    view.handleInput('\x7f');
+    view.handleInput('enter');
+    body = strip(view.render(80).join('\n'));
+    const cleared = filterRows(body);
+    assert.equal(cleared.length, 3, 'clearing the query restores every document');
+    assert.match(body.split('\n')[1], /3\/3 documents/, 'the counts return with the list');
+  });
+
+  test('S29: assignmentEnabled false hides marks/hints/unsaved and refuses Space and ctrl+s bytes', async () => {
+    const calls = [];
+    const opened = [];
+    const { view } = build({
+      assigned: ['odd/tasks/alpha.md'],
+      assignmentEnabled: false,
+      saveAssignment: (...args) => { calls.push(args); return { ok: true }; },
+      openExternal: (target) => { opened.push(target); return { ok: true }; },
+    });
+    view.render(80);
+    const body = strip(view.render(80).join('\n'));
+    const rows = body.split('\n').filter((line) => /[▸ ] (alpha|beta)( |$)/.test(line));
+    assert.equal(rows.length, 2, 'both documents still list');
+    assert.ok(rows.every((line) => !/[✓✎·] (alpha|beta)/.test(line)), 'no assignment marks on the rows');
+    assert.ok(!body.includes('unsaved'), 'no unsaved indicator');
+    assert.ok(!body.includes('space'), 'no space hint');
+    assert.ok(!body.includes('ctrl+s'), 'no save hint');
+    assert.ok(!/\d+ assigned/.test(body), 'no assigned count');
+    assert.match(body, /ctrl\+j\/k scroll/, 'the scroll hint stays');
+    assert.match(body, /T filter/, 'the filter hint stays');
+    assert.match(body, /o open/, 'the open hint stays');
+    assert.match(body, /esc close/, 'the close hint stays');
+    view.handleInput(' ');
+    view.handleInput('\x13'); // ctrl+s
+    await tick();
+    assert.deepEqual(calls, [], 'Space and ctrl+s bytes never call the save callback');
+    assert.ok(!strip(view.render(80).join('\n')).split('\n').some((line) => /✎ (alpha|beta)/.test(line)), 'no pending mark appears');
+    view.handleInput('\n');
+    assert.ok(view.state.scroll > 0, 'scrolling still works with assignment disabled');
+    view.handleInput('T');
+    view.handleInput('a');
+    view.handleInput('l');
+    view.handleInput('enter');
+    assert.match(strip(view.render(80).join('\n')).split('\n')[1], /1\/2 documents/, 'search still works');
+    view.handleInput('o');
+    await tick();
+    assert.equal(opened.length, 1, 'the external open still works');
+    view.handleInput('escape');
+  });
+
+  test('S29: the default keeps assignment enabled for existing callers', async () => {
+    const calls = [];
+    const { view } = build({ assigned: [], saveAssignment: (...args) => { calls.push(args); return { ok: true }; } });
+    view.render(80);
+    view.handleInput(' ');
+    assert.match(strip(view.render(80).join('\n')), /✎/, 'the pending mark appears by default');
+    view.handleInput('\x13');
+    await tick();
+    assert.equal(calls.length, 1, 'ctrl+s saves by default');
+    assert.deepEqual(calls[0][0], ['odd/tasks/alpha.md']);
+    const body = strip(view.render(80).join('\n'));
+    assert.match(body, /space toggle/, 'the space hint stays by default');
+    assert.match(body, /ctrl\+s/, 'the save hint stays by default');
   });
 });
