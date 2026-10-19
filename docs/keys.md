@@ -4,7 +4,7 @@ One key per action, in every view. The canonical key is defined per ACTION,
 not per view, so a new view inherits it instead of inventing one, and the
 same action answers the same key wherever it exists.
 
-`c` = customize panel · `w` = warp selector · `z` = warp create panel ·
+`c` = customize panel · `w` = warp selector · `z` = warp create/edit panel ·
 `o` = odd viewer · `i` = issues viewer.
 
 | Action | Key | c | w | z | o | i |
@@ -12,25 +12,44 @@ same action answers the same key wherever it exists.
 | Move the selection | `↑`/`↓`, `j`/`k` | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Scroll the right pane | `ctrl+j`/`ctrl+k`, `pgUp`/`pgDn` | – | – | – | ✓ | ✓ |
 | First/last | `home`/`end` | wraps | clamp | clamp | ✓ | ✓ |
-| Next/previous page or pane | `tab` / `→`, `shift+tab` / `←` | ✓ panes | – | ✓ panes | – | ✓ pages |
+| Next/previous page or pane | `tab` / `→`, `shift+tab` / `←` | ✓ panes | – | ←/→ tab | – | ✓ pages |
 | Search/filter | `T` (issues also `/`) | – | ✓ | ✓ | ✓ | ✓ |
 | List pagination | `[` / `]` | – | ✓ | ✓ | – | ✓ |
-| Toggle a row | `space` | – | – | ✓ | ✓ assign | ✓ assign |
+| Toggle a row | `space` | – | – | ✓ | ✓ assign when enabled | ✓ assign when enabled |
 | Confirm/apply | `enter` | ✓ | ✓ | ✓ | – | ✓ sub-panels |
-| Save/persist | `ctrl+s` | – | – | ✓ | ✓ | ✓ |
+| Save/persist | `ctrl+s` | – | – | ✓ | ✓ when enabled | ✓ when enabled |
 | Refresh | `r` | – | ✓ | – | ✓ | ✓ |
 | Edit the focused row | `e` | – | ✓ issues/odd | – | – | – |
 | Open outside Pi | `o` | – | – | – | ✓ editor | ✓ browser |
-| Help | `?` | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Copy number / URL | `y` / `Y` | – | – | – | – | ✓ |
 | Cancel/close | `esc` (aliases `ctrl+c`, `q`) | ✓ | `esc`/`ctrl+c` | `esc`/`ctrl+c` | ✓ | ✓ |
 
 ## Deliberate divergences
 
-- **`tab` switches the create panel's Issues and Odd panes; it no longer
-  means "back one step".** The sequential create wizard is gone — the
-  single panel has no steps — so there is no previous step to return to,
-  and `tab` keeps its "next pane" meaning everywhere.
+- **The create/edit panel is two content panes, never three columns.** The
+  active dataset's list is on the left and that row's read-only preview on
+  the right, in the miniature shape of the issues and odd commands. `tab`
+  (and `←`/`→` inside the list) toggles the dataset — the panel's "next
+  pane" — while each dataset keeps its own cursor, filter and selections;
+  `space` toggles the focused row's association. The header stacks `Type`
+  above `Name` with the derived branch/path and the selected association
+  counts beneath them: `↓` walks Type → Name → list and `↑` on the first
+  list row walks back to Name and then Type, so no field is a dead end. The
+  preview is read-only and is never focused.
+- **The create/edit filter is a dedicated `Search Issues:` / `Search Odd:`
+  row directly under the title**, showing the active dataset's query in the
+  Commands-palette shape instead of burying it in a dataset heading or the
+  footer. It stays opened by the same `T` or by any printable key in a pane,
+  with the same paging and confirm keys; the row adds no shortcut and is not
+  a focus stop.
+- **There is no `?` help overlay.** Each view keeps its shortcuts visible
+  instead of repeating them in a second screen. Performance previews explain
+  behavior, benefit and tradeoff in plain language; benchmark evidence belongs
+  in the documentation, not in the panel.
+- **`tab` switches the create panel's Issues and Odd panes; it never means
+  "back one step".** The sequential create wizard is gone — the single panel
+  has no steps — so there is no previous step to return to, and `tab` keeps
+  its "next pane" meaning everywhere.
 - **The warp popup and the create panel do not close on `q`**, because in
   both a printable key is meaningful: with the popup on screen a printable
   (other than a bound key) opens the extended list's always-active filter,

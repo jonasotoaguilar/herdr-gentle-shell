@@ -11,7 +11,7 @@
 // Text presence alone is never the assertion: width bounds, line budgets
 // and frame structure travel with every case.
 
-const { test, describe } = require('node:test');
+const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
@@ -360,6 +360,18 @@ describe('extension wiring', () => {
   const LIB_DIR = path.resolve(__dirname, '../lib');
   const SRC = path.resolve(__dirname, '../extensions/gentle-worktree-tools.ts');
 
+  // Isolated mode state: registration and render hints read the worktree
+  // mode flag, so the ambient user's flag must never decide these fixtures.
+  // A missing mode file means enabled.
+  let modeDir = null;
+  function wiredModeDir() {
+    if (modeDir === null) modeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-card-mode-'));
+    return modeDir;
+  }
+  after(() => {
+    if (modeDir !== null) fs.rmSync(modeDir, { recursive: true, force: true });
+  });
+
   async function loadWiredExtension() {
     const srcText = fs.readFileSync(SRC, 'utf8');
     const stubbed = srcText
@@ -379,8 +391,10 @@ describe('extension wiring', () => {
       const pi = { registerTool: (tool) => { tools.set(tool.name, tool); }, registerCommand: () => {}, on: () => () => {} };
       // The card hooks resolve lib/ at module evaluation time, so the lib
       // dir must be set before the import — like every other suite's
-      // setEnv-before-loadExtension pattern.
+      // setEnv-before-loadExtension pattern. The mode dir stays set for the
+      // file's lifetime: render hooks read it too.
       process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
+      process.env.GENTLE_STATUS_STATE_DIR = wiredModeDir();
       const mod = await import(pathToFileURL(copy).href);
       mod.default(pi);
       return { mod, tools };

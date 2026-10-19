@@ -3,9 +3,10 @@
 //
 // One component holds everything a creation needs at once: the change
 // type (with its sub-panel — there is no native dropdown in this host),
-// the change name with its live branch/path preview, and the Issues and
-// Odd panes side by side with the focused row's complete, read-only
-// preview. Every test renders headlessly at a fixed size and asserts that
+// the change name with its live branch/path preview, and TWO content
+// panes: the active dataset (Issues or Odd) on the left and that row's
+// complete, read-only preview on the right (S11). Every test renders
+// headlessly at a fixed size and asserts that
 // every line is EXACTLY the requested width, and drives the component with
 // synthetic keys. The issue fetcher, the odd lister and both preview
 // readers are injected; two tests use the real seams (lib/gh-issues.js
@@ -150,12 +151,18 @@ function focusName(view) {
 function focusIssues(view) {
   view.handleInput('\t');
 }
+// Tab only toggles the dataset once a pane owns focus, so the Odd dataset
+// takes two presses from the header fields (S11).
+function focusOdd(view) {
+  view.handleInput('\t');
+  view.handleInput('\t');
+}
 function typeText(view, text) {
   for (const char of text) view.handleInput(char);
 }
 
 describe('the rendered panel', { concurrency: false }, () => {
-  test('shows the type and name fields, the live branch and path preview, both panes and the footers', () => {
+  test('shows the type and name fields, the live branch and path preview, the active dataset and its preview, and the footers', () => {
     const { view } = openPanel({ initialName: 'new-change' });
     const lines = boxLines(view, 100, 24);
     const text = allText(lines);
@@ -163,15 +170,20 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.match(text, /Name: new-change/, 'the typed name');
     findLine(lines, 'preview branch: feat/new-change');
     findLine(lines, `preview path: ${path.join(path.dirname(REPO), `${path.basename(REPO)}-worktrees`, 'feat-new-change')}`);
-    assert.match(text, /Issues/, 'the Issues pane header');
-    assert.match(text, /Odd/, 'the Odd pane header');
+    assert.match(text, /Issues 2/, 'the Issues tab names the dataset and its count');
+    assert.match(text, /Odd 2/, 'the Odd tab stays visible so the toggle is discoverable');
     assert.match(text, /Preview/, 'the preview header');
     assert.match(text, /#12 Crash on empty/, 'the first issue row');
-    assert.match(text, /alpha/, 'the first odd row');
+    assert.ok(!text.includes('[ ] alpha'), 'the inactive Odd list is not a second list column');
     assert.match(text, /body of issue 12/, 'the focused row preview');
+    assert.match(text, /↑\/↓ fields & rows/, 'the footer names the arrow map');
+    assert.match(text, /←\/→ type \/ dataset/, 'the footer names the type and dataset keys');
+    assert.match(text, /Space select/, 'the footer names the selection key');
+    assert.match(text, /Tab dataset/, 'the footer names the dataset toggle');
+    assert.match(text, /Enter confirm/, 'the footer names the confirm key');
     assert.match(text, /Ctrl\+S create/, 'the keys footer names ctrl+s');
     assert.match(text, /Esc cancel/, 'the keys footer names esc');
-    assert.match(text, /\? help/, 'the keys footer names the help key');
+    assert.ok(!text.includes('? help'), 'the footer never advertises a help key');
   });
 
   test('every line is exactly the requested width at several terminal sizes', () => {
@@ -290,7 +302,7 @@ describe('the two panes', { concurrency: false }, () => {
     let lines = boxLines(view, 100, 24);
     assert.match(allText(lines), /#12 Crash on empty/);
     assert.match(allText(lines), /#7 Docs drift/);
-    assert.match(allText(lines), /alpha/);
+    assert.ok(!allText(lines).includes('[ ] alpha'), 'the Issues dataset is the only list rendered');
     assert.match(allText(lines), /body of issue 12/);
     focusIssues(view);
     view.handleInput('down');
@@ -301,6 +313,9 @@ describe('the two panes', { concurrency: false }, () => {
     view.handleInput('up');
     assert.deepEqual(reads.issues, [12, 7], 'a revisited row comes from the cache');
     assert.match(allText(boxLines(view, 100, 24)), /body of issue 12/);
+    view.handleInput('\t'); // Issues dataset -> Odd dataset
+    assert.deepEqual(reads.odd, ['/odd/alpha.md'], 'the Odd row is read when its dataset becomes active');
+    assert.match(allText(boxLines(view, 100, 24)), /specs for alpha/);
   });
 
   test('the odd preview reads the document and renders it with the markdown renderer', () => {
@@ -329,6 +344,7 @@ describe('the two panes', { concurrency: false }, () => {
       readOddPreview: () => ({ ok: true, text: 'PREVIEW' }),
       renderMarkdown: () => ['PREVIEW'],
     });
+    focusOdd(view);
     const order = oddRowOrder(boxLines(view, 100, 24), docs.map((entry) => entry.name));
     assert.equal(order[0], 'zulu', 'the newest document (last alphabetically) is the first row');
     assert.deepEqual(order, ['zulu', 'mike', 'alpha-early'], 'the whole pane keeps the handed order');
@@ -348,6 +364,7 @@ describe('the two panes', { concurrency: false }, () => {
       readOddPreview: () => ({ ok: true, text: 'PREVIEW' }),
       renderMarkdown: () => ['PREVIEW'],
     });
+    focusOdd(view);
     const order = oddRowOrder(boxLines(view, 100, 24), docs.map((entry) => entry.name));
     assert.deepEqual(order, ['zulu', 'mike', 'ghost'], 'every document is listed in the source order');
     assert.equal(order[order.length - 1], 'ghost', 'the unreadable one stays last, never promoted or dropped');
@@ -383,6 +400,7 @@ describe('the two panes', { concurrency: false }, () => {
 
   test('no odd documents says so in the Odd pane', () => {
     const { view } = openPanel({ listOdd: () => ({ ok: true, docs: [] }) });
+    focusOdd(view);
     const text = allText(boxLines(view, 100, 24));
     assert.match(text, /Odd/);
     assert.match(text, /no odd documents in this/);
@@ -396,13 +414,15 @@ describe('the two panes', { concurrency: false }, () => {
     });
     const text = allText(boxLines(view, 100, 24));
     assert.match(text, /gh unavailable/);
-    assert.match(text, /not available/);
+    assert.match(text, /gh CLI is not/);
+    assert.match(text, /available/);
     view.handleInput('\x13');
     assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change', issues: [], odd: [] }]);
   });
 
   test('an odd listing failure says so instead of an empty pane', () => {
     const { view } = openPanel({ listOdd: () => ({ ok: false, error: 'odd/tasks is unreadable' }) });
+    focusOdd(view);
     const text = allText(boxLines(view, 100, 24));
     assert.match(text, /cannot list odd/);
     assert.match(text, /unreadable/);
@@ -437,7 +457,7 @@ describe('the pane filter (S6 rule)', { concurrency: false }, () => {
     let text = allText(boxLines(view, 100, 24));
     assert.match(text, /#12 Crash on empty/);
     assert.ok(!text.includes('#7 Docs drift'), 'the filter narrows the list');
-    assert.match(text, /filter:"crash "▊/);
+    assert.match(text, /Search Issues: crash ▊/);
     view.handleInput('enter');
     assert.equal(view.state.filterOpen, false, 'enter leaves the filter');
     assert.equal(view.state.queries.issues, 'crash ', 'the filter is kept');
@@ -515,15 +535,191 @@ describe('selection and focus', { concurrency: false }, () => {
     assert.deepEqual(finished, [], 'tab never completes or cancels');
   });
 
-  test('left/right move between fields off the type field', () => {
-    const { view } = openPanel();
+  test('left/right in the list switch the dataset without focusing a lateral field or the preview', () => {
+    const { view } = openPanel({ initialName: 'new-change' });
+    view.handleInput('\x1b[B'); // type -> name
+    view.handleInput('\x1b[B'); // name -> issues list
+    view.handleInput('\x1b[B'); // cursor -> #7
+    assert.match(allText(boxLines(view, 100, 24)), /❯ \[ \] #7 Docs drift/);
+    view.handleInput('\x1b[C'); // right -> Odd
+    let text = allText(boxLines(view, 100, 24));
+    assert.match(text, /❯ \[ \] alpha/, 'right selects the Odd dataset and keeps the list focused');
+    assert.ok(!text.includes('❯ Name:'), 'no lateral field or the preview gains focus');
+    assert.ok(!text.includes('❯ Type:'), 'the type field is not focused either');
+    view.handleInput('\x1b[B'); // odd cursor -> beta
+    view.handleInput('\x1b[D'); // left -> Issues
+    text = allText(boxLines(view, 100, 24));
+    assert.match(text, /❯ \[ \] #7 Docs drift/, 'the Issues cursor survives the switch');
+    assert.ok(!text.includes('❯ Name:'));
+    view.handleInput('\x1b[C'); // right -> Odd again
+    assert.match(allText(boxLines(view, 100, 24)), /❯ \[ \] beta/, 'the Odd cursor survives the switch');
+  });
+});
+
+describe('the two content panes (S11, S20)', { concurrency: false }, () => {
+  test('renders the active dataset list beside its own preview, never a third list column', () => {
+    for (const [width, height] of [[80, 24], [80, 40], [160, 24], [160, 40]]) {
+      const { view } = openPanel({ rowsAvailable: () => height });
+      const lines = boxLines(view, width, height);
+      const text = allText(lines);
+      assert.match(text, /Issues 2/, 'the Issues tab names the dataset and its count');
+      assert.match(text, /Odd 2/, 'the Odd tab stays visible so the toggle is discoverable');
+      const focused = findLine(lines, '[ ] #12 Crash on empty');
+      assert.ok(focused.includes('#12 Issue 12'), 'the right side of the same row is that issue preview');
+      assert.ok(
+        focused.indexOf('#12 Issue 12') > focused.indexOf('[ ] #12 Crash on empty'),
+        'the preview sits to the right of the list',
+      );
+      assert.ok(!text.includes('[ ] alpha'), 'the inactive Odd list is not a third column');
+      assert.ok(!text.includes('[ ] beta'));
+      view.handleInput('\t'); // header -> Issues
+      view.handleInput('\t'); // Issues -> Odd dataset
+      const oddLines = boxLines(view, width, height);
+      const oddText = allText(oddLines);
+      const oddFocused = findLine(oddLines, '[ ] alpha');
+      assert.ok(!oddText.includes('[ ] #12 Crash on empty'), 'the Issues list yields the left pane');
+      assert.ok(!oddText.includes('[ ] #7 Docs drift'));
+      assert.ok(oddFocused.includes('# alpha'), 'the right side of the same row is the odd preview');
+      assert.ok(
+        oddFocused.indexOf('# alpha') > oddFocused.indexOf('[ ] alpha'),
+        'the odd preview sits to the right of the odd list',
+      );
+    }
+  });
+
+  test('Tab toggles the dataset preserving each cursor, filter and selection, and Space toggles only that dataset', () => {
+    const { view, finished } = openPanel({ initialName: 'new-change' });
     focusIssues(view);
-    view.handleInput('left');
-    assert.equal(view.state.focus, 'name');
-    view.handleInput('left');
-    assert.equal(view.state.focus, 'type');
-    view.handleInput('down');
-    assert.equal(view.state.focus, 'name', 'down reaches the name field from the type field');
+    view.handleInput('down'); // Issues cursor -> #7
+    view.handleInput(' '); // select #7
+    assert.match(allText(boxLines(view, 100, 24)), /❯ \[x\] #7 Docs drift/);
+    view.handleInput('T');
+    typeText(view, 'docs'); // Issues filter -> #7 only
+    view.handleInput('enter'); // leave the filter, keeping it
+    let text = allText(boxLines(view, 100, 24));
+    assert.match(text, /Search Issues: docs/);
+    assert.ok(!text.includes('#12 Crash on empty'), 'the Issues filter narrows its dataset');
+    view.handleInput('\t'); // toggle to Odd
+    text = allText(boxLines(view, 100, 24));
+    assert.ok(!text.includes('#7 Docs drift'), 'the inactive Issues list is gone');
+    assert.match(text, /\[ \] alpha/);
+    assert.match(text, /\[ \] beta/, 'the Odd dataset keeps its own unfiltered list');
+    view.handleInput('down'); // Odd cursor -> beta
+    view.handleInput(' '); // select beta
+    assert.match(allText(boxLines(view, 100, 24)), /❯ \[x\] beta/);
+    view.handleInput('\t'); // toggles back to Issues
+    text = allText(boxLines(view, 100, 24));
+    assert.match(text, /Search Issues: docs/, 'the Issues filter survived the toggle');
+    assert.match(text, /❯ \[x\] #7 Docs drift/, 'the Issues cursor and selection survived');
+    assert.match(text, /Issues 1\/2/, 'the inactive tab still reports its filtered count');
+    assert.ok(!text.includes('[ ] alpha'), 'the Odd list is not rendered while Issues is active');
+    view.handleInput('\t'); // back to Odd
+    assert.match(allText(boxLines(view, 100, 24)), /❯ \[x\] beta/, 'the Odd cursor and selection survived');
+    view.handleInput('\x13');
+    assert.deepEqual(finished, [{
+      ok: true, type: 'feat', name: 'new-change', issues: [7], odd: ['/odd/beta.md'],
+    }], 'toggling never drops either association set');
+  });
+
+  test('the vertical header and the requested arrow map reach every field, with raw key bytes (S21)', () => {
+    const { view, finished } = openPanel();
+    const lines = () => boxLines(view, 100, 24);
+    const UP = '\x1b[A';
+    const DOWN = '\x1b[B';
+    const RIGHT = '\x1b[C';
+    const LEFT = '\x1b[D';
+    const frame = () => lines().map(stripAnsi);
+    const typeAt = frame().findIndex((line) => line.includes('Type: Feature (feat)'));
+    const nameAt = frame().findIndex((line) => line.includes('Name:'));
+    const branchAt = frame().findIndex((line) => line.includes('preview branch:'));
+    assert.ok(typeAt >= 0 && nameAt > typeAt, 'Type sits ABOVE Name');
+    assert.ok(branchAt > nameAt, 'the preview summary sits beneath the two fields');
+    assert.ok(frame()[typeAt].includes('❯ Type:'), 'the type field starts focused');
+    view.handleInput(DOWN); // Type -> Name
+    assert.ok(findLine(lines(), 'Name:').includes('❯ Name:'), 'down reaches the name field');
+    typeText(view, 'new');
+    assert.match(allText(lines()), /Name: new▊/, 'typing still reaches the name');
+    view.handleInput(DOWN); // Name -> list
+    assert.ok(!findLine(lines(), 'Name:').includes('❯ Name:'), 'down leaves the header for the list');
+    assert.ok(findLine(lines(), '#12 Crash on empty').startsWith('❯ [ ] #12'));
+    view.handleInput(RIGHT); // list -> Odd dataset
+    assert.ok(findLine(lines(), '[ ] alpha').startsWith('❯ [ ] alpha'), 'right selects Odd');
+    view.handleInput(LEFT); // list -> Issues dataset
+    assert.ok(findLine(lines(), '#12 Crash on empty').startsWith('❯ [ ] #12'), 'left selects Issues');
+    view.handleInput(UP); // FIRST row -> Name
+    assert.ok(findLine(lines(), 'Name:').includes('❯ Name:'), 'up from the first row returns to Name');
+    assert.match(allText(lines()), /Name: new▊/, 'the typed name survives the trip');
+    view.handleInput(UP); // -> Type
+    assert.ok(findLine(lines(), 'Type: Feature (feat)').includes('❯ Type:'), 'another up reaches Type');
+    view.handleInput(RIGHT);
+    assert.match(allText(lines()), /Type: Bug fix \(fix\)/, 'right cycles the type');
+    view.handleInput(LEFT);
+    assert.match(allText(lines()), /Type: Feature \(feat\)/, 'left cycles it back');
+    view.handleInput(DOWN); // -> Name
+    view.handleInput(DOWN); // -> list
+    view.handleInput(DOWN); // cursor -> #7
+    assert.match(allText(lines()), /❯ \[ \] #7 Docs drift/);
+    view.handleInput(UP); // cursor -> #12, NOT the header
+    assert.ok(
+      findLine(lines(), '#12 Crash on empty').startsWith('❯ [ ] #12'),
+      'up moves the row before it leaves the list',
+    );
+    view.handleInput(UP); // first row -> Name
+    assert.ok(findLine(lines(), 'Name:').includes('❯ Name:'));
+    view.handleInput('escape');
+    assert.deepEqual(finished, [null], 'esc still cancels after navigating');
+  });
+
+  test('the filter is a dedicated Search row under the title, showing the active dataset and the query (S26)', () => {
+    const { view } = openPanel();
+    const frame = () => boxLines(view, 100, 24).map(stripAnsi);
+    let rows = frame();
+    const titleAt = rows.findIndex((line) => line.includes('New worktree'));
+    const searchAt = rows.findIndex((line) => line.includes('Search Issues:'));
+    const typeAt = rows.findIndex((line) => line.includes('Type: Feature (feat)'));
+    assert.ok(searchAt === titleAt + 1, 'the Search row sits directly under the title');
+    assert.ok(typeAt > searchAt, 'Type stays below the Search row (S21 header is preserved)');
+    assert.ok(!rows.some((line) => line.includes('filter:"')), 'nothing is buried in a dataset heading');
+    focusIssues(view);
+    view.handleInput('T');
+    typeText(view, 'docs');
+    rows = frame();
+    const searchLine = rows.find((line) => line.includes('Search Issues:'));
+    assert.ok(searchLine !== undefined, 'the dedicated row stays visible while filtering');
+    assert.match(searchLine, /Search Issues: docs▊/, 'the query is visible in the dedicated row');
+    view.handleInput('enter'); // keep the filter, leave the input
+    view.handleInput('\t'); // Issues -> Odd dataset
+    rows = frame();
+    assert.ok(rows.some((line) => line.includes('Search Odd:')), 'the row follows the active dataset');
+    assert.ok(!rows.some((line) => line.includes('Search Issues:')), 'only the active dataset is shown');
+    assert.ok(!rows.some((line) => line.includes('filter:"')), 'the query is never a heading suffix');
+    view.handleInput('\t'); // back to Issues
+    assert.match(frame().find((line) => line.includes('Search Issues:')), /Search Issues: docs/, 'the Issues query is kept');
+  });
+
+  test('the header carries the preview summary and the selected counts, and claims no branch/path before a valid name', () => {
+    const { view } = openPanel();
+    let lines = boxLines(view, 100, 24);
+    let text = allText(lines);
+    assert.match(findLine(lines, 'preview branch:').trim(), /✗ name is empty/, 'no branch is claimed yet');
+    assert.match(findLine(lines, 'preview path:').trim(), /✗ not derived/, 'no path is claimed yet');
+    assert.match(text, /selected: 0 issues · 0 odd/, 'the header starts with empty selected counts');
+    focusName(view);
+    typeText(view, 'new-change');
+    lines = boxLines(view, 100, 24);
+    text = allText(lines);
+    assert.match(text, /preview branch: feat\/new-change/);
+    findLine(lines, 'preview path:');
+    view.handleInput('\t'); // name -> Issues
+    view.handleInput(' '); // select #12
+    text = allText(boxLines(view, 100, 24));
+    assert.match(text, /selected: 1 issue · 0 odd/, 'the header count follows the Issues selection');
+    view.handleInput('\t'); // -> Odd dataset
+    view.handleInput(' '); // select alpha
+    text = allText(boxLines(view, 100, 24));
+    assert.match(text, /selected: 1 issue · 1 odd/, 'the header count follows the Odd selection');
+    view.handleInput(' '); // deselect alpha
+    assert.match(allText(boxLines(view, 100, 24)), /selected: 1 issue · 0 odd/, 'deselecting updates the header');
   });
 });
 
@@ -595,19 +791,18 @@ describe('completion', { concurrency: false }, () => {
     assert.deepEqual(finished, [null]);
   });
 
-  test('? opens the key help and any other key closes it', () => {
+  test('there is no key-help overlay: the footer already carries every shortcut', () => {
     const { view } = openPanel();
+    const before = allText(boxLines(view, 100, 24));
     view.handleInput('?');
-    assert.equal(view.state.help, true);
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Ctrl\+S {2,}create/);
-    assert.match(text, /\? {2,}close this help/);
-    assert.match(text, /Tab {2,}switch between the Issues and Odd panes/);
-    assert.match(text, /Space {2,}select the focused row/);
-    assert.ok(!text.includes('#12 Crash on empty'), 'the help replaces the panes');
-    view.handleInput('x');
-    assert.equal(view.state.help, false);
-    assert.match(allText(boxLines(view, 100, 24)), /#12 Crash on empty/);
+    const after = allText(boxLines(view, 100, 24));
+    assert.equal(after, before, '? is not a binding any more: no overlay opens on the Type field');
+    assert.ok(!after.includes('close this help'), 'no key list replaces the panes');
+    assert.ok(!after.includes('? help'), 'the footer never advertises a help key');
+    assert.match(after, /#12 Crash on empty/, 'the pane keeps its rows');
+    assert.match(after, /Enter confirm/);
+    assert.match(after, /Ctrl\+S create/);
+    assert.match(after, /Esc cancel/);
   });
 });
 
@@ -727,7 +922,9 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.ok(!text.includes('feat/feat-odd-viewer'), 'the derived branch is never shown');
     assert.ok(!text.includes('feat-feat-odd-viewer'), 'the derived path is never shown');
     assert.match(text, /\[x\] #12 Crash on empty/, 'the assigned issue is pre-selected');
-    assert.match(text, /\[x\] alpha/, 'the assigned odd document is pre-selected');
+    assert.ok(!text.includes('[x] alpha'), 'the Odd list is not a second list column');
+    focusOdd(view);
+    assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/, 'the assigned odd document is pre-selected');
     assert.deepEqual(view.state.selectedIssues, [12]);
     assert.deepEqual(view.state.selectedOdd, ['/odd/alpha.md']);
   });
@@ -784,8 +981,13 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.equal(view.state.name, 'old-change', 'typing and backspace never touch the frozen name');
     assert.match(allText(boxLines(view, 100, 24)), /Name: old-change/);
     assert.ok(!allText(boxLines(view, 100, 24)).includes('old-changexyz'));
-    // ← and → still move focus, but never cycle the frozen type.
+    // S21: ←/→ are inert on the frozen Name; `↑` is the way back to Type,
+    // where ←/→ still never cycle the frozen type.
     view.handleInput('left');
+    assert.equal(view.state.focus, 'name', 'left on the frozen name moves no field');
+    view.handleInput('right');
+    assert.equal(view.state.focus, 'name', 'right on the frozen name moves no field');
+    view.handleInput('up');
     assert.equal(view.state.focus, 'type');
     view.handleInput('right');
     assert.equal(view.state.typeIndex, 0, 'right on the frozen type never cycles');
@@ -802,6 +1004,19 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     view.handleInput('enter');
     assert.equal(view.state.typePanelOpen, false);
     assert.ok(!allText(boxLines(view, 100, 24)).includes('Choose the change type'));
+  });
+
+  test('the edit header carries the checkout summary and the preselected association counts', () => {
+    const { view } = editPanel({ initialIssues: [12], initialOdd: ['/odd/alpha.md'] });
+    let lines = boxLines(view, 100, 24);
+    let text = allText(lines);
+    findLine(lines, 'checkout branch: feat/old-change');
+    findLine(lines, 'checkout path: /checkouts/feat-old-change');
+    assert.match(text, /selected: 1 issue · 1 odd/, 'the header shows the preselected counts');
+    view.handleInput('\t'); // -> Issues dataset
+    view.handleInput(' '); // deselect #12
+    text = allText(boxLines(view, 100, 24));
+    assert.match(text, /selected: 0 issues · 1 odd/, 'the header count follows the edit toggle');
   });
 
   test('an empty pre-selection stays empty and saving carries the empty sets', () => {
@@ -842,6 +1057,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
   test('a stored odd assignment named by its relative path still marks its document', () => {
     const { view, finished } = editPanel({ initialOdd: ['odd/tasks/alpha.md'] });
     assert.deepEqual(view.state.selectedOdd, ['odd/tasks/alpha.md'], 'the caller value is preserved');
+    focusOdd(view);
     assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/);
     view.handleInput('\x13');
     assert.deepEqual(finished[0].odd, ['odd/tasks/alpha.md']);
@@ -873,7 +1089,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.deepEqual(finished, [null]);
   });
 
-  test('the filter, paging and the help still work while editing', () => {
+  test('the filter and paging still work while editing, and there is no key-help overlay', () => {
     const { view } = editPanel({ pageSize: 1 });
     view.handleInput('\t'); // issues
     view.handleInput('T');
@@ -885,22 +1101,32 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.equal(view.state.queries.issues, 'crash', 'the filter is kept');
     view.handleInput(']');
     assert.match(allText(boxLines(view, 100, 24)), /page \d\/\d/);
+    // Move back to the header so `?` is pressed on a focused field, not in
+    // a pane where a printable key opens the filter.
+    view.handleInput('up');
+    view.handleInput('up');
+    const before = allText(boxLines(view, 100, 24));
     view.handleInput('?');
-    assert.equal(view.state.help, true);
-    assert.match(allText(boxLines(view, 100, 24)), /frozen/i);
-    view.handleInput('x');
-    assert.equal(view.state.help, false);
+    const after = allText(boxLines(view, 100, 24));
+    assert.equal(after, before, '? opens no overlay in editing mode either');
+    assert.ok(after.includes('[frozen]'), 'the frozen fields stay visible');
+    assert.ok(!after.includes('? help'), 'the footer never advertises a help key');
+    assert.match(after, /Enter save/);
+    assert.match(after, /Ctrl\+S save/);
+    assert.match(after, /Esc cancel/);
   });
 
   test('create mode keeps its editable fields, its sub-panel and its payload without a mode marker', () => {
     const { view, finished } = openPanel({ initialName: 'new-change' });
-    view.handleInput('down');
+    view.handleInput('down'); // type -> name
     typeText(view, '-2');
     assert.equal(view.state.name, 'new-change-2', 'the create name is still editable');
-    view.handleInput('right'); // -> issues
+    view.handleInput('down'); // name -> issues
     assert.equal(view.state.focus, 'issues');
-    view.handleInput('left'); // -> name
-    view.handleInput('left'); // -> type
+    view.handleInput('up'); // first row -> name
+    assert.equal(view.state.focus, 'name');
+    view.handleInput('up'); // -> type
+    assert.equal(view.state.focus, 'type');
     view.handleInput('right');
     assert.equal(view.state.typeIndex, 1, '←/→ still cycle the type while creating');
     view.handleInput('\x13');

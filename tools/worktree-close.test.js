@@ -246,7 +246,8 @@ function scratchModeEnv() {
 
 const savedEnv = { ...process.env };
 function setEnv(vars) {
-  for (const [key, value] of Object.entries(vars)) {
+  const env = 'GENTLE_STATUS_STATE_DIR' in vars ? vars : { ...vars, ...scratchModeEnv() };
+  for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
@@ -259,12 +260,41 @@ function restoreEnv() {
 }
 
 // Import the stubbed extension copy with the lib override in place.
+// gentle-shell answers YOLO questions on this channel with an adapter whose
+// read() is 'ON' only while the live session holds the grant (upstream
+// lib/yolo-session-policy.ts). Tests install a stand-in responder; `null`
+// stands for a host that never answers, and must fail closed.
+let yoloResponder = null;
+const yoloChannels = [];
+
+function answerYolo(display) {
+  yoloResponder = (channel, payload) => {
+    if (channel !== 'gentle:yolo:host-ui') return;
+    if (display === null) return;
+    if (display === 'malformed') { payload.respond({ notAnAdapter: true }); return; }
+    payload.respond({ read: async () => display, dispose: () => {} });
+  };
+}
+
+function resetYolo() {
+  yoloResponder = null;
+  yoloChannels.length = 0;
+}
+
 async function loadExtension() {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-close-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
   const tools = new Map();
-  const pi = { registerTool: (tool) => { tools.set(tool.name, tool); } };
+  const pi = {
+    registerTool: (tool) => { tools.set(tool.name, tool); },
+    events: {
+      emit: (channel, payload) => {
+        yoloChannels.push(channel);
+        if (typeof yoloResponder === 'function') yoloResponder(channel, payload);
+      },
+    },
+  };
   const factory = (await import(pathToFileURL(copy).href)).default;
   factory(pi);
   return tools;
@@ -835,6 +865,78 @@ describe('worktree_close', { concurrency: false }, () => {
       assert.match(message, /kept|keep|surviv/i, `message says the branch survives: ${message}`);
     } finally {
       restoreEnv();
+    }
+  });
+
+  test('YOLO active waives the approval of a clean checkout', async () => {
+    const root = makeRepo('close-yolo-clean');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/yolo-clean', { thread: 'thread-1', issues: [35] });
+      answerYolo('ON');
+      const tools = await loadExtension();
+      // This ctx refuses every dialog: reaching the removal proves the
+      // dialog was never consulted, not merely that it was answered.
+      const { ctx, confirms } = makeCtx({ repoRoot: root, hasUI: true, confirm: false });
+      const result = await callClose(tools, { branch: 'feat/yolo-clean' }, ctx);
+      assert.equal(result.isError, undefined, resultText(result));
+      assert.equal(confirms.length, 0, 'YOLO waives the clean close confirmation');
+      assert.ok(yoloChannels.includes('gentle:yolo:host-ui'), 'the host YOLO channel was consulted');
+      assert.deepEqual(resultText(result).split('\n'), [
+        'removed: feat-yolo-clean · feat/yolo-clean',
+        'branch kept',
+      ]);
+      assert.ok(!fs.existsSync(target), 'the checkout is gone');
+    } finally {
+      restoreEnv();
+      resetYolo();
+    }
+  });
+
+  test('YOLO never waives the approval of a checkout with pending changes', async () => {
+    const root = makeRepo('close-yolo-dirty');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/yolo-dirty', { dirty: true });
+      answerYolo('ON');
+      const tools = await loadExtension();
+      const { ctx, confirms } = makeCtx({ repoRoot: root, hasUI: true, confirm: true });
+      const result = await callClose(tools, { branch: 'feat/yolo-dirty' }, ctx);
+      assert.equal(confirms.length, 1, 'a dirty checkout is confirmed even under YOLO');
+      assert.match(confirms[0][1], /Pending changes: 2 files, \+2\/-0/, 'the dirty summary still travels');
+      assert.equal(result.isError, true, 'the approval smuggles no force in');
+      assert.ok(fs.existsSync(target), 'the checkout is kept');
+    } finally {
+      restoreEnv();
+      resetYolo();
+    }
+  });
+
+  test('an off, unavailable, malformed or missing YOLO answer still asks', async () => {
+    for (const display of ['OFF', 'UNAVAILABLE', 'malformed', null]) {
+      const root = makeRepo(`close-yolo-${String(display)}`);
+      const herdr = makeHerdrStub();
+      const gh = makeGhStub([35]);
+      const modeEnv = scratchModeEnv();
+      setEnv(stdEnv({ herdr, gh, modeEnv }));
+      try {
+        addRegistered(root, 'feat/yolo-ask', { thread: 'thread-1', issues: [35] });
+        answerYolo(display);
+        const tools = await loadExtension();
+        const { ctx, confirms } = makeCtx({ repoRoot: root, hasUI: true, confirm: true });
+        const result = await callClose(tools, { branch: 'feat/yolo-ask' }, ctx);
+        assert.equal(confirms.length, 1, `YOLO answer ${String(display)} still asks`);
+        assert.equal(result.isError, undefined, resultText(result));
+      } finally {
+        restoreEnv();
+        resetYolo();
+      }
     }
   });
 

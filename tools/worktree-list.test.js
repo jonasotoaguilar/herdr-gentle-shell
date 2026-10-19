@@ -1023,3 +1023,222 @@ describe('worktree_list shows the CURRENT git branch over a stale row (S39)', { 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// S10: the canonical principal is registered ONCE idempotently, first in the
+// metadata registry, and the list never repeats it as an agent row. The
+// registration records WHEN the row was registered, never claiming that as
+// the checkout's filesystem birth date.
+// ---------------------------------------------------------------------------
+describe('S10: canonical principal registration', { concurrency: false }, () => {
+  function registryLib() { return require('../lib/worktree-registry.js'); }
+  function gitLib() { return require('../lib/worktree-git.js'); }
+
+  function discover(root) {
+    const live = gitLib().listWorktrees(root);
+    const principalId = fs.realpathSync(root);
+    return { live, principalId, result: registryLib().registerMissingWorktrees(root, live, principalId) };
+  }
+
+  test('registers the principal first, once, with registration provenance instead of a birth date', () => {
+    const root = makeRepo('s10-principal-first');
+    setEnv(stdEnv());
+    try {
+      const { result } = discover(root);
+      assert.equal(result.ok, true, `discovery failed: ${result.error}`);
+      assert.deepEqual(result.registered.map((entry) => entry.path), [fs.realpathSync(root)]);
+      const rows = registryLib().readRegistry(root).worktrees;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].path, fs.realpathSync(root), 'the principal is the first metadata row');
+      assert.equal(rows[0].branch, git(root, ['branch', '--show-current']));
+      assert.equal(typeof rows[0].registeredAt, 'string', 'the registration time is recorded');
+      assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'createdAt'), false, 'registration time never claims the birth date');
+      assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'registeredAt'), true);
+      assert.deepEqual(rows[0].issues, []);
+      assert.deepEqual(rows[0].odd, []);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a repeated discovery rewrites nothing and registers no duplicate', () => {
+    const root = makeRepo('s10-idempotent');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/agent', { thread: 'thread-1', issues: [35] });
+      const first = discover(root);
+      assert.equal(first.result.ok, true);
+      assert.deepEqual(first.result.registered.map((entry) => entry.path), [fs.realpathSync(root)], 'only the unowned principal is newly registered');
+      const file = registryLib().registryPath(root);
+      const bytesAfterFirst = fs.readFileSync(file, 'utf8');
+      const rowsAfterFirst = registryLib().readRegistry(root).worktrees;
+      assert.equal(rowsAfterFirst.length, 2, 'the agent row is preserved and the principal added');
+      assert.equal(rowsAfterFirst[0].path, fs.realpathSync(root), 'the principal stays first');
+
+      const second = discover(root);
+      assert.equal(second.result.ok, true);
+      assert.deepEqual(second.result.registered, [], 'nothing new is registered');
+      assert.equal(fs.readFileSync(file, 'utf8'), bytesAfterFirst, 'the registry bytes are untouched');
+      assert.deepEqual(registryLib().readRegistry(root).worktrees, rowsAfterFirst, 'no row is rewritten');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('preserves a principal association row rather than duplicating it', () => {
+    const root = makeRepo('s10-preserve-association');
+    setEnv(stdEnv());
+    try {
+      const principalPath = fs.realpathSync(root);
+      const branch = git(root, ['branch', '--show-current']);
+      const existing = registryLib().upsertWorktree(root, {
+        branch, path: principalPath, thread: 'thread-1', issues: [12], odd: ['odd/tasks/x.md'],
+      });
+      assert.equal(existing.ok, true);
+      const { result } = discover(root);
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.registered, [], 'the already-registered principal is not re-registered');
+      const rows = registryLib().readRegistry(root).worktrees;
+      assert.equal(rows.length, 1, 'no duplicate principal row');
+      assert.deepEqual(rows[0].issues, [12], 'the stored associations survive');
+      assert.deepEqual(rows[0].odd, ['odd/tasks/x.md']);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('worktree_list shows the principal once, never as a duplicate agent row', async () => {
+    const root = makeRepo('s10-list-once');
+    setEnv(stdEnv());
+    try {
+      const agent = addRegistered(root, 'feat/agent', { thread: 'thread-1', issues: [35] });
+      const { result: discovered } = discover(root);
+      assert.equal(discovered.ok, true);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-s10', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const branch = git(root, ['branch', '--show-current']);
+      assert.equal(
+        text,
+        `worktree list: principal ${branch} principal\n`
+        + `worktree list: feat-agent feat/agent thread=thread-1 issues=35`,
+        'the registered principal is the principal line, not a second agent row',
+      );
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [fs.realpathSync(root), agent]);
+      const principalLines = text.split('\n').filter((line) => line.includes(' principal'));
+      assert.equal(principalLines.length, 1, 'exactly one principal line');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S10/S32: the independent verifier's principal probes, kept as durable
+// regression tests — idempotent registration and byte stability, principal
+// first regardless of listing order or symlink spelling, and the public
+// `worktree_close` refusal that protects the principal.
+// ---------------------------------------------------------------------------
+describe('S10/S32: principal registration and close protection (verifier probes)', { concurrency: false }, () => {
+  function registryLib() { return require('../lib/worktree-registry.js'); }
+  function gitLib() { return require('../lib/worktree-git.js'); }
+
+  test('a second registerMissingWorktrees call registers nothing and rewrites no byte', () => {
+    const root = makeRepo('s10-idempotent-bytes');
+    setEnv(stdEnv());
+    try {
+      const principalId = fs.realpathSync(root);
+      const live = gitLib().listWorktrees(root);
+      const first = registryLib().registerMissingWorktrees(root, live, principalId);
+      assert.equal(first.ok, true, `discovery failed: ${first.error}`);
+      assert.deepEqual(first.registered.map((entry) => entry.path), [principalId], 'the principal is registered once');
+      const file = registryLib().registryPath(root);
+      const before = fs.readFileSync(file);
+
+      const second = registryLib().registerMissingWorktrees(root, live, principalId);
+      assert.equal(second.ok, true, `second discovery failed: ${second.error}`);
+      assert.deepEqual(second.registered, [], 'the second discovery registers nothing');
+      assert.deepEqual(fs.readFileSync(file), before, 'the registry bytes are byte-identical');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a principal spelled LAST in the live list still lands at index 0 as thread=principal without a createdAt', () => {
+    const root = makeRepo('s10-principal-last');
+    setEnv(stdEnv());
+    try {
+      const agent = addRegistered(root, 'feat/agent', { thread: 'thread-1', issues: [35] });
+      const principalId = fs.realpathSync(root);
+      const branch = git(root, ['branch', '--show-current']);
+      // Hand the discovery the principal AFTER the agent, so "first" can only
+      // come from the registration rule, never from the listing order.
+      const live = [
+        { path: agent, branch: 'feat/agent', head: null, detached: false, bare: false },
+        { path: principalId, branch, head: null, detached: false, bare: false },
+      ];
+
+      const result = registryLib().registerMissingWorktrees(root, live, principalId);
+      assert.equal(result.ok, true, `discovery failed: ${result.error}`);
+      const rows = registryLib().readRegistry(root).worktrees;
+      assert.equal(rows[0].path, principalId, 'the principal is the first metadata row');
+      assert.equal(rows[0].branch, branch);
+      assert.equal(rows[0].thread, 'principal', 'the principal row is labelled');
+      assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'createdAt'), false, 'no fabricated creation date');
+      assert.equal(typeof rows[0].registeredAt, 'string', 'the registration time is recorded instead');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a symlink-spelled principal yields exactly one row', () => {
+    const root = makeRepo('s10-principal-symlink');
+    setEnv(stdEnv());
+    try {
+      const principalId = fs.realpathSync(root);
+      const branch = git(root, ['branch', '--show-current']);
+      const link = path.join(path.dirname(root), `${path.basename(root)}-principal-alias`);
+      track(link);
+      fs.symlinkSync(principalId, link);
+      const live = [
+        { path: link, branch, head: null, detached: false, bare: false },
+        { path: principalId, branch, head: null, detached: false, bare: false },
+      ];
+
+      const first = registryLib().registerMissingWorktrees(root, live, principalId);
+      assert.equal(first.ok, true, `discovery failed: ${first.error}`);
+      assert.equal(registryLib().readRegistry(root).worktrees.length, 1, 'one row, never one per spelling');
+
+      const second = registryLib().registerMissingWorktrees(root, live, principalId);
+      assert.equal(second.ok, true);
+      assert.deepEqual(second.registered, [], 'the alias spelling is owned by identity, not by string');
+      assert.equal(registryLib().readRegistry(root).worktrees.length, 1, 'still exactly one row');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('public worktree_close refuses the principal and leaves the registry bytes unchanged', async () => {
+    const root = makeRepo('s10-close-principal');
+    setEnv(stdEnv());
+    try {
+      const registered = registryLib().registerMissingWorktrees(
+        root, gitLib().listWorktrees(root), fs.realpathSync(root),
+      );
+      assert.equal(registered.ok, true, `discovery failed: ${registered.error}`);
+      const file = registryLib().registryPath(root);
+      const before = fs.readFileSync(file);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_close').execute('call-s10-close', { name: 'principal' }, undefined, undefined, makeCtx(root));
+      assert.equal(result.isError, true, `the principal is never closable: ${resultText(result)}`);
+      assert.match(resultText(result), /principal/);
+      assert.deepEqual(fs.readFileSync(file), before, 'a refused close writes nothing');
+    } finally {
+      restoreEnv();
+    }
+  });
+});

@@ -21,7 +21,7 @@
 // .mjs with the package import lines stubbed and import()s it with a fake
 // `pi` object.
 
-const { test, describe, after } = require('node:test');
+const { test, describe, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -95,6 +95,14 @@ const savedEnv = { ...process.env };
 after(() => {
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
+});
+
+// Every test in this file runs against an isolated worktree-mode directory: a
+// missing mode file means enabled, so the assignment tests never read the
+// user's real flag (which may be disabled) and never write to it. The S29
+// block overrides this per test with its own isolated directory.
+before(() => {
+  process.env.GENTLE_STATUS_STATE_DIR = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-mode-iso-')));
 });
 
 async function loadExtension() {
@@ -310,8 +318,10 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
     const body = clean(component.render(100).join('\n'));
     assert.match(rowFor(body, 'alpha'), /✓/, 'the stored row carries ✓');
     assert.match(rowFor(body, 'beta'), /·/, 'the unassigned row carries ·');
-    assert.match(body, new RegExp(path.basename(root)), 'the title names the checkout');
-    assert.match(body, /1 assigned/, 'the title carries the assigned count');
+    const titleLine = body.split('\n')[0];
+    assert.match(titleLine, /✎ Odd · 2 documents/, 'the title carries only the viewer name and the count');
+    assert.ok(!titleLine.includes(path.basename(root)), 'the concise title does not repeat the checkout name');
+    assert.match(body, /(alpha|beta) · \d+-\d+\/\d+ · 1 assigned/, 'the status row names the selected document and the assigned count');
     assert.deepEqual(notes, [], 'reading writes nothing and notifies nothing');
   });
 
@@ -570,5 +580,139 @@ describe('/herdr-gentle:odd external open (K3)', () => {
       if (prevEditor === undefined) delete process.env.EDITOR;
       else process.env.EDITOR = prevEditor;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S29: `/herdr-gentle:odd` stays registered while the worktree mode is off or
+// malformed; only the worktree association is disabled. This file covers the
+// extension seam (mode read plus refuse-to-save); the view-side hiding of the
+// association marks, hints and keys is asserted in tools/odd-view.test.js.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
+  const modeLib = require('../lib/worktree-mode.js');
+  const S29_REFUSAL = 'worktree tools are disabled; enable them in /herdr-gentle:customize to assign issues or odd documents';
+
+  function modeDir() {
+    return track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-mode-')));
+  }
+
+  async function withModeDir(run, { malformed = false } = {}) {
+    const dir = modeDir();
+    const saved = { ...process.env };
+    process.env.GENTLE_STATUS_STATE_DIR = dir;
+    try {
+      if (malformed) fs.writeFileSync(modeLib.modePath(process.env), 'not json\n');
+      // Await inside the try so the isolated dir is still in effect while the
+      // async handler runs; restoring first let the mode read ambient state.
+      return await run();
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      for (const [key, value] of Object.entries(saved)) process.env[key] = value;
+    }
+  }
+
+  function oddRegistryFile(root) {
+    const common = git(root, ['rev-parse', '--git-common-dir']).trim();
+    const dir = path.isAbsolute(common) ? common : path.resolve(root, common);
+    return path.join(dir, 'pi-worktrees.json');
+  }
+
+  function captureOddView() {
+    const lib = require('../lib/odd-view.js');
+    const original = lib.createOddView;
+    const holder = { options: null };
+    lib.createOddView = (options) => {
+      holder.options = options;
+      return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+    };
+    return { holder, restore: () => { lib.createOddView = original; } };
+  }
+
+  async function openOdd(root) {
+    const { commands, mod } = await loadExtension();
+    mod.setOddTuiLoader(async () => stubTui);
+    const { ctx } = makeCtx({
+      cwd: root,
+      customImpl: async (factory) => {
+        factory(makeHostTui(20).tui, {}, {}, () => {});
+        return null;
+      },
+    });
+    await commands.get('herdr-gentle:odd').handler('', ctx);
+    return commands;
+  }
+
+  test('mode off: the command exists, assignmentEnabled is false and the callback refuses with zero writes', async () => {
+    await withModeDir(async () => {
+      modeLib.writeMode(false, process.env);
+      const capture = captureOddView();
+      try {
+        const root = makeRepo({ docs: { 'a.md': '# a\n\n## Specs\nS1. one rule\n' }, tag: 'odd-s29-off' });
+        const file = oddRegistryFile(root);
+        const commands = await openOdd(root);
+        assert.ok(commands.has('herdr-gentle:odd'), 'the command stays registered while the mode is off');
+        assert.ok(capture.holder.options, 'the view was constructed');
+        assert.equal(capture.holder.options.assignmentEnabled, false, 'the disabled mode travels to the view');
+        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
+        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the refusal is honest and exact');
+        assert.equal(fs.existsSync(file), false, 'a refused save writes no registry');
+      } finally {
+        capture.restore();
+      }
+    });
+  });
+
+  test('malformed mode: assignmentEnabled is false and the callback refuses', async () => {
+    await withModeDir(async () => {
+      const capture = captureOddView();
+      try {
+        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-malformed' });
+        const file = oddRegistryFile(root);
+        const commands = await openOdd(root);
+        assert.ok(commands.has('herdr-gentle:odd'));
+        assert.equal(capture.holder.options.assignmentEnabled, false, 'a malformed mode never enables assignment');
+        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
+        assert.deepEqual(result, { ok: false, error: S29_REFUSAL });
+        assert.equal(fs.existsSync(file), false, 'a malformed mode never writes');
+      } finally {
+        capture.restore();
+      }
+    }, { malformed: true });
+  });
+
+  test('mode switched off after opening: the callback re-reads and refuses', async () => {
+    await withModeDir(async () => {
+      modeLib.writeMode(true, process.env);
+      const capture = captureOddView();
+      try {
+        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-switched' });
+        const file = oddRegistryFile(root);
+        await openOdd(root);
+        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode opened normally');
+        modeLib.writeMode(false, process.env);
+        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
+        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the callback re-reads the mode, not the snapshot');
+        assert.equal(fs.existsSync(file), false, 'the registry is untouched');
+      } finally {
+        capture.restore();
+      }
+    });
+  });
+
+  test('enabled mode: assignmentEnabled stays true (regression)', async () => {
+    await withModeDir(async () => {
+      // Explicit, not inferred: a missing file also means enabled, but the
+      // test names the enabled state it exercises.
+      modeLib.writeMode(true, process.env);
+      const capture = captureOddView();
+      try {
+        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-on' });
+        await openOdd(root);
+        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode passes true');
+      } finally {
+        capture.restore();
+      }
+    });
   });
 });

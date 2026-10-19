@@ -442,7 +442,7 @@ assert.ok(worktreeStubbed !== worktreeSrcText, 'expected both worktree package i
 
 const LIB_DIR = path.resolve(__dirname, '../lib');
 const RESET_ROW = 'Reset every option to its default';
-const CATEGORY_TITLES = ['Agentes sidebar', 'Moshi notifications', 'Worktree tools', 'Performance switches', 'Reset'];
+const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Worktree tools', 'Performance', 'Reset'];
 
 async function loadWorktreeExtension() {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-reset-')));

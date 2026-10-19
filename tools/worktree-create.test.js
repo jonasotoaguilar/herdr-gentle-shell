@@ -177,7 +177,8 @@ function scratchModeEnv() {
 
 const savedEnv = { ...process.env };
 function setEnv(vars) {
-  for (const [key, value] of Object.entries(vars)) {
+  const env = 'GENTLE_STATUS_STATE_DIR' in vars ? vars : { ...vars, ...scratchModeEnv() };
+  for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
@@ -587,8 +588,8 @@ describe('worktree_upsert', { concurrency: false }, () => {
     }
   });
 
-  test('an approved confirmation names branch, path, and issues', async () => {
-    const root = makeRepo('approve');
+  test('creation never asks for approval: a refusing confirm cannot block it', async () => {
+    const root = makeRepo('no-ask');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35, 7]);
     const modeEnv = scratchModeEnv();
@@ -602,54 +603,24 @@ describe('worktree_upsert', { concurrency: false }, () => {
     });
     try {
       const tools = await loadExtension();
+      // A ctx whose confirm refuses ANY dialog. Creating a worktree is not
+      // destructive: the checkout and the registry row are both new and no
+      // existing data is touched, so the dialog must never be consulted.
       const { ctx, confirms } = makeCtx({
-        repoRoot: root, thread: 'thread-1', hasUI: true, confirm: true,
+        repoRoot: root, thread: 'thread-1', hasUI: true, confirm: false,
       });
-      const target = expectedTarget(root, 'feat-approved');
-      const result = await callCreate(tools, { branch: 'feat/approved', issues: [35, 7] }, ctx);
-      assert.equal(result.isError, undefined);
+      const target = expectedTarget(root, 'feat-no-ask');
+      const result = await callCreate(tools, { branch: 'feat/no-ask', issues: [35, 7] }, ctx);
+      assert.equal(result.isError, undefined, resultText(result));
+      assert.equal(confirms.length, 0, 'ctx.ui.confirm is never called for a create');
       assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-approved · feat/approved',
+        'created: feat-no-ask · feat/no-ask',
         `path: ${target}`,
         'issues: 35,7',
       ]);
-      assert.equal(confirms.length, 1);
-      const [title, message] = confirms[0];
-      assert.ok(title.includes('feat/approved'), `title names the branch: ${title}`);
-      assert.ok(message.includes(target), `message names the path: ${message}`);
-      assert.ok(message.includes('35') && message.includes('7'), `message names issues: ${message}`);
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a declined approval creates nothing and writes no registry entry', async () => {
-    const root = makeRepo('decline');
-    const herdr = makeHerdrStub();
-    const gh = makeGhStub([35]);
-    const modeEnv = scratchModeEnv();
-    setEnv({
-      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
-      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
-      HERDR_BIN_PATH: herdr.bin,
-      HERDR_SHIM_LOG: herdr.log,
-      GH_BIN_PATH: gh,
-      GENTLE_WORKTREE_THREAD: undefined,
-    });
-    try {
-      const tools = await loadExtension();
-      const { ctx } = makeCtx({
-        repoRoot: root, thread: 'thread-1', hasUI: true, confirm: false,
-      });
-      const before = listWorktreePaths(root);
-      const result = await callCreate(tools, { branch: 'feat/declined', issues: [35] }, ctx);
-      assert.equal(result.isError, true);
-      assert.match(resultText(result), /cancel/i);
-      assert.deepEqual(listWorktreePaths(root), before, 'no checkout is created');
-      assert.deepEqual(shimArgv(herdr.log), [], 'herdr is never invoked');
-      assert.ok(!fs.existsSync(expectedTarget(root, 'feat-declined')), 'no target dir');
+      assert.ok(fs.existsSync(target), 'the checkout exists');
       const registryLib = require('../lib/worktree-registry.js');
-      assert.deepEqual(registryLib.readRegistry(root).worktrees, [], 'no registry entry');
+      assert.equal(registryLib.readRegistry(root).worktrees.length, 1, 'the registry row is written');
     } finally {
       restoreEnv();
     }

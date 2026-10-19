@@ -624,7 +624,7 @@ the producer keeps beating for the new one — the consumer then rejects those
 fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
 report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
-  preserved on disk, never auto-loaded next to ours). The `Agentes sidebar`
+  preserved on disk, never auto-loaded next to ours). The `Herdr Sidebar`
   rows of `/herdr-gentle:customize` (`Gentle (this extension)` / `Native
   Herdr`, plus read-only `customize status`) select the publisher: native
   gates
@@ -650,9 +650,13 @@ checkout's repository GitHub issues (issue list plus the selected issue
 with its comments), implemented in `lib/gh-issues.js` (the only place
 that runs `gh`), `lib/issues-view.js` (the pure view) and the command in
 `extensions/gentle-worktree-tools.ts` next to `/herdr-gentle:odd` —
-listing, search, paging, filtering, scrolling and help never write; only
+listing, search, paging, filtering and scrolling never write; only
 the assignment save, the label edit, the comment and the close/reopen
-write. The sidebar and Moshi actions stay inline in
+write. The viewers retain shortcut legends rather than a duplicate `?`
+help overlay. ODD and Issues remain registered with Worktree tools disabled,
+but their association toggles and saves are unavailable; save callbacks also
+re-read the mode before writing. Warp itself is registered only with
+Worktree tools enabled. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
@@ -874,8 +878,10 @@ registration plus per-execution re-read — and the panel itself always
 stays registered so the mode can be flipped back. Registration changes
 reload the extension runtime automatically when the registration must
 change (`enabled !== toolsRegistered`, i.e. enabling while the runtime
-loaded disabled or vice versa), which `customize status` reports. Create and close
-prompt for approval when the host offers dialog UI; list is read-only
+loaded disabled or vice versa), which `customize status` reports. Create never
+prompts — a create touches no existing data; close prompts when the host
+offers dialog UI, waived under gentle-shell YOLO only for a checkout proven
+clean; list is read-only
 and never prompts.
 
 ### Known limitations (stated, not solved here)

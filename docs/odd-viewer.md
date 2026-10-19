@@ -12,8 +12,14 @@ worktree registry. `Esc` closes.
 The list reads exactly `odd/tasks/*.md` (non-recursive, `*.md` only) in the
 checkout the session runs in — inside a worktree that is that worktree,
 never the principal — sorted by name. Each row shows the document NAME
-only: the `.md` extension stripped, no path. The overlay title names the
-checkout and carries the document count and the assigned count.
+only: the `.md` extension stripped, no path. The title stays short, just
+the viewer and the document count (`✎ Odd · 4 documents`).
+
+Below the title a dedicated search row carries the live filter query and
+the `visible/total documents` count, and the status row under it names the
+selected document, its scroll position and the assigned count
+(`alpha · 1-14/200 · 2 assigned`). The header never repeats the
+checkout/branch identity or the selected document.
 
 Every row carries its assignment mark:
 
@@ -23,7 +29,13 @@ Every row carries its assignment mark:
 | `·` | not assigned |
 | `✎` | changed but unsaved — differs from the stored assignment |
 
-The title adds `· unsaved` while any toggle is pending.
+When the Worktree tools mode is off or malformed, the worktree association
+is unavailable: `space` and `ctrl+s` do nothing (no pending mark, no
+callback), the rows drop their marks, and the status row drops the
+assigned/unsaved facts. Reading, filtering, the external open and
+scrolling keep working; the footer keeps the keys that still apply.
+
+An `unsaved` marker appears on the status row while any toggle is pending.
 
 The right pane reads the selected document from disk and renders its full
 content as styled markdown rather than raw text: `##`/`###` section
@@ -41,10 +53,13 @@ document.
 | `↑` / `↓`, `j` / `k` | Move the selection |
 | `ctrl+j` / PageDown | Scroll the document down one page |
 | `ctrl+k` / PageUp | Scroll the document up one page |
+| mouse wheel | Scroll the document up/down, never the selection |
 | `home` / `end` | Jump to the top / bottom of the document |
+| `T` (or `/`) | Filter the list by document name; the query and counts stay on the search row |
 | `r` | Re-list `odd/tasks/*.md` |
 | `space` | Toggle the focused row's assignment (local only, writes nothing) |
 | `ctrl+s` | Save the pending set as this checkout's `odd[]` and apply it |
+| `o` | Open the focused document in `$VISUAL`/`$EDITOR` |
 | `esc` (`ctrl+c`, `q`) | Close; discards unsaved toggles, writes nothing |
 
 The document pane scrolls independently of the list.

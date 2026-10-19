@@ -399,6 +399,80 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.equal(Date.parse(commitWins.lastActivity.value), newer);
   });
 
+  test('an inherited pre-checkout commit is never presented as a local modification', async () => {
+    const root = makeRepo('activity-inherited');
+    const wt = addWorktree(root, 'feat/activity-inherited');
+    // The row's createdAt is AFTER the newest commit, so the commit is
+    // inherited from before this checkout existed: presenting it as
+    // `modified` would place the modification before the checkout.
+    writeRow(root, { ...fullRow(wt, 'feat/activity-inherited'), createdAt: '2999-01-01T00:00:00.000Z' });
+    const got = await makeFacts(root).facts(wt);
+    assert.equal(got.lastActivity.available, false, JSON.stringify(got.lastActivity));
+    assert.equal(got.lastActivity.value, null);
+    assert.equal(got.lastActivity.source, null);
+    assert.equal(got.lastActivity.reason, 'no activity since the checkout was created', 'the reason is the exact honest line');
+    assert.match(got.lastActivity.reason, /checkout|activity/i, 'the reason names the missing local activity');
+    assert.ok(!/20\d\d/.test(got.lastActivity.reason || ''), 'no fake pre-creation date');
+  });
+
+  test('a commit made after the checkout creation is the honest modification', async () => {
+    const root = makeRepo('activity-later-commit');
+    const wt = addWorktree(root, 'feat/activity-later-commit');
+    writeRow(root, fullRow(wt, 'feat/activity-later-commit'));
+    commit(wt, 'local work', { 'local.txt': 'l\n' });
+    const commitMs = Number(git(wt, ['log', '-1', '--format=%ct'])) * 1000;
+    const got = await makeFacts(root).facts(wt);
+    assert.deepEqual(got.lastActivity, {
+      available: true, value: new Date(commitMs).toISOString(), reason: null, source: 'commit',
+    });
+  });
+
+  test('a dirty file newer than an inherited commit is the local modification', async () => {
+    const root = makeRepo('activity-inherited-dirty');
+    const wt = addWorktree(root, 'feat/activity-inherited-dirty');
+    writeRow(root, { ...fullRow(wt, 'feat/activity-inherited-dirty'), createdAt: '2999-01-01T00:00:00.000Z' });
+    fs.writeFileSync(path.join(wt, 'dirty.txt'), 'd\n');
+    const dirtyMs = Math.trunc(fs.statSync(path.join(wt, 'dirty.txt')).mtimeMs);
+    const got = await makeFacts(root).facts(wt);
+    assert.equal(got.lastActivity.available, true, JSON.stringify(got.lastActivity));
+    assert.equal(got.lastActivity.source, 'dirty');
+    assert.equal(Date.parse(got.lastActivity.value), dirtyMs);
+  });
+
+  test('an unknown checkout creation leaves the commit as the honest activity', async () => {
+    const root = makeRepo('activity-unknown-created');
+    const wt = addWorktree(root, 'feat/activity-unknown-created');
+    // No registry row and no readable birth time: the commit cannot be
+    // classified as inherited, so it stays the (honestly uncertain) activity.
+    const got = await makeFacts(root, { fs: birthFs(0) }).facts(wt);
+    assert.equal(got.createdAt.available, false, JSON.stringify(got.createdAt));
+    assert.equal(got.lastActivity.available, true, JSON.stringify(got.lastActivity));
+    assert.equal(got.lastActivity.source, 'commit');
+  });
+
+  test('a discovery row without createdAt never turns its registration time into a creation date', async () => {
+    const root = makeRepo('discovery-registered');
+    const wt = addWorktree(root, 'feat/discovery-registered');
+    // A discovery row (S10) records only WHEN it was registered. With no
+    // readable birth time the creation stays unknown, and the registration
+    // time must never answer in its place.
+    writeRow(root, {
+      branch: 'feat/discovery-registered',
+      path: wt,
+      thread: 'discovery',
+      issues: [],
+      odd: [],
+      registeredAt: '2024-01-02T03:04:05.000Z',
+      updatedAt: '2024-01-02T03:04:05.000Z',
+    });
+    const got = await makeFacts(root, { fs: birthFs(0) }).facts(wt);
+    assert.equal(got.createdAt.available, false, JSON.stringify(got.createdAt));
+    assert.equal(got.createdAt.value, null);
+    assert.equal(got.createdAt.source, null, 'a registration time is not a creation source');
+    assert.equal(got.lastActivity.available, true, JSON.stringify(got.lastActivity));
+    assert.equal(got.lastActivity.source, 'commit', 'with no creation bound the commit stays the honest activity');
+  });
+
   test('lastActivity is unavailable with a reason when neither the commit nor the changes can be read', async () => {
     const root = makeRepo('activity-none');
     const broken = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-activity-none-')));

@@ -346,14 +346,14 @@ describe('customize panel', { concurrency: false }, () => {
       for (const copy of [
         'Customize · Herdr Gentle Shell',
         'CATEGORIES',
-        'Agentes sidebar',
+        'Herdr Sidebar',
         'Moshi notifications',
         'Worktree tools',
         'Gentle (this extension)',
         'publishes agent state and SessionChanges from Gentle',
         'Native Herdr',
         'Preview · Gentle (this extension)',
-        '←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close',
+        '←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close',
       ]) {
         assert.ok(seen().includes(copy), `panel copy missing: ${copy}`);
       }
@@ -461,7 +461,7 @@ describe('customize panel', { concurrency: false }, () => {
         customImpl: async (factory) => {
           const { component, done } = openComponent(factory, host);
           const first = component.render(100).join('\n');
-          assert.ok(first.includes('▸ Agentes sidebar'), 'cursor starts on the first category');
+          assert.ok(first.includes('▸ Herdr Sidebar'), 'cursor starts on the first category');
           component.handleInput('down');
           assert.equal(host.paints.length, 1, 'a selection change requests a repaint');
           const second = component.render(100).join('\n');
@@ -958,7 +958,7 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
         const rightOf = (line) => line.slice(1 + column + 1, -1);
         assert.ok(leftOf(body[1]).includes('CATEGORIES'), 'left heading sits left of the divider');
         assert.ok(rightOf(body[1]).includes('· 1/2'), 'right heading names the category with i/N right of the divider');
-        assert.ok(leftOf(body[2]).includes('Agentes sidebar'), 'first category sits left of the divider');
+        assert.ok(leftOf(body[2]).includes('Herdr Sidebar'), 'first category sits left of the divider');
         assert.ok(rightOf(body[2]).includes('Gentle (this extension)'), 'first value sits right of the divider');
       } finally {
         cleanup();
@@ -1010,7 +1010,7 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
       for (const line of lines) assert.equal(visible(line), 50, 'every narrow row still fits');
       assert.equal(dividerColumn(lines), null, 'no inner divider in single-pane mode');
       const text = lines.map(stripAnsi).join('\n');
-      assert.ok(text.includes('Agentes sidebar') && text.includes('Worktree tools'), 'categories stay navigable');
+      assert.ok(text.includes('Herdr Sidebar') && text.includes('Worktree tools'), 'categories stay navigable');
     } finally {
       cleanup();
     }
@@ -1034,7 +1034,7 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
     try {
       const text = component.render(80).map(stripAnsi).join('\n');
       assert.ok(text.includes('Preview · Gentle (this extension)'), 'preview names the focused choice');
-      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close'), 'footer survives inside the card');
+      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close'), 'footer survives inside the card');
     } finally {
       cleanup();
     }
@@ -1112,7 +1112,7 @@ describe('customize label-only rows with focused preview', { concurrency: false 
         assert.ok(text.includes('Native Herdr'), 'unfocused row label renders');
         assert.ok(text.includes('→'), 'the active row keeps the → marker');
         // The heading still names the category with i/N.
-        assert.ok(text.includes('Agentes sidebar · 1/2'), 'heading still renders');
+        assert.ok(text.includes('Herdr Sidebar · 1/2'), 'heading still renders');
         // No per-row detail line: the unfocused row's detail is absent.
         assert.equal(countIn(text, "hands the pane back to Herdr's own agent state"), 0, 'unfocused detail renders nowhere');
         // The focused row's detail appears exactly once, in the bottom block.
@@ -1135,7 +1135,7 @@ describe('customize label-only rows with focused preview', { concurrency: false 
       assert.equal(countIn(text, "hands the pane back to Herdr's own agent state"), 1, 'new focused detail appears exactly once');
       assert.equal(countIn(text, 'publishes agent state and SessionChanges from Gentle'), 0, 'old focused detail is gone');
       assert.ok(text.includes('→'), 'the active marker stays on the active value');
-      assert.ok(text.includes('Agentes sidebar · 2/2'), 'the heading tracks the focused row');
+      assert.ok(text.includes('Herdr Sidebar · 2/2'), 'the heading tracks the focused row');
     } finally {
       cleanup();
     }
@@ -1186,7 +1186,7 @@ describe('worktree registration under an injected state dir (S15)', { concurrenc
       for (const name of WORKTREE_TOOLS) {
         assert.ok(!tools.has(name), `${name} must stay unregistered while the stored flag is disabled`);
       }
-      assert.ok(commands.has('herdr-gentle:warp'), 'warp stays registered');
+      assert.ok(!commands.has('herdr-gentle:warp'), 'S28: warp is hidden while the mode is disabled');
       assert.ok(commands.has('herdr-gentle:customize'), 'customize stays registered');
     } finally {
       setSlot(hadSlot);
@@ -1413,30 +1413,25 @@ describe('customize key consistency (K1/K3)', { concurrency: false }, () => {
     }
   });
 
-  test('? toggles a key-help overlay and esc closes the overlay, not the panel', async () => {
+  test('? is unbound: no key-help overlay, and esc still closes the panel', async () => {
     const { component, done, cleanup } = await openPanel();
     try {
-      assert.ok(!component.render(80).map(stripAnsi).join('\n').includes('Keys'), 'no help before ?');
+      const before = component.render(80).map(stripAnsi).join('\n');
       component.handleInput('?');
-      const body = component.render(80).map(stripAnsi).join('\n');
-      assert.match(body, /Keys/, 'the help overlay lists the keys');
-      assert.match(body, /Enter apply/, 'the help names the apply key');
+      assert.equal(component.render(80).map(stripAnsi).join('\n'), before, '? changes nothing');
       component.handleInput('escape');
-      assert.equal(done(), 'pending', 'esc with help open closes the overlay, never the panel');
-      assert.ok(!component.render(80).map(stripAnsi).join('\n').includes('Keys'), 'the overlay is gone');
-      component.handleInput('escape');
-      assert.equal(done(), null, 'esc with no overlay still closes the panel');
+      assert.equal(done(), null, 'esc closes the panel');
     } finally {
       cleanup();
     }
   });
 
-  test('the footer names every key the panel gained', async () => {
+  test('the footer names only the real keys', async () => {
     const { component, cleanup } = await openPanel();
     try {
       const text = component.render(80).map(stripAnsi).join('\n');
       assert.match(text, /↑\/↓ or j\/k move/, 'the footer names the j/k aliases');
-      assert.match(text, /\? help/, 'the footer names the help key');
+      assert.ok(!text.includes('? help'), 'no redundant help key');
     } finally {
       cleanup();
     }
@@ -1528,7 +1523,7 @@ describe('customize performance rows', { concurrency: false }, () => {
     const { component } = await runPanel({ env, inputs: TO_PERF });
     const text = flatCard(component);
     for (const copy of [
-      'Performance switches',
+      'Performance',
       'Height index + eviction · OFF',
       'Recent tool output expansion · OFF',
       'Incremental search corpus · OFF',
@@ -1539,42 +1534,34 @@ describe('customize performance rows', { concurrency: false }, () => {
     assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'opening the panel writes no settings file');
   });
 
-  test('the fused row states both what it improves and what it worsens, labelled synthetic', async () => {
+  test('the fused row states behaviour, benefit and tradeoff in plain language', async () => {
     const env = scratchStateEnv();
     const { component } = await runPanel({ env, inputs: TO_PERF });
     const text = flatCard(component);
-    assert.ok(text.includes('3.36 -> 1.84 ms'), 'the improvement carries its measured number');
-    assert.ok(text.includes('32.48 -> 63.52 ms'), 'the regression carries its measured number');
-    assert.ok(text.includes('SYNTHETIC'), 'the note keeps its synthetic label');
-    assert.ok(text.includes('Eviction needs the index'), 'the fused dependency is stated');
+    assert.ok(text.includes('Caches row heights and unloads far rows'), 'behaviour is stated');
+    assert.ok(text.includes('repaint faster with less memory'), 'the benefit is stated');
+    assert.ok(text.includes('stale height until you scroll back'), 'the tradeoff is stated');
+    assert.ok(!/\d+\.\d+|\bMB\b|SYNTHETIC/.test(text), 'no benchmark apparatus in the UI');
   });
 
-  test('the recent-output row states what it costs: a stub is not searchable and not copyable', async () => {
+  test('the recent-output row states its cost: a stub is not searchable and not copyable', async () => {
     const env = scratchStateEnv();
     const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
     const text = flatCard(component);
     assert.ok(text.includes('Preview · Recent tool output expansion · OFF'));
-    assert.ok(text.includes('3.88 -> 1.44 ms'), 'the improvement carries its measured number');
-    assert.ok(text.includes('87.9 -> 68.0 MB'));
-    assert.ok(
-      text.includes('neither searchable nor copyable until you expand it by hand'),
-      'the cost is the transcript text itself, stated plainly',
-    );
+    assert.ok(text.includes('Collapses older tool output to expandable stubs'), 'behaviour is stated');
+    assert.ok(text.includes('long transcripts stay compact'), 'the benefit is stated');
+    assert.ok(text.includes('not searchable or copyable until you expand'), 'the cost is stated plainly');
+    assert.ok(!/\d+\.\d+|\bMB\b|SYNTHETIC/.test(text), 'no benchmark apparatus in the UI');
   });
 
-  test('the help key shows the full measured detail the footer leaves out', async () => {
+  test('? shows no benchmark detail: the panel is unchanged', async () => {
     const env = scratchStateEnv();
     const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
     const footer = flatCard(component);
-    assert.ok(!footer.includes('load 5.7-6.4'), 'the apparatus stays behind the help key');
     component.handleInput('?');
-    const help = flatCard(component);
-    assert.ok(help.includes('4 bash rows of 10 lines per turn'), 'the help states the content shape');
-    assert.ok(help.includes('load 5.7-6.4'), 'the help states the box was not idle');
-    assert.ok(help.includes('Ctrl+O toggles that mode for the session'), 'the mode semantics are in the help');
-    assert.ok(help.includes('survives a new prompt'), 'the help states the mode is session state');
-    component.handleInput('?');
-    assert.equal(flatCard(component), footer, 'the help key toggles back to the same footer');
+    assert.equal(flatCard(component), footer, '? changes nothing on the panel');
+    assert.ok(!footer.includes('load 5.7-6.4'), 'no benchmark apparatus is reachable');
   });
 
   test('Enter on the recent-output row writes the single key, keeps other settings and reloads', async () => {
@@ -1661,11 +1648,11 @@ describe('customize performance rows', { concurrency: false }, () => {
       const { ctx, notes } = makeCtx({
         selectImpl: (title, options) => {
           picked.push([title, options]);
-          return title === 'Customize · Herdr Gentle Shell' ? 'Performance switches' : options[1];
+          return title === 'Customize · Herdr Gentle Shell' ? 'Performance' : options[1];
         },
       });
       await customizeDef(commands).handler('', ctx);
-      assert.equal(picked[0][1][3], 'Performance switches', 'the category keeps its place in the fallback menu');
+      assert.equal(picked[0][1][3], 'Performance', 'the category keeps its place in the fallback menu');
       assert.deepEqual(picked[1][1], [
         'Height index + eviction · OFF',
         'Recent tool output expansion · OFF',
@@ -1682,20 +1669,17 @@ describe('customize performance rows', { concurrency: false }, () => {
     }
   });
 
-  test('the footer note comes from the setting\'s own description when the host exposes one', async () => {
+  test('a host setting description never reaches the UI', async () => {
     const lib = perfLib();
     const filler = 'Filler sentence that only exists to overflow the footer area. '.repeat(3);
-    lib.setDescriptions({ heightIndex: `Pi's own description first sentence. ${filler}APPENDIX-TAIL.` });
+    lib.setDescriptions({ heightIndex: `Pi benchmark 3.36 -> 1.84 ms. ${filler}APPENDIX-TAIL.` });
     try {
       const env = scratchStateEnv();
       const { component } = await runPanel({ env, inputs: TO_PERF });
       const footer = flatCard(component);
-      assert.ok(footer.includes("Pi's own description first sentence."), 'the setting description reaches the footer');
-      assert.ok(!footer.includes('APPENDIX-TAIL'), 'the footer shows the short form only');
-      component.handleInput('?');
-      const help = flatCard(component);
-      assert.ok(help.includes('APPENDIX-TAIL'), 'the help shows the description whole');
-      assert.ok(help.includes("Pi's own description first sentence."));
+      assert.ok(!footer.includes('APPENDIX-TAIL'), 'the host description is ignored');
+      assert.ok(!/3\.36|\bms\b/.test(footer), 'no host benchmark text reaches the UI');
+      assert.ok(footer.includes('Caches row heights and unloads far rows'), 'the concise pinned copy renders');
     } finally {
       lib.setDescriptions({});
     }

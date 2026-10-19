@@ -110,8 +110,15 @@ function oddOf(root, branch) {
 }
 
 const savedEnv = { ...process.env };
+// Isolated mode state per test: missing file means enabled. The ambient
+// user's flag must never decide a fixture's outcome; a test that wants
+// disabled mode writes it into its own dir.
+function scratchModeEnv() {
+  return { GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-mode-'))) };
+}
 function setEnv(vars) {
-  for (const [key, value] of Object.entries(vars)) {
+  const env = 'GENTLE_STATUS_STATE_DIR' in vars ? vars : { ...vars, ...scratchModeEnv() };
+  for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
