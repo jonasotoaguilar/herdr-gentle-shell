@@ -20,6 +20,16 @@ const assert = require('node:assert/strict');
 const { createIssuesView } = require('../lib/issues-view.js');
 const ghIssues = require('../lib/gh-issues.js');
 
+// Optional real host helpers, guarded exactly like tools/odd-view.test.js:
+// CI installs no dependencies, so the byte-level key assertions run only
+// when the installed matcher resolves and skip honestly when it does not.
+let realTui = null;
+try {
+  realTui = require('@earendil-works/pi-tui');
+} catch {
+  realTui = null;
+}
+
 afterEach(() => {
   ghIssues.setGhRunner(null);
 });
@@ -77,7 +87,7 @@ function makeView(opts = {}) {
     saveAssignment: opts.saveAssignment,
     actions,
     labels: opts.labels,
-    helpers,
+    helpers: opts.helpers || helpers,
     theme: plainTheme,
     rowsAvailable: () => opts.rows || 24,
     requestRender: () => { paints.push(true); },
@@ -351,6 +361,66 @@ describe('issues view right pane', () => {
     });
     await tick();
     assert.match(bodyOf(view, 100), /boom/);
+  });
+});
+
+// S15: ctrl+j/ctrl+k are not delivered by every Linux terminal, so the issue
+// preview also answers the Vim-universal half-page pair and the shifted
+// letters — while their unshifted forms keep moving the list selection. These
+// drive the real installed matcher with the raw bytes a terminal emits.
+describe('issues view preview scroll variants (S15)', () => {
+  const skipReal = realTui ? false : 'requires @earendil-works/pi-tui';
+  const longBody = Array.from({ length: 100 }, (_, i) => `body line ${i + 1}`).join('\n');
+
+  function realKeyView() {
+    return makeView({
+      helpers: realTui,
+      pages: pagesOf([[issue(1, { body: longBody }), issue(2, { body: longBody })], [], []]),
+      issues: [issue(1, { body: longBody }), issue(2, { body: longBody })],
+      rows: 14,
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { body: longBody }), comments: [] }),
+    });
+  }
+
+  test('ctrl+d/ctrl+u and shifted J/K scroll the pane, j/k still move the list', { skip: skipReal }, async () => {
+    const { view } = realKeyView();
+    await tick();
+    view.render(100);
+    view.handleInput('\x1b[6~');            // PageDown: the full-page step
+    const paged = view.state.scroll;
+    assert.ok(paged > 0, 'PageDown scrolls the pane');
+    view.handleInput('home');
+    assert.equal(view.state.scroll, 0, 'home returns to the top first');
+    view.handleInput('\x04');               // ctrl+d
+    const half = view.state.scroll;
+    assert.ok(half > 0, 'raw ctrl+d scrolls the pane down');
+    assert.ok(half < paged, 'ctrl+d moves half a page, less than PageDown');
+    assert.equal(view.state.index, 0, 'ctrl+d never moves the list selection');
+    view.handleInput('\x15');               // ctrl+u
+    assert.equal(view.state.scroll, 0, 'raw ctrl+u scrolls the pane back up');
+    view.handleInput('\x1b[100;5u');        // Kitty ctrl+d
+    assert.ok(view.state.scroll > 0, 'Kitty ctrl+d scrolls the pane down');
+    view.handleInput('\x1b[117;5u');        // Kitty ctrl+u
+    assert.equal(view.state.scroll, 0, 'Kitty ctrl+u scrolls the pane back up');
+    view.handleInput('\x04');
+    view.handleInput('K');                  // shifted K scrolls up
+    assert.equal(view.state.scroll, 0, 'K scrolls the pane back up');
+    view.handleInput('J');                  // shifted J scrolls down
+    assert.ok(view.state.scroll > 0, 'J scrolls the pane down');
+    assert.equal(view.state.index, 0, 'J never moves the list selection');
+    view.handleInput('home');
+    view.handleInput('j');
+    assert.equal(view.state.index, 1, 'j still moves the list selection');
+    view.handleInput('k');
+    assert.equal(view.state.index, 0, 'k still moves the list selection');
+    view.handleInput('\n');                 // ctrl+j keeps scrolling
+    assert.ok(view.state.scroll > 0, 'ctrl+j still scrolls the pane');
+    view.handleInput('\x0b');               // ctrl+k keeps scrolling
+    assert.equal(view.state.scroll, 0, 'ctrl+k still scrolls the pane');
+    view.handleInput('\x1b[6~');
+    assert.equal(view.state.scroll, paged, 'PageDown still scrolls a full page');
+    view.handleInput('\x1b[5~');
+    assert.equal(view.state.scroll, 0, 'PageUp still scrolls the page back');
   });
 });
 

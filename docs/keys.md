@@ -10,7 +10,7 @@ same action answers the same key wherever it exists.
 | Action | Key | c | w | z | o | i |
 | --- | --- | --- | --- | --- | --- | --- |
 | Move the selection | `↑`/`↓`, `j`/`k` | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Scroll the right pane | `ctrl+j`/`ctrl+k`, `pgUp`/`pgDn` | – | – | – | ✓ | ✓ |
+| Scroll the right pane | `ctrl+j`/`ctrl+k`, `pgUp`/`pgDn`, `ctrl+d`/`ctrl+u`, `J`/`K` | – | – | – | ✓ | ✓ |
 | First/last | `home`/`end` | wraps | clamp | clamp | ✓ | ✓ |
 | Next/previous page or pane | `tab` / `→`, `shift+tab` / `←` | ✓ panes | – | ←/→ tab | – | ✓ pages |
 | Search/filter | `T` (issues also `/`) | – | ✓ | ✓ | ✓ | ✓ |
@@ -25,6 +25,18 @@ same action answers the same key wherever it exists.
 | Cancel/close | `esc` (aliases `ctrl+c`, `q`) | ✓ | `esc`/`ctrl+c` | `esc`/`ctrl+c` | ✓ | ✓ |
 
 ## Deliberate divergences
+
+- **Scrolling carries variants because `ctrl+j`/`ctrl+k` are terminal-hostile.**
+  Some terminals (Linux consoles and several setups behind tmux) never deliver
+  `ctrl+j`/`ctrl+k` to the application: `ctrl+j` is a newline and `ctrl+k` is a
+  control byte the terminal or the multiplexer keeps. The odd and issues
+  previews therefore accept the same action under two more pairs —
+  `ctrl+d`/`ctrl+u` (half a page, the Vim-universal pair) and `J`/`K` (the
+  same half-page step, upper case so they can never collide with the
+  `j`/`k` list-selection keys). `pgUp`/`pgDn` remain the full-page step. All of
+  them move the preview only: the list selection still answers `↑`/`↓` and
+  `j`/`k`. The one-row footer legend keeps naming the canonical pair, because
+  S2 forbids a second row; the variants live here instead.
 
 - **The create/edit panel is two content panes, never three columns.** The
   active dataset's list is on the left and that row's read-only preview on

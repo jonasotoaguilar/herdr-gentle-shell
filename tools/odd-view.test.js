@@ -587,6 +587,72 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     assert.equal(view.state.index, 1, 'Down still moves the list selection');
   });
 
+  // S15: ctrl+j/ctrl+k are not delivered by every Linux terminal, so the
+  // preview also answers the Vim-universal half-page pair and the shifted
+  // letters — while their unshifted forms keep moving the list selection.
+  test('S15: ctrl+d/ctrl+u and shifted J/K scroll the preview, j/k still move the list', { skip: skipReal }, () => {
+    const { view } = build();
+    view.render(80);
+    view.handleInput('\x1b[6~');            // PageDown: the full-page step
+    const paged = view.state.scroll;
+    view.handleInput('\x1b[H');
+    assert.equal(view.state.scroll, 0, 'home returns to the top first');
+    view.handleInput('\x04');               // ctrl+d
+    const half = view.state.scroll;
+    assert.ok(half > 0, 'raw ctrl+d scrolls the preview down');
+    assert.ok(half < paged, 'ctrl+d moves half a page, less than PageDown');
+    assert.equal(view.state.index, 0, 'ctrl+d never moves the list selection');
+    view.handleInput('\x15');               // ctrl+u
+    assert.equal(view.state.scroll, 0, 'raw ctrl+u scrolls the preview back up');
+    view.handleInput('\x1b[100;5u');        // Kitty ctrl+d
+    assert.ok(view.state.scroll > 0, 'Kitty ctrl+d scrolls the preview down');
+    view.handleInput('\x1b[117;5u');        // Kitty ctrl+u
+    assert.equal(view.state.scroll, 0, 'Kitty ctrl+u scrolls the preview back up');
+    view.handleInput('\x04');
+    view.handleInput('K');                  // shifted K scrolls up
+    assert.equal(view.state.scroll, 0, 'K scrolls the preview back up');
+    view.handleInput('J');                  // shifted J scrolls down
+    assert.ok(view.state.scroll > 0, 'J scrolls the preview down');
+    assert.equal(view.state.index, 0, 'J never moves the list selection');
+    view.handleInput('\x1b[H');
+    view.handleInput('j');
+    assert.equal(view.state.index, 1, 'j still moves the list selection');
+    view.handleInput('k');
+    assert.equal(view.state.index, 0, 'k still moves the list selection');
+    view.handleInput('\n');                 // ctrl+j keeps scrolling
+    assert.ok(view.state.scroll > 0, 'ctrl+j still scrolls the preview');
+    view.handleInput('\x0b');               // ctrl+k keeps scrolling
+    assert.equal(view.state.scroll, 0, 'ctrl+k still scrolls the preview');
+    view.handleInput('\x1b[6~');
+    assert.equal(view.state.scroll, paged, 'PageDown still scrolls a full page');
+    view.handleInput('\x1b[5~');
+    assert.equal(view.state.scroll, 0, 'PageUp still scrolls the page back');
+  });
+
+  test('S15: the half-page keys also work with no helpers injected (raw table plus name comparison)', () => {
+    const { view } = build({ helpers: null });
+    view.render(80);
+    view.handleInput('\x04');
+    const half = view.state.scroll;
+    assert.ok(half > 0, 'raw ctrl+d scrolls with no helpers');
+    view.handleInput('\x15');
+    assert.equal(view.state.scroll, 0, 'raw ctrl+u scrolls back with no helpers');
+    view.handleInput('\x04');
+    view.handleInput('K');
+    assert.equal(view.state.scroll, 0, 'K scrolls back with no helpers');
+    view.handleInput('J');
+    assert.ok(view.state.scroll > 0, 'J scrolls with no helpers');
+    assert.equal(view.state.index, 0, 'J never moves the list selection without helpers');
+    view.handleInput('\x1b[100;5u');        // Kitty ctrl+d
+    const kittyDown = view.state.scroll;
+    assert.ok(kittyDown > half, 'Kitty ctrl+d scrolls further down with no helpers');
+    view.handleInput('\x1b[117;5u');        // Kitty ctrl+u
+    assert.ok(view.state.scroll < kittyDown, 'Kitty ctrl+u scrolls back with no helpers');
+    view.handleInput('\x1b[H');
+    view.handleInput('j');
+    assert.equal(view.state.index, 1, 'j still moves the list selection without helpers');
+  });
+
   test('the scroll keys repaint without writing anything', { skip: skipReal }, async () => {
     const calls = [];
     const { view, paints } = build({ saveAssignment: (...args) => { calls.push(args); return { ok: true }; } });
