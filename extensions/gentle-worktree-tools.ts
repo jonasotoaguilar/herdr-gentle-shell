@@ -6057,12 +6057,19 @@ function warpDeletableAt(others, index, principal, read, repoRoot) {
   }
 }
 
-// The warp surface's overlay geometry (W5): the popup needs 10 rows and
-// the extended list 8, so the overlay is anchored centre and capped at
-// enough rows that the frame always fits; `rowsAvailable` never reports
-// more than the overlay can show, so the view's frame fills it exactly.
+// The warp surface's overlay geometry (T3/S3-S4, L6). The SELECTOR keeps a
+// focusable `ctx.ui.custom()` overlay — gentle-shell's `setWidget()` panel is
+// display-only and cannot take keys — but only its geometry changes: anchored
+// at the bottom, full width, no margin and no minimum width, so it reads as a
+// bottom panel. Its height is the view's own content (S4), never a fixed
+// frame, and `rowsAvailable` is the ceiling it may use. The create/edit panel
+// keeps its centred popup untouched (T5/T6 own that surface).
 const WARP_OVERLAY_MAX_ROWS = 24;
 const WARP_SELECTOR_OVERLAY = Object.freeze({
+  overlay: true,
+  overlayOptions: Object.freeze({ anchor: "bottom-center", width: "100%", margin: 0 }),
+});
+const WARP_PANEL_OVERLAY = Object.freeze({
   overlay: true,
   overlayOptions: Object.freeze({ anchor: "center", width: "70%", minWidth: 60, maxHeight: WARP_OVERLAY_MAX_ROWS }),
 });
@@ -6307,7 +6314,7 @@ async function warpCreateAndEnter(ctx, git, notify) {
         ...warpPanelSources(ctx, panelCwd, panelRoot),
         done,
       }),
-      WARP_SELECTOR_OVERLAY,
+      WARP_PANEL_OVERLAY,
     );
   } catch (err) {
     notify?.(`warp: the create panel failed (${(err && err.message) || err}); nothing was created.`, "error");
@@ -6422,7 +6429,7 @@ async function warpEditCheckout(ctx, git, registry, repoRoot, target, checkoutFa
         ...warpPanelSources(ctx, target.path, target.path),
         done,
       }),
-      WARP_SELECTOR_OVERLAY,
+      WARP_PANEL_OVERLAY,
     );
   } catch (err) {
     notify?.(`warp: the edit panel failed (${(err && err.message) || err}); nothing was changed.`, "error");
@@ -6442,16 +6449,17 @@ async function warpEditCheckout(ctx, git, registry, repoRoot, target, checkoutFa
   if (checkoutFacts && typeof checkoutFacts.invalidate === "function") checkoutFacts.invalidate(target.path);
 }
 
-// Warp selector loop (human selector): the popup and its extended list
-// from lib/warp-selector-view.js, mounted through `ctx.ui.custom` as an
-// overlay sized so the view always has its rows. Returns undefined when
-// the interaction resolved (warp, create, delete flow, or cancel) and
-// "fallback" when the host custom UI or the overlay is unusable, so the
-// caller falls through to the plain select path. Each iteration re-reads
-// the registry and the live git listing fresh, so a delete never leaves a
-// stale row on screen. The selector closes FIRST (ctx.ui.custom resolves)
-// and only then does one explicit ctx.ui.confirm name the target and its
-// absolute path; a refused confirmation reopens the selector with zero
+// Warp selector loop (human selector): the S4 bottom panel and its extended
+// list from lib/warp-selector-view.js, mounted through `ctx.ui.custom` as a
+// bottom-anchored, full-width overlay whose height the view computes from its
+// own content (S3). Returns undefined when the interaction resolved (warp,
+// create, delete flow, or cancel) and "fallback" when the host custom UI or
+// the overlay is unusable, so the caller falls through to the plain select
+// path. Each iteration re-reads the registry and the live git listing fresh,
+// so a delete never leaves a stale row on screen. The selector closes FIRST
+// (ctx.ui.custom resolves) and only then does one explicit ctx.ui.confirm name
+// the target and its absolute path; a refused confirmation reopens the
+// selector with zero
 // git/fs/registry/workspace mutations, while acceptance reuses the shared
 // executeWorktreeClose exactly once with hasUI:false (the Ctrl+D
 // confirmation IS the approval, so no second prompt — tool semantics for

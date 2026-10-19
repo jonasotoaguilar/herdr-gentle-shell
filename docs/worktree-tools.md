@@ -714,19 +714,29 @@ something to reset. The
 `/herdr-gentle:warp <name>` moves the session to the named
 checkout, where `<name>` is the flattened branch slug the listing prints
 (`feat/worktree-warp` → `feat-worktree-warp`), or `principal`. With no
-argument it opens the redesigned selector as a framed OVERLAY (S1): the
-popup titles itself `Warp`, names the current checkout, offers a
-`create a worktree` row, then a bounded `Choose worktree` list — the
-principal first, then the registry rows, then the live checkouts the
-registry does not own — whose last row is `View all` whenever more
-checkouts exist than the panel can show, and a footer with the focused
-checkout's facts. Rows show checkout names only; the selected branch appears
-in the footer, not in a redundant second column. The selector mounts before
-slow facts complete and refreshes the visible data asynchronously. `v` (or the `View all` row) opens the extended list of
+argument it opens the redesigned selector as a BOTTOM PANEL (S3, L6): it is
+still a focusable `ctx.ui.custom()` overlay — a `setWidget()` panel is
+display-only and cannot receive keys — anchored `bottom-center` at full
+width with no margin, and its height is the content's own, so the frame always
+fills what it draws. It is laid out top to bottom (S4): the title line
+`Warp`, the current session's worktree, that worktree's data line, a blank
+separator, at most five worktree rows, an optional `view all worktrees` row,
+the focused worktree's data line, and the ONE key-legend row. The current
+worktree owns the header and is never one of the rows; the rest are ordered
+most recently modified first (`lastActivity`, the same activity the data
+lines already render — ordering adds no git call), with the principal always
+first whenever it is not the current worktree (S4b). The
+`view all worktrees` row appears if and only if at least one worktree is not
+shown (S4c, reconciled in L2): with five or fewer others every row fits and
+neither the row nor its key exists. Rows show checkout names only; a branch
+appears in a data line, never in a redundant second column. Creation is a
+hotkey (`c`), never a row (S6). The selector mounts before
+slow facts complete and refreshes the visible data asynchronously. `v` (or the
+`view all worktrees` row) opens the extended list of
 every checkout of the project, with an always-active filter (`T` or `/`
 opens it empty, any other printable opens it with that character, and once
 open every printable — space included — is text), pagination with
-`pgUp`/`pgDn`, and `esc` to step back to the popup. The facts footer is
+`pgUp`/`pgDn`, and `esc` to step back to the panel. Both data lines are
 honest: branch, the registry's assigned issues and odd documents, the
 change size as LINE counts (`changes +A −D` — the tracked diff plus the
 lines each untracked file adds), the commits ahead/behind `main` and both
@@ -743,11 +753,12 @@ show their count, `0` included (never `none`). `unavailable` is not a zero
 and stays on the line, with its reason where one was supplied, whenever git
 or the registry cannot answer (S9) or an untracked file's lines cannot be
 read (S16), so "nothing to report" and "could not read it" never look
-alike. Every label on this line is English (`branch`, `issues`, `odd`,
-`changes`, `created`, `modified`). The principal checkout comes first among destinations when it is not current.
+alike. Every label on a data line is English (`branch`, `issues`, `odd`,
+`changes`, `created`, `modified`). The current worktree's line reads the same
+way as the focused one (S4a). The principal checkout comes first among destinations when it is not current.
 Other rows are ordered by readable activity, newest first; unavailable activity
 sorts after known activity. Counts for issues and ODD remain numeric (including
-zero); the footer never lists their IDs or document paths. Detail/edit retains
+zero); a data line never lists their IDs or document paths. Detail/edit retains
 the full associations.
 
 The focused checkout is editable with `e` (S13): the SAME single panel
@@ -761,7 +772,7 @@ viewers use (a created row takes the checkout's real branch and thread, a
 refusal writes nothing), and `esc` cancels with nothing written. The
 selector then reopens — with the fresh values after a save, unchanged
 after a cancel — and a refusing registry shows its error without changing
-what the popup displays. Both panes are handed their SOURCE order
+what the panel displays. Both panes are handed their SOURCE order
 verbatim (issues from `sort:updated-desc`, odd documents from
 `lib/odd-docs.js`'s modification ordering) and the extension never
 re-sorts them (S15). Both datasets render their handed source order unchanged; switching datasets
@@ -808,7 +819,7 @@ a row proven clean, never for a dirty one — and an explicit Yes then reuses th
 shared close exactly once with `force: true` for exactly that approved row.
 Only a REGISTERED agent worktree is deletable — the principal checkout,
 the current checkout and an unregistered live checkout are safe no-ops,
-and the create row is not a checkout. The project's live checkouts are discovered at session startup
+and the `view all worktrees` row is not a checkout. The project's live checkouts are discovered at session startup
 (S28: every repository worktree through git is registered when missing —
 the creation path is only where new ones are born) and freshly on every
 warp invocation. The agent tool (`worktree_warp`) resolves the same way — a required name-or-path, name first then path, unknown/foreign/ambiguous failing closed with the available checkouts listed — but never awaits `waitForIdle` (a self-deadlock from inside a tool) and never opens a selector. The command keeps the idle-slot wait (`await ctx.waitForIdle()` before forking); the tool switches through `withSession` from the tool context, emitting the S42 card from the fresh session and starting the continuation turn (`triggerTurn: true`, `deliverAs: "followUp"`). Session control

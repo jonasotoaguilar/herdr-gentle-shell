@@ -19,7 +19,8 @@ same action answers the same key wherever it exists.
 | Confirm/apply | `enter` | ✓ | ✓ | ✓ | – | ✓ sub-panels |
 | Save/persist | `ctrl+s` | – | – | ✓ | ✓ when enabled | ✓ when enabled |
 | Refresh | `r` | – | ✓ | – | ✓ | ✓ |
-| Edit the focused row | `e` | – | ✓ issues/odd | – | – | – |
+| Create a worktree | `c` | – | ✓ | – | – | – |
+| Edit the focused row | `e` | – | ✓ issues/odd until the detail lands | – | – | – |
 | Open outside Pi | `o` | – | – | – | ✓ editor | ✓ browser |
 | Copy number / URL | `y` / `Y` | – | – | – | – | ✓ |
 | Cancel/close | `esc` (aliases `ctrl+c`, `q`) | ✓ | `esc`/`ctrl+c` | `esc`/`ctrl+c` | ✓ | ✓ |
@@ -62,8 +63,8 @@ same action answers the same key wherever it exists.
   "back one step".** The sequential create wizard is gone — the single panel
   has no steps — so there is no previous step to return to, and `tab` keeps
   its "next pane" meaning everywhere.
-- **The warp popup and the create panel do not close on `q`**, because in
-  both a printable key is meaningful: with the popup on screen a printable
+- **The warp panel and the create panel do not close on `q`**, because in
+  both a printable key is meaningful: with the panel on screen a printable
   (other than a bound key) opens the extended list's always-active filter,
   and in the create panel it opens the focused pane's filter or types into
   the name. `q` is therefore filter text or a typed value there, and `esc`
@@ -75,7 +76,7 @@ same action answers the same key wherever it exists.
 - **`home`/`end` wrap in the customize panel** because its lists are short and
   circular by design, and clamp elsewhere.
 - **`esc` closes, except where it steps back**: in the warp selector's
-  extended list it steps back to the popup, and in the issues viewer's
+  extended list it steps back to the panel, and in the issues viewer's
   label editor and comment box it returns to the list, where a non-empty
   comment draft asks once before being discarded.
 

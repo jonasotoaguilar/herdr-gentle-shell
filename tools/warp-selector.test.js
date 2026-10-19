@@ -418,12 +418,17 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       await warpDef(commands).handler('', built.ctx);
       assert.equal(built.customs.length, 1, 'the popup mounted once');
       const options = built.customs[0];
-      assert.equal(options.overlay, true, 'the popup is an overlay');
-      assert.equal(options.overlayOptions.anchor, 'center');
-      assert.ok(options.overlayOptions.maxHeight >= 10, 'the overlay gives the popup its 10 rows');
-      assert.match(rendered, /Warp/, 'the popup title renders');
-      assert.match(rendered, /current:/, 'the current checkout renders');
-      assert.match(rendered, /create a worktree/, 'the create row renders');
+      assert.equal(options.overlay, true, 'the panel is an overlay');
+      // T3/S3-S4: a bottom panel, not a centred popup box. Its height is the
+      // view's own content, so no maxHeight and no minimum width are pinned.
+      assert.equal(options.overlayOptions.anchor, 'bottom-center');
+      assert.equal(options.overlayOptions.width, '100%');
+      assert.equal(options.overlayOptions.margin, 0);
+      assert.equal(options.overlayOptions.minWidth, undefined, 'full width needs no minimum');
+      assert.equal(options.overlayOptions.maxHeight, undefined, 'the panel computes its own height');
+      assert.match(rendered, /Warp/, 'the panel title renders');
+      assert.match(rendered, /feat-one/, 'the registered worktree renders as a row');
+      assert.ok(!rendered.includes('create a worktree'), 'S6: creation is a hotkey, not a row');
       assert.deepEqual(built.notes, [], 'Esc is silent');
     } finally {
       restoreEnv();
@@ -438,7 +443,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['\x1b[B', '\r']); // down past create, enter
+      const driver = selectorDriver(['\r']); // enter on the first (only) worktree row
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: driver.mount });
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
@@ -461,7 +466,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['\r']); // enter on the create row
+      const driver = selectorDriver(['c']); // S6: the create hotkey
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: driver.mount });
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
@@ -505,7 +510,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
           const drive = () => {
             try {
               if (mounts === 1) {
-                view.handleInput('\r'); // enter on the create row
+                view.handleInput('c'); // S6: the create hotkey
                 return;
               }
               view.handleInput('\x1b[B'); // type -> name
@@ -943,9 +948,9 @@ function watchRegistryWrites() {
   };
 }
 
-// The popup's `e` on the admin worktree row: the only other row is the
-// create row, so one Down reaches it.
-const EDIT_KEYS = ['\x1b[B', 'e'];
+// The panel's `e` on the first listed worktree row: creation is no longer a
+// row (S6), so the first row is already the focused checkout.
+const EDIT_KEYS = ['e'];
 
 describe('T12: editing the focused checkout (S13)', { concurrency: false }, () => {
   test('e opens the panel in editing mode with the checkout REAL branch and path, frozen and pre-selected from the registry', async () => {
@@ -1260,7 +1265,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       const before = createdState(root);
       const watcher = watchMutations();
       try {
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           view.render(120); // the frame the user sees
           assert.equal(watcher.events.length, 0, 'drawing the create panel mutated nothing');
           view.handleInput('\x1b'); // cancel
@@ -1329,7 +1334,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         let cursorAfterPage = null;
         let oddSelected = null;
         let query = null;
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           const step = stepRecorder(view, watcher);
           step('move from the type field to the name field', (v) => v.handleInput('\x1b[B'));
           step('enter the Issues pane', (v) => v.handleInput('\r'));
@@ -1470,7 +1475,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       const watcher = watchMutations();
       try {
         let confirmedAt = 0;
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           view.handleInput('\x1b[B');
           for (const char of 'nothing-yet') view.handleInput(char);
           assert.deepEqual(watcher.kinds(), [], 'navigating and typing before the confirm wrote nothing');
@@ -1512,7 +1517,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       try {
         const sessionFile = missingSessionFile('refused-sess');
         let confirmedAt = 0;
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           view.handleInput('\x1b[B');
           for (const char of 'refused-create') view.handleInput(char);
           confirmedAt = watcher.events.length;
@@ -1631,7 +1636,7 @@ describe('S1: the selector paints before the facts, then enriches', { concurrenc
 
       const callsBeforeRender = factsCalls;
       const firstPaint = view.render(120).map(clean).join('\n');
-      assert.match(firstPaint, /create a worktree/, 'the first frame is usable');
+      assert.match(firstPaint, /Warp/, 'the first frame is usable');
       view.render(120);
       assert.equal(factsCalls, callsBeforeRender, 'render() performed no additional facts I/O');
       const before = view.state.checkouts.find((entry) => entry.path === target);
