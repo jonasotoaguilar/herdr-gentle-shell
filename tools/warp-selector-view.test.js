@@ -10,12 +10,17 @@
 // exactly the requested width and the frame fills the requested height;
 // section order is current → create → separator → choose; the list is
 // bounded by the height and gains a final "View all" row only when rows
-// were left out; the facts line carries branch, issues, odd, the change size
+// were left out; S5 rows are the checkout NAMES alone (the branch lives in
+// the focused checkout's facts footer, never repeated on the row); the
+// facts line carries branch, the issue and odd COUNTS, the change size
 // as LINE COUNTS (`changes +A −D`, S16), `↑N ↓M` and both ages for the
 // focused checkout, omits a measured zero for the change size and for each
 // of `↑`/`↓` (issues and odd keep their `0`), and says `unavailable` — never
-// `0` — for each fact it cannot read; the facts are
-// read for the focused checkout only and cached; S6's printable-key rule
+// `0` — for each fact it cannot read; S6 keeps the principal first among the
+// selectable rows; S9 binds no `?` help overlay and the footer still names
+// every shortcut; the facts are
+// read for the focused checkout only and cached; render() performs no I/O;
+// S6's printable-key rule
 // holds exactly (`space` toggles while the filter is closed, types once it
 // is open); `esc` steps back one level from the list; no key outside the
 // documented map changes state.
@@ -63,6 +68,9 @@ const CHECKOUTS = [
 ];
 
 const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
+
+// Epoch ms used to pin the checkout's creation for the S8 activity-provenance
+// tests: an activity timestamp before it is inherited, never local.
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -127,9 +135,10 @@ describe('popup frame (S1)', () => {
     assert.equal(rows[3], '▸ create a worktree', 'the create row is focused first');
     assert.equal(rows[4], '', 'a blank separator follows the create section');
     assert.equal(rows[5], 'Choose worktree');
-    assert.match(rows[6], /^ {2}main\s+main · use the local project$/, 'the principal says the local project');
-    assert.match(rows[7], /^ {2}feat-alpha\s+feat\/alpha$/);
-    assert.match(rows[8], /^ {2}fix-beta\s+fix\/beta$/);
+    assert.equal(rows[6], '  main · use the local project', 'the principal says the local project');
+    assert.equal(rows[7], '  feat-alpha', 'S5: the row is the name alone, the branch is never repeated');
+    assert.equal(rows[8], '  fix-beta', 'S5: the row is the name alone, the branch is never repeated');
+    assert.ok(!rows.slice(6, 9).join('\n').includes('feat/'), 'no branch on any selector row');
     assert.equal(rows[9], '', 'unused list rows are blank');
     assert.match(rows[18], /↑↓ move/, 'the footer names moving');
     assert.match(rows[18], /enter choose/);
@@ -153,8 +162,8 @@ describe('popup frame (S1)', () => {
     assert.equal(lines.length, 14);
     assertWidth(lines);
     // 14 rows - 9 fixed rows = 5 list rows: 4 checkouts then the final View all.
-    assert.match(rows[6], /^ {2}wt-1\s+feat\/wt-1$/);
-    assert.match(rows[9], /^ {2}wt-4\s+feat\/wt-4$/);
+    assert.equal(rows[6], '  wt-1');
+    assert.equal(rows[9], '  wt-4');
     assert.match(rows[10], /^ {2}View all\s+4 more$/, 'View all is the last list row and counts the rest');
     const body = rows.join('\n');
     assert.ok(!body.includes('wt-5'), 'the rows beyond the bound are not rendered');
@@ -192,7 +201,7 @@ describe('popup frame (S1)', () => {
 
 describe('focused checkout facts (S2, S9)', () => {
   const BASE = { branch: 'main', issues: [7], odd: ['w9-x'], changes: { added: 12, deleted: 3 }, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
-  const FULL = 'branch main · issues #7 · odd w9-x · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
+  const FULL = 'branch main · issues 1 · odd 1 · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
 
   async function focusSecondCheckout(options) {
     const made = makeView(options);
@@ -210,7 +219,7 @@ describe('focused checkout facts (S2, S9)', () => {
   test('the focused checkout reports branch, issues, odd, the change-size line counts, ahead/behind and created-at', async () => {
     const { rows } = await focusSecondCheckout({ facts: () => BASE, width: 200 });
     assert.equal(rows[1], 'current: feat-odd-viewer  /w/feat-odd-viewer');
-    assert.match(rows[6], /^▸ main\s+main · use the local project$/, 'the selection moved');
+    assert.equal(rows[6], '▸ main · use the local project', 'the selection moved');
     assert.equal(rows[17], FULL, 'the facts line carries every fact of the focused checkout');
   });
 
@@ -220,6 +229,16 @@ describe('focused checkout facts (S2, S9)', () => {
     // value.
     const { rows } = await focusSecondCheckout({ facts: () => null, width: 200 });
     assert.equal(rows[17], 'branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · created unavailable · modified unavailable');
+  });
+
+  test('more associations never widen the footer: only their counts render', async () => {
+    const many = await focusSecondCheckout({
+      facts: () => ({ ...BASE, issues: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], odd: ['a', 'b', 'c'] }),
+      width: 200,
+    });
+    assert.ok(many.rows[17].includes('issues 10 · odd 3'), `counts render: ${many.rows[17]}`);
+    assert.ok(!/issues #/.test(many.rows[17]), `no issue numbers in the footer: ${many.rows[17]}`);
+    assert.ok(!/odd a/.test(many.rows[17]), `no odd names in the footer: ${many.rows[17]}`);
   });
 
   test('each single unavailable fact is reported on its own while the others survive', async () => {
@@ -248,9 +267,9 @@ describe('focused checkout facts (S2, S9)', () => {
 
   test('a one-sided ahead shows only ↑N, and a one-sided behind only ↓M', async () => {
     const aheadOnly = await focusSecondCheckout({ facts: () => ({ ...BASE, behind: 0 }), width: 200 });
-    assert.equal(aheadOnly.rows[17], 'branch main · issues #7 · odd w9-x · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
+    assert.equal(aheadOnly.rows[17], 'branch main · issues 1 · odd 1 · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
     const behindOnly = await focusSecondCheckout({ facts: () => ({ ...BASE, ahead: 0 }), width: 200 });
-    assert.equal(behindOnly.rows[17], 'branch main · issues #7 · odd w9-x · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
+    assert.equal(behindOnly.rows[17], 'branch main · issues 1 · odd 1 · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
   });
 
   test('the change size is the tracked and untracked LINE counts, never a file count', async () => {
@@ -395,10 +414,10 @@ describe('extended list (S1, S6)', () => {
     assertWidth(lines);
     assert.match(lines[0], /^╭─ Warp · all worktrees ─+ esc ─╮$/);
     assert.equal(rows[1], 'filter: type to search', 'the filter row is always present and never selectable');
-    assert.match(rows[2], /^▸ feat-odd-viewer\s+feat\/odd-viewer · current$/);
-    assert.match(rows[3], /^ {2}main\s+main · use the local project$/);
-    assert.match(rows[4], /^ {2}feat-alpha\s+feat\/alpha$/);
-    assert.match(rows[5], /^ {2}fix-beta\s+fix\/beta$/);
+    assert.equal(rows[2], '▸ main · use the local project', 'S6: the principal leads the list');
+    assert.equal(rows[3], '  feat-odd-viewer · current');
+    assert.equal(rows[4], '  feat-alpha');
+    assert.equal(rows[5], '  fix-beta');
     assert.equal(rows[17], 'page 1/1 · 4 worktrees');
     assert.match(rows[18], /enter warp/);
     assert.match(rows[18], /esc back/);
@@ -417,7 +436,7 @@ describe('extended list (S1, S6)', () => {
     for (const ch of 'lpha') view.handleInput(ch);
     ({ rows } = screen(view));
     assert.equal(rows[1], 'filter: alpha▏');
-    assert.match(rows[2], /^▸ feat-alpha\s+feat\/alpha$/);
+    assert.equal(rows[2], '▸ feat-alpha');
     assert.equal(rows[3], '');
     const body = rows.join('\n');
     assert.ok(!body.includes('fix-beta'), 'non-matching rows are filtered out');
@@ -495,7 +514,7 @@ describe('extended list (S1, S6)', () => {
     view.handleInput('v');
     view.handleInput('down');
     view.handleInput('enter');
-    assert.deepEqual(results, [{ warp: '/w/herdr' }]);
+    assert.deepEqual(results, [{ warp: '/w/feat-odd-viewer' }]);
   });
 });
 
@@ -508,7 +527,7 @@ describe('the S6 space rule', () => {
     assert.equal(view.state.listCursor, 1);
 
     view.handleInput(' ');
-    assert.deepEqual(toggles, ['/w/herdr'], 'space toggles the focused row while the filter is closed');
+    assert.deepEqual(toggles, ['/w/feat-odd-viewer'], 'space toggles the focused row while the filter is closed');
     assert.equal(view.state.filterOpen, false, 'and never opens the filter');
     assert.equal(view.state.filter, '');
 
@@ -517,7 +536,7 @@ describe('the S6 space rule', () => {
     assert.equal(view.state.filter, 'z');
     view.handleInput(' ');
     assert.equal(view.state.filter, 'z ', 'once open, space goes to the text');
-    assert.deepEqual(toggles, ['/w/herdr'], 'and no longer toggles');
+    assert.deepEqual(toggles, ['/w/feat-odd-viewer'], 'and no longer toggles');
 
     view.handleInput('escape');
     assert.equal(view.state.filterOpen, false);
@@ -528,7 +547,7 @@ describe('the S6 space rule', () => {
     view.handleInput('escape');
     view.handleInput('down');
     view.handleInput(' ');
-    assert.deepEqual(toggles, ['/w/herdr', '/w/herdr'], 'closing an empty filter restores the toggle');
+    assert.deepEqual(toggles, ['/w/feat-odd-viewer', '/w/feat-odd-viewer'], 'closing an empty filter restores the toggle');
   });
 
   test('without a toggle, space is a printable and opens the filter', async () => {
@@ -541,29 +560,105 @@ describe('the S6 space rule', () => {
   });
 });
 
-describe('help overlay (S5)', () => {
-  test('? opens and closes a key-help overlay in both views', async () => {
+describe('S9: no redundant help overlay', () => {
+  test('? is unbound in both views and never replaces the rows', async () => {
     const { view } = makeView();
     await tick();
+    const before = JSON.parse(JSON.stringify(view.state));
     view.handleInput('?');
     let { rows } = screen(view);
-    assert.equal(rows[6], 'keys — one key per action');
-    const help = rows.slice(6, 14).join('\n');
-    assert.match(help, /j k\s+move the selection/);
-    assert.match(help, /v\s+every worktree/);
-    assert.match(help, /esc\s+back one level/);
-    assert.ok(!rows.join('\n').includes('feat-alpha'), 'the overlay replaces the list rows');
-    view.handleInput('?');
-    ({ rows } = screen(view));
-    assert.match(rows[7], /feat-alpha/);
+    assert.match(rows[7], /feat-alpha/, 'the popup rows stay');
+    assert.deepEqual(view.state, before, '? changes no state in the popup');
 
     view.handleInput('v');
     view.handleInput('?');
     ({ rows } = screen(view));
-    assert.equal(rows[2], 'keys — one key per action', 'the overlay covers the list rows too');
-    view.handleInput('?');
+    assert.equal(view.state.filter, '?', '? is ordinary printable text in the list, never a help toggle');
+    assert.match(rows[1], /filter: \?/);
+    assert.match(rows[2], /no matches for/);
+  });
+
+  test('the footers name every shortcut and never advertise ? help', async () => {
+    const { view } = makeView();
+    await tick();
+    let { rows } = screen(view);
+    assert.equal(rows[18], '↑↓ move · enter choose · e edit · v all · r reload · esc close');
+    assert.ok(!rows[18].includes('?'), 'no generic help hint in the popup footer');
+    view.handleInput('v');
     ({ rows } = screen(view));
-    assert.match(rows[2], /feat-odd-viewer/);
+    assert.equal(rows[18], '↑↓ move · pgUp/pgDn page · enter warp · r reload · esc back');
+    assert.ok(!rows[18].includes('?'), 'no generic help hint in the list footer');
+  });
+});
+
+describe('S6: the principal leads when it is not the current checkout', () => {
+  test('a principal with the oldest activity still renders before newer checkouts', async () => {
+    const checkouts = [
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      { name: 'recent', path: '/w/recent', branch: 'feat/recent', lastActivity: ago(60_000) },
+      { name: 'main', path: '/w/herdr', branch: 'main', isPrincipal: true, lastActivity: ago(90 * 86400_000) },
+      { name: 'older', path: '/w/older', branch: 'feat/older', lastActivity: ago(120 * 86400_000) },
+    ];
+    const { view } = makeView({ checkouts, current: { name: 'cur', path: '/w/cur' }, facts: () => null });
+    await tick();
+    const { rows } = screen(view, 200);
+    assert.equal(rows[6], '  main · use the local project', 'the principal is first despite the oldest activity');
+    assert.equal(rows[7], '  recent');
+    assert.equal(rows[8], '  older');
+  });
+});
+
+describe('S1: render performs no I/O and enrichment keeps the selection', () => {
+  test('render() never calls the facts reader; moving the focus does', async () => {
+    let calls = 0;
+    const { view } = makeView({ facts: () => { calls += 1; return DEFAULT_FACTS; } });
+    screen(view);
+    screen(view, 120);
+    assert.equal(calls, 0, 'render() reads no facts');
+    view.handleInput('down');
+    assert.equal(calls, 1, 'moving the focus starts the one read');
+  });
+
+  test('apply() re-sorts by the newly arrived activity and keeps the focused checkout', async () => {
+    const initial = [
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      { name: 'alpha', path: '/w/alpha', branch: 'feat/alpha' },
+      { name: 'beta', path: '/w/beta', branch: 'feat/beta' },
+    ];
+    const { view } = makeView({ checkouts: initial, current: { name: 'cur', path: '/w/cur' }, facts: () => null });
+    await tick();
+    view.handleInput('down');
+    view.handleInput('down'); // focus beta (the second selectable row)
+    assert.equal(view.state.cursor, 2);
+    view.apply([
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      { name: 'alpha', path: '/w/alpha', branch: 'feat/alpha', lastActivity: '2026-02-01T00:00:00.000Z' },
+      { name: 'beta', path: '/w/beta', branch: 'feat/beta', lastActivity: '2026-02-02T00:00:00.000Z' },
+    ]);
+    const { rows } = screen(view, 200);
+    assert.equal(rows[6], '▸ beta', 'beta now leads by activity and holds the focus');
+    assert.equal(rows[7], '  alpha');
+  });
+
+  test('apply() after escape is ignored while a delayed facts answer settles, and never throws', async () => {
+    let releaseFacts;
+    const delayed = new Promise((resolve) => { releaseFacts = resolve; });
+    const { view, results } = makeView({ facts: () => delayed });
+    await tick();
+    view.handleInput('down'); // start the focused checkout's pending read
+    view.handleInput('escape'); // the popup resolves: the component is settled
+    assert.deepEqual(results, [null]);
+    const before = JSON.parse(JSON.stringify(view.state.checkouts));
+
+    const replacement = [
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      { name: 'late', path: '/w/late', branch: 'feat/late', lastActivity: '2026-02-02T00:00:00.000Z' },
+    ];
+    assert.doesNotThrow(() => view.apply(replacement));
+    releaseFacts(DEFAULT_FACTS);
+    await tick();
+    await tick();
+    assert.deepEqual(view.state.checkouts, before, 'a settled view ignores late enrichment');
   });
 });
 

@@ -31,7 +31,7 @@
 // lib/gh-issues.js `setGhRunner` seam (same module instance the
 // extension loads via GENTLE_WORKTREE_LIB_DIR), so no live `gh` runs.
 
-const { test, describe, after, afterEach } = require('node:test');
+const { test, describe, beforeEach, after, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -89,6 +89,11 @@ function makeRepo({ tag = 'issues' } = {}) {
 }
 
 const savedEnv = { ...process.env };
+// Mode is a user preference, never a test fixture. Each invocation starts in
+// an isolated default-enabled state; mode-specific cases override only that.
+beforeEach(() => {
+  process.env.GENTLE_STATUS_STATE_DIR = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-default-mode-')));
+});
 after(() => {
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
@@ -263,23 +268,27 @@ async function openIssues(root, { runner } = {}) {
   return { component, notes, customs, commands };
 }
 
-describe('/herdr-gentle:issues gate (S9)', () => {
-  test('registers the command when gh reports an authenticated user', async () => {
+describe('/herdr-gentle:issues gate (S3)', () => {
+  test('registers the command eagerly so it is in the autocomplete snapshot from load', async () => {
+    const { commands } = await loadExtension();
+    const def = commands.get('herdr-gentle:issues');
+    assert.ok(def, 'the command is registered at load, independent of the gh check');
+    assert.equal(typeof def.handler, 'function');
+  });
+
+  test('an authenticated gate keeps the command registered and notifies nothing', async () => {
     const { commands, sessionStarts } = await loadExtension();
-    assert.ok(!commands.has('herdr-gentle:issues'), 'nothing registered at load: the check runs at session start');
     const { runner } = makeIssuesRunner();
     ghIssues.setGhRunner(runner);
     const root = makeRepo({ tag: 'gate-ok' });
     const notes = [];
     await fireSessionStart(sessionStarts, gateCtx(root, notes));
-    const def = commands.get('herdr-gentle:issues');
-    assert.ok(def, 'the authenticated gate registers the command');
-    assert.equal(typeof def.handler, 'function');
+    assert.ok(commands.has('herdr-gentle:issues'), 'the open gate keeps the command');
     assert.deepEqual(notes, [], 'an open gate notifies nothing');
   });
 
-  test('a missing gh notifies once with the fix and never registers', async () => {
-    const { commands, sessionStarts } = await loadExtension();
+  test('a missing gh notifies the fix once at startup and again on invocation, opening nothing', async () => {
+    const { commands, mod, sessionStarts } = await loadExtension();
     ghIssues.setGhRunner(async (bin, argv) => ({
       status: null, stdout: '', stderr: '', error: `spawn ${bin} ENOENT: gh CLI is not available`,
     }));
@@ -287,24 +296,31 @@ describe('/herdr-gentle:issues gate (S9)', () => {
     const notes = [];
     await fireSessionStart(sessionStarts, gateCtx(root, notes));
     await fireSessionStart(sessionStarts, gateCtx(root, notes));
-    assert.ok(!commands.has('herdr-gentle:issues'), 'no registration without gh');
-    assert.equal(notes.length, 1, 'exactly one notification per session');
+    assert.ok(commands.has('herdr-gentle:issues'), 'the command stays discoverable');
+    assert.equal(notes.length, 1, 'exactly one startup notification per session');
     assert.match(notes[0][0], /gh CLI is not available/, 'the note names what is missing');
     assert.match(notes[0][0], /gh auth login/, 'the note names the command that fixes it');
-    assert.equal(notes[0][1], 'info');
+
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const { ctx, customs, notes: invokeNotes } = makeCtx({ cwd: root, customImpl: async () => null });
+    await commands.get('herdr-gentle:issues').handler('', ctx);
+    assert.equal(customs.length, 0, 'invocation without gh opens nothing');
+    assert.equal(invokeNotes.length, 1, 'invocation reports the honest dependency error');
+    assert.match(invokeNotes[0][0], /gh auth login/);
+    assert.equal(invokeNotes[0][1], 'error');
   });
 
-  test('an unauthenticated gh notifies once with the login fix and never registers', async () => {
-    const { commands, sessionStarts } = await loadExtension();
+  test('an unauthenticated gh notifies the login fix on invocation and opens nothing', async () => {
+    const { commands, mod } = await loadExtension();
     ghIssues.setGhRunner(async () => ({
       status: 1, stdout: '', stderr: 'Failed to log in: authentication required', error: null,
     }));
     const root = makeRepo({ tag: 'gate-auth' });
-    const notes = [];
-    await fireSessionStart(sessionStarts, gateCtx(root, notes));
-    await fireSessionStart(sessionStarts, gateCtx(root, notes));
-    assert.ok(!commands.has('herdr-gentle:issues'), 'no registration while unauthenticated');
-    assert.equal(notes.length, 1, 'exactly one notification per session');
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const { ctx, customs, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+    await commands.get('herdr-gentle:issues').handler('', ctx);
+    assert.equal(customs.length, 0, 'no overlay while unauthenticated');
+    assert.equal(notes.length, 1);
     assert.match(notes[0][0], /gh auth login/, 'the note names the login fix');
   });
 });
@@ -323,12 +339,13 @@ describe('/herdr-gentle:issues overlay', () => {
     const searches = calls
       .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
       .map((call) => call.argv[call.argv.indexOf('--search') + 1]);
-    // S10: the source asks gh for last-update ordering, so each page's query
-    // carries the sort and the view never re-sorts the rows itself.
+    // S10/S16: the source asks gh for last-update ordering, so each page's
+    // query carries the sort; Involved excludes the viewer's own issues so
+    // the two buckets are disjoint at the source, before any client filter.
     assert.deepEqual(searches, [
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
-      'involves:@me sort:updated-desc',
+      'involves:@me -author:@me sort:updated-desc',
     ]);
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues/, 'first page tab');
@@ -336,7 +353,8 @@ describe('/herdr-gentle:issues overlay', () => {
     assert.match(body, /Involved/, 'third page tab');
     assert.match(body, /76/, 'the listed issue number');
     assert.match(body, /chore: update/, 'the listed issue title');
-    assert.match(body, new RegExp(path.basename(root)), 'the title names the checkout');
+    assert.match(body, /◈ Issues · My issues/, 'the header names the focused bucket');
+    assert.ok(!body.includes(path.basename(root)), 'S25: the header never repeats the checkout name');
   });
 
   test('an argument notifies and opens nothing', async () => {
@@ -512,6 +530,9 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
 
     component.handleInput('L');
     assert.equal(component.state.mode, 'labels');
+    // S19: the label list loads lazily on the editor's first open, so wait
+    // for it before naming a label to toggle.
+    await tick();
     component.handleInput('down');
     component.handleInput('space');
     component.handleInput('ctrl+s');
@@ -546,7 +567,7 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
 
     const gitCalls = [];
     const originalRunArgv = worktreeGit.runArgv;
-    worktreeGit.runArgv = (bin, argv, opts) => {
+    worktreeGit.runArgv = (bin, argv, _opts) => {
       gitCalls.push({ bin, argv: argv.slice() });
       return { status: 0, stdout: '', stderr: '', error: null };
     };
@@ -647,7 +668,243 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
     const { runner } = makeBoundedRunner(500);
     const { component } = await openIssues(root, { runner });
     const body = clean(component.render(110).join('\n'));
-    assert.match(body, /My issues \(500\)/, 'the tab names the bounded total');
+    assert.match(body, /My issues \(500\+\)/, 'the tab names the bounded total');
     assert.match(body, /30\+ issues/, 'the bounded totals line carries the + marker');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S19/S18: mount before any network read, and toggle the state filter between
+// exactly `open` (default) and `closed`, refetching through the one seam.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues first paint and state filter', () => {
+  test('the overlay mounts before any list or label fetch and requests open pages', async () => {
+    const root = makeRepo({ tag: 'issues-lazy' });
+    const { runner, calls } = makeIssuesRunner();
+    const { commands, mod, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(runner);
+    const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+    await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+    const def = commands.get('herdr-gentle:issues');
+    assert.ok(def, 'the command is registered');
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const host = makeHostTui(24);
+    let callsAtMount = null;
+    const { ctx } = makeCtx({
+      cwd: root,
+      customImpl: async (factory) => {
+        callsAtMount = calls.map((call) => call.argv.join(' '));
+        openComponent(factory, host);
+        await tick();
+        return null;
+      },
+    });
+    await def.handler('', ctx);
+    assert.ok(callsAtMount !== null, 'the overlay mounted');
+    assert.equal(callsAtMount.filter((line) => line.includes('issue list')).length, 0, 'no list fetch before mount');
+    assert.equal(callsAtMount.filter((line) => line.includes('label list')).length, 0, 'no label fetch before mount');
+    const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
+    assert.equal(lists.length, 3, 'three buckets fetched after mount');
+    for (const call of lists) {
+      const at = call.argv.indexOf('--state');
+      assert.equal(call.argv[at + 1], 'open', `open state requested: ${call.argv.join(' ')}`);
+    }
+  });
+
+  test('f toggles to closed and back, refetching each time with the shown state', async () => {
+    const root = makeRepo({ tag: 'issues-closed' });
+    const { runner, calls } = makeIssuesRunner();
+    const { component } = await openIssues(root, { runner });
+    const states = () => calls
+      .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
+      .map((call) => call.argv[call.argv.indexOf('--state') + 1]);
+    assert.deepEqual(states(), ['open', 'open', 'open'], 'the default fetch is open');
+    component.handleInput('f');
+    await tick();
+    assert.deepEqual(states().slice(3), ['closed', 'closed', 'closed'], 'f refetches closed');
+    component.handleInput('f');
+    await tick();
+    assert.deepEqual(states().slice(6), ['open', 'open', 'open'], 'f refetches open again');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S29: `/herdr-gentle:issues` stays registered while the worktree mode is off
+// or malformed; only the worktree association is disabled. The extension
+// re-reads the mode inside the save callback, so a panel opened while enabled
+// still refuses once the mode is switched off.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
+  const modeLib = require('../lib/worktree-mode.js');
+  const S29_REFUSAL = 'worktree tools are disabled; enable them in /herdr-gentle:customize to assign issues or odd documents';
+
+  function modeDir() {
+    return track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-mode-')));
+  }
+
+  async function withModeDir(run, { malformed = false } = {}) {
+    const dir = modeDir();
+    const saved = { ...process.env };
+    process.env.GENTLE_STATUS_STATE_DIR = dir;
+    try {
+      if (malformed) fs.writeFileSync(modeLib.modePath(process.env), 'not json\n');
+      return await run();
+    } finally {
+      for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+      for (const [key, value] of Object.entries(saved)) process.env[key] = value;
+    }
+  }
+
+  function captureIssuesView() {
+    const lib = require('../lib/issues-view.js');
+    const original = lib.createIssuesView;
+    const holder = { options: null };
+    lib.createIssuesView = (options) => {
+      holder.options = options;
+      return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+    };
+    return { holder, restore: () => { lib.createIssuesView = original; } };
+  }
+
+  test('mode off: the command exists, assignmentEnabled is false and the save callback refuses with zero writes', async () => {
+    await withModeDir(async () => {
+      modeLib.writeMode(false, process.env);
+      const capture = captureIssuesView();
+      try {
+        const root = makeRepo({ tag: 'issues-s29-off' });
+        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const before = readRaw(file);
+        const { runner } = makeIssuesRunner();
+        const { commands } = await openIssues(root, { runner });
+        assert.ok(commands.has('herdr-gentle:issues'), 'the command stays registered while the mode is off');
+        assert.ok(capture.holder.options, 'the view was constructed');
+        assert.equal(capture.holder.options.assignmentEnabled, false, 'the disabled mode travels to the view');
+        const result = await capture.holder.options.saveAssignment([76]);
+        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the refusal is honest and exact');
+        assert.equal(readRaw(file), before, 'a refused save leaves the registry bytes unchanged');
+      } finally {
+        capture.restore();
+      }
+    });
+  });
+
+  test('malformed mode: the command exists, assignmentEnabled is false and the callback refuses', async () => {
+    await withModeDir(async () => {
+      const capture = captureIssuesView();
+      try {
+        const root = makeRepo({ tag: 'issues-s29-malformed' });
+        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const before = readRaw(file);
+        const { runner } = makeIssuesRunner();
+        const { commands } = await openIssues(root, { runner });
+        assert.ok(commands.has('herdr-gentle:issues'), 'the command stays registered with a malformed mode');
+        assert.equal(capture.holder.options.assignmentEnabled, false, 'a malformed mode never enables assignment');
+        const result = await capture.holder.options.saveAssignment([76]);
+        assert.deepEqual(result, { ok: false, error: S29_REFUSAL });
+        assert.equal(readRaw(file), before, 'a malformed mode never writes');
+      } finally {
+        capture.restore();
+      }
+    }, { malformed: true });
+  });
+
+  test('mode switched off after opening: the callback re-reads and refuses', async () => {
+    await withModeDir(async () => {
+      modeLib.writeMode(true, process.env);
+      const capture = captureIssuesView();
+      try {
+        const root = makeRepo({ tag: 'issues-s29-switched' });
+        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const before = readRaw(file);
+        const { runner } = makeIssuesRunner();
+        await openIssues(root, { runner });
+        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode opened normally');
+        modeLib.writeMode(false, process.env);
+        const result = await capture.holder.options.saveAssignment([76]);
+        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the callback re-reads the mode, not the snapshot');
+        assert.equal(readRaw(file), before, 'the registry is untouched');
+      } finally {
+        capture.restore();
+      }
+    });
+  });
+
+  test('enabled mode: assignmentEnabled stays true (regression)', async () => {
+    await withModeDir(async () => {
+      const capture = captureIssuesView();
+      try {
+        const root = makeRepo({ tag: 'issues-s29-on' });
+        writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const { runner } = makeIssuesRunner();
+        await openIssues(root, { runner });
+        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode passes true');
+      } finally {
+        capture.restore();
+      }
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S19/S16: the verifier's page-read probes — the three bucket fetches must
+// overlap in wall-clock time, and no read may ask `gh` for `--state all`
+// while Involved excludes the authored bucket at the source.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => {
+  test('the three page fetches run in parallel, never serialized', async () => {
+    const DELAY_MS = 120;
+    const root = makeRepo({ tag: 'issues-parallel' });
+    const base = makeIssuesRunner();
+    let firstListAt = null;
+    let listsDone = 0;
+    let resolveAll;
+    const allListsDone = new Promise((resolve) => { resolveAll = resolve; });
+    const runner = async (bin, argv) => {
+      if (argv[0] === 'issue' && argv[1] === 'list') {
+        if (firstListAt === null) firstListAt = Date.now();
+        await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
+        listsDone += 1;
+        if (listsDone === 3) resolveAll(Date.now());
+      }
+      return base.runner(bin, argv);
+    };
+
+    const { commands, mod, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(runner);
+    const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+    await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+    const def = commands.get('herdr-gentle:issues');
+    assert.ok(def, 'the command is registered');
+    mod.setIssuesTuiLoader(async () => stubTui);
+    let factory = null;
+    const { ctx } = makeCtx({ cwd: root, customImpl: async (captured) => { factory = captured; return null; } });
+    await def.handler('', ctx);
+    openComponent(factory, makeHostTui(24));
+
+    const finishedAt = await allListsDone;
+    assert.equal(listsDone, 3, 'all three buckets were fetched');
+    const elapsed = finishedAt - firstListAt;
+    assert.ok(
+      elapsed < 260,
+      `three ${DELAY_MS}ms pages finished in ${elapsed}ms; serialized they would need ~${DELAY_MS * 3}ms`,
+    );
+  });
+
+  test('no page fetch ever asks for --state all, and Involved excludes the authored bucket', async () => {
+    const root = makeRepo({ tag: 'issues-state-honest' });
+    const { runner, calls } = makeIssuesRunner();
+    await openIssues(root, { runner });
+    const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
+    assert.equal(lists.length, 3, 'three buckets fetched');
+    for (const call of lists) {
+      const at = call.argv.indexOf('--state');
+      assert.ok(at >= 0, `every list call names its state: ${call.argv.join(' ')}`);
+      assert.notEqual(call.argv[at + 1], 'all', `--state all is never emitted: ${call.argv.join(' ')}`);
+      assert.ok(['open', 'closed'].includes(call.argv[at + 1]), `the state is a real filter: ${call.argv.join(' ')}`);
+    }
+    const involved = lists
+      .map((call) => call.argv[call.argv.indexOf('--search') + 1])
+      .filter((query) => query.startsWith('involves:'));
+    assert.deepEqual(involved, ['involves:@me -author:@me sort:updated-desc'], 'Involved excludes authored issues at the source');
   });
 });

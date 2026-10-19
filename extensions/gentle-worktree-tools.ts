@@ -5799,6 +5799,14 @@ function warpOfferedCheckouts(git, read, principal, live, repoRoot) {
   if (principal) {
     offered.push({ name: "principal", path: principal.path, branch: principal.branch });
   }
+  // S10: the principal's own registry row (registered first, idempotently)
+  // is the principal entry already offered above, never a second agent row.
+  const principalState = principal && typeof principal.path === "string" && principal.path.length > 0
+    ? checkoutState(principal.path, repoRoot)
+    : null;
+  const principalId = principalState && principalState.absolute !== null
+    ? (principalState.real !== null ? principalState.real : principalState.absolute)
+    : null;
   const rows = read && Array.isArray(read.worktrees) ? read.worktrees : [];
   // S39: sole claimants offer the CURRENT git branch; shared checkouts keep
   // their stored names so the ambiguity keeps resolving (and every offered
@@ -5811,6 +5819,7 @@ function warpOfferedCheckouts(git, read, principal, live, repoRoot) {
     if (!st.exists || !st.isDirectory) continue;
     const id = st.real !== null ? st.real : st.absolute;
     if (id === null || !liveIds.has(id)) continue;
+    if (principalId !== null && id === principalId) continue;
     const liveShown = (claimCounts.get(id) || 0) === 1 ? liveBranchById.get(id) : undefined;
     const shownBranch = liveShown || row.branch;
     const name = slugOf(git, shownBranch);
@@ -6099,6 +6108,45 @@ function warpFactsForView(entry) {
       ? entry.lastActivity.reason
       : undefined,
   };
+}
+
+// Injectable seam for the warp selector's checkout-facts provider (tests):
+// production leaves it null and the loop builds lib/checkout-facts.js. Tests
+// inject a deterministic delayed provider to prove the selector mounts before
+// the facts resolve.
+let warpFactsFactory = null;
+
+function setWarpFactsFactory(factory) {
+  warpFactsFactory = typeof factory === "function" ? factory : null;
+}
+
+// The checkouts the popup hands its view at MOUNT time (S1): only the
+// synchronous `peek` cache is read — never a git spawn — so the first frame
+// paints immediately and a re-mount reuses whatever ages were already read.
+// A checkout with no cached facts keeps no timestamp (it sorts last until the
+// background enrichment arrives).
+function warpCheckoutsWithCachedActivity(checkoutFacts, entries) {
+  const rows = Array.isArray(entries) ? entries : [];
+  if (!checkoutFacts || typeof checkoutFacts.peek !== "function") return rows;
+  return rows.map((entry) => {
+    if (!entry || typeof entry.path !== "string" || entry.path.length === 0) return entry;
+    let facts = null;
+    try {
+      facts = checkoutFacts.peek(entry.path);
+    } catch {
+      facts = null;
+    }
+    if (!facts) return entry;
+    const activity = facts.lastActivity;
+    return {
+      ...entry,
+      lastActivity: activity,
+      createdAt: facts.createdAt,
+      lastActivityReason: activity && activity.available === false && typeof activity.reason === "string"
+        ? activity.reason
+        : undefined,
+    };
+  });
 }
 
 // The checkouts the popup hands its view: every row carries its own
@@ -6425,7 +6473,7 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
     factsLib = null;
   }
   const checkoutFacts = factsLib && typeof factsLib.createCheckoutFacts === "function"
-    ? factsLib.createCheckoutFacts({ repoRoot: repo.root })
+    ? (warpFactsFactory !== null ? warpFactsFactory({ repoRoot: repo.root }) : factsLib.createCheckoutFacts({ repoRoot: repo.root }))
     : null;
   let helpers = null;
   try {
@@ -6491,11 +6539,11 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
     };
     // S12: the rows carry their own activity/creation values, so the view
     // orders them newest-first and the footer names both ages; nothing here
-    // re-sorts.
-    const mountedCheckouts = await warpCheckoutsWithActivity(
-      checkoutFacts,
-      withPrincipalFlag(freshPrincipal, freshOffered),
-    );
+    // re-sorts. S1: only the synchronous peek cache is used at mount, so the
+    // overlay paints before any git work; the full reads run afterwards and
+    // apply to the still-alive component.
+    const mountEntries = withPrincipalFlag(freshPrincipal, freshOffered);
+    const mountedCheckouts = warpCheckoutsWithCachedActivity(checkoutFacts, mountEntries);
     let out;
     try {
       out = await ctx.ui.custom(
@@ -6518,6 +6566,16 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
             },
             done,
           });
+          // S1 background enrichment: the activity ages arrive after the
+          // first frame and are applied to the still-alive component. The
+          // view drops late work once it settles, and a failed read can
+          // never reject into the host.
+          if (checkoutFacts && typeof view.apply === "function") {
+            void warpCheckoutsWithActivity(checkoutFacts, mountEntries).then(
+              (enriched) => view.apply(enriched),
+              () => {},
+            );
+          }
           return withWarpDeleteKeys(view, { helpers, done, canDelete });
         },
         WARP_SELECTOR_OVERLAY,
@@ -6798,7 +6856,7 @@ function setCustomizeTuiLoader(loader) {
 const CUSTOMIZE_CATEGORIES = [
   {
     id: "sidebar",
-    title: "Agentes sidebar",
+    title: "Herdr Sidebar",
     rows: [
       { id: "gentle", label: "Gentle (this extension)", detail: "publishes agent state and SessionChanges from Gentle" },
       { id: "native", label: "Native Herdr", detail: "hands the pane back to Herdr's own agent state" },
@@ -6822,7 +6880,7 @@ const CUSTOMIZE_CATEGORIES = [
   },
   {
     id: "perf",
-    title: "Performance switches",
+    title: "Performance",
     // Rows, setting names and note text live in lib/customize-perf-rows.js
     // (perf-switches S2-S6): this file delegates and carries no copy.
     rows: [],
@@ -7034,14 +7092,6 @@ function customizeSelect(helpers, theme, label, size, focused) {
   return prefix + customizeFit(helpers, safe, Math.max(0, size - 2));
 }
 
-// The `?` key-help overlay lines (key-consistency K3/S5): the same
-// keys the footer names, spelled out once.
-const CUSTOMIZE_HELP_LINES = [
-  "Keys",
-  "←/→ or Tab panes · ↑/↓ or j/k move",
-  "Enter apply · ? help · Esc close",
-];
-
 function customizeCard(helpers, theme, lines, width) {
   const innerWidth = Math.max(1, width - CUSTOMIZE_CARD_PADDING);
   let border = (text) => text;
@@ -7067,10 +7117,6 @@ function customizeCard(helpers, theme, lines, width) {
 function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, done }) {
   const state = {
     pane: "categories",
-    // `?` key-help overlay (key-consistency K3/S5): toggled, never
-    // modal — esc closes the overlay first, every other key is ignored
-    // while it is open.
-    help: false,
     cat: 0,
     row: model.map((category) => {
       const at = category.rows.findIndex((row) => row.id === category.active);
@@ -7124,14 +7170,9 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     // Right pane: LABELS ONLY (gentle-shell visual-customize-view
     // style) — each choice's S2 detail lives exactly once in the
     // preview block below, never under the rows. The unavailable note
-    // when the provider slot is missing or malformed. The `?` help
-    // overlay replaces the rows with the key list instead.
+    // when the provider slot is missing or malformed. S15/S30: no `?`
+    // key-help overlay and no benchmark disclosure.
     const rightLines = [];
-    if (state.help) {
-      for (const row of CUSTOMIZE_HELP_LINES) {
-        rightLines.push({ label: row, focused: false, muted: true });
-      }
-    } else {
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       // S2 pins → on the active value; focus adds its own ▸ beside it
@@ -7144,7 +7185,6 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     }
     if (!category.available) {
       rightLines.push({ label: "(unavailable in this session)", mark: "    ", focused: false, muted: true });
-    }
     }
     const contentHeight = Math.max(1, height - 2 - 1 - (showHeading ? 1 : 0) - previewLines - (showHeading ? 1 : 0));
     const position = navOnly ? state.cat : state.row[state.cat];
@@ -7166,34 +7206,20 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const escGap = Math.max(1, inner - customizeMeasure(helpers, title) - 3);
     lines.push(paint(`${title}${" ".repeat(escGap)}esc`, inner, "accent"));
     if (showHeading) {
-      const heading = state.help
-        ? "Help · keys"
-        : navOnly
-          ? "Categories · choose a category →"
-          : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
+      const heading = navOnly
+        ? "Categories · choose a category →"
+        : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
       lines.push(join(
         leftWidth ? paint("CATEGORIES", leftWidth, "accent") : "",
         paint(heading, rightWidth, "accent"),
       ));
     }
-    // Help detail (perf-switches S4/S12): the focused row's full measured note
-    // takes over the list area, so the footer line stays short and the numbers
-    // sit one key away. Rows without help keep the ordinary pane.
     const current = focused();
-    const helpLines = state.help && current.row && typeof current.row.helpLines === "function"
-      ? current.row.helpLines(inner)
-      : null;
     for (let i = 0; i < contentHeight; i += 1) {
       const nav = model[navStart + i];
       const left = nav
         ? customizeSelect(helpers, theme, nav.title, leftWidth, navOnly || (navStart + i === state.cat && state.pane === "categories"))
         : "";
-      if (helpLines) {
-        // The help view takes the whole card width: the detail is the point
-        // here, and the category column is already named one row above.
-        lines.push(helpLines[i] ? paint(helpLines[i], inner, "text") : "");
-        continue;
-      }
       const item = navOnly ? (model[start + i] || null) : (rightLines[start + i] || null);
       let right = "";
       if (item) {
@@ -7222,11 +7248,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     // once. The redundant Active: repeat is gone on purpose.
     const previewTitle = `Preview · ${current.row ? current.row.label : current.category.title}`;
     const previewSample = current.row ? current.row.detail : "unavailable";
-    if (helpLines) {
-      if (showHeading) {
-        lines.push(paint("? closes help · Esc closes the panel", inner, "muted"));
-      }
-    } else if (previewLines === 3) {
+    if (previewLines === 3) {
       const wrapped = current.row && typeof current.row.noteLines === "function"
         ? current.row.noteLines(inner)
         : null;
@@ -7244,10 +7266,10 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     } else if (previewLines === 1) {
       lines.push(paint(previewTitle, inner, "muted"));
     }
-    // The help view carries its own key hint, so the generic footer stands
-    // down while the focused row's measured detail fills the card.
-    if (showHeading && !helpLines) {
-      lines.push(paint("←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · ? help · Esc close", inner, "muted"));
+    // S15/S30: the footer names every shortcut; no `?` help and no
+    // benchmark disclosure widget.
+    if (showHeading) {
+      lines.push(paint("←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close", inner, "muted"));
     }
     return customizeCard(helpers, theme, lines.slice(0, Math.max(0, height - 2)), w);
   }
@@ -7260,36 +7282,16 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
   }
   function handleInput(data) {
     if (customizeIsKeyRelease(helpers, data)) return;
-    // Help overlay first (key-consistency K3/S5): `?` toggles, esc
-    // closes the overlay only, and every other key is ignored while it
-    // is open — the same rule the odd and issues viewers use.
-    if (customizeKeyMatches(helpers, data, ["?"])) {
-      state.help = !state.help;
-      requestPaint();
-      return;
-    }
-    if (state.help && customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
-      state.help = false;
-      requestPaint();
-      return;
-    }
-    if (state.help) return;
     if (customizeKeyMatches(helpers, data, ["escape", "ctrl+c"])) {
       done(null);
       return;
     }
-    // perf-switches S4/S12: the footer note stays short on purpose, so the
-    // full measured detail sits behind the help key and never costs the list
-    // its rows. The `?` handler above owns that toggle for every row: one
-    // with `helpLines` shows that detail, one without shows the key list.
     if (customizeKeyMatches(helpers, data, ["left", "right", "tab"])) {
       state.pane = state.pane === "categories" ? "values" : "categories";
-      state.help = false;
       requestPaint();
       return;
     }
     if (customizeKeyMatches(helpers, data, ["up", "k"])) {
-      state.help = false;
       if (state.pane === "categories") state.cat = (state.cat + model.length - 1) % model.length;
       else {
         const count = model[state.cat].rows.length;
@@ -7299,7 +7301,6 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
       return;
     }
     if (customizeKeyMatches(helpers, data, ["down", "j"])) {
-      state.help = false;
       if (state.pane === "categories") state.cat = (state.cat + 1) % model.length;
       else {
         const count = model[state.cat].rows.length;
@@ -7990,6 +7991,22 @@ async function runOddFallback(ctx, listing) {
   if (typeof notify === "function") notify(doc.path, "info");
 }
 
+// S29: the worktree-association switch is a LIVE mode check, never the UI's
+// snapshot. `/odd` and `/issues` stay registered while the mode is off; only
+// the association write is refused, and the callback re-reads the mode so a
+// stale panel cannot write.
+function worktreeAssignmentEnabled() {
+  try {
+    return libRequire("worktree-mode.js").readMode().enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+function worktreeAssignmentRefused() {
+  return { ok: false, error: "worktree tools are disabled; enable them in /herdr-gentle:customize to assign issues or odd documents" };
+}
+
 async function executeOdd(rawArgs, ctx) {
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const raw = String(rawArgs ?? "").trim();
@@ -8018,6 +8035,7 @@ async function executeOdd(rawArgs, ctx) {
   const repoRoot = checkoutRoot || cwd;
   const assigned = checkoutRoot ? oddStoredAssignment(repoRoot, checkoutRoot) : [];
   const checkoutName = checkoutRoot ? path.basename(checkoutRoot) : "";
+  const assignmentEnabled = worktreeAssignmentEnabled();
   let helpers = null;
   try {
     helpers = await oddTuiLoader();
@@ -8031,7 +8049,11 @@ async function executeOdd(rawArgs, ctx) {
           docs: listing.docs,
           assigned,
           checkoutName,
-          saveAssignment: (names) => oddSaveAssignment(repoRoot, checkoutRoot, names, ctx),
+          assignmentEnabled,
+          saveAssignment: (names) => {
+            if (!worktreeAssignmentEnabled()) return worktreeAssignmentRefused();
+            return oddSaveAssignment(repoRoot, checkoutRoot, names, ctx);
+          },
           // `o` opens the focused document outside Pi through
           // $VISUAL/$EDITOR (key-consistency K3): the shared opener
           // reports honestly, so the view shows the miss or the failure
@@ -8089,12 +8111,17 @@ function setIssuesTuiLoader(loader) {
   issuesTuiLoader = loader;
 }
 
+// S16: the three buckets are disjoint at the source. `mine` is what the
+// viewer authored; `involved` is participation that EXCLUDES the viewer's own
+// issues (they already own a row in `mine`), so the two never overlap. Each
+// query asks gh for last-update ordering so no client re-sorts.
 const ISSUES_PAGE_QUERIES = [
-  { id: "mine", label: "My issues", query: "author:@me" },
-  { id: "assigned", label: "Assigned", query: "assignee:@me" },
-  { id: "involved", label: "Involved", query: "involves:@me" },
+  { id: "mine", label: "My issues", query: "author:@me sort:updated-desc" },
+  { id: "assigned", label: "Assigned", query: "assignee:@me sort:updated-desc" },
+  { id: "involved", label: "Involved", query: "involves:@me -author:@me sort:updated-desc" },
 ];
-const ISSUES_FETCH_STATE = "all";
+// S18: the viewer toggles between exactly these two states; `all` is never
+// requested (a closed issue never counts as open).
 const ISSUES_FETCH_PAGE_SIZE = 30;
 
 // Gate state: the command registers once, and a failed gate notifies
@@ -8103,6 +8130,11 @@ const ISSUES_FETCH_PAGE_SIZE = 30;
 // never consumes the session's single alert.
 let issuesCommandRegistered = false;
 let issuesGateNotified = false;
+// S3: `null` = not probed yet, `true` = gh is usable this session, `false` =
+// the last probe failed. The command is registered eagerly at load so it is
+// always discoverable; this state gates the INVOCATION so a missing or
+// unauthenticated `gh` still reports the honest fix instead of opening.
+let issuesGateOpen = null;
 
 // Stored assignment for the viewer (S5): the checkout's own `issues[]`
 // (issue numbers) read fail-soft — an unreadable or malformed registry
@@ -8120,8 +8152,13 @@ function issuesStoredAssignment(repoRoot, checkoutRoot) {
   }
 }
 
-function issuesListArgs(query) {
-  return { query, state: ISSUES_FETCH_STATE, page: 1, pageSize: ISSUES_FETCH_PAGE_SIZE };
+function issuesListArgs(query, state) {
+  return {
+    query,
+    state: state === "closed" ? "closed" : "open",
+    page: 1,
+    pageSize: ISSUES_FETCH_PAGE_SIZE,
+  };
 }
 
 // The `o`-key browser opener: `gh issue view <n> --web` through the
@@ -8155,24 +8192,42 @@ function issuesWrapFailure(promise, what) {
   }).catch((err) => ({ ok: false, error: (err && err.message) || `${what}: failed` }));
 }
 
-async function issuesFetchPages(gh, cwd) {
-  const pages = [];
-  let loadError = null;
-  for (const spec of ISSUES_PAGE_QUERIES) {
-    let res = null;
+// S19: the three buckets fetch together (Promise.all, order preserved) for
+// ONE state — `open` by default, `closed` once the reader toggles. The
+// viewer mounts first and calls this itself, so first paint never waits on
+// the network. Partial failure keeps the successful pages and reports the
+// first error in `loadError`; when every bucket fails the result is
+// `{ok:false, error}` so the view paints the honest error, never fake rows.
+async function issuesFetchPages(gh, cwd, state = "open") {
+  const requestState = state === "closed" ? "closed" : "open";
+  const outcomes = await Promise.all(ISSUES_PAGE_QUERIES.map(async (spec) => {
+    const empty = { id: spec.id, label: spec.label, issues: [], total: 0, truncated: false };
     try {
-      res = await gh.listIssues(issuesListArgs(spec.query), { cwd });
+      const res = await gh.listIssues(issuesListArgs(spec.query, requestState), { cwd });
+      if (res && res.ok === true) {
+        return {
+          ok: true,
+          error: null,
+          page: {
+            id: spec.id,
+            label: spec.label,
+            issues: res.issues,
+            total: res.total,
+            truncated: res.truncated === true,
+          },
+        };
+      }
+      return { ok: false, error: (res && res.error) || "gh issue list failed", page: empty };
     } catch (err) {
-      res = { ok: false, error: (err && err.message) || "gh issue list failed" };
+      return { ok: false, error: (err && err.message) || "gh issue list failed", page: empty };
     }
-    if (res && res.ok === true) {
-      pages.push({ id: spec.id, label: spec.label, issues: res.issues, total: res.total, truncated: res.truncated === true });
-    } else {
-      if (!loadError) loadError = (res && res.error) || "gh issue list failed";
-      pages.push({ id: spec.id, label: spec.label, issues: [], total: 0, truncated: false });
-    }
+  }));
+  const pages = outcomes.map((outcome) => outcome.page);
+  const firstError = outcomes.find((outcome) => outcome.ok !== true);
+  if (!outcomes.some((outcome) => outcome.ok === true)) {
+    return { ok: false, error: (firstError && firstError.error) || "gh issue list failed", pages };
   }
-  return { pages, loadError };
+  return { ok: true, pages, loadError: firstError ? firstError.error : null };
 }
 
 async function executeIssues(rawArgs, ctx) {
@@ -8199,22 +8254,15 @@ async function executeIssues(rawArgs, ctx) {
     if (typeof notify === "function") notify(`issues: cannot load the gh client: ${(err && err.message) || err}`, "error");
     return;
   }
-  // Fetched with state `all` so the view's `f` key can alternate
-  // between open-only (the default) and closed; the totals line names
-  // the bounded count. A failed page leaves an empty page plus the
-  // error, never fake rows.
-  const { pages, loadError } = await issuesFetchPages(gh, checkoutRoot);
-  // Repo labels load best-effort: an empty list still leaves the label
-  // editor usable (toggle nothing, create-new still applies).
-  let labels = [];
-  try {
-    const listed = await gh.listLabels({ cwd: checkoutRoot });
-    if (listed && listed.ok === true && Array.isArray(listed.labels)) labels = listed.labels;
-  } catch {
-    labels = [];
-  }
+  // S19: mount the viewer FIRST, with no eager page or label fetch. The view
+  // asks for its (open) pages through `loadPages({state})` and its labels
+  // through `loadLabels()` on first use, so the first frame paints a loading
+  // state instead of waiting on `gh`.
+  const loadPages = ({ state } = {}) => issuesFetchPages(gh, checkoutRoot, state);
+  const loadLabels = () => gh.listLabels({ cwd: checkoutRoot });
   const assigned = issuesStoredAssignment(repoRoot, checkoutRoot);
   const checkoutName = path.basename(checkoutRoot);
+  const assignmentEnabled = worktreeAssignmentEnabled();
   let helpers = null;
   try {
     helpers = await issuesTuiLoader();
@@ -8222,9 +8270,17 @@ async function executeIssues(rawArgs, ctx) {
     helpers = null;
   }
   if (!helpers || !ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
+    // No interactive host: fetch once so the one-line notice states the real
+    // total, then say the viewer needs an interactive session.
+    const loaded = await issuesFetchPages(gh, checkoutRoot, "open");
+    const pages = Array.isArray(loaded.pages) ? loaded.pages : [];
     if (typeof notify === "function") {
-      const total = pages.reduce((sum, page) => sum + (Array.isArray(page.issues) ? page.issues.length : 0), 0);
-      notify(`issues: ${total} issue(s) across ${pages.length} pages (the viewer needs an interactive session)`, "info");
+      if (loaded.ok !== true) {
+        notify(`issues: ${loaded.error || "gh issue list failed"}`, "info");
+      } else {
+        const total = pages.reduce((sum, page) => sum + (Array.isArray(page.issues) ? page.issues.length : 0), 0);
+        notify(`issues: ${total} issue(s) across ${pages.length} pages (the viewer needs an interactive session)`, "info");
+      }
     }
     return;
   }
@@ -8244,13 +8300,9 @@ async function executeIssues(rawArgs, ctx) {
     postComment: (number, text) => issuesWrapFailure(gh.commentIssue(number, text, { cwd: checkoutRoot }), "cannot comment"),
     setState: (number, state) => issuesWrapFailure(gh.setIssueState(number, state, { cwd: checkoutRoot }), "cannot change the issue state"),
     openBrowser: (number) => issuesOpenInBrowser(checkoutRoot, number),
-    reload: async () => {
+    reload: async ({ state } = {}) => {
       try {
-        const fresh = await issuesFetchPages(gh, checkoutRoot);
-        if (fresh.loadError && fresh.pages.every((page) => !Array.isArray(page.issues) || page.issues.length === 0)) {
-          return { ok: false, error: fresh.loadError };
-        }
-        return { ok: true, pages: fresh.pages };
+        return await issuesFetchPages(gh, checkoutRoot, state);
       } catch (err) {
         return { ok: false, error: (err && err.message) || "cannot reload issues" };
       }
@@ -8259,12 +8311,16 @@ async function executeIssues(rawArgs, ctx) {
   try {
     await ctx.ui.custom(
       (hostTui, theme, _keybindings, done) => libRequire("issues-view.js").createIssuesView({
-        pages,
-        labels,
+        loadPages,
+        loadLabels,
         assigned,
         checkoutName,
+        assignmentEnabled,
         loadIssue: (number) => gh.getIssue(number, { cwd: checkoutRoot }),
-        saveAssignment: (numbers) => issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx),
+        saveAssignment: (numbers) => {
+          if (!worktreeAssignmentEnabled()) return worktreeAssignmentRefused();
+          return issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx);
+        },
         actions,
         helpers,
         theme,
@@ -8277,7 +8333,6 @@ async function executeIssues(rawArgs, ctx) {
           }
         },
         done,
-        ...(loadError ? { loadError } : {}),
       }),
       // Full screen like the odd viewer: the point of this surface is
       // reading long issues with their comments.
@@ -8305,6 +8360,7 @@ async function checkIssuesGate(pi, ctx) {
     const gh = libRequire("gh-issues.js");
     const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
     const res = await gh.ghStatus({ cwd });
+    issuesGateOpen = !!(res && res.ok === true);
     if (res && res.ok === true) {
       registerIssuesCommand(pi);
       return { ok: true };
@@ -8325,6 +8381,25 @@ async function checkIssuesGate(pi, ctx) {
   }
 }
 
+// S3 invocation gate: the command is discoverable even before the session
+// gate resolves, so running it probes `gh` on demand. A session that already
+// answered `ok` never re-probes (no added latency); a failure notifies the
+// same honest fix every time the reader asks.
+async function probeIssuesGate(ctx) {
+  if (issuesGateOpen === true) return { ok: true };
+  let gate;
+  try {
+    const gh = libRequire("gh-issues.js");
+    const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+    const res = await gh.ghStatus({ cwd });
+    gate = res && res.ok === true ? { ok: true } : { ok: false, error: (res && res.error) || "gh check failed" };
+  } catch (err) {
+    gate = { ok: false, error: (err && err.message) || String(err) };
+  }
+  issuesGateOpen = gate.ok === true;
+  return gate;
+}
+
 function registerIssuesCommand(pi) {
   if (issuesCommandRegistered) return;
   if (typeof pi?.registerCommand !== "function") return;
@@ -8332,6 +8407,12 @@ function registerIssuesCommand(pi) {
   pi.registerCommand("herdr-gentle:issues", {
     description: "Read and triage this repository's GitHub issues: three pages, detail pane, labels, comments, close/reopen",
     handler: async (args, ctx) => {
+      const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+      const gate = await probeIssuesGate(ctx);
+      if (gate.ok !== true) {
+        if (typeof notify === "function") notify(issuesGateMessage(gate.error), "error");
+        return;
+      }
       await executeIssues(args, ctx);
     },
   });
@@ -8365,23 +8446,24 @@ export default function (pi) {
   } catch {
     toolsRegistered = false;
   }
-  // perf-switches S4: the panel's performance notes read pi's own setting
-  // descriptions, so `/settings` and this footer cannot drift apart. A host
-  // that exposes none keeps the pinned measured text; the load is
-  // fire-and-forget and never blocks startup.
-  try {
-    const perfRows = libRequire("customize-perf-rows.js");
-    if (perfRows && typeof perfRows.primeDescriptions === "function") {
-      void perfRows.primeDescriptions(() => import("@earendil-works/pi-coding-agent"));
-    }
-  } catch {
-    // No rows module: the performance category reports itself unavailable.
-  }
-  registerWarpCommand(pi);
+  // S30: the customize panel's performance previews are plain-language
+  // behavior/benefit/tradeoff copy from lib/customize-perf-rows.js; the
+  // measured evidence lives in the docs, never in the UI (so the host's own
+  // raw setting descriptions are intentionally not read into the panel).
   registerWarpMessageRenderer(pi);
   registerCustomizeCommand(pi, toolsRegistered);
   registerOddCommand(pi);
+  // S3: register the issues command eagerly so it is in the autocomplete
+  // snapshot from load; the gh check gates the INVOCATION instead of the
+  // registration, so a missing/unauthenticated gh still reports the honest
+  // fix and never opens.
+  registerIssuesCommand(pi);
   if (toolsRegistered) {
+    // S28: `/herdr-gentle:warp` is part of the worktree tool surface, so it
+    // is registered only while the worktree tools are enabled; a disabled or
+    // malformed mode hides the command. The customize panel stays registered
+    // so the mode can be flipped back, and a reload re-runs this gate.
+    registerWarpCommand(pi);
     pi.registerTool(worktreeCreateTool);
     pi.registerTool(worktreeListTool);
     pi.registerTool(worktreeCloseTool);

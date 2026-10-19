@@ -23,7 +23,7 @@
 // exact select title and option strings, notification text, and written
 // state.
 
-const { test, describe, after } = require('node:test');
+const { test, describe, beforeEach, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -76,6 +76,11 @@ function scratchModeEnv() {
 }
 
 const savedEnv = { ...process.env };
+// Registration now depends on this preference: never inherit the operator's
+// current mode, and never let a mode test affect a subsequent command test.
+beforeEach(() => {
+  process.env.GENTLE_STATUS_STATE_DIR = scratchModeEnv().GENTLE_STATUS_STATE_DIR;
+});
 function setEnv(vars) {
   for (const [key, value] of Object.entries(vars)) {
     if (value === undefined) delete process.env[key];
@@ -338,15 +343,49 @@ function oscFake(isTTY) {
 }
 
 describe('herdr-gentle:warp command (S11)', { concurrency: false }, () => {
-  test('the command is registered under the exact name even while the mode says disabled', async () => {
+  test('S28: warp is registered when the worktree mode is enabled', async () => {
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR });
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands } = await loadExtension();
+      assert.ok(commands.has('herdr-gentle:warp'), `warp is part of the enabled worktree surface, got ${JSON.stringify([...commands.keys()])}`);
+      for (const name of ['herdr-gentle:customize', 'herdr-gentle:odd', 'herdr-gentle:issues']) {
+        assert.ok(commands.has(name), `${name} stays registered regardless of the worktree mode`);
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S28: a disabled worktree mode hides warp while the read commands stay registered', async () => {
     const modeEnv = scratchModeEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR });
     try {
       modeLib().writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
-      assert.ok(commands.has('herdr-gentle:warp'), `exact name, got ${JSON.stringify([...commands.keys()])}`);
+      assert.ok(!commands.has('herdr-gentle:warp'), `warp is hidden while disabled, got ${JSON.stringify([...commands.keys()])}`);
       assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
+      for (const name of ['herdr-gentle:customize', 'herdr-gentle:odd', 'herdr-gentle:issues']) {
+        assert.ok(commands.has(name), `${name} stays registered so reading and re-enabling work`);
+      }
       assert.deepEqual([...tools.keys()], [], 'the worktree tools stay gated while disabled');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S28: a malformed worktree mode also hides warp without hiding the read commands', async () => {
+    const modeEnv = scratchModeEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR });
+    try {
+      fs.writeFileSync(modeLib().modePath(process.env), 'not json\n');
+      const { tools, commands } = await loadExtension();
+      assert.ok(!commands.has('herdr-gentle:warp'), `a malformed mode never enables warp, got ${JSON.stringify([...commands.keys()])}`);
+      for (const name of ['herdr-gentle:customize', 'herdr-gentle:odd', 'herdr-gentle:issues']) {
+        assert.ok(commands.has(name), `${name} stays registered with a malformed mode`);
+      }
+      assert.deepEqual([...tools.keys()], [], 'the worktree tools stay gated while malformed');
     } finally {
       restoreEnv();
     }
@@ -1014,7 +1053,7 @@ describe('worktree warp command verb (S23, T32 RED)', { concurrency: false }, ()
 });
 
 describe('S14 startup discovery + unregistered warp (T7 RED)', { concurrency: false }, () => {
-  test('S28: session_start registers the missing repository worktrees, never the principal', async () => {
+  test('S10: session_start registers the canonical principal first and once, preserving rows and staying idempotent', async () => {
     const root = makeRepo('s14-startup');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -1022,29 +1061,38 @@ describe('S14 startup discovery + unregistered warp (T7 RED)', { concurrency: fa
       track(unreg);
       git(root, ['worktree', 'add', '-b', 'feat/s14-unreg', unreg, 'HEAD']);
       const realUnreg = fs.realpathSync(unreg);
+      const registryLib = require('../lib/worktree-registry.js');
+      // Seed the principal with REAL associations: discovery must preserve
+      // them, never overwrite them, and keep the row first.
+      const principalReal = fs.realpathSync(root);
+      const principalBranch = git(root, ['branch', '--show-current']);
+      assert.equal(registryLib.upsertWorktree(root, {
+        branch: principalBranch, path: principalReal, thread: 'seed-thread', issues: [9], odd: ['odd/tasks/keep.md'],
+      }).ok, true);
       const { handlers } = await loadExtension();
       assert.ok(handlers.has('session_start'), 'the extension observes session_start for startup discovery');
-      const registryLib = require('../lib/worktree-registry.js');
       const fire = handlers.get('session_start');
       assert.ok(Array.isArray(fire) && fire.length > 0, 'at least one session_start handler');
       for (const handler of fire) {
         await handler({ reason: 'startup' }, { cwd: root, sessionManager: { getSessionId: () => 's14' } });
       }
-      // S28: every repository worktree through git is registered when
-      // missing — the creation path is only where new ones are born.
-      const entry = registryLib.findByBranch(root, 'feat/s14-unreg');
-      assert.ok(entry, 'discovery registered the missing worktree');
-      assert.equal(entry.path, realUnreg, 'the checkout path is registered');
-      // The principal checkout is never registered by discovery (S31:
-      // its record is created on demand by an explicit edit).
-      const principalBranch = git(root, ['branch', '--show-current']);
       const read = registryLib.readRegistry(root);
       assert.ok(read.ok, 'registry readable after discovery');
-      assert.ok(
-        !read.worktrees.some((row) => row.path === root || row.path === fs.realpathSync(root)),
-        `discovery never registers the principal: ${JSON.stringify(read.worktrees)}`,
-      );
-      void principalBranch;
+      assert.equal(read.worktrees[0].path, principalReal, 'the principal is the first metadata row');
+      assert.equal(read.worktrees[0].thread, 'seed-thread', 'the principal row is preserved, not rewritten');
+      assert.deepEqual(read.worktrees[0].issues, [9], 'the principal associations survive discovery');
+      assert.deepEqual(read.worktrees[0].odd, ['odd/tasks/keep.md']);
+      assert.equal(read.worktrees.filter((row) => row.path === principalReal).length, 1, 'the principal is registered exactly once');
+      const entry = registryLib.findByBranch(root, 'feat/s14-unreg');
+      assert.ok(entry, 'the missing worktree is registered');
+      assert.equal(entry.path, realUnreg, 'the checkout path is registered');
+      // A repeated startup rewrites nothing: byte-identical registry.
+      const file = registryLib.registryPath(root);
+      const bytes = fs.readFileSync(file, 'utf8');
+      for (const handler of fire) {
+        await handler({ reason: 'startup' }, { cwd: root, sessionManager: { getSessionId: () => 's14' } });
+      }
+      assert.equal(fs.readFileSync(file, 'utf8'), bytes, 'a repeated startup is byte-idempotent');
     } finally {
       restoreEnv();
     }

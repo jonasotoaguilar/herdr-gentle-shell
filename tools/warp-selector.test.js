@@ -822,6 +822,104 @@ function multiDriver(steps) {
   return { mount, views, mounts: () => mounts };
 }
 
+// A driver whose FIRST mount waits for the background enrichment before it
+// presses its keys; later mounts drive after a tick like `multiDriver`. S1
+// mounts before the facts, so an activity-order assertion must keep the
+// component alive long enough for the enrichment to apply.
+function activityDriver(keys) {
+  const views = [];
+  let mounts = 0;
+  const mount = async (factory) => {
+    mounts += 1;
+    const index = mounts - 1;
+    const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('component did not settle')), 6000);
+      const done = (value) => { clearTimeout(timer); resolve(value); };
+      let view;
+      try {
+        view = factory(hostTui, plainTheme, {}, done);
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+        return;
+      }
+      views.push(view);
+      const drive = async () => {
+        try {
+          if (index === 0) await waitForActivity(view);
+          for (const key of keys) view.handleInput(key);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      if (index === 0) setTimeout(drive, 0);
+      else flush().then(drive).catch(reject);
+    });
+  };
+  return { mount, views, mounts: () => mounts };
+}
+
+// S1: the popup now mounts before its facts arrive, so a wiring test that
+// asserts activity order must let the background enrichment land. Poll the
+// mounted component's public state until every row carries an activity, or
+// the bounded wait runs out.
+async function waitForActivity(view, tries = 400) {
+  for (let i = 0; i < tries; i += 1) {
+    const rows = view && view.state && Array.isArray(view.state.checkouts) ? view.state.checkouts : [];
+    if (rows.length > 0 && rows.every((row) => row.lastActivity !== null && row.lastActivity !== undefined)) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+// A driver whose FIRST mount waits for the background enrichment before it
+// presses its keys; later mounts drive after a tick like `multiDriver`.
+function activityDriver(keys) {
+  const views = [];
+  let mounts = 0;
+  const mount = async (factory) => {
+    mounts += 1;
+    const index = mounts - 1;
+    const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('component did not settle')), 5000);
+      const done = (value) => { clearTimeout(timer); resolve(value); };
+      let view;
+      try {
+        view = factory(hostTui, plainTheme, {}, done);
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+        return;
+      }
+      views.push(view);
+      const drive = async () => {
+        try {
+          if (index === 0) await waitForActivity(view);
+          for (const key of keys) view.handleInput(key);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      if (index === 0) setTimeout(drive, 0);
+      else flush().then(drive).catch(reject);
+    });
+  };
+  return { mount, views, mounts: () => mounts };
+}
+
+// Render until the focused checkout's facts footer stops saying `reading`,
+// then return the frame text. render() is pure, so this never starts a read.
+async function waitForFactsFooter(view, width = 120, tries = 400) {
+  let text = '';
+  for (let i = 0; i < tries; i += 1) {
+    text = clean(view.render(width).join('\n'));
+    if (!text.includes('reading')) return text;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return text;
+}
+
 function wiredCtx(root, driver, extra = {}) {
   const calls = [];
   const sessionFile = sessionFileIn();
@@ -910,7 +1008,9 @@ describe('T12: editing the focused checkout (S13)', { concurrency: false }, () =
       assert.match(text, /Name: real-target \[frozen\]/, 'the name is frozen and never re-derived');
       assert.ok(!text.includes('preview branch:'), 'no invented create-time branch');
       assert.match(text, /\[x\] #2/, 'the assigned issue arrives pre-selected');
-      assert.match(text, /\[x\] w1-a/, 'the assigned odd document arrives pre-selected');
+      // The panel shows one dataset at a time; the summary line is the
+      // visible proof the assigned odd document is pre-selected too.
+      assert.match(text, /selected: 1 issue · 1 odd/, 'the assigned odd document arrives pre-selected');
       assert.deepEqual(built.notes, [], 'Esc is silent');
     } finally {
       restoreEnv();
@@ -985,12 +1085,10 @@ describe('T12: editing the focused checkout (S13)', { concurrency: false }, () =
         // the saver stores both spellings sorted.
         assert.deepEqual(row.odd, ['/fixtures/odd/w1-b.md', 'w1-a'], 'the selected odd documents were saved');
         assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
-        // The popup reads the focused row's facts on the frame that draws
-        // it, so prime one frame, let the read settle, then assert.
-        driver.views[2].render(120);
-        await flush();
-        const reopened = clean(driver.views[2].render(120).join('\n'));
-        assert.match(reopened, /issues #2 #7/, `the reopened popup shows the saved issues\n${reopened}`);
+        // S1: the popup reads the focused row's facts after the mount; wait
+        // for the async read instead of assuming it was pre-fetched.
+        const reopened = await waitForFactsFooter(driver.views[2]);
+        assert.match(reopened, /issues 2/, `the reopened popup shows the saved issue count\n${reopened}`);
         assert.deepEqual(built.notes, [], 'a successful save is silent');
       } finally {
         watcher.restore();
@@ -1030,10 +1128,8 @@ describe('T12: editing the focused checkout (S13)', { concurrency: false }, () =
         const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
         assert.deepEqual(row.issues, [2], 'the refused write changed nothing');
         assert.deepEqual(row.odd, ['w1-a'], 'the refused write changed nothing');
-        driver.views[2].render(120);
-        await flush();
-        const reopened = clean(driver.views[2].render(120).join('\n'));
-        assert.match(reopened, /issues #2/, `the reopened popup still shows the old assignment\n${reopened}`);
+        const reopened = await waitForFactsFooter(driver.views[2]);
+        assert.match(reopened, /issues 1/, `the reopened popup still shows the old assignment\n${reopened}`);
         assert.ok(!reopened.includes('#7'), 'nothing optimistic is displayed');
       } finally {
         registryLib.updateWorktree = original;
@@ -1074,16 +1170,13 @@ describe('T12: the popup and its panes keep the SOURCE order (S15)', { concurren
     try {
       const root = makeRepo('ordered-rows');
       const older = addRegisteredWorktree(root, 'feat/older');
-      commitAt(older, 'old work', '2020-01-02T03:04:05');
+      commitAt(older, 'old work', '2099-01-02T03:04:05');
       const newer = addRegisteredWorktree(root, 'feat/newer');
-      commitAt(newer, 'recent work', '2024-06-07T08:09:10');
-      const driver = multiDriver([['\x1b[B', '\x1b']]);
+      commitAt(newer, 'recent work', '2099-06-07T08:09:10');
+      const driver = activityDriver(['\x1b[B', '\x1b']);
       const built = wiredCtx(root, driver);
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      await flush();
-      driver.views[0].render(120);
-      await flush();
       const lines = driver.views[0].render(120).map(clean);
       const at = (needle) => lines.findIndex((line) => line.includes(needle));
       const newerAt = at('feat-newer');
@@ -1272,7 +1365,6 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         let cursorAfterPage = null;
         let oddSelected = null;
         let query = null;
-        let helpOpen = null;
         const driver = multiDriver([['\r'], (view) => {
           const step = stepRecorder(view, watcher);
           step('move from the type field to the name field', (v) => v.handleInput('\x1b[B'));
@@ -1293,13 +1385,9 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           query = view.state.queries.odd;
           assert.ok(query.length > 0, 'the filter received the typed text');
           step('close the filter', (v) => v.handleInput('\x1b'));
-          step('open the help', (v) => v.handleInput('?'));
-          helpOpen = view.state.help;
-          assert.equal(helpOpen, true, 'the help opened');
-          step('close the help', (v) => v.handleInput('\x1b'));
           step('cancel the panel', (v) => v.handleInput('\x1b'));
           assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 12, 'every scripted interaction was measured');
+          assert.ok(step.steps.length >= 10, 'every scripted interaction was measured');
         }]);
         const built = wiredCtx(root, driver);
         const { commands, mod } = await loadExtension();
@@ -1349,12 +1437,9 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           step('type in the filter', (v) => v.handleInput('1'));
           assert.ok(view.state.queries.odd.length > 0, 'the filter received the typed text');
           step('close the filter', (v) => v.handleInput('\x1b'));
-          step('open the help', (v) => v.handleInput('?'));
-          assert.equal(view.state.help, true, 'the help opened');
-          step('close the help', (v) => v.handleInput('\x1b'));
           step('cancel the panel', (v) => v.handleInput('\x1b'));
           assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 15, 'every scripted interaction was measured');
+          assert.ok(step.steps.length >= 13, 'every scripted interaction was measured');
         }, ['\x1b']]);
         const built = wiredCtx(root, driver);
         const { commands, mod } = await loadExtension();
@@ -1508,20 +1593,94 @@ describe('T12: the reload option is preserved', { concurrency: false }, () => {
     try {
       const root = makeRepo('reload-rows');
       const older = addRegisteredWorktree(root, 'feat/older');
-      commitAt(older, 'old work', '2020-01-02T03:04:05');
+      commitAt(older, 'old work', '2099-01-02T03:04:05');
       const newer = addRegisteredWorktree(root, 'feat/newer');
-      commitAt(newer, 'recent work', '2024-06-07T08:09:10');
-      const driver = multiDriver([['r', '\x1b']]);
+      commitAt(newer, 'recent work', '2099-06-07T08:09:10');
+      const driver = activityDriver(['r', '\x1b']);
       const built = wiredCtx(root, driver);
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      await flush();
       const lines = driver.views[0].render(120).map(clean);
       const at = (needle) => lines.findIndex((line) => line.includes(needle));
       assert.equal(driver.mounts(), 1, 'r never closes and re-mounts the popup');
       assert.ok(at('feat-newer') >= 0 && at('feat-older') >= 0, `both rows survive the reload\n${lines.join('\n')}`);
       assert.ok(at('feat-newer') < at('feat-older'), 'the reload keeps the newest-first order');
       assert.deepEqual(built.notes, [], 'a reload notifies nothing');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S1: the popup mounts before the (slow) facts resolve, render performs no
+// I/O, and the background enrichment applies to the still-alive component.
+// ---------------------------------------------------------------------------
+describe('S1: the selector paints before the facts, then enriches', { concurrency: false }, () => {
+  test('mounted before the delayed facts, no I/O in render, then the rows gain their activity', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('s1-paint-first');
+      const target = addRegisteredWorktree(root, 'feat/slow');
+      const delayMs = 400;
+      let factsCalls = 0;
+      const { commands, mod } = await loadExtension();
+      mod.setWarpFactsFactory(() => ({
+        peek: () => null,
+        invalidate: () => {},
+        ttlMs: 5000,
+        facts: (checkoutPath) => {
+          factsCalls += 1;
+          return new Promise((resolve) => setTimeout(() => resolve({
+            checkout: checkoutPath,
+            fetchedAt: Date.now(),
+            cached: false,
+            branch: { available: true, value: 'feat/slow', reason: null },
+            issues: { available: true, value: [], reason: null },
+            odd: { available: true, value: [], reason: null },
+            createdAt: { available: true, value: new Date(0).toISOString(), reason: null, source: 'registry' },
+            lastActivity: { available: true, value: new Date().toISOString(), reason: null, source: 'commit' },
+            changes: { available: true, value: { added: 0, deleted: 0 }, reason: null },
+            aheadBehind: { available: true, value: { ahead: 0, behind: 0, base: 'main' }, reason: null },
+          }), delayMs));
+        },
+      }));
+
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      let view = null;
+      let mountedAt = null;
+      const mount = async (factory) => new Promise((resolve) => {
+        mountedAt = Date.now();
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        view = factory(hostTui, plainTheme, {}, resolve);
+      });
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount });
+      const started = Date.now();
+      const handler = warpDef(commands).handler('', built.ctx);
+      // The mount happens before the facts promise can resolve.
+      for (let i = 0; i < 50 && mountedAt === null; i += 1) await tick();
+      assert.ok(mountedAt !== null, 'the overlay mounted');
+      const mountMs = mountedAt - started;
+      assert.ok(mountMs < delayMs, `mounted in ${mountMs}ms, before the ${delayMs}ms facts delay`);
+
+      const callsBeforeRender = factsCalls;
+      const firstPaint = view.render(120).map(clean).join('\n');
+      assert.match(firstPaint, /create a worktree/, 'the first frame is usable');
+      view.render(120);
+      assert.equal(factsCalls, callsBeforeRender, 'render() performed no additional facts I/O');
+      const before = view.state.checkouts.find((entry) => entry.path === target);
+      assert.equal(before.lastActivity, null, 'no activity is invented before the read');
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs + 120));
+      assert.ok(factsCalls > 0, 'the background read ran');
+      const after = view.state.checkouts.find((entry) => entry.path === target);
+      assert.ok(after && typeof after.lastActivity === 'number', 'the enrichment applied to the live component');
+
+      view.handleInput('\x1b');
+      await handler;
+      assert.deepEqual(built.notes, [], 'Esc stays silent');
     } finally {
       restoreEnv();
     }
