@@ -778,3 +778,28 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     assert.match(body, /ctrl\+s/, 'the save hint stays by default');
   });
 });
+
+// S2: the key legend is ONE terminal row — the keys the view gained (`T`
+// filter, `o` open) ride the same row as the rest instead of a second one.
+describe('S2: one-row key legends', () => {
+  const WIDTHS = [40, 60, 80, 120];
+  const tickOnce = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  test('the footer legend owns exactly one row at every width', async () => {
+    for (const width of WIDTHS) {
+      const { view } = makeView({
+        docs: [doc('alpha'), doc('beta')],
+        load: () => ({ ok: true, text: '# alpha\n\nbody of alpha\n' }),
+      });
+      await tickOnce();
+      const lines = view.render(width).map(strip);
+      assert.equal(lines.length, 20, `width ${width}: the frame fills the available rows`);
+      for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `width ${width}: row is not ${width} wide`);
+      const legend = lines.filter((line) => /esc close|T filter|o open/.test(line));
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /↑↓/, `width ${width}: the movement keys survive`);
+      assert.match(legend[0], /esc close/, `width ${width}: the close key survives`);
+    }
+  });
+});

@@ -7029,6 +7029,16 @@ function customizeTruncate(helpers, text, width) {
 const CUSTOMIZE_CARD_PADDING = 4;
 const CUSTOMIZE_NARROW_WIDTH = 60;
 const CUSTOMIZE_MAX_HEIGHT = 24;
+// S2: the key legend is ONE terminal row. `text` is the full token, `short`
+// the compact form used when the full one does not fit, and `priority` the
+// drop order (the lowest goes first, ties drop the later token), so the close
+// key outlives every other hint.
+const CUSTOMIZE_FOOTER_KEYS = [
+  { text: "←/→ or Tab panes", short: "←/→ panes", priority: 60 },
+  { text: "↑/↓ or j/k move", short: "↑/↓ move", priority: 70 },
+  { text: "Enter apply", short: "↵ apply", priority: 80 },
+  { text: "Esc close", short: "esc close", priority: 100 },
+];
 
 function customizeStripAnsi(value) {
   return String(value).replace(/\x1b\[[0-9;]*m/g, "").replace(/\x1b\]8;;.*?\x07/g, "");
@@ -7066,6 +7076,29 @@ function customizePaint(helpers, theme, role, text, size) {
     // A hostile theme never breaks the panel.
   }
   return padded;
+}
+
+// S2: a key legend stays on ONE row. The full text is used while it fits;
+// otherwise it compacts to its short tokens and then drops its lowest-priority
+// keys (display order never changes, and no token carries a newline), so it
+// never wraps onto a second row. The caller still paints through
+// customizePaint, which keeps the row cell-exact if a single token is wider
+// than the card.
+function customizeLegend(helpers, entries, width) {
+  const join = (list, field) => list.map((entry) => entry[field]).join(" · ");
+  const fits = (text) => customizeMeasure(helpers, text) <= width;
+  if (fits(join(entries, "text"))) return join(entries, "text");
+  if (fits(join(entries, "short"))) return join(entries, "short");
+  const kept = entries.slice();
+  while (kept.length > 1) {
+    let drop = 0;
+    for (let at = 1; at < kept.length; at += 1) {
+      if (kept[at].priority <= kept[drop].priority) drop = at;
+    }
+    kept.splice(drop, 1);
+    if (fits(join(kept, "short"))) break;
+  }
+  return join(kept, "short");
 }
 
 // Focused-row selection (the palette's renderPaletteSelection pattern):
@@ -7269,7 +7302,7 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     // S15/S30: the footer names every shortcut; no `?` help and no
     // benchmark disclosure widget.
     if (showHeading) {
-      lines.push(paint("←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close", inner, "muted"));
+      lines.push(paint(customizeLegend(helpers, CUSTOMIZE_FOOTER_KEYS, inner), inner, "muted"));
     }
     return customizeCard(helpers, theme, lines.slice(0, Math.max(0, height - 2)), w);
   }

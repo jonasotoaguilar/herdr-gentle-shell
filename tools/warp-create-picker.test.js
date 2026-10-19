@@ -741,7 +741,7 @@ describe('freeze/cancel/key regression (S52: real matcher + raw fallback)', { co
   test('the async gh fetch keeps the verified argv shape', async () => {
     const seen = [];
     const { EventEmitter } = require('node:events');
-    const spawnFn = (bin, argv, opts) => {
+    const spawnFn = (bin, argv, _opts) => {
       seen.push({ bin, argv });
       const proc = new EventEmitter();
       proc.stdout = new EventEmitter();
@@ -1193,5 +1193,62 @@ describe('S64 footer totals (T50, test-first RED)', () => {
     assert.match(text, /12\s*total/i, 'TOTAL survives paging');
     assert.match(text, /1\s*selected/i, 'selection survives paging');
     assert.match(text, /page 2\/3/i, 'page advances');
+  });
+});
+
+// S2: every picker footer is ONE terminal row; a footer wider than the panel
+// is compacted (short tokens, then the lowest-priority keys dropped), never
+// ellipsis-clipped and never wrapped.
+describe('S2: one-row key legends', { concurrency: false }, () => {
+  const WIDTHS = [40, 60, 80, 120];
+  const rows = Array.from({ length: 6 }, (_, i) => ({ id: i + 1, label: `row ${i + 1}` }));
+  const base = { helpers: null, hostTui: null, theme: null, done: () => {} };
+
+  function legendRows(lines, marker) {
+    return lines.filter((line) => marker.test(line));
+  }
+
+  test('the write prompt footer owns exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const view = picker.createTextInput({ ...base, title: 'Name', placeholder: 'name-change', initial: '' });
+      const lines = view.render(width);
+      const legend = legendRows(lines, /esc cancel/i);
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /esc cancel/i, `width ${width}: the cancel key survives`);
+    }
+  });
+
+  test('the single-select footer owns exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const view = picker.createSingleSelect({ ...base, title: 'Type', items: ['feat', 'fix', 'docs'] });
+      const lines = view.render(width);
+      const legend = legendRows(lines, /esc cancel/i);
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /esc cancel/i, `width ${width}: the cancel key survives`);
+    }
+  });
+
+  test('the multi-select list and search footers own exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const view = picker.createMultiSelect({
+        ...base,
+        title: 'Select rows (optional)',
+        items: rows,
+        pageSize: 5,
+        filterFn: (list, q) => list.filter((item) => item.label.includes(String(q || ''))),
+      });
+      const listLines = view.render(width);
+      const listLegend = legendRows(listLines, /esc cancel/i);
+      assert.equal(listLegend.length, 1, `width ${width}: exactly one list legend row, got ${listLegend.length}`);
+      assert.ok(!listLegend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${listLegend[0]}`);
+      assert.match(listLegend[0], /esc cancel/i, `width ${width}: the cancel key survives`);
+      view.handleInput('t');
+      const searchLines = view.render(width);
+      const searchLegend = legendRows(searchLines, /filter kept|back to list|Tab back|tab/);
+      assert.equal(searchLegend.length, 1, `width ${width}: exactly one search legend row, got ${searchLegend.length}`);
+      assert.ok(!searchLegend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${searchLegend[0]}`);
+    }
   });
 });

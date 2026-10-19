@@ -1040,6 +1040,25 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
     }
   });
 
+  // S2: the key legend is ONE terminal row at every width. A legend that does
+  // not fit the card is compacted (short tokens, then the lowest-priority keys
+  // dropped) instead of ellipsis-clipped, so the close key never disappears.
+  test('the key legend owns exactly one row at every width', async () => {
+    const { component, cleanup } = await openPanel();
+    try {
+      for (const width of [40, 60, 80, 120]) {
+        const lines = component.render(width);
+        for (const line of lines) assert.equal(visible(line), width, `width ${width}: every row stays cell-exact`);
+        const legend = lines.map(stripAnsi).filter((line) => /Esc close|esc close/.test(line));
+        assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+        assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+        assert.match(legend[0], /close/, `width ${width}: the close key survives`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   test('the card paints through the injected theme instead of hardcoding escapes', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });

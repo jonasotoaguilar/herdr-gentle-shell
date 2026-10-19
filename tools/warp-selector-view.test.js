@@ -752,3 +752,45 @@ describe('selection and reload', () => {
     assert.deepEqual(factCalls, ['/w/old-shape', '/w/new-shape'], 'the cached facts are dropped on reload');
   });
 });
+
+// S2: a key legend is ONE terminal row. A legend that does not fit the frame
+// is compacted (short tokens, then the lowest-priority keys dropped), so it
+// is never ellipsis-clipped and never spills onto a second row.
+describe('S2: one-row key legends', () => {
+  const WIDTHS = [40, 60, 80, 120];
+
+  function legendRows(lines, marker) {
+    return lines.map(strip).filter((line) => marker.test(line));
+  }
+
+  test('the popup footer owns exactly one row at every width', async () => {
+    for (const width of WIDTHS) {
+      const { view } = makeView();
+      await tick();
+      const { lines } = screen(view, width);
+      assert.equal(lines.length, HEIGHT, `width ${width}: the pinned frame keeps its height`);
+      const legend = legendRows(lines, /esc close|↑↓/);
+      assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /↑↓/, `width ${width}: the movement keys survive`);
+      assert.match(legend[0], /esc close/, `width ${width}: the close key survives`);
+      assert.equal(helpers.visibleWidth(lines[18]), width, `width ${width}: the footer row is cell-exact`);
+    }
+  });
+
+  test('the extended-list footer owns exactly one row at every width', async () => {
+    for (const width of WIDTHS) {
+      const { view } = makeView();
+      await tick();
+      view.handleInput('v');
+      const { lines } = screen(view, width);
+      assert.equal(lines.length, HEIGHT, `width ${width}: the pinned frame keeps its height`);
+      const legend = legendRows(lines, /esc back|↑↓/);
+      assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /↑↓/, `width ${width}: the movement keys survive`);
+      assert.match(legend[0], /esc back/, `width ${width}: the back key survives`);
+      assert.equal(helpers.visibleWidth(lines[18]), width, `width ${width}: the footer row is cell-exact`);
+    }
+  });
+});

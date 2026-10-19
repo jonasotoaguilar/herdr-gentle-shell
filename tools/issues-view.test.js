@@ -1576,3 +1576,28 @@ describe('issues view assignment gate (S29)', () => {
     assert.deepEqual(off.saves, [], 'no assignment save ever ran');
   });
 });
+
+// S2: the footer legend is ONE terminal row; a legend wider than the card is
+// compacted (short tokens, then the lowest-priority keys dropped) instead of
+// being ellipsis-clipped inside the frame.
+describe('S2: one-row key legends', () => {
+  const WIDTHS = [40, 60, 80, 120];
+
+  test('the footer legend owns exactly one row at every width', async () => {
+    for (const width of WIDTHS) {
+      const { view } = makeView({
+        pages: pagesOf([[issue(1)], [], []]),
+        issues: [issue(1)],
+        loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      });
+      await tick();
+      const lines = view.render(width);
+      for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `width ${width}: row is not ${width} wide`);
+      const legend = lines.map(strip).filter((line) => /esc close|↑↓ move/.test(line));
+      assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /↑↓ move/, `width ${width}: the movement keys survive`);
+      assert.match(legend[0], /esc close/, `width ${width}: the close key survives`);
+    }
+  });
+});

@@ -176,8 +176,8 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.match(text, /#12 Crash on empty/, 'the first issue row');
     assert.ok(!text.includes('[ ] alpha'), 'the inactive Odd list is not a second list column');
     assert.match(text, /body of issue 12/, 'the focused row preview');
-    assert.match(text, /↑\/↓ fields & rows/, 'the footer names the arrow map');
-    assert.match(text, /←\/→ type \/ dataset/, 'the footer names the type and dataset keys');
+    assert.match(text, /↑\/↓ fields/, 'the footer names the arrow map');
+    assert.match(text, /←\/→ type/, 'the footer names the type and dataset keys');
     assert.match(text, /Space select/, 'the footer names the selection key');
     assert.match(text, /Tab dataset/, 'the footer names the dataset toggle');
     assert.match(text, /Enter confirm/, 'the footer names the confirm key');
@@ -1133,5 +1133,55 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.equal(finished.length, 1);
     assert.ok(!('mode' in finished[0]), 'a creation carries no mode marker');
     assert.deepEqual(Object.keys(finished[0]).sort(), ['issues', 'name', 'odd', 'ok', 'type']);
+  });
+});
+
+// S2: a key legend is ONE terminal row. The create panel used to spend two
+// rows on the same legend; a merged legend that does not fit is compacted
+// (short tokens, then the lowest-priority keys dropped), never clipped with
+// an ellipsis and never wrapped onto a second row.
+describe('S2: one-row key legends', { concurrency: false }, () => {
+  const WIDTHS = [40, 60, 80, 120];
+  const LEGEND = /Esc cancel|Ctrl\+S create|Space select/;
+
+  function legendRows(lines, marker) {
+    return lines.map(stripAnsi).filter((line) => marker.test(line));
+  }
+
+  test('the create legend owns exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const { view } = openPanel();
+      const lines = boxLines(view, width, 24);
+      const legend = legendRows(lines, LEGEND);
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /↑\/↓/, `width ${width}: the field keys survive`);
+      assert.match(legend[0], /Esc cancel/, `width ${width}: the cancel key survives`);
+    }
+  });
+
+  test('the type sub-panel legend owns exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const { view } = openPanel();
+      view.handleInput('enter');
+      const lines = boxLines(view, width, 24);
+      const legend = legendRows(lines, /Esc close|Enter pick/);
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /Esc close/, `width ${width}: the close key survives`);
+    }
+  });
+
+  test('the filter legend owns exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const { view } = openPanel();
+      focusIssues(view);
+      view.handleInput('T');
+      const lines = boxLines(view, width, 24);
+      const legend = legendRows(lines, /filter|type to narrow/);
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /narrow/, `width ${width}: the filter hint survives`);
+    }
   });
 });
