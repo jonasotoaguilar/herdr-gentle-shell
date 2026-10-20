@@ -304,3 +304,14 @@ exists either way. The row's new state reports what is verifiable — "this buil
 does not declare these settings", never "these optimizations do not work" —
 because a minified bundle could rename a setting internally while still reading
 it.
+
+L10. T14a review finding. The first `lib/pi-perf-support.js` resolved the
+package through `require.resolve.paths`, so it scanned this worktree's DEV
+DEPENDENCY (`piVersion: 0.86.1`) instead of the Pi actually running the
+extension (`~/.pi/agent/install/releases/1.3.0`). Its 11 tests passed because
+they only ever inject an explicit `piRoot`. A confident verdict about a package
+the user is not running is worse than `unknown`, so resolution now prefers the
+running entry script (`process.argv[1]`, walking up to the package), then
+`PI_MANAGED_INSTALL_ROOT/releases/<highest>`, and only then `require.resolve`.
+Recorded because it is the same class of defect as L8: an answer that looks
+authoritative and describes the wrong thing.
