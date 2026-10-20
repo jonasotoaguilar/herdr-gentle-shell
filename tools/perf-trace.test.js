@@ -485,6 +485,20 @@ describe('perf trace state dir resolution', { concurrency: false }, () => {
     assert.deepEqual(fs.readdirSync(xdg), [], 'resolving never creates the state dir');
   });
 
+  // The flag only earns its own state dir when that dir is recognised as
+  // ours; otherwise an injected dir wins and a trace switched on here reads
+  // as missing there.
+  test('a stored dir holding only the trace flag is recognised as ours', () => {
+    const xdg = scratch('perf-trace-only-flag-');
+    const stored = path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents');
+    fs.mkdirSync(stored, { recursive: true });
+    fs.writeFileSync(path.join(stored, trace.FLAG_NAME), JSON.stringify({ version: 1, enabled: true }));
+    const injected = scratch('perf-trace-injected-');
+    const env = { XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected };
+    assert.equal(modeLib.stateDir(env), stored);
+    assert.equal(trace.readTraceMode(env).enabled, true, 'the flag in the stored dir is the one that counts');
+  });
+
   test('the module exports the documented names', () => {
     assert.deepEqual([...PERF_KEYS], [
       'heightIndex',
