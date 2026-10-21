@@ -15,9 +15,9 @@ same action answers the same key wherever it exists.
 | Next/previous page or pane | `tab` / `→`, `shift+tab` / `←` | ✓ panes | – | ←/→ tab | – | ✓ pages |
 | Search/filter | `T` (issues also `/`) | – | ✓ | ✓ | ✓ | ✓ |
 | List pagination | `[` / `]` | – | ✓ | ✓ | – | ✓ |
-| Toggle a row | `space` | – | – | ✓ | ✓ assign when enabled | ✓ assign when enabled |
+| Toggle a row | `space` | – | – | ✓ | – | – |
 | Confirm/apply | `enter` | ✓ | ✓ | ✓ | – | ✓ sub-panels |
-| Save/persist | `ctrl+s` | – | – | ✓ | ✓ when enabled | ✓ when enabled |
+| Save/persist | `ctrl+s` | – | – | ✓ | – | – |
 | Refresh | `r` | – | ✓ | – | ✓ | ✓ |
 | Create a worktree | `c` | – | ✓ | – | – | – |
 | Edit the focused row | `e` | – | ✓ issues/odd until the detail lands | – | – | – |
@@ -26,6 +26,20 @@ same action answers the same key wherever it exists.
 | Cancel/close | `esc` (aliases `ctrl+c`, `q`) | ✓ | `esc`/`ctrl+c` | `esc`/`ctrl+c` | ✓ | ✓ |
 
 ## Deliberate divergences
+
+- **Every hint is named once (S13).** The search key `T` lives on the search
+  row that owns the widget, so no footer repeats it; the issue total lives on
+  its tab, the document total in the title, and no chrome row repeats the
+  focused item the list already marks. The footer is the legend of the
+  interaction in progress: while a search box holds the keyboard it names
+  that interaction's keys (`type to filter · bksp edit · enter/esc keep`) and
+  the box itself carries only the query, so `enter`/`esc` are never spelled
+  out twice.
+
+- **The issues viewer lists open issues only (S10a).** There is no state
+  toggle, no other state is requested, and `x`/`X` both close the focused
+  issue — a closed issue leaves the list at once, so there is no reopen path
+  in this view.
 
 - **Scrolling carries variants because `ctrl+j`/`ctrl+k` are terminal-hostile.**
   Some terminals (Linux consoles and several setups behind tmux) never deliver
@@ -38,6 +52,14 @@ same action answers the same key wherever it exists.
   them move the preview only: the list selection still answers `↑`/`↓` and
   `j`/`k`. The one-row footer legend keeps naming the canonical pair, because
   S2 forbids a second row; the variants live here instead.
+
+- **The odd and issues viewers have no association keys (S10b).** Neither
+  viewer marks, toggles or saves which document or issue belongs to the
+  checkout's worktree — that association lives in the worktree detail — so
+  their `space` and `ctrl+s` cells are `–`. The issues viewer's own
+  sub-panels keep their local keys: the label editor still toggles a label
+  with `space` and applies with `ctrl+s`, and the comment input still posts
+  with `ctrl+s`; those keys never leave the sub-panel they belong to.
 
 - **The create/edit panel is two content panes, never three columns.** The
   active dataset's list is on the left and that row's read-only preview on

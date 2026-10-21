@@ -168,194 +168,113 @@ describe('createOddView states', () => {
   });
 });
 
-describe('createOddView assignment (S7/S8)', () => {
-  function makeAssignView({ docs, assigned, checkoutName, saveImpl, rows = 20 } = {}) {
+// S10b: the odd viewer is read-only with respect to the checkout↔document
+// association. The options the existing callers still pass (`assigned`,
+// `saveAssignment`, `assignmentEnabled`) are accepted and ignored: no mark,
+// no toggle, no save, no unsaved claim — and no key that writes.
+describe('createOddView read-only association (S10b)', () => {
+  function makeInertView({ docs, rows = 20, ...rest } = {}) {
     const calls = [];
     let settled = 'pending';
-    const save = (...args) => {
-      calls.push(args);
-      if (typeof saveImpl === 'function') return saveImpl(...args);
-      return { ok: true };
-    };
     const view = createOddView({
       docs,
-      assigned,
-      checkoutName,
-      saveAssignment: save,
       loadDoc: (entry) => ({ ok: true, text: `# ${entry.name}\n` }),
       helpers,
       theme: plainTheme,
       rowsAvailable: () => rows,
       requestRender: () => {},
       done: (result) => { settled = result; },
+      ...rest,
+      saveAssignment: (...args) => { calls.push(args); return { ok: true }; },
     });
     return { view, calls, done: () => settled };
   }
 
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-  // List rows carry the row structure `▸|  <mark> <name>`; the title and
-  // the document pane may repeat the name, so match the mark explicitly.
-  const rowFor = (body, name) => body.split('\n').find((line) =>
-    new RegExp(`[▸ ] [✓·✎] ${name}( |$)`).test(line));
+  const ASSIGNED = ['odd/tasks/alpha.md'];
+  // The list rows are the cells between the left border and the divider; the
+  // title icon (`✎`) and the legend separators (`·`) live outside them.
+  const listRows = (body) => body.split('\n').filter((line) => /│ [▸ ] (alpha|beta)( |$)/.test(line));
 
-  test('stored assignments show ✓, unassigned show ·, and the title names the checkout and the count', async () => {
-    const { view } = makeAssignView({
+  test('no association mark renders and the status row carries no assigned or unsaved fact', async () => {
+    const { view } = makeInertView({
       docs: [doc('alpha'), doc('beta')],
-      assigned: ['odd/tasks/alpha.md'],
+      assigned: ASSIGNED,
+      assignmentEnabled: true,
       checkoutName: 'demo-checkout',
     });
     await tick();
     const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/, 'the stored row carries ✓');
-    assert.match(rowFor(body, 'beta'), /·/, 'the unassigned row carries ·');
-    assert.match(body, /alpha · \d+-\d+\/\d+ · 1 assigned/, 'the status row names the selected document next to its scroll position and the assigned count');
-    assert.ok(!body.includes('demo-checkout'), 'the concise title no longer repeats the checkout name');
-    assert.ok(!body.includes('unsaved'), 'nothing is pending, so no unsaved indicator');
-    assert.match(body, /space/, 'the footer names the toggle key');
-    assert.match(body, /ctrl\+s/, 'the footer names the save key');
+    const rows = listRows(body);
+    assert.equal(rows.length, 2, 'both documents still list');
+    assert.ok(rows.every((line) => !/[✓✎]/.test(line)), 'no association mark on any row');
+    assert.match(rows[0], /▸ alpha/, 'the focused row renders unmarked');
+    assert.ok(!body.includes('assigned'), 'no assigned count is claimed');
+    assert.ok(!body.includes('unsaved'), 'no unsaved indicator exists');
+    assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
+    assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
+    assert.match(body, /ctrl\+j\/k scroll/, 'the reading keys stay in the legend');
+    assert.match(body, /esc close/, 'the close key stays in the legend');
   });
 
-  test('space toggles the focused row locally: ✎ appears and nothing is written', async () => {
-    const { view, calls } = makeAssignView({
-      docs: [doc('alpha'), doc('beta')],
-      assigned: ['odd/tasks/alpha.md'],
-      checkoutName: 'demo-checkout',
+  test('space and ctrl+s change nothing: no save call, no state change, no repaint difference', async () => {
+    const { view, calls } = makeInertView({ docs: [doc('alpha'), doc('beta')], assigned: ASSIGNED });
+    await tick();
+    const snapshot = JSON.stringify(view.state);
+    const rendered = view.render(80).join('\n');
+    for (const key of ['space', ' ', 'ctrl+s', '\x13', 'space', 'ctrl+s']) view.handleInput(key);
+    await tick();
+    assert.deepEqual(calls, [], 'the injected save callback is never reached');
+    assert.equal(JSON.stringify(view.state), snapshot, 'no state changed');
+    assert.equal(view.render(80).join('\n'), rendered, 'nothing repainted differently');
+  });
+
+  test('the association options are inert: the frame is identical with, without and with the gate off', async () => {
+    const docs = [doc('alpha'), doc('beta')];
+    const plain = makeInertView({ docs });
+    const passed = makeInertView({ docs, assigned: ASSIGNED, assignmentEnabled: true, checkoutName: 'demo-checkout' });
+    const gatedOff = makeInertView({ docs, assigned: ASSIGNED, assignmentEnabled: false });
+    await tick();
+    const expected = plain.view.render(80).join('\n');
+    assert.equal(passed.view.render(80).join('\n'), expected, 'assigned/saveAssignment/assignmentEnabled change no cell');
+    assert.equal(gatedOff.view.render(80).join('\n'), expected, 'assignmentEnabled false changes no cell either');
+  });
+
+  test('the viewer still opens, navigates, filters, scrolls, reloads and closes with the options passed', async () => {
+    const long = Array.from({ length: 80 }, (_, index) => `line ${index + 1}`).join('\n');
+    let current = [doc('alpha'), doc('beta')];
+    const { view, done } = makeInertView({
+      docs: current,
+      assigned: ASSIGNED,
+      assignmentEnabled: false,
+      loadDoc: () => ({ ok: true, text: long }),
+      reloadDocs: () => ({ ok: true, docs: current }),
     });
     await tick();
-    view.handleInput('space');
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✎/, 'the toggled row carries the unsaved mark');
-    assert.match(rowFor(body, 'beta'), /·/, 'the untouched row keeps its mark');
-    assert.match(body, /· unsaved/, 'the title gains the unsaved indicator');
-    assert.match(body, /0 assigned/, 'the count follows the pending set');
-    assert.deepEqual(calls, [], 'toggling alone never calls the save callback');
-  });
-
-  test('toggling the same row twice reverts it and clears the unsaved indicator', async () => {
-    const { view, calls } = makeAssignView({
-      docs: [doc('alpha')],
-      assigned: [],
-      checkoutName: 'demo-checkout',
-    });
-    await tick();
-    view.handleInput('space');
-    assert.match(strip(view.render(80).join('\n')), /✎/);
-    view.handleInput('space');
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/, 'the row is back to unassigned');
-    assert.ok(!body.includes('unsaved'), 'no pending change remains');
-    assert.deepEqual(calls, []);
-  });
-
-  test('ctrl+s persists the whole pending set and applies the assignment', async () => {
-    const { view, calls } = makeAssignView({
-      docs: [doc('alpha'), doc('beta')],
-      assigned: ['odd/tasks/alpha.md'],
-      checkoutName: 'demo-checkout',
-    });
-    await tick();
-    view.handleInput('down');
-    view.handleInput('space');
-    view.handleInput('ctrl+s');
-    await tick();
-    assert.equal(calls.length, 1, 'one save for the whole set');
-    assert.deepEqual(calls[0][0], ['odd/tasks/alpha.md', 'odd/tasks/beta.md']);
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/);
-    assert.match(rowFor(body, 'beta'), /✓/, 'the saved toggle is now stored');
-    const rowLines = body.split('\n').filter((line) => /[▸ ] [✓·✎] (alpha|beta)( |$)/.test(line));
-    assert.ok(rowLines.every((line) => !line.includes('✎')), 'no pending mark survives a successful save');
-    assert.ok(!body.includes('unsaved'), 'the indicator clears on success');
-    assert.match(body, /2 assigned/);
-  });
-
-  test('ctrl+s can also remove: untoggling a stored row saves the smaller set', async () => {
-    const { view, calls } = makeAssignView({
-      docs: [doc('alpha'), doc('beta')],
-      assigned: ['odd/tasks/alpha.md', 'odd/tasks/beta.md'],
-    });
-    await tick();
-    view.handleInput('space');
-    view.handleInput('ctrl+s');
-    await tick();
-    assert.deepEqual(calls[0][0], ['odd/tasks/beta.md']);
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/, 'removal applies only after save');
-    assert.match(rowFor(body, 'beta'), /✓/);
-  });
-
-  test('a failed save keeps the pending marks and shows the error', async () => {
-    const { view, calls } = makeAssignView({
-      docs: [doc('alpha')],
-      assigned: [],
-      saveImpl: () => ({ ok: false, error: 'disk full' }),
-    });
-    await tick();
-    view.handleInput('space');
-    view.handleInput('ctrl+s');
-    await tick();
-    assert.equal(calls.length, 1);
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✎/, 'the pending mark survives the failure');
-    assert.match(body, /· unsaved/, 'the indicator survives the failure');
-    assert.match(body, /save failed: disk full/, 'the error is shown, never success');
-  });
-
-  test('a throwing save is reported as a failure and keeps every pending mark', async () => {
-    const { view } = makeAssignView({
-      docs: [doc('alpha')],
-      assigned: [],
-      saveImpl: () => { throw new Error('lock timeout'); },
-    });
-    await tick();
-    view.handleInput('space');
-    view.handleInput('ctrl+s');
-    await tick();
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✎/);
-    assert.match(body, /save failed: lock timeout/);
-  });
-
-  test('esc closes and discards unsaved toggles without writing', async () => {
-    const { view, calls, done } = makeAssignView({
-      docs: [doc('alpha')],
-      assigned: [],
-    });
-    await tick();
-    view.handleInput('space');
-    assert.match(strip(view.render(80).join('\n')), /✎/);
-    view.handleInput('escape');
-    assert.equal(done(), null, 'esc still closes with a null result');
-    assert.deepEqual(calls, [], 'closing never saves the pending toggles');
-  });
-
-  test('ctrl+s with no pending changes writes nothing', async () => {
-    const { view, calls } = makeAssignView({
-      docs: [doc('alpha')],
-      assigned: ['odd/tasks/alpha.md'],
-    });
-    await tick();
-    view.handleInput('ctrl+s');
-    await tick();
-    assert.deepEqual(calls, [], 'a clean state saves nothing');
-    assert.match(strip(view.render(80).join('\n')), /✓/);
-  });
-
-  test('a missing assignment leaves every row unmarked and the view usable', async () => {
-    const { view, calls } = makeAssignView({ docs: [doc('alpha'), doc('beta')] });
-    await tick();
-    const body = strip(view.render(80).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/);
-    assert.match(rowFor(body, 'beta'), /·/);
-    assert.ok(!body.includes('✓'), 'nothing is marked when nothing was assigned');
     view.handleInput('down');
     assert.equal(view.state.index, 1, 'navigation still works');
-    view.handleInput('space');
-    view.handleInput('ctrl+s');
+    view.handleInput('up');
+    assert.equal(view.state.index, 0, 'navigation still works both ways');
+    view.handleInput('T');
+    view.handleInput('b');
+    view.handleInput('enter');
+    const narrowed = strip(view.render(80).join('\n')).split('\n');
+    assert.ok(!narrowed.some((line) => /│ [▸ ] alpha *│/.test(line)), 'the filter still narrows the list');
+    view.handleInput('/');
+    view.handleInput('\x7f');
+    view.handleInput('enter');
+    const cleared = strip(view.render(80).join('\n')).split('\n');
+    assert.ok(cleared.some((line) => /│ [▸ ] alpha *│/.test(line)), 'the filter still clears');
+    view.handleInput('ctrl+j');
+    assert.ok(view.state.scroll > 0, 'the preview still scrolls');
+    current = [doc('alpha'), doc('beta'), doc('gamma')];
+    view.handleInput('r');
     await tick();
-    assert.equal(calls.length, 1, 'toggling then saving still works from an empty start');
-    assert.deepEqual(calls[0][0], ['odd/tasks/beta.md']);
+    assert.match(strip(view.render(80).join('\n')), /3 documents/, 'reload still re-lists');
+    view.handleInput('escape');
+    assert.equal(done(), null, 'esc still closes with a null result');
   });
+
 });
 
 describe('createOddView key consistency (K3)', () => {
@@ -403,7 +322,7 @@ describe('createOddView key consistency (K3)', () => {
     const body = strip(view.render(80).join('\n'));
     assert.match(body, /alpha/, 'the matching document stays');
     assert.ok(!body.includes('beta') || body.includes('filter'), 'non-matching rows leave the list');
-    const rows = body.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line));
+    const rows = body.split('\n').filter((line) => /│ [▸ ] /.test(line));
     assert.ok(rows.every((line) => !line.includes('beta') && !line.includes('gamma')), 'only the match is listed');
     assert.match(body, / › al/, 'the filter is visible while typing');
     view.handleInput('enter');
@@ -425,7 +344,7 @@ describe('createOddView key consistency (K3)', () => {
     const body = strip(view.render(80).join('\n'));
     assert.match(body, /› gam \(T to edit\)/, 'the / filter is kept like the T filter');
     assert.match(body, /gamma/);
-    assert.ok(!body.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line)).some((line) => line.includes('alpha')), 'alpha is filtered out');
+    assert.ok(!body.split('\n').filter((line) => /│ [▸ ] /.test(line)).some((line) => line.includes('alpha')), 'alpha is filtered out');
   });
 
   test('a filter matching nothing renders its empty state instead of a blank frame', async () => {
@@ -478,7 +397,8 @@ describe('createOddView key consistency (K3)', () => {
     const { view } = makeKeyView();
     await tick();
     const body = strip(view.render(80).join('\n'));
-    assert.match(body, /T filter/, 'the footer names the filter key');
+    assert.match(body, /› Search \(T\)/, 'the search row names the filter key once');
+    assert.ok(!/T filter/.test(body), 'the footer does not repeat the filter hint');
     assert.match(body, /o open/, 'the footer names the external-open key');
     assert.ok(!body.includes('? help'), 'the footer no longer hints the removed help key');
   });
@@ -682,17 +602,17 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     assert.ok(!strip(lines.join('\n')).includes('demo-checkout'), 'the checkout name is gone from the whole frame');
   });
 
-  test('the search row sits directly below the title with the query and the visible/total count', () => {
+  test('the search row sits directly below the title and carries only the query and the position', () => {
     const { view } = build();
     view.handleInput('T');
     view.handleInput('a');
     view.handleInput('l');
     let lines = strip(view.render(80).join('\n')).split('\n');
-    assert.match(strip(lines[1]), /› al█ \(enter\/esc keep\) · 1\/2 documents/, 'typing shows the live query and counts on its own row');
+    assert.match(strip(lines[1]), /› al█/, 'typing shows the live query on its own row');
     assert.ok(!strip(lines[0]).includes('1/2'), 'the count is not buried in the title');
     view.handleInput('enter');
     lines = strip(view.render(80).join('\n')).split('\n');
-    assert.match(strip(lines[1]), /› al \(T to edit\) · 1\/2 documents/, 'leaving the box keeps the query and counts visible');
+    assert.match(strip(lines[1]), /› al \(T to edit\)/, 'leaving the box keeps the query visible');
     view.handleInput('/');
     lines = strip(view.render(80).join('\n')).split('\n');
     assert.match(strip(lines[1]), /› al█/, '/ edits the same row');
@@ -725,7 +645,7 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
       let body = strip(view.render(width).join('\n'));
       assert.equal(view.state.scroll, 0, `${width}x${rows}: the start is the top`);
       assert.match(body, /line 1\b/, `${width}x${rows}: the first source line is visible at the start`);
-      assert.match(body.split('\n')[1], /› Search \(T\) · 2\/2 documents/, `${width}x${rows}: the query row is visible`);
+      assert.match(body.split('\n')[1], /› Search \(T\)/, `${width}x${rows}: the query row is visible`);
       view.handleInput('\x1b[6~');
       body = strip(view.render(width).join('\n'));
       assert.ok(view.state.scroll > 0, `${width}x${rows}: PageDown reaches a middle window`);
@@ -748,25 +668,24 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     view.handleInput('G');
     view.handleInput('a');
     let body = strip(view.render(80).join('\n'));
-    const filterRows = (text) => text.split('\n').filter((line) => /[▸ ] [✓·✎] (alpha|beta|gamma)( |$)/.test(line));
+    const filterRows = (text) => text.split('\n').filter((line) => /│ [▸ ] (alpha|beta|gamma)( |$)/.test(line));
     const rows = filterRows(body);
     assert.equal(rows.length, 1, 'an uppercase query still matches the lowercase name');
     assert.match(rows[0], /gamma/, 'only the case-insensitive match is listed');
-    assert.match(body.split('\n')[1], /1\/3 documents/, 'the visible/total count follows the filter');
-    assert.match(body.split('\n')[2], /gamma · /, 'the selected document follows the filtered list');
+    assert.ok(!body.split('\n').some((line) => /│ [▸ ] (alpha|beta) *│/.test(line)), 'the filter hides the other rows');
+    assert.ok(body.split('\n').some((line) => /│ ▸ gamma *│/.test(line)), 'the only match stays focused');
     view.handleInput('enter');
     view.handleInput('down');
     assert.equal(view.state.index, 0, 'one match has nowhere to move');
     view.handleInput('/');
     view.handleInput('\x7f');
     body = strip(view.render(80).join('\n'));
-    assert.match(body.split('\n')[1], /1\/3 documents/, 'Backspace edits the kept query');
+    assert.equal(filterRows(body).length, 1, 'Backspace edits the kept query');
     view.handleInput('\x7f');
     view.handleInput('enter');
     body = strip(view.render(80).join('\n'));
     const cleared = filterRows(body);
     assert.equal(cleared.length, 3, 'clearing the query restores every document');
-    assert.match(body.split('\n')[1], /3\/3 documents/, 'the counts return with the list');
   });
 
   test('the raw DEL byte edits the kept query even with no host helpers injected', () => {
@@ -777,71 +696,60 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     view.handleInput('enter');
     view.handleInput('down');
     view.handleInput('/');
+    const narrowedRows = (text) => text.split('\n').filter((line) => /│ [▸ ] (alpha|beta|gamma) *│/.test(line));
     let body = strip(view.render(80).join('\n'));
-    assert.match(body.split('\n')[1], /1\/3 documents/, 'the kept query still filters to the single match');
+    assert.equal(narrowedRows(body).length, 1, 'the kept query still filters to the single match');
     view.handleInput('\x7f');
     body = strip(view.render(80).join('\n'));
-    assert.match(body.split('\n')[1], /1\/3 documents/, 'DEL edits the kept query without host helpers');
+    assert.equal(narrowedRows(body).length, 1, 'DEL edits the kept query without host helpers');
     assert.ok(!/\x7f/i.test(body), 'the raw DEL byte never becomes visible query text');
     view.handleInput('\x7f');
     view.handleInput('\x7f');
     body = strip(view.render(80).join('\n'));
-    assert.match(body.split('\n')[1], /3\/3 documents/, 'emptying the query restores every document');
+    assert.equal(narrowedRows(body).length, 3, 'emptying the query restores every document');
   });
 
-  test('S29: assignmentEnabled false hides marks/hints/unsaved and refuses Space and ctrl+s bytes', async () => {
+  test('S10b: the association options are inert in the rendered frame', async () => {
     const calls = [];
     const opened = [];
-    const { view } = build({
+    const plain = build();
+    const gatedOff = build({
       assigned: ['odd/tasks/alpha.md'],
       assignmentEnabled: false,
       saveAssignment: (...args) => { calls.push(args); return { ok: true }; },
       openExternal: (target) => { opened.push(target); return { ok: true }; },
     });
-    view.render(80);
-    const body = strip(view.render(80).join('\n'));
-    const rows = body.split('\n').filter((line) => /[▸ ] (alpha|beta)( |$)/.test(line));
+    const expected = plain.view.render(80).join('\n');
+    gatedOff.view.render(80);
+    assert.equal(gatedOff.view.render(80).join('\n'), expected, 'no cell differs when the options are passed');
+    const body = strip(gatedOff.view.render(80).join('\n'));
+    const rows = body.split('\n').filter((line) => /│ [▸ ] (alpha|beta)( |$)/.test(line));
     assert.equal(rows.length, 2, 'both documents still list');
-    assert.ok(rows.every((line) => !/[✓✎·] (alpha|beta)/.test(line)), 'no assignment marks on the rows');
+    assert.ok(rows.every((line) => !/[✓✎]/.test(line)), 'no assignment marks on the rows');
     assert.ok(!body.includes('unsaved'), 'no unsaved indicator');
     assert.ok(!body.includes('space'), 'no space hint');
     assert.ok(!body.includes('ctrl+s'), 'no save hint');
-    assert.ok(!/\d+ assigned/.test(body), 'no assigned count');
+    assert.ok(!body.includes('assigned'), 'no assigned count');
     assert.match(body, /ctrl\+j\/k scroll/, 'the scroll hint stays');
-    assert.match(body, /T filter/, 'the filter hint stays');
+    assert.match(body, /› Search \(T\)/, 'the filter hint stays, once, on the search row');
     assert.match(body, /o open/, 'the open hint stays');
     assert.match(body, /esc close/, 'the close hint stays');
-    view.handleInput(' ');
-    view.handleInput('\x13'); // ctrl+s
+    gatedOff.view.handleInput(' ');
+    gatedOff.view.handleInput('\x13'); // ctrl+s
     await tick();
     assert.deepEqual(calls, [], 'Space and ctrl+s bytes never call the save callback');
-    assert.ok(!strip(view.render(80).join('\n')).split('\n').some((line) => /✎ (alpha|beta)/.test(line)), 'no pending mark appears');
-    view.handleInput('\n');
-    assert.ok(view.state.scroll > 0, 'scrolling still works with assignment disabled');
-    view.handleInput('T');
-    view.handleInput('a');
-    view.handleInput('l');
-    view.handleInput('enter');
-    assert.match(strip(view.render(80).join('\n')).split('\n')[1], /1\/2 documents/, 'search still works');
-    view.handleInput('o');
+    assert.ok(!strip(gatedOff.view.render(80).join('\n')).split('\n').some((line) => /✎ (alpha|beta)/.test(line)), 'no pending mark appears');
+    gatedOff.view.handleInput('\n');
+    assert.ok(gatedOff.view.state.scroll > 0, 'scrolling still works with the options passed');
+    gatedOff.view.handleInput('T');
+    gatedOff.view.handleInput('a');
+    gatedOff.view.handleInput('l');
+    gatedOff.view.handleInput('enter');
+    assert.match(strip(gatedOff.view.render(80).join('\n')).split('\n')[1], /› al \(T to edit\)/, 'search still works');
+    gatedOff.view.handleInput('o');
     await tick();
     assert.equal(opened.length, 1, 'the external open still works');
-    view.handleInput('escape');
-  });
-
-  test('S29: the default keeps assignment enabled for existing callers', async () => {
-    const calls = [];
-    const { view } = build({ assigned: [], saveAssignment: (...args) => { calls.push(args); return { ok: true }; } });
-    view.render(80);
-    view.handleInput(' ');
-    assert.match(strip(view.render(80).join('\n')), /✎/, 'the pending mark appears by default');
-    view.handleInput('\x13');
-    await tick();
-    assert.equal(calls.length, 1, 'ctrl+s saves by default');
-    assert.deepEqual(calls[0][0], ['odd/tasks/alpha.md']);
-    const body = strip(view.render(80).join('\n'));
-    assert.match(body, /space toggle/, 'the space hint stays by default');
-    assert.match(body, /ctrl\+s/, 'the save hint stays by default');
+    gatedOff.view.handleInput('escape');
   });
 });
 
@@ -861,11 +769,87 @@ describe('S2: one-row key legends', () => {
       const lines = view.render(width).map(strip);
       assert.equal(lines.length, 20, `width ${width}: the frame fills the available rows`);
       for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `width ${width}: row is not ${width} wide`);
-      const legend = lines.filter((line) => /esc close|T filter|o open/.test(line));
+      const legend = lines.filter((line) => /esc close|o open/.test(line));
       assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
       assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
       assert.match(legend[0], /↑↓/, `width ${width}: the movement keys survive`);
       assert.match(legend[0], /esc close/, `width ${width}: the close key survives`);
     }
+  });
+});
+
+// S13: the frame says each thing once. The document total lives in the title
+// only, no chrome row repeats the focused document, the search key is named by
+// the search row alone, and the escape hint belongs to the interaction the
+// keyboard is in — while the box is open the footer names its keys once
+// instead of the box and the footer both naming them.
+describe('S13: the odd frame repeats nothing', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const footerOf = (lines) => lines[lines.length - 2];
+  const tokensOf = (footer) => footer.split('·').map((token) => token.trim());
+
+  function quietView({ docs = [doc('alpha'), doc('beta')], text = 'body line\n', rows = 20 } = {}) {
+    return makeView({ docs, load: () => ({ ok: true, text }), rows }).view;
+  }
+
+  test('the document total renders once and no chrome row repeats the focused name', async () => {
+    const view = quietView();
+    await tick();
+    const lines = strip(view.render(80).join('\n')).split('\n');
+    const body = lines.join('\n');
+    assert.equal((body.match(/documents?\b/g) || []).length, 1, `the total renders once: ${body}`);
+    assert.equal((body.match(/alpha/g) || []).length, 1, 'the focused name appears in the list row only');
+    assert.match(lines[0], /✎ Odd · 2 documents/, 'the title carries the one total');
+  });
+
+  test('the search key is named by the search row alone, never by the footer', async () => {
+    const view = quietView();
+    await tick();
+    const lines = strip(view.render(80).join('\n')).split('\n');
+    const footer = footerOf(lines);
+    assert.match(lines[1], /› Search \(T\)/, 'the search row names its own key');
+    assert.ok(!tokensOf(footer).some((token) => /^T\b/.test(token)), `the footer does not repeat T: ${footer}`);
+    assert.ok(!footer.includes('search'), 'the footer does not repeat the search hint');
+  });
+
+  test('while searching the footer names the search keys once and the input carries only the query', async () => {
+    const view = quietView();
+    await tick();
+    view.handleInput('T');
+    view.handleInput('a');
+    const lines = strip(view.render(80).join('\n')).split('\n');
+    const body = lines.join('\n');
+    assert.match(lines[1], /› a█/, 'the input row carries the live query');
+    assert.ok(!lines[1].includes('enter'), 'the input row repeats no key hint');
+    assert.ok(!lines[1].includes('esc'), 'the input row names no escape key');
+    const footer = footerOf(lines);
+    assert.match(footer, /enter\/esc keep/, 'the footer names the search keys of this interaction');
+    assert.ok(!footer.includes('esc close'), 'the close hint belongs to the reading interaction only');
+    assert.ok(!footer.includes('ctrl+j/k'), 'the reading keys leave the footer while typing');
+    assert.equal((body.match(/esc/g) || []).length, 1, `one escape hint for the current interaction: ${body}`);
+    assert.equal((body.match(/enter/g) || []).length, 1, 'one enter hint for the current interaction');
+  });
+
+  test('leaving the box swaps the footer back and keeps a single escape hint', async () => {
+    const view = quietView();
+    await tick();
+    view.handleInput('T');
+    view.handleInput('a');
+    view.handleInput('enter');
+    const lines = strip(view.render(80).join('\n')).split('\n');
+    const footer = footerOf(lines);
+    assert.match(footer, /esc close/, 'the reading legend returns');
+    assert.ok(!footer.includes('enter/esc keep'), 'the search keys leave with the box');
+    assert.equal((lines.join('\n').match(/esc/g) || []).length, 1, 'still one escape hint');
+  });
+
+  test('the scroll position shares the search row instead of owning a second chrome row', async () => {
+    const view = quietView({ docs: [doc('alpha')], text: longDoc(200) });
+    await tick();
+    view.handleInput('ctrl+j');
+    const lines = strip(view.render(80).join('\n')).split('\n');
+    assert.equal(lines.length, 20, 'the frame still fills every row');
+    assert.match(lines[1], /› Search \(T\) +\d+-\d+\/\d+/, 'the position rides the search row');
+    assert.equal(lines.length - 3, 20 - 3, 'the panes keep the rows the status row used to take');
   });
 });

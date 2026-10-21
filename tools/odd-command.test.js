@@ -253,11 +253,13 @@ describe('/herdr-gentle:odd', () => {
   });
 });
 
-describe('/herdr-gentle:odd assignment (S8/T9)', () => {
+// S10b: the odd viewer no longer associates a checkout with documents. These
+// drive the public command end to end: the frame never shows an association
+// and the removed keys (`space`, list `ctrl+s`) never write, even though the
+// command still supplies the old `assigned`/`saveAssignment` options.
+describe('/herdr-gentle:odd read-only association (S10b)', () => {
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
   const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
-  const rowFor = (body, name) => body.split('\n').find((line) =>
-    new RegExp(`[▸ ] [✓·✎] ${name}( |$)`).test(line));
 
   function registryFile(root) {
     const common = git(root, ['rev-parse', '--git-common-dir']).trim();
@@ -279,18 +281,9 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
     return git(root, ['branch', '--show-current']).trim();
   }
 
-  // Thread identity for created rows resolves exactly like the create
-  // path: GENTLE_WORKTREE_THREAD first, then the Pi session id. The
-  // viewer tests run without a session manager, so the env override is
-  // the identity under test; the previous value is always restored.
-  function withThread(value) {
-    const prev = process.env.GENTLE_WORKTREE_THREAD;
-    if (value === undefined) delete process.env.GENTLE_WORKTREE_THREAD;
-    else process.env.GENTLE_WORKTREE_THREAD = value;
-    return () => {
-      if (prev === undefined) delete process.env.GENTLE_WORKTREE_THREAD;
-      else process.env.GENTLE_WORKTREE_THREAD = prev;
-    };
+  // S8: the registry stores ONE odd path or `null`, never a list.
+  function storedRow(root, odd) {
+    return { branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd };
   }
 
   async function openOdd(root) {
@@ -305,218 +298,97 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
     });
     await def.handler('', ctx);
     assert.ok(factory, 'the overlay opens');
-    const { component } = openComponent(factory, host);
-    return { component, notes };
+    const { component, done } = openComponent(factory, host);
+    return { component, notes, done };
   }
 
-  test('reads the stored assignment for the current checkout', async () => {
+  // The list rows are the cells between the left border and the divider; the
+  // title icon (`✎`) and the legend separators (`·`) live outside them.
+  const listRows = (body) => body.split('\n').filter((line) => /│ [▸ ] (alpha|beta)( |$)/.test(line));
+
+  test('renders no association mark, hint or unsaved claim even with a stored odd', async () => {
     const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
-    writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
-    }]);
+    writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
     const { component, notes } = await openOdd(root);
     const body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/, 'the stored row carries ✓');
-    assert.match(rowFor(body, 'beta'), /·/, 'the unassigned row carries ·');
-    const titleLine = body.split('\n')[0];
-    assert.match(titleLine, /✎ Odd · 2 documents/, 'the title carries only the viewer name and the count');
-    assert.ok(!titleLine.includes(path.basename(root)), 'the concise title does not repeat the checkout name');
-    assert.match(body, /(alpha|beta) · \d+-\d+\/\d+ · 1 assigned/, 'the status row names the selected document and the assigned count');
+    const rows = listRows(body);
+    assert.equal(rows.length, 2, 'both documents still list');
+    assert.ok(rows.every((line) => !/[✓✎]/.test(line)), 'no association mark on any row');
+    assert.match(rows[0], /│ ▸ (alpha|beta)( |$)/, 'the focused row renders unmarked');
+    assert.ok(!body.includes('assigned'), 'no assigned count is claimed');
+    assert.ok(!body.includes('unsaved'), 'no unsaved claim exists');
+    assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
+    assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
+    assert.match(body, /ctrl\+j\/k scroll/, 'the reading legend stays');
+    assert.match(body, /› Search \(T\)/, 'the search row names the filter key once');
+    assert.ok(!/T filter/.test(body), 'the footer never repeats the search hint (S13)');
+    assert.match(body, /o open/, 'the open legend stays');
+    assert.match(body, /esc close/, 'the close legend stays');
     assert.deepEqual(notes, [], 'reading writes nothing and notifies nothing');
   });
 
-  test('ctrl+s persists the whole pending set through the registry', async () => {
-    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
-    const file = writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
-    }]);
-    const { component } = await openOdd(root);
-    component.handleInput('down');
-    component.handleInput('space');
-    component.handleInput('ctrl+s');
-    await tick();
-    const stored = JSON.parse(readRaw(file));
-    assert.deepEqual(stored.worktrees[0].odd, ['odd/tasks/alpha.md', 'odd/tasks/beta.md']);
-    const body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/);
-    assert.match(rowFor(body, 'beta'), /✓/, 'the saved toggle is applied');
-    assert.ok(!body.includes('unsaved'), 'a successful save clears the pending state');
+  test('the stored odd changes no cell: the frame matches a row with odd null', async () => {
+    const withOdd = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    writeRegistry(withOdd, [storedRow(withOdd, 'odd/tasks/alpha.md')]);
+    const withoutOdd = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    writeRegistry(withoutOdd, [storedRow(withoutOdd, null)]);
+    const first = await openOdd(withOdd);
+    const second = await openOdd(withoutOdd);
+    assert.equal(
+      clean(first.component.render(100).join('\n')),
+      clean(second.component.render(100).join('\n')),
+      'the stored association renders nothing in either direction',
+    );
   });
 
-  test('saving creates the registry row when absent', async () => {
-    const restoreThread = withThread('test-thread');
-    try {
-    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-    const file = registryFile(root);
-    const expectedBranch = branchOf(root);
-    assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
-    const { component } = await openOdd(root);
-    let body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/, 'nothing is marked when no row exists');
-    component.handleInput('space');
-    component.handleInput('ctrl+s');
-    await tick();
-    assert.ok(fs.existsSync(file), 'the save creates the registry');
-    const stored = JSON.parse(readRaw(file));
-    assert.equal(stored.worktrees.length, 1);
-    assert.equal(stored.worktrees[0].path, root);
-    assert.equal(stored.worktrees[0].branch, expectedBranch, 'the created row carries the checkout real branch');
-    assert.equal(stored.worktrees[0].thread, 'test-thread', 'the created row carries the resolved thread identity');
-    assert.deepEqual(stored.worktrees[0].odd, ['odd/tasks/alpha.md']);
-    body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/, 'the created row reads back as stored');
-    } finally { restoreThread(); }
-  });
-
-  test('a refusing registry reports the error without writing', async () => {
-    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
-    const file = writeRegistry(root, []);
-    fs.writeFileSync(file, '{not json');
+  test('space and list ctrl+s leave the registry bytes unchanged', async () => {
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    const file = writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
     const before = readRaw(file);
     const { component } = await openOdd(root);
-    let body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/, 'a malformed registry leaves the view usable with nothing marked');
     component.handleInput('down');
     assert.equal(component.state.index, 1, 'navigation still works');
     component.handleInput('space');
+    component.handleInput('space');
     component.handleInput('ctrl+s');
     await tick();
-    body = clean(component.render(100).join('\n'));
-    assert.match(body, /save failed/, 'the failed save shows its error');
-    assert.match(rowFor(body, 'beta'), /✎/, 'the pending mark survives the refusal');
-    assert.equal(readRaw(file), before, 'the refusing registry is left untouched');
+    assert.equal(readRaw(file), before, 'the removed keys write nothing to the registry');
   });
 
-  test('toggling without ctrl+s writes nothing to the registry', async () => {
+  test('with no registry at all, space and ctrl+s create nothing', async () => {
     const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-    const file = writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
-    }]);
-    const before = readRaw(file);
+    const file = registryFile(root);
+    assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
     const { component } = await openOdd(root);
-    component.handleInput('space');
-    component.handleInput('escape');
-    await tick();
-    assert.equal(readRaw(file), before, 'no write happens without ctrl+s');
-  });
-
-  test('creating the row records the real branch and the resolved thread identity', async () => {
-    const restoreThread = withThread('odd-test-thread-a');
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      const file = registryFile(root);
-      assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
-      const expectedBranch = branchOf(root);
-      assert.ok(expectedBranch.length > 0, 'the fixture checkout has a real branch');
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.ok(!body.includes('save failed'), 'the save succeeds');
-      const stored = JSON.parse(readRaw(file));
-      assert.equal(stored.worktrees.length, 1);
-      assert.equal(stored.worktrees[0].branch, expectedBranch, 'the created row carries the checkout real branch, never a placeholder');
-      assert.equal(stored.worktrees[0].thread, 'odd-test-thread-a', 'the created row carries the resolved thread, never a placeholder');
-    } finally { restoreThread(); }
-  });
-
-  test('without a resolvable thread identity the save refuses and writes nothing', async () => {
-    const restoreThread = withThread(undefined);
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      const file = writeRegistry(root, []);
-      const before = readRaw(file);
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.match(body, /save failed/, 'the refusal surfaces in the view');
-      assert.match(body, /thread identity/, 'the error names the missing thread identity');
-      assert.equal(readRaw(file), before, 'the registry file stays byte-identical');
-      assert.deepEqual(JSON.parse(readRaw(file)).worktrees, [], 'no row is created');
-    } finally { restoreThread(); }
-  });
-
-  test('without a determinable branch the save refuses and writes nothing', async () => {
-    const restoreThread = withThread('odd-test-thread-c');
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      git(root, ['checkout', '--detach', 'HEAD']);
-      const file = writeRegistry(root, []);
-      const before = readRaw(file);
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.match(body, /save failed/, 'the refusal surfaces in the view');
-      assert.match(body, /branch/, 'the error names the missing branch');
-      assert.equal(readRaw(file), before, 'the registry file stays byte-identical');
-      assert.deepEqual(JSON.parse(readRaw(file)).worktrees, [], 'no row is created');
-    } finally { restoreThread(); }
-  });
-
-  test('updating one row leaves the other row untouched (no data loss)', async () => {
-    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
-    const otherPath = path.join(os.tmpdir(), `wt-odd-other-${process.pid}-${Date.now()}`);
-    const stamp = '2026-01-01T00:00:00.000Z';
-    const file = writeRegistry(root, [
-      {
-        branch: branchOf(root), path: root, thread: 'test-thread', issues: [3],
-        odd: ['odd/tasks/alpha.md'], createdAt: stamp, updatedAt: stamp,
-      },
-      {
-        branch: 'other-branch', path: otherPath, thread: 'other-thread', issues: [7],
-        odd: ['odd/tasks/keep.md'], createdAt: stamp, updatedAt: stamp,
-      },
-    ]);
-    const otherBefore = JSON.parse(readRaw(file)).worktrees[1];
-    const { component } = await openOdd(root);
-    component.handleInput('down');
     component.handleInput('space');
     component.handleInput('ctrl+s');
     await tick();
-    const stored = JSON.parse(readRaw(file));
-    assert.equal(stored.worktrees.length, 2, 'both rows still exist');
-    assert.deepEqual(stored.worktrees[1], otherBefore, 'the untouched row keeps its issues/odd/thread/timestamps');
-    assert.deepEqual(stored.worktrees[0].odd, ['odd/tasks/alpha.md', 'odd/tasks/beta.md'], 'only the current row odd changes');
-    assert.deepEqual(stored.worktrees[0].issues, [3], 'the current row issues survive');
+    assert.equal(fs.existsSync(file), false, 'no registry row is created by the removed keys');
   });
 
-  test('a same-branch row at a different live checkout is kept, not replaced', async () => {
-    const restoreThread = withThread('odd-test-thread-e');
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      const targetBranch = branchOf(root);
-      const wtBase = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-collide-')));
-      const linked = path.join(wtBase, 'linked');
-      git(root, ['worktree', 'add', linked, '-b', 'collide-branch']);
-      const linkedReal = fs.realpathSync(linked);
-      const stamp = '2026-02-01T00:00:00.000Z';
-      const keeper = {
-        branch: targetBranch, path: linkedReal, thread: 'keeper-thread', issues: [9],
-        odd: ['odd/tasks/keep.md'], createdAt: stamp, updatedAt: stamp,
-      };
-      const file = writeRegistry(root, [keeper]);
-      const keeperBefore = JSON.parse(readRaw(file)).worktrees[0];
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.ok(!body.includes('save failed'), 'the save succeeds');
-      const stored = JSON.parse(readRaw(file));
-      assert.equal(stored.worktrees.length, 2, 'both rows still exist');
-      const kept = stored.worktrees.find((row) => row.path === linkedReal);
-      assert.deepEqual(kept, keeperBefore, 'the colliding row keeps its issues/odd/thread/createdAt');
-      const created = stored.worktrees.find((row) => row.path === root);
-      assert.ok(created, 'the new checkout is registered alongside it');
-      assert.equal(created.branch, targetBranch);
-      assert.equal(created.thread, 'odd-test-thread-e');
-      assert.deepEqual(created.odd, ['odd/tasks/alpha.md']);
-    } finally { restoreThread(); }
+  test('the viewer still reads, filters, scrolls and closes with a stored odd', async () => {
+    const long = ['# alpha', ...Array.from({ length: 60 }, (_, index) => `line ${index + 1}`)].join('\n');
+    const longBeta = ['# beta', ...Array.from({ length: 60 }, (_, index) => `beta line ${index + 1}`)].join('\n');
+    const root = makeRepo({ docs: { 'alpha.md': `${long}\n`, 'beta.md': `${longBeta}\n` } });
+    writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
+    const { component, notes, done } = await openOdd(root);
+    component.handleInput('ctrl+j');
+    assert.ok(component.state.scroll > 0, 'the preview still scrolls');
+    component.handleInput('T');
+    component.handleInput('b');
+    component.handleInput('enter');
+    let body = clean(component.render(100).join('\n'));
+    assert.ok(!listRows(body).some((line) => line.includes('alpha')), 'the filter still narrows the list');
+    assert.ok(listRows(body).some((line) => line.includes('beta')), 'the match stays listed');
+    component.handleInput('/');
+    component.handleInput('\x7f');
+    component.handleInput('enter');
+    body = clean(component.render(100).join('\n'));
+    assert.equal(listRows(body).length, 2, 'the filter still clears');
+    assert.equal(component.state.index, 0, 'navigation is untouched');
+    component.handleInput('escape');
+    assert.equal(done(), null, 'esc still closes with a null result');
+    assert.deepEqual(notes, [], 'reading and closing notify nothing');
   });
 });
 

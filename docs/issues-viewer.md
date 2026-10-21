@@ -3,9 +3,9 @@
 Full-screen three-page overlay over the current checkout's repository
 GitHub issues: the left pane lists the issues, the right pane shows the
 selected issue in full (labels, state, author, dates, reactions, separated
-comments) with its own scroll. Each list row also marks whether that issue
-is assigned to the checkout the session runs in; `space` toggles the
-assignment locally and `ctrl+s` saves it through the worktree registry.
+comments) with its own scroll. The viewer is read-only about the checkout's
+worktree association: it never marks, toggles or saves which issue belongs
+to a worktree — that association lives in the worktree detail (S10b).
 `Esc` closes.
 
 ## What it shows
@@ -15,20 +15,20 @@ for My issues, `assignee:@me` for Assigned, and `involves:@me -author:@me`
 for Involved). The frame reads top to bottom: the concise header, then the
 dedicated search/filter row (`› Search (T)`, showing the live query while
 typing and the kept query after leaving), then the bucket tabs with their
-counts, then the filter/notice row (`f:open` or `f:closed`, followed by any
-error or notice), and finally the list with its totals line
-(`page n/m · N issues`). The three tabs are disjoint by design: an issue
+counts, then a notice row (errors and copy notices only, blank when there is
+nothing to say), and finally the list with its page footer (`page n/m`).
+The three tabs are disjoint by design: an issue
 the viewer both authored and commented on belongs to My issues only, never
 to Involved; Assigned keeps its own meaning and may overlap either.
 Typing filters live: author `@user`, `#number`, title words.
 
-Only open issues show by default, and every tab count names the rows the
-current filter actually lists — closed issues never inflate an open list.
-`f` alternates between the two states, open-only and closed-only; there is
-no combined "all" view (the footer legend and the hint above the list both
-name it: the row reads `f:open` / `f:closed`).
+Only open issues are listed (S10a): the state toggle is gone, no other state
+is ever requested, and a page that arrives carrying a closed row counts only
+its open rows — a closed issue never inflates a tab count or the page footer.
 Each row shows the issue number and title. While a page is being fetched
 the view says `loading issues…` instead of claiming an empty list.
+Closing the focused issue removes it from the list at once, because the list
+only ever shows open issues.
 
 The right pane shows the selected issue: number and title, state, labels,
 author, created and updated time, `👍` reactions, comment count, the body,
@@ -36,28 +36,21 @@ then each comment separated by its author and time. The body and the
 comments render as plain wrapped text, never as styled markdown. Moving
 the selection resets the scroll to the top of that issue.
 
-Every list row carries its assignment mark:
+Rows carry no association mark and the notice row carries no
+assignment hint: the viewer never claims which issue belongs to the
+checkout's worktree (S10b). Reading, search, labels, comments, closing and
+opening in the browser all work as before; the checkout↔issue association
+lives in the worktree detail.
 
-| Mark | Meaning |
-| --- | --- |
-| `✓` | assigned to this checkout and stored |
-| `·` | not assigned |
-| `✎` | changed but unsaved — differs from the stored assignment |
-
-These marks, the `space assign · ctrl+s save` legend on the filter/notice
-row and the `· unsaved` header claim belong to the worktree-tools
-association. When that association is off (fresh mode, or a malformed
-association), the marks and the legend are absent, `space` and `ctrl+s` do
-nothing at all — no save is attempted — and stored associations are simply
-not shown. Reading, search, the open/closed toggle, labels, comments,
-close/reopen and opening in the browser are unchanged in that mode.
-
-The frame header stays short and carries only what the panes do not already
-show: the surface and the active bucket (`◈ Issues · My issues`), plus
-`· unsaved` while any toggle is pending. It never repeats the
-branch/worktree — the session already sits in that checkout. There is no
-`esc` text in the top-right corner: the footer legend names the key and the
-right border runs unbroken to the terminal's last cell.
+The frame header stays short and carries only the surface (`◈ Issues`): the
+active bucket is named and marked by its own tab, and the header repeats
+neither it nor the branch/worktree — the session already sits in that
+checkout. There is no `esc` text in the top-right corner: the footer legend
+names the key and the right border runs unbroken to the terminal's last cell.
+Each hint is named once: `T` belongs to the search row, the issue total to
+the tab, and while the search box holds the keyboard the footer names that
+interaction's keys (`type to filter · bksp edit · enter/esc keep`) instead of
+repeating them beside the query or naming the list keys.
 
 ## Keys
 
@@ -67,21 +60,20 @@ right border runs unbroken to the terminal's last cell.
 | `tab` / `→`, `shift+tab` / `←` | next / previous page (My issues, Assigned, Involved — the `stats-view` convention) |
 | `ctrl+j`/`ctrl+k`, `pgDn`/`pgUp` | scroll the issue pane |
 | `home`/`end` | first / last issue in the current page |
-| `[` / `]` | previous / next list page, with the totals line showing `page n/m · N issues` |
+| `[` / `]` | previous / next list page, with the page footer showing `page n/m` |
 | `T` (also `/`) | open the search row directly below the header; typing filters live (author `@user`, `#number`, title words); `Enter`/`Esc` leave the row keeping the filter, which stays visible in it |
-| `f` | toggle between the two states, open-only <-> closed-only (S4/S18); the tab counts follow it |
-| `space` | toggle "assigned to this checkout" (S5), applied only on save; only while the worktree-tools association is available |
-| `ctrl+s` | save the pending assignment through the worktree registry `issues[]`, exactly the odd viewer's path and guards; only while the association is available |
 | `L` | open the label editor (S3) |
 | `n` | create a new label inside the label editor |
 | `c` | open the comment input (S7) |
-| `x` / `X` | close / reopen the issue (S4), after the host's own confirm |
+| `x` / `X` | close the focused issue (S4/S10a), after the host's own confirm; it leaves the open list at once |
 | `o` | open the issue in the browser (S5) |
 | `r` | reload the current page from `gh` |
-| `esc`/`ctrl+c`/`q` | close (discarding unsaved toggles, like the odd viewer) |
+| `esc`/`ctrl+c`/`q` | close |
 
 There is no `?` key-help overlay: the footer shortcut legend is the only
-key reference, and every shortcut it names stays on screen.
+key reference, and every shortcut it names stays on screen. It is also the
+legend of the interaction in progress — the search keys while the search box
+is open, the list keys otherwise — on ONE row.
 
 Reserved keys this view must not steal: `ctrl+c`, `ctrl+u`, `ctrl+d`, `alt+*` shortcuts registered elsewhere.
 
@@ -107,19 +99,18 @@ and the view does not open. The note says the command cannot open until
 then — never that it is unregistered, because it always is. Nothing in this
 view runs `gh` through a shell, echoes a token, or writes user config.
 
-## What writes (four actions, each behind its explicit key)
+## What writes (three actions, each behind its explicit key)
 
 Listing, search, paging, filtering, scrolling, opening and reloading
-never write anything. Only these four actions write, each after an explicit key, each
+never write anything. Only these three actions write, each after an explicit key, each
 reported honestly — a failed action leaves the local state unchanged and
 shows the error; nothing claims success:
 
 | Key | Write | What it does |
 | --- | --- | --- |
-| `ctrl+s` (list) | assignment save | persists the whole pending set as this checkout's `issues[]` through the worktree registry, replacing the stored set exactly like the odd viewer's save |
 | `ctrl+s` (label editor) | label edit | creates each new name first through `gh label create`, then applies the whole add/remove delta through `gh issue edit --add-label/--remove-label` |
 | `ctrl+s` (comment input) | comment | posts the draft through `gh issue comment` |
-| `Enter` (confirm) | state change | closes (`x`) or reopens (`X`) the issue through `gh issue close`/`gh issue reopen` after the host's own confirm |
+| `Enter` (confirm) | state change | closes the focused issue (`x` or `X`) through `gh issue close` after the host's own confirm |
 
 `o` opens `gh issue view <n> --web` through the fixed-argv runner and
 changes nothing; `esc` always discards.
@@ -138,12 +129,10 @@ changes nothing; `esc` always discards.
   while the pages are in flight. A slow answer can never overwrite a
   newer one: the viewer keeps only the answer to its latest request, and a
   closed view paints nothing.
-- **Worktree tools off:** the command still opens and stays readable, but the
-  assignment interaction is gone as described above (no marks, no legend, no
-  `· unsaved`, no save callback).
-- **Unreadable assignment:** the stored `issues[]` loads fail-soft — the
-  view opens with nothing marked and stays usable; the failure is reported
-  only if a save is attempted, and a refusing registry is left untouched.
+- **Read-only association (S10b):** the view never marks, toggles or saves
+  which issue belongs to the checkout's worktree. A malformed or unreadable
+  worktree registry therefore changes nothing here: the command opens and
+  stays fully usable.
 - **`gh` unavailable:** the command stays registered and stays in the
   command list, but it refuses to open, names the install plus login fix,
   and the view's own `gh unavailable` state says the same thing.
@@ -152,10 +141,8 @@ changes nothing; `esc` always discards.
 
 ## Limits
 
-The list total is a bounded count: when the fetch bound is reached the
-totals line renders it as `N+` and the tab marks it the same way (a lower
-bound, not the exact total). Scope
-is the current checkout only — the session's cwd resolved to its Git root,
-and the assignment marks belong to the checkout the session runs in. The
-issue body and the comments show as plain wrapped text (no markdown
-styling).
+The list total is a bounded count: when the fetch bound is reached the tab
+renders it as `N+` (a lower bound, not the exact total); the page footer
+names only the page position. Scope is the current checkout only — the
+session's cwd resolved to its Git root. The issue body and the comments
+show as plain wrapped text (no markdown styling).

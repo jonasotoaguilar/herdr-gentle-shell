@@ -234,16 +234,6 @@ function branchOf(root) {
   return git(root, ['branch', '--show-current']).trim();
 }
 
-function withThread(value) {
-  const prev = process.env.GENTLE_WORKTREE_THREAD;
-  if (value === undefined) delete process.env.GENTLE_WORKTREE_THREAD;
-  else process.env.GENTLE_WORKTREE_THREAD = value;
-  return () => {
-    if (prev === undefined) delete process.env.GENTLE_WORKTREE_THREAD;
-    else process.env.GENTLE_WORKTREE_THREAD = prev;
-  };
-}
-
 // Gate the extension through session_start fired with a scratch cwd (so
 // the unrelated worktree discovery never touches the fixture repo),
 // then run the command handler against the fixture checkout.
@@ -263,9 +253,9 @@ async function openIssues(root, { runner } = {}) {
   });
   await def.handler('', ctx);
   assert.ok(factory, 'the overlay opens');
-  const { component } = openComponent(factory, host);
+  const { component, done } = openComponent(factory, host);
   await tick();
-  return { component, notes, customs, commands };
+  return { component, notes, customs, commands, done };
 }
 
 describe('/herdr-gentle:issues gate (S3)', () => {
@@ -289,7 +279,7 @@ describe('/herdr-gentle:issues gate (S3)', () => {
 
   test('a missing gh notifies the fix once at startup and again on invocation, opening nothing', async () => {
     const { commands, mod, sessionStarts } = await loadExtension();
-    ghIssues.setGhRunner(async (bin, argv) => ({
+    ghIssues.setGhRunner(async (bin, _argv) => ({
       status: null, stdout: '', stderr: '', error: `spawn ${bin} ENOENT: gh CLI is not available`,
     }));
     const root = makeRepo({ tag: 'gate-missing' });
@@ -370,7 +360,9 @@ describe('/herdr-gentle:issues overlay', () => {
     assert.match(body, /Involved/, 'third page tab');
     assert.match(body, /76/, 'the listed issue number');
     assert.match(body, /chore: update/, 'the listed issue title');
-    assert.match(body, /◈ Issues · My issues/, 'the header names the focused bucket');
+    assert.match(body, /◈ Issues/, 'the header names the surface');
+    assert.ok(!/◈ Issues · /.test(body), 'S13: the header never repeats the active tab');
+    assert.match(body, /▸ My issues \(\d+\)/, 'the tab row names and marks the active bucket');
     assert.ok(!body.includes(path.basename(root)), 'S25: the header never repeats the checkout name');
   });
 
@@ -412,134 +404,93 @@ describe('/herdr-gentle:issues outside a Git checkout (S11)', () => {
   });
 });
 
-describe('/herdr-gentle:issues assignment', () => {
-  test('reads the stored issues[] for the current checkout', async () => {
-    const root = makeRepo({ tag: 'issues-read' });
-    writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [76], odd: [],
-    }]);
+// S10b: the issues viewer no longer associates a checkout with issues. These
+// drive the public command end to end: no association mark or hint renders and
+// the removed list keys (`space`, `ctrl+s`) never write, even though the
+// command still supplies the old `assigned`/`saveAssignment` options. The
+// label editor and comment input keep their own `ctrl+s`, covered by the
+// actions describe below.
+describe('/herdr-gentle:issues read-only association (S10b)', () => {
+  // S8: the registry stores ONE odd path or `null`, never a list.
+  function storedRow(root, issues) {
+    return { branch: branchOf(root), path: root, thread: 'test-thread', issues, odd: null };
+  }
+
+  test('renders no association mark, hint or unsaved claim even with a stored issues[]', async () => {
+    const root = makeRepo({ tag: 'issues-readonly' });
+    writeRegistry(root, [storedRow(root, [76])]);
     const { component, notes } = await openIssues(root);
     const body = clean(component.render(110).join('\n'));
     const row = body.split('\n').find((line) => line.includes('76'));
-    assert.ok(row, 'the stored issue is listed');
-    assert.match(row, /✓/, 'the stored row carries ✓');
+    assert.ok(row, 'the stored issue is still listed');
+    assert.ok(!/[✓✎]/.test(row), 'no association mark on the row');
+    assert.ok(!body.includes('space assign'), 'no Space hint');
+    assert.ok(!body.includes('ctrl+s save'), 'no save hint');
+    assert.ok(!body.includes('unsaved'), 'no unsaved claim');
+    assert.ok(!/\d+ assigned/.test(body), 'no assigned count');
+    assert.match(body, /x\/X close/, 'the footer legend stays');
+    assert.ok(!body.includes('f open/closed'), 'S10a: the removed state toggle never reaches the legend');
     assert.deepEqual(notes, [], 'reading writes nothing and notifies nothing');
   });
 
-  test('ctrl+s creates the missing row with the real branch and thread', async () => {
-    const restoreThread = withThread('issues-test-thread');
-    try {
-      const root = makeRepo({ tag: 'issues-create' });
-      const file = registryFile(root);
-      const expectedBranch = branchOf(root);
-      assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
-      const { component } = await openIssues(root);
-      let body = clean(component.render(110).join('\n'));
-      assert.ok(!body.includes('unsaved'), 'nothing pending before the toggle');
-      assert.ok(!fs.existsSync(file), 'opening the view writes nothing');
-      component.handleInput('space');
-      assert.ok(!fs.existsSync(file), 'toggling alone writes nothing without ctrl+s');
-      component.handleInput('ctrl+s');
-      await tick();
-      assert.ok(fs.existsSync(file), 'the save creates the registry');
-      const stored = JSON.parse(readRaw(file));
-      assert.equal(stored.worktrees.length, 1);
-      assert.equal(stored.worktrees[0].path, root);
-      assert.equal(stored.worktrees[0].branch, expectedBranch, 'the created row carries the real branch');
-      assert.equal(stored.worktrees[0].thread, 'issues-test-thread', 'the created row carries the resolved thread');
-      assert.deepEqual(stored.worktrees[0].issues, [76]);
-      body = clean(component.render(110).join('\n'));
-      assert.ok(!body.includes('unsaved'), 'a successful save clears the pending state');
-    } finally { restoreThread(); }
+  test('the stored issues[] changes no cell: the frame matches an empty list', async () => {
+    const withIssues = makeRepo({ tag: 'issues-readonly-with' });
+    writeRegistry(withIssues, [storedRow(withIssues, [76])]);
+    const withoutIssues = makeRepo({ tag: 'issues-readonly-without' });
+    writeRegistry(withoutIssues, [storedRow(withoutIssues, [])]);
+    const first = await openIssues(withIssues);
+    const second = await openIssues(withoutIssues);
+    assert.equal(
+      clean(first.component.render(110).join('\n')),
+      clean(second.component.render(110).join('\n')),
+      'the stored association renders nothing in either direction',
+    );
   });
 
-  test('without a resolvable thread the save refuses and writes nothing', async () => {
-    const restoreThread = withThread(undefined);
-    try {
-      const root = makeRepo({ tag: 'issues-nothread' });
-      const file = writeRegistry(root, []);
-      const before = readRaw(file);
-      const { component } = await openIssues(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(110).join('\n'));
-      assert.match(body, /save failed/, 'the refusal surfaces in the view');
-      assert.match(body, /thread identity/, 'the error names the missing thread identity');
-      assert.equal(readRaw(file), before, 'the registry file stays byte-identical');
-    } finally { restoreThread(); }
-  });
-
-  test('without a determinable branch the save refuses and writes nothing', async () => {
-    const restoreThread = withThread('issues-test-thread-b');
-    try {
-      const root = makeRepo({ tag: 'issues-nobranch' });
-      git(root, ['checkout', '--detach', 'HEAD']);
-      const file = writeRegistry(root, []);
-      const before = readRaw(file);
-      const { component } = await openIssues(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(110).join('\n'));
-      assert.match(body, /save failed/, 'the refusal surfaces in the view');
-      assert.match(body, /branch/, 'the error names the missing branch');
-      assert.equal(readRaw(file), before, 'the registry file stays byte-identical');
-    } finally { restoreThread(); }
-  });
-
-  test('a same-branch row at a different live checkout is kept, not replaced', async () => {
-    const restoreThread = withThread('issues-test-thread-e');
-    try {
-      const root = makeRepo({ tag: 'issues-collide' });
-      const targetBranch = branchOf(root);
-      const wtBase = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-collide-')));
-      const linked = path.join(wtBase, 'linked');
-      git(root, ['worktree', 'add', linked, '-b', 'collide-branch']);
-      const linkedReal = fs.realpathSync(linked);
-      const stamp = '2026-02-01T00:00:00.000Z';
-      const keeper = {
-        branch: targetBranch, path: linkedReal, thread: 'keeper-thread', issues: [9],
-        odd: ['odd/tasks/keep.md'], createdAt: stamp, updatedAt: stamp,
-      };
-      const file = writeRegistry(root, [keeper]);
-      const keeperBefore = JSON.parse(readRaw(file)).worktrees[0];
-      const { component } = await openIssues(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(110).join('\n'));
-      assert.ok(!body.includes('save failed'), 'the save succeeds');
-      const stored = JSON.parse(readRaw(file));
-      assert.equal(stored.worktrees.length, 2, 'both rows still exist');
-      const kept = stored.worktrees.find((row) => row.path === linkedReal);
-      assert.deepEqual(kept, keeperBefore, 'the colliding row keeps its issues/odd/thread/createdAt');
-      const created = stored.worktrees.find((row) => row.path === root);
-      assert.ok(created, 'the new checkout is registered alongside it');
-      assert.equal(created.branch, targetBranch);
-      assert.equal(created.thread, 'issues-test-thread-e');
-      assert.deepEqual(created.issues, [76]);
-    } finally { restoreThread(); }
-  });
-
-  test('a refusing registry reports the error without writing', async () => {
-    const root = makeRepo({ tag: 'issues-refuse' });
-    const file = writeRegistry(root, []);
-    fs.writeFileSync(file, '{not json');
+  test('space and list ctrl+s leave the registry bytes unchanged', async () => {
+    const root = makeRepo({ tag: 'issues-readonly-write' });
+    const file = writeRegistry(root, [storedRow(root, [76])]);
     const before = readRaw(file);
+    const { component } = await openIssues(root);
+    component.handleInput('down');
+    component.handleInput('space');
+    component.handleInput('ctrl+s');
+    await tick();
+    assert.equal(readRaw(file), before, 'the removed keys write nothing to the registry');
+  });
+
+  test('with no registry at all, space and ctrl+s create nothing', async () => {
+    const root = makeRepo({ tag: 'issues-readonly-nofile' });
+    const file = registryFile(root);
+    assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
     const { component } = await openIssues(root);
     component.handleInput('space');
     component.handleInput('ctrl+s');
     await tick();
-    const body = clean(component.render(110).join('\n'));
-    assert.match(body, /save failed/, 'the failed save shows its error');
-    assert.match(body, /unsaved/, 'the pending mark survives the refusal');
-    assert.equal(readRaw(file), before, 'the refusing registry is left untouched');
+    assert.equal(fs.existsSync(file), false, 'no registry row is created by the removed keys');
+  });
+
+  test('the viewer still reads, filters and closes with a stored issues[]', async () => {
+    const root = makeRepo({ tag: 'issues-readonly-read' });
+    writeRegistry(root, [storedRow(root, [76])]);
+    const { component, notes } = await openIssues(root);
+    assert.match(clean(component.render(110).join('\n')), /76/, 'the issue still lists');
+    const beforeF = clean(component.render(110).join('\n'));
+    component.handleInput('f');
+    await tick();
+    assert.equal(component.state.showClosed, undefined, 'S10a: the state toggle does not exist');
+    assert.equal(clean(component.render(110).join('\n')), beforeF, 'f repaints nothing');
+    component.handleInput('T');
+    for (const ch of 'chore') component.handleInput(ch);
+    component.handleInput('enter');
+    assert.equal(component.state.query, 'chore', 'search still filters');
+    component.handleInput('escape');
+    assert.deepEqual(notes, [], 'reading and closing notify nothing');
   });
 });
 
 describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
-  test('label toggle, create-new, comment, browser and close/reopen reach gh with fixed argv', async () => {
+  test('label toggle, create-new, comment, browser and close reach gh with fixed argv', async () => {
     const root = makeRepo({ tag: 'issues-actions' });
     const { runner, calls } = makeIssuesRunner();
     const { component } = await openIssues(root, { runner });
@@ -597,20 +548,30 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
     assert.deepEqual(gitCalls[0].argv, ['issue', 'view', '76', '--web']);
     assert.ok(!gitCalls[0].argv.join(' ').includes('xdg-open'), 'never an invented opener');
 
-    component.handleInput('X');
-    assert.equal(component.state.mode, 'confirm');
-    component.handleInput('enter');
-    await tick();
-    const reopen = ghCalls().find((call) => call.argv[1] === 'reopen');
-    assert.ok(reopen, 'reopen reaches gh issue reopen');
-    assert.deepEqual(reopen.argv, ['issue', 'reopen', '76']);
-
     component.handleInput('x');
+    assert.equal(component.state.mode, 'confirm');
+    assert.match(clean(component.render(110).join('\n')), /Confirm close #76/, 'the confirm names the close');
     component.handleInput('enter');
     await tick();
+    assert.equal(component.state.mode, 'list');
+    assert.ok(!clean(component.render(110).join('\n')).includes('#76'), 'the closed issue leaves the open list at once');
     const close = ghCalls().find((call) => call.argv[1] === 'close');
     assert.ok(close, 'close reaches gh issue close');
     assert.deepEqual(close.argv, ['issue', 'close', '76']);
+    assert.equal(ghCalls().some((call) => call.argv[1] === 'reopen'), false, 'the view has no reopen path');
+
+    // The reload brings the fixture's open row back, so X exercises the same
+    // close through its own key.
+    component.handleInput('r');
+    await tick();
+    assert.match(clean(component.render(110).join('\n')), /#76/, 'the reload lists the open issue again');
+    component.handleInput('X');
+    assert.equal(component.state.mode, 'confirm', 'X asks the same close confirmation');
+    component.handleInput('enter');
+    await tick();
+    const closes = ghCalls().filter((call) => call.argv[1] === 'close');
+    assert.equal(closes.length, 2, 'X closes too');
+    assert.deepEqual(closes[1].argv, ['issue', 'close', '76']);
   });
 
   test('a failing comment keeps the draft, shows the error and changes nothing', async () => {
@@ -680,21 +641,21 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
     assert.ok(!body.includes('+ issues'), 'an under-bound fetch never carries the + marker');
   });
 
-  test('a bound-reached fetch carries the truncated flag into the view totals line', async () => {
+  test('a bound-reached fetch carries the truncated flag into the view tab', async () => {
     const root = makeRepo({ tag: 'issues-trunc' });
     const { runner } = makeBoundedRunner(500);
     const { component } = await openIssues(root, { runner });
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues \(500\+\)/, 'the tab names the bounded total');
-    assert.match(body, /30\+ issues/, 'the bounded totals line carries the + marker');
+    assert.ok(!/\d+\+ issues/.test(body), 'S13: the bound is never repeated below the list');
   });
 });
 
 // ---------------------------------------------------------------------------
-// S19/S18: mount before any network read, and toggle the state filter between
-// exactly `open` (default) and `closed`, refetching through the one seam.
+// S19/S10a: mount before any network read. Every read asks for `open` — the
+// view lists open issues only, so no other state is ever requested.
 // ---------------------------------------------------------------------------
-describe('/herdr-gentle:issues first paint and state filter', () => {
+describe('/herdr-gentle:issues first paint and open-only reads', () => {
   test('the overlay mounts before any list or label fetch and requests open pages', async () => {
     const root = makeRepo({ tag: 'issues-lazy' });
     const { runner, calls } = makeIssuesRunner();
@@ -728,7 +689,7 @@ describe('/herdr-gentle:issues first paint and state filter', () => {
     }
   });
 
-  test('f toggles to closed and back, refetching each time with the shown state', async () => {
+  test('the removed state key is inert and a reload asks for open again', async () => {
     const root = makeRepo({ tag: 'issues-closed' });
     const { runner, calls } = makeIssuesRunner();
     const { component } = await openIssues(root, { runner });
@@ -736,12 +697,15 @@ describe('/herdr-gentle:issues first paint and state filter', () => {
       .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
       .map((call) => call.argv[call.argv.indexOf('--state') + 1]);
     assert.deepEqual(states(), ['open', 'open', 'open'], 'the default fetch is open');
+    const before = clean(component.render(110).join('\n'));
     component.handleInput('f');
     await tick();
-    assert.deepEqual(states().slice(3), ['closed', 'closed', 'closed'], 'f refetches closed');
-    component.handleInput('f');
+    assert.deepEqual(states(), ['open', 'open', 'open'], 'f fetches nothing: no other state is asked for');
+    assert.equal(clean(component.render(110).join('\n')), before, 'f repaints nothing');
+    component.handleInput('r');
     await tick();
-    assert.deepEqual(states().slice(6), ['open', 'open', 'open'], 'f refetches open again');
+    assert.deepEqual(states().slice(3), ['open', 'open', 'open'], 'a reload asks for open again');
+    assert.equal(states().includes('closed'), false, 'the closed state is never requested');
   });
 });
 
@@ -789,7 +753,7 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
       const capture = captureIssuesView();
       try {
         const root = makeRepo({ tag: 'issues-s29-off' });
-        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
         const before = readRaw(file);
         const { runner } = makeIssuesRunner();
         const { commands } = await openIssues(root, { runner });
@@ -810,7 +774,7 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
       const capture = captureIssuesView();
       try {
         const root = makeRepo({ tag: 'issues-s29-malformed' });
-        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
         const before = readRaw(file);
         const { runner } = makeIssuesRunner();
         const { commands } = await openIssues(root, { runner });
@@ -831,7 +795,7 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
       const capture = captureIssuesView();
       try {
         const root = makeRepo({ tag: 'issues-s29-switched' });
-        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
         const before = readRaw(file);
         const { runner } = makeIssuesRunner();
         await openIssues(root, { runner });
@@ -851,7 +815,7 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
       const capture = captureIssuesView();
       try {
         const root = makeRepo({ tag: 'issues-s29-on' });
-        writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: [] }]);
+        writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
         const { runner } = makeIssuesRunner();
         await openIssues(root, { runner });
         assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode passes true');

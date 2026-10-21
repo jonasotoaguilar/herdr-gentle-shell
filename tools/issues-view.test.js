@@ -6,10 +6,10 @@
 // exactly the requested rows at the requested width; tabs carry counts;
 // search opens/filters/leaves keeping the filter; pagination bounds and the
 // totals line; selection movement; right-pane scroll to the last line;
-// labels/state/author/dates/reactions/comments; assignment toggle/save;
-// label editor; comment input; close/reopen confirm; the lazy page/label
-// loader seams (S19); open-only totals and the open/closed toggle (S18);
-// empty/error/gh-unavailable states; no key outside S8 mutates state.
+// labels/state/author/dates/reactions/comments; label editor; comment
+// input; close confirm; the lazy page/label loader seams (S19);
+// open-only listing with no state toggle (S10a); empty/error/
+// gh-unavailable states; no key outside S8 mutates state.
 //
 // S17: the generic `?` key-help overlay is gone; the footer legend is the
 // only key reference.
@@ -109,12 +109,6 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-// Pages as the loader seam hands them over: same shape the eager `pages`
-// option takes, counts included when the source knows them.
-function loadedPage(label, rows, extra = {}) {
-  return { id: label.toLowerCase().replace(/\s+/g, '-'), label, issues: rows, total: rows.length, ...extra };
-}
-
 function pagesResult(lists, extra = {}) {
   const names = ['My issues', 'Assigned', 'Involved'];
   return {
@@ -189,20 +183,22 @@ describe('issues view tabs and list', () => {
     assert.equal(view.state.index, 0);
   });
 
-  test('the totals line uses the singular "1 issue" for exactly one issue', async () => {
+  test('the tab carries the issue count and the list footer only the page position', async () => {
+    const rows = [issue(1, { title: 'alpha bug' })];
     const { view } = makeView({
-      pages: pagesOf([[issue(1)], [], []]),
-      issues: [issue(1)],
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
       rows: 12,
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { title: 'alpha bug' }), comments: [] }),
     });
     await tick();
     const body = bodyOf(view, 100);
-    assert.match(body, /1 issue\b/, 'exactly one renders the singular');
-    assert.ok(!body.includes('1 issues'), 'exactly one never renders the plural');
+    assert.match(body, /My issues \(1\)/, 'the open tab names its count');
+    assert.match(body, /page 1\/1/, 'the list footer names the page position');
+    assert.ok(!/\b1 issues?\b/.test(body.replace('My issues', '')), 'no second total is repeated below the list');
   });
 
-  test('pagination bounds and the totals line name the filtered count, never the total', async () => {
+  test('pagination bounds move the page position, never a repeated count', async () => {
     const rows = Array.from({ length: 10 }, (_, i) => issue(i + 1));
     const { view } = makeView({
       pages: [{ id: 'p0', label: 'My issues', issues: rows, total: rows.length }],
@@ -213,12 +209,13 @@ describe('issues view tabs and list', () => {
     await tick();
     view.state.pageSize = 4;
     const first = bodyOf(view, 100);
-    assert.match(first, /page 1\/3 · 10 issues/, 'totals line shows page and count');
+    assert.match(first, /page 1\/3/, 'the list footer shows the page position');
+    assert.ok(!/\b10 issues\b/.test(first), 'the count is not repeated under the list');
     view.handleInput(']');
     view.handleInput(']');
     view.handleInput(']');
     assert.equal(view.state.listPage, 3, 'never past the last page');
-    assert.match(bodyOf(view, 100), /page 3\/3 · 10 issues/);
+    assert.match(bodyOf(view, 100), /page 3\/3/);
     view.handleInput('[');
     assert.equal(view.state.listPage, 2);
     view.handleInput('[');
@@ -226,7 +223,7 @@ describe('issues view tabs and list', () => {
     assert.equal(view.state.listPage, 1, 'never before the first page');
   });
 
-  test('state filter f toggles open-only versus closed-only, never both', async () => {
+  test('the state filter is gone: f changes nothing and closed rows never list (S10a)', async () => {
     const rows = [issue(1), issue(2, { state: 'closed' })];
     const { view } = makeView({
       pages: pagesOf([rows, [], []]),
@@ -234,16 +231,14 @@ describe('issues view tabs and list', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    assert.match(bodyOf(view, 100), /issue title 1/);
-    assert.ok(!bodyOf(view, 100).includes('issue title 2'), 'closed hidden by default');
+    const before = bodyOf(view, 100);
+    assert.match(before, /issue title 1/);
+    assert.ok(!before.includes('issue title 2'), 'closed rows are never listed');
+    const snapshot = JSON.stringify(view.state);
     view.handleInput('f');
-    const closed = bodyOf(view, 100);
-    assert.match(closed, /issue title 2/, 'f shows the closed issues');
-    assert.ok(!closed.includes('issue title 1'), 'closed view excludes the open rows');
-    view.handleInput('f');
-    const open = bodyOf(view, 100);
-    assert.match(open, /issue title 1/, 'f returns to the open issues');
-    assert.ok(!open.includes('issue title 2'), 'the open view excludes closed rows');
+    assert.equal(JSON.stringify(view.state), snapshot, 'f no longer toggles any state');
+    assert.equal(bodyOf(view, 100), before, 'f repaints nothing');
+    assert.ok(!/f[:(]/.test(before), 'no state indicator survives in the frame');
   });
 });
 
@@ -424,47 +419,103 @@ describe('issues view preview scroll variants (S15)', () => {
   });
 });
 
-describe('issues view assignment', () => {
-  test('stored marks show ✓, space toggles ✎ locally, ctrl+s saves, failure keeps marks', async () => {
-    const calls = [];
-    const rows = [issue(1), issue(2)];
-    const { view } = makeView({
-      pages: pagesOf([rows, [], []]),
-      issues: rows,
-      assigned: [1],
-      saveAssignment: (nums) => { calls.push(nums); return { ok: true }; },
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
-    });
-    await tick();
-    let body = bodyOf(view, 100);
-    assert.match(body.split('\n').find((l) => l.includes('issue title 1')), /✓/);
-    view.handleInput('down');
-    view.handleInput('space');
-    body = bodyOf(view, 100);
-    assert.match(body, /unsaved/);
-    assert.deepEqual(calls, [], 'toggle alone never saves');
-    view.handleInput('ctrl+s');
-    await tick();
-    assert.deepEqual(calls, [[[1, 2]][0]], 'the whole pending set is saved');
-    body = bodyOf(view, 100);
-    assert.ok(!body.includes('unsaved'), 'success clears the indicator');
+// S10b: the issues viewer is read-only with respect to the checkout↔issue
+// association. The options the existing callers still pass (`assigned`,
+// `saveAssignment`, `assignmentEnabled`) are accepted and ignored: no mark,
+// no toggle, no save, no unsaved claim — and no key that writes.
+describe('issues view read-only association (S10b)', () => {
+  const ASSIGNED = [1];
 
-    const failCalls = [];
-    const second = makeView({
+  function inertView(overrides = {}) {
+    const saves = [];
+    const rows = [issue(1), issue(2)];
+    const made = makeView({
       pages: pagesOf([rows, [], []]),
       issues: rows,
-      assigned: [],
-      saveAssignment: (nums) => { failCalls.push(nums); return { ok: false, error: 'disk full' }; },
+      assigned: ASSIGNED,
+      saveAssignment: (nums) => { saves.push(nums); return { ok: true }; },
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      ...overrides,
+    });
+    return { ...made, saves, rows };
+  }
+
+  test('no association mark, hint or unsaved claim renders even when assigned and saveAssignment are passed', async () => {
+    const { view } = inertView({ assignmentEnabled: true });
+    await tick();
+    for (const width of [80, 160]) {
+      const body = bodyOf(view, width);
+      assert.ok(!body.includes('space assign'), `width ${width}: no Space hint`);
+      assert.ok(!body.includes('ctrl+s save'), `width ${width}: no save hint`);
+      assert.ok(!body.includes('unsaved'), `width ${width}: no unsaved claim`);
+      assert.ok(!/\d+ assigned/.test(body), `width ${width}: no assigned count`);
+      const row = body.split('\n').find((line) => line.includes('#1 issue title 1'));
+      assert.match(row, /#1 issue title 1/, 'the issue row still renders');
+      assert.ok(!/[✓✎]/.test(row), 'no assignment mark on the row');
+      const second = body.split('\n').find((line) => line.includes('#2 issue title 2'));
+      assert.ok(!/[✓✎]/.test(second), 'no assignment mark on the other row either');
+    }
+    assert.match(bodyOf(view, 160), /x\/X close/, 'the footer legend stays');
+  });
+
+  test('space and ctrl+s change nothing: no save call, no state change, no repaint difference', async () => {
+    const { view, saves } = inertView();
+    await tick();
+    const snapshot = JSON.stringify(view.state);
+    const rendered = view.render(80).join('\n');
+    for (const key of ['space', ' ', 'ctrl+s']) view.handleInput(key);
+    await tick();
+    assert.deepEqual(saves, [], 'the injected save callback is never reached');
+    assert.equal(JSON.stringify(view.state), snapshot, 'no state changed');
+    assert.equal(view.render(80).join('\n'), rendered, 'nothing repainted differently');
+    assert.ok(!bodyOf(view, 80).includes('unsaved'), 'no pending-assignment claim appears');
+    assert.ok(!/[✓✎]/.test(bodyOf(view, 80)), 'no assignment mark appears');
+  });
+
+  test('the association options are inert: the frame is identical with them and with the gate off', async () => {
+    const common = {
+      pages: pagesOf([[issue(1)], [], []]),
+      issues: [issue(1)],
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    };
+    const plain = makeView(common);
+    const passed = makeView({ ...common, assigned: ASSIGNED, saveAssignment: () => ({ ok: true }), assignmentEnabled: true });
+    const gatedOff = makeView({ ...common, assigned: ASSIGNED, saveAssignment: () => ({ ok: true }), assignmentEnabled: false });
+    await tick();
+    const expected = plain.view.render(80).join('\n');
+    assert.equal(passed.view.render(80).join('\n'), expected, 'assigned/saveAssignment/assignmentEnabled change no cell');
+    assert.equal(gatedOff.view.render(80).join('\n'), expected, 'assignmentEnabled false changes no cell either');
+  });
+
+  test('reading, search and the GitHub actions stay usable with the options passed', async () => {
+    const writes = [];
+    const { view } = inertView({
+      assignmentEnabled: false,
+      actions: {
+        setState: () => { writes.push('setState'); return { ok: true }; },
+        postComment: () => { writes.push('postComment'); return { ok: true }; },
+        editLabels: () => { writes.push('editLabels'); return { ok: true }; },
+        openBrowser: () => { writes.push('openBrowser'); return { ok: true }; },
+      },
     });
     await tick();
-    second.view.handleInput('space');
-    second.view.handleInput('ctrl+s');
+    view.handleInput('T');
+    for (const ch of 'title 2') view.handleInput(ch);
+    assert.match(bodyOf(view, 80), /issue title 2/);
+    assert.ok(!bodyOf(view, 80).includes('issue title 1'), 'search still filters');
+    view.handleInput('enter');
+    view.handleInput('T');
+    for (let i = 0; i < 7; i += 1) view.handleInput('backspace');
+    view.handleInput('enter');
+    assert.match(bodyOf(view, 80), /#1 issue title 1/, 'the query clears again');
+    const beforeF = bodyOf(view, 80);
+    view.handleInput('f');
+    assert.equal(bodyOf(view, 80), beforeF, 'the removed state key repaints nothing');
+    view.handleInput('x');
+    assert.equal(view.state.mode, 'confirm', 'close still asks first');
+    view.handleInput('enter');
     await tick();
-    const failed = bodyOf(second.view, 100);
-    assert.match(failed, /save failed: disk full/);
-    assert.match(failed, /unsaved/);
-    assert.equal(failCalls.length, 1);
+    assert.deepEqual(writes, ['setState'], 'the GitHub action ran, the association did not');
   });
 });
 
@@ -563,37 +614,34 @@ describe('issues view editors and confirmations', () => {
     assert.match(bodyOf(view, 100), /rate limited/);
   });
 
-  test('x asks to close and X asks to reopen; confirm runs setState', async () => {
+  test('x and X close the issue, and a closed issue leaves the open list (S10a)', async () => {
     const calls = [];
-    const openRows = [issue(1, { state: 'open' })];
-    const first = makeView({
+    const openRows = [issue(1), issue(2)];
+    const { view } = makeView({
       pages: pagesOf([openRows, [], []]),
       issues: openRows,
       actions: { setState: (number, state) => { calls.push([number, state]); return { ok: true }; } },
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    first.view.handleInput('x');
-    assert.equal(first.view.state.mode, 'confirm');
-    assert.match(bodyOf(first.view, 100), /close/i);
-    first.view.handleInput('enter');
+    view.handleInput('x');
+    assert.equal(view.state.mode, 'confirm');
+    assert.match(bodyOf(view, 100), /Confirm close #1/, 'the confirm names the close');
+    view.handleInput('enter');
     await tick();
-    assert.deepEqual(calls, [[1, 'closed']]);
+    assert.deepEqual(calls, [[1, 'closed']], 'x closes through the injected action');
+    const afterClose = bodyOf(view, 100);
+    assert.ok(!afterClose.includes('#1 issue title 1'), 'the closed issue leaves the open list at once');
+    assert.match(afterClose, /My issues \(1\)/, 'the tab count drops with it');
+    assert.match(afterClose, /#2 issue title 2/, 'the remaining open issue stays listed');
 
-    const closedRows = [issue(9, { state: 'closed' })];
-    const second = makeView({
-      pages: pagesOf([closedRows, [], []]),
-      issues: closedRows,
-      actions: { setState: (number, state) => { calls.push([number, state]); return { ok: true }; } },
-      loadIssue: (n) => ({ ok: true, issue: issue(n, { state: 'closed' }), comments: [] }),
-    });
+    view.handleInput('X');
+    assert.equal(view.state.mode, 'confirm', 'X asks the same close confirmation');
+    assert.match(bodyOf(view, 100), /Confirm close #2/, 'X names a close, never a reopen');
+    view.handleInput('enter');
     await tick();
-    second.view.state.showClosed = true;
-    second.view.handleInput('X');
-    assert.equal(second.view.state.mode, 'confirm');
-    second.view.handleInput('enter');
-    await tick();
-    assert.deepEqual(calls[1], [9, 'open']);
+    assert.deepEqual(calls, [[1, 'closed'], [2, 'closed']], 'X closes too: the view has no reopen path');
+    assert.match(bodyOf(view, 100), /no issues/, 'the emptied list says so honestly');
   });
 
   test('o opens in the browser without changing state; r reloads', async () => {
@@ -633,7 +681,8 @@ describe('issues view editors and confirmations', () => {
     assert.equal(after, before, '? repaints nothing: there is no overlay to open');
     assert.equal(view.state.help, undefined, 'no help state survives');
     assert.match(after, /esc close/, 'the footer shortcut legend survives');
-    assert.match(after, /f open\/closed/, 'the footer documents the open/closed key');
+    assert.match(after, /x\/X close/, 'the footer documents the close key');
+    assert.ok(!after.includes('f open/closed'), 'the removed state-toggle key is gone from the legend');
   });
 });
 
@@ -709,7 +758,7 @@ describe('issues view states and key discipline', () => {
     assert.match(top, /body line 1/, 'the top of the first issue is shown');
   });
 
-  test('a truncated fetch renders the totals line with N+ and a plain fetch renders N', async () => {
+  test('a bounded fetch marks the count on the tab and never repeats it below the list', async () => {
     const rows = Array.from({ length: 5 }, (_, i) => issue(i + 1));
     const truncated = makeView({
       pages: [{ id: 'p0', label: 'My issues', issues: rows, total: rows.length, truncated: true }],
@@ -718,7 +767,8 @@ describe('issues view states and key discipline', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    assert.match(bodyOf(truncated.view, 100), /5\+ issues/, 'truncated totals line carries the + marker');
+    assert.match(bodyOf(truncated.view, 100), /My issues \(5\+\)/, 'the tab marks the bounded count');
+    assert.ok(!/5\+ issues/.test(bodyOf(truncated.view, 100)), 'the bound is never repeated below the list');
     const plain = makeView({
       pages: [{ id: 'p0', label: 'My issues', issues: rows, total: rows.length }],
       issues: rows,
@@ -726,8 +776,8 @@ describe('issues view states and key discipline', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    assert.match(bodyOf(plain.view, 100), /5 issues/, 'plain totals line has no + marker');
-    assert.ok(!bodyOf(plain.view, 100).includes('5+ issues'), 'plain totals line never carries +');
+    assert.match(bodyOf(plain.view, 100), /My issues \(5\)/, 'a plain fetch renders the exact count');
+    assert.ok(!bodyOf(plain.view, 100).includes('5+'), 'a plain fetch never carries the + marker');
   });
 
   test('esc closes with null; no key outside S8 changes state', async () => {
@@ -1052,7 +1102,7 @@ describe('issues view lazy page loading (S19)', () => {
     assert.match(body, /timed out/, 'the failure is named, never hidden');
   });
 
-  test('a stale state response never wins over the newest request', async () => {
+  test('a stale answer never wins over the newest request', async () => {
     const pending = [];
     const { view } = makeView({
       loadPages: ({ state }) => {
@@ -1062,20 +1112,20 @@ describe('issues view lazy page loading (S19)', () => {
       },
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
-    assert.deepEqual(pending.map((p) => p.state), ['open']);
-    view.handleInput('f');
-    view.handleInput('f');
-    assert.deepEqual(pending.map((p) => p.state), ['open', 'closed', 'open'], 'each toggle asks for its own state');
+    assert.deepEqual(pending.map((p) => p.state), ['open'], 'the mount read asks for open');
+    view.handleInput('r');
+    view.handleInput('r');
+    assert.deepEqual(pending.map((p) => p.state), ['open', 'open', 'open'], 'every reload asks for open again');
     const newest = pending[2].entry;
     const stale = pending[1].entry;
     newest.resolve(pagesResult([[issue(1)], [], []]));
     await tick();
-    stale.resolve(pagesResult([[issue(2, { state: 'closed' })], [], []]));
+    stale.resolve(pagesResult([[issue(2)], [], []]));
     await tick();
     const body = bodyOf(view, 80);
     assert.match(body, /My issues \(1\)/, 'the newest open-only answer is the one shown');
-    assert.match(body, /issue title 1/, 'the newest open answer paints its row');
-    assert.ok(!body.includes('issue title 2'), 'the stale closed answer never paints');
+    assert.match(body, /issue title 1/, 'the newest answer paints its row');
+    assert.ok(!body.includes('issue title 2'), 'the stale answer never paints');
   });
 
   test('closing stops every later repaint and a late load changes nothing', async () => {
@@ -1093,10 +1143,9 @@ describe('issues view lazy page loading (S19)', () => {
   });
 });
 
-describe('issues view open-only totals and the open/closed toggle (S18)', () => {
+describe('issues view open-only list (S10a)', () => {
   // A state-honest source, like `gh --state <state>`: each state carries
-  // only its own rows and its own total. The view only ever asks for one of
-  // the two states, never a combined all.
+  // only its own rows and its own total. The view only ever asks for open.
   function stateSource(rows) {
     const asked = [];
     const pages = (state) => {
@@ -1107,7 +1156,7 @@ describe('issues view open-only totals and the open/closed toggle (S18)', () => 
     return { asked, pages };
   }
 
-  test('the default fetch asks for open and the tab names the open count only', async () => {
+  test('the default fetch asks for open and the tab names the open count', async () => {
     const rows = [issue(1), issue(2, { state: 'closed' }), issue(3, { state: 'closed' })];
     const source = stateSource(rows);
     const { view } = makeView({
@@ -1120,9 +1169,9 @@ describe('issues view open-only totals and the open/closed toggle (S18)', () => 
     assert.match(body, /My issues \(1\)/, 'the tab counts the open row it lists');
     assert.ok(!body.includes('My issues (3)'), 'the all-state total is never shown while only open issues list');
     assert.ok(!body.includes('issue title 2'), 'closed rows stay out of the list');
-    assert.match(body, /page 1\/1 · 1 issue\b/, 'the totals line agrees with the tab');
-    assert.match(body, /f:open/, 'the visible hint names the current filter');
-    assert.match(bodyOf(view, 160), /f open\/closed/, 'the footer documents the toggle');
+    assert.match(body, /page 1\/1/, 'the list footer names the page position');
+    assert.ok(!/f[:(]/.test(body), 'no state indicator is left in the frame');
+    assert.ok(!bodyOf(view, 160).includes('open/closed'), 'the removed toggle never reaches the legend');
   });
 
   test('an all-state total never inflates the open count (reported symptom)', async () => {
@@ -1137,11 +1186,12 @@ describe('issues view open-only totals and the open/closed toggle (S18)', () => 
     const body = bodyOf(view, 80);
     assert.match(body, /My issues \(1\)/, 'the tab counts the one open issue it lists');
     assert.ok(!body.includes('My issues (3)'), 'closed issues never inflate the open tab');
-    assert.match(body, /page 1\/1 · 1 issue\b/, 'the totals line agrees');
+    assert.match(body, /page 1\/1/, 'the list footer agrees');
     assert.ok(!body.includes('issue title 2'), 'no closed row is listed under open');
+    assert.ok(!/\b2 issues\b|\b3 issues\b/.test(body), 'no closed row inflates a count');
   });
 
-  test('f asks for closed: only closed rows list and the counts are the closed ones', async () => {
+  test('f is inert: no other state is ever requested and closed rows never count', async () => {
     const rows = [issue(1), issue(2, { state: 'closed' }), issue(3, { state: 'closed' })];
     const source = stateSource(rows);
     const asked = [];
@@ -1153,32 +1203,26 @@ describe('issues view open-only totals and the open/closed toggle (S18)', () => 
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
+    assert.deepEqual(source.asked, ['open'], 'the mount fetch asks for open');
+    const before = bodyOf(view, 80);
     view.handleInput('f');
     await tick();
-    assert.deepEqual(source.asked, ['open', 'closed'], 'the toggle asks gh for closed, never for all');
-    assert.deepEqual(asked, ['reload:closed'], 'the toggle refetches through the reload seam with the new state');
-    const closed = bodyOf(view, 80);
-    assert.match(closed, /My issues \(2\)/, 'the tab counts the closed rows it lists');
-    assert.match(closed, /issue title 2/);
-    assert.match(closed, /issue title 3/);
-    assert.ok(!closed.includes('issue title 1'), 'the closed view excludes the open row');
-    assert.match(closed, /f:closed/, 'the hint follows the filter');
-    assert.match(closed, /page 1\/1 · 2 issues/, 'the totals line follows the filter too');
-    assert.ok(!closed.includes('all'), 'no combined all state is ever offered');
-    view.handleInput('f');
+    assert.deepEqual(source.asked, ['open'], 'f never asks gh for another state');
+    assert.deepEqual(asked, [], 'f never refetches through the reload seam');
+    assert.equal(bodyOf(view, 80), before, 'f repaints nothing');
+    view.handleInput('r');
     await tick();
-    assert.deepEqual(asked, ['reload:closed', 'reload:open'], 'toggling back asks for open again');
-    const open = bodyOf(view, 80);
-    assert.match(open, /My issues \(1\)/, 'the tab is the open count again');
-    assert.match(open, /issue title 1/, 'the open row is back');
-    assert.ok(!open.includes('issue title 2'), 'toggling back hides closed rows again');
-    assert.match(open, /f:open/);
-    assert.equal(view.state.index, 0, 'the selection is reset to the first row of the new state');
-    assert.equal(view.state.listPage, 1, 'the list page is reset too');
-    assert.equal(view.state.scroll, 0, 'the detail scroll is reset too');
+    assert.deepEqual(asked, ['reload:open'], 'a reload asks for open, never for closed');
+    assert.equal(source.asked.includes('closed'), false, 'the closed state is never requested');
+    const reloaded = bodyOf(view, 80);
+    assert.match(reloaded, /My issues \(1\)/, 'only the open row is counted');
+    assert.ok(!reloaded.includes('issue title 2'), 'closed rows stay out of the reloaded list');
+    assert.equal(view.state.index, 0, 'the selection stays on the first open row');
+    assert.equal(view.state.listPage, 1, 'the list page stays at one');
+    assert.equal(view.state.scroll, 0, 'the detail scroll stays at the top');
   });
 
-  test('a bounded fetch marks the tab count and the totals line with +', async () => {
+  test('a bounded fetch marks the count on the tab only', async () => {
     const rows = Array.from({ length: 5 }, (_, i) => issue(i + 1));
     const { view } = makeView({
       loadPages: () => ({
@@ -1191,10 +1235,10 @@ describe('issues view open-only totals and the open/closed toggle (S18)', () => 
     await tick();
     const body = bodyOf(view, 80);
     assert.match(body, /My issues \(500\+\)/, 'the tab marks the bounded count');
-    assert.match(body, /5\+ issues/, 'the totals line marks the bounded count');
+    assert.ok(!/500\+ issues|5\+ issues/.test(body), 'the bound is never repeated below the list');
   });
 
-  test('opening, searching and the state toggle issue no write action', async () => {
+  test('opening, searching and the removed state key issue no write action', async () => {
     const writes = [];
     const rows = [issue(1), issue(2, { state: 'closed' })];
     const { view } = makeView({
@@ -1222,6 +1266,7 @@ describe('issues view open-only totals and the open/closed toggle (S18)', () => 
     assert.deepEqual(writes, [], 'no key outside the four write actions writes');
   });
 });
+
 describe('issues view lazy labels (S19)', () => {
   test('labels load on the first L, never at mount, and only once', async () => {
     let labelCalls = 0;
@@ -1309,13 +1354,16 @@ describe('issues view over the real gh client (argv, status, stderr)', () => {
     view.handleInput('enter');
     view.handleInput('f');
     await tick();
+    view.handleInput('r');
+    await tick();
     const lists = calls.filter((argv) => argv[0] === 'issue' && argv[1] === 'list');
-    assert.equal(lists.length, 2, 'one read per requested state');
+    assert.equal(lists.length, 2, 'the mount read and the reload');
     assert.deepEqual(
       lists.map((argv) => argv[argv.indexOf('--state') + 1]),
-      ['open', 'closed'],
-      'the default read is open, the toggle reads closed',
+      ['open', 'open'],
+      'open is the only state ever requested',
     );
+    assert.ok(!calls.some((argv) => argv.includes('closed')), 'the closed state is never requested');
     assert.ok(lists.every((argv) => argv.includes('--search')), 'each read carries the page query');
     const body = bodyOf(view, 80);
     assert.match(body, /failed to load issues: gh issue list failed: HTTP 401: Bad credentials/);
@@ -1333,14 +1381,15 @@ describe('issues view over the real gh client (argv, status, stderr)', () => {
     await tick();
     const body = bodyOf(view, 80);
     assert.match(body, /My issues \(45\)/, 'the eager page keeps its own reported total');
-    assert.match(body, /1 issue\b/, 'the totals line still names the loaded rows');
+    assert.match(body, /page 1\/1/, 'the list footer names the page position');
+    assert.ok(!/\b45 issues\b/.test(body), 'the total is named once, on the tab');
   });
 });
 
 describe('issues view concise header (S25)', () => {
   const CHECKOUT = 'feat-yolo-worktree-confirmations';
 
-  test('the header never repeats the checkout and keeps the counts and filter', async () => {
+  test('the header repeats neither the checkout nor the active tab', async () => {
     const { view } = makeView({
       checkoutName: CHECKOUT,
       pages: pagesOf([[issue(1)], [], []]),
@@ -1349,21 +1398,21 @@ describe('issues view concise header (S25)', () => {
     });
     await tick();
     const header = strip(view.render(80)[0]);
-    assert.match(header, /◈ Issues · My issues/, 'the header names the surface and the active bucket');
+    assert.match(header, /◈ Issues/, 'the header names the surface');
+    assert.ok(!header.includes('My issues'), 'the header never repeats the active tab the tab row shows');
     assert.ok(!header.includes(CHECKOUT), 'the header never repeats the checkout/branch');
     assert.ok(!bodyOf(view, 80).includes(CHECKOUT), 'no part of the frame repeats the checkout');
     assert.ok(!/#\d/.test(header), 'the header repeats no issue id the list or preview already shows');
     const body = bodyOf(view, 160);
     assert.match(body, /My issues \(1\)/, 'the tab count survives the trim');
-    assert.match(body, /f:open/, 'the filter hint survives the trim');
-    assert.match(body, /page 1\/1 · 1 issue\b/, 'the totals line survives the trim');
-    assert.match(body, /f open\/closed/, 'the footer toggle legend survives the trim');
+    assert.match(body, /x\/X close/, 'the close legend survives the trim');
+    assert.match(body, /page 1\/1/, 'the list footer survives the trim');
+    assert.ok(!body.includes('f open/closed'), 'the removed state toggle legend stays gone');
+    const beforeSpace = strip(view.render(80).join('\n'));
     view.handleInput('space');
-    assert.match(
-      strip(view.render(80).join('\n')),
-      /◈ Issues · My issues · unsaved/,
-      'the relevant pending-assignment state stays in the header',
-    );
+    const after = strip(view.render(80).join('\n'));
+    assert.equal(after, beforeSpace, 'space changes nothing, the header included');
+    assert.ok(!after.includes('unsaved'), 'the header never claims a pending assignment');
   });
 
   test('the loading header is the surface name alone, with no checkout', async () => {
@@ -1398,12 +1447,12 @@ describe('issues view dedicated search row (S26)', () => {
     await tick();
     for (const width of [80, 160]) {
       const lines = chrome(view, width);
-      assert.match(lines[0], /◈ Issues · My issues/, 'row 1 is the concise title');
+      assert.match(lines[0], /◈ Issues/, 'row 1 is the concise title');
       assert.ok(!/search/i.test(lines[0]), 'the title buries nothing about search');
       assert.match(lines[1], /› Search \(T\)/, 'row 2 is the dedicated Search widget');
       assert.match(lines[2], /My issues \(1\)/, 'row 3 carries the tabs and their counts');
       assert.match(lines[2], /Assigned \(0\)/, 'every tab count stays');
-      assert.match(lines[3], /f:open/, 'row 4 keeps the open/closed state visible');
+      assert.ok(!/f[:(]/.test(lines[3]), 'row 4 carries notices only, no state toggle');
       assert.equal(lines.length, 24, 'the chrome plus body still fills the terminal exactly');
     }
   });
@@ -1421,9 +1470,11 @@ describe('issues view dedicated search row (S26)', () => {
     for (const width of [80, 160]) {
       const lines = chrome(view, width);
       assert.match(lines[1], /› beta█/, 'the query renders in the search widget');
-      assert.match(lines[1], /enter\/esc keep/, 'the editing hint stays with the input');
+      assert.ok(!lines[1].includes('enter/esc keep'), 'the input row repeats no key hint');
       assert.match(lines[2], /My issues/, 'the tabs stay below the search row');
-      assert.match(lines[3], /f:open/, 'the filter state stays visible while typing');
+      const footer = lines[lines.length - 2];
+      assert.match(footer, /enter\/esc keep/, 'the footer names the search keys of this interaction once');
+      assert.ok(!footer.includes('esc close'), 'the close hint belongs to the reading interaction only');
     }
     view.handleInput('enter');
     const settled = chrome(view, 80);
@@ -1436,23 +1487,19 @@ describe('issues view dedicated search row (S26)', () => {
     const { view } = makeView({
       pages: pagesOf([rows, [], []]),
       issues: rows,
-      assigned: [],
-      saveAssignment: () => ({ ok: false, error: 'disk full' }),
+      actions: { copyText: () => ({ ok: false, error: 'no clipboard tool available' }) },
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    view.handleInput('space');
-    view.handleInput('ctrl+s');
+    view.handleInput('y');
     await tick();
     let lines = chrome(view, 80);
-    assert.match(lines[3], /f:open/, 'the state stays on its own row');
-    assert.match(lines[3], /save failed: disk full/, 'the notice lands on the state row');
+    assert.match(lines[3], /clipboard unavailable/, 'the error lands on the notice row');
     view.handleInput('T');
     view.handleInput('1');
     lines = chrome(view, 80);
     assert.match(lines[1], /› 1█/, 'the query row stays the input');
-    assert.match(lines[3], /save failed: disk full/, 'the notice never disappears while typing');
-    assert.match(lines[3], /f:open/, 'the state stays honest next to it');
+    assert.match(lines[3], /clipboard unavailable/, 'the error never disappears while typing');
   });
 
   test('a long notice truncates inside the frame instead of overflowing it', async () => {
@@ -1470,7 +1517,7 @@ describe('issues view dedicated search row (S26)', () => {
         assert.equal(helpers.visibleWidth(line), width, `every row keeps the exact cell width at ${width}`);
       }
     }
-    assert.match(chrome(view, 80)[3], /clipboard unavailable/, 'the notice still shows on the state row');
+    assert.match(chrome(view, 80)[3], /clipboard unavailable/, 'the notice still shows on the notice row');
   });
 
   test('the loading frame keeps the search widget directly under the title', async () => {
@@ -1542,111 +1589,6 @@ describe('issues view frame header (S27)', () => {
   });
 });
 
-describe('issues view assignment gate (S29)', () => {
-  const HINT = 'space assign';
-
-  function gateView(enabled, overrides = {}) {
-    const saves = [];
-    const writes = [];
-    const rows = [issue(1), issue(2)];
-    const made = makeView({
-      pages: pagesOf([rows, [], []]),
-      issues: rows,
-      assigned: [1],
-      saveAssignment: (nums) => { saves.push(nums); return { ok: true }; },
-      assignmentEnabled: enabled,
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
-      actions: {
-        postComment: () => { writes.push('postComment'); return { ok: true }; },
-        setState: () => { writes.push('setState'); return { ok: true }; },
-        editLabels: () => { writes.push('editLabels'); return { ok: true }; },
-        ...(overrides.actions || {}),
-      },
-    });
-    return { ...made, saves, writes, rows };
-  }
-
-  test('disabled: no marks, no key hint and no unsaved claim in the frame', async () => {
-    const on = gateView(true);
-    await tick();
-    const wideOn = bodyOf(on.view, 160);
-    assert.match(wideOn, new RegExp(HINT), 'enabled: the state row names the Space toggle');
-    assert.match(wideOn, /ctrl\+s save/, 'enabled: the state row names the save key');
-    assert.match(wideOn.split('\n').find((line) => line.includes('issue title 1')), /✓/, 'enabled: stored mark');
-
-    const off = gateView(false);
-    await tick();
-    for (const width of [80, 160]) {
-      const body = bodyOf(off.view, width);
-      assert.ok(!body.includes(HINT), `disabled at ${width}: no Space hint`);
-      assert.ok(!body.includes('ctrl+s save'), `disabled at ${width}: no save hint`);
-      assert.ok(!body.includes('unsaved'), `disabled at ${width}: no unsaved claim`);
-      const row = body.split('\n').find((line) => line.includes('issue title 1'));
-      assert.match(row, /#1 issue title 1/, 'disabled: the issue row still renders');
-      assert.ok(!/[✓✎]/.test(row), 'disabled: no assignment mark');
-    }
-  });
-
-  test('disabled: injected Space and ctrl+s mutate nothing and call nothing', async () => {
-    const off = gateView(false);
-    await tick();
-    const snapshot = JSON.stringify(off.view.state);
-    const rendered = off.view.render(80).join('\n');
-    for (const key of ['space', ' ', 'ctrl+s', 'space', 'ctrl+s']) off.view.handleInput(key);
-    await tick();
-    assert.deepEqual(off.saves, [], 'the save callback is never reached');
-    assert.equal(JSON.stringify(off.view.state), snapshot, 'no state changed');
-    assert.equal(off.view.render(80).join('\n'), rendered, 'nothing repainted differently');
-    const body = bodyOf(off.view, 80);
-    assert.ok(!body.includes('unsaved'), 'no pending-assignment claim appears');
-    assert.ok(!/[✓✎]/.test(body), 'no assignment mark appears');
-  });
-
-  test('enabled by default and when passed true: the toggle, save and hint stay pinned', async () => {
-    for (const enabled of [undefined, true]) {
-      const on = gateView(enabled);
-      await tick();
-      assert.match(bodyOf(on.view, 160), new RegExp(HINT), 'the hint is present');
-      on.view.handleInput('down');
-      on.view.handleInput('space');
-      await tick();
-      const pending = bodyOf(on.view, 80);
-      assert.match(pending, /unsaved/, 'the pending claim appears');
-      assert.match(pending, /✎/, 'the pending mark appears on the toggled row');
-      assert.match(pending.split('\n').find((line) => line.includes('#1 issue title 1')), /✓/, 'the stored mark stays');
-      on.view.handleInput('ctrl+s');
-      await tick();
-      assert.deepEqual(on.saves, [[1, 2]], 'the whole pending set saves');
-      assert.ok(!bodyOf(on.view, 80).includes('unsaved'), 'success clears the claim');
-    }
-  });
-
-  test('disabled: reading, filtering and GitHub actions stay usable', async () => {
-    const off = gateView(false);
-    await tick();
-    off.view.handleInput('T');
-    for (const ch of 'title 2') off.view.handleInput(ch);
-    assert.match(bodyOf(off.view, 80)[0] === undefined ? '' : bodyOf(off.view, 80), /issue title 2/);
-    assert.ok(!bodyOf(off.view, 80).includes('issue title 1'), 'search still filters');
-    off.view.handleInput('enter');
-    assert.match(bodyOf(off.view, 80), /f:open/, 'the state row stays honest');
-    off.view.handleInput('T');
-    for (let i = 0; i < 7; i += 1) off.view.handleInput('backspace');
-    off.view.handleInput('enter');
-    assert.match(bodyOf(off.view, 80), /#1 issue title 1/, 'the query clears again');
-    off.view.handleInput('f');
-    assert.match(bodyOf(off.view, 80), /f:closed/, 'the open/closed toggle still works');
-    off.view.handleInput('f');
-    assert.match(bodyOf(off.view, 80), /f:open/, 'and back to open');
-    off.view.handleInput('x');
-    assert.equal(off.view.state.mode, 'confirm', 'close still asks first');
-    off.view.handleInput('enter');
-    await tick();
-    assert.deepEqual(off.writes, ['setState'], 'the GitHub action ran, the assignment did not');
-    assert.deepEqual(off.saves, [], 'no assignment save ever ran');
-  });
-});
-
 // S2: the footer legend is ONE terminal row; a legend wider than the card is
 // compacted (short tokens, then the lowest-priority keys dropped) instead of
 // being ellipsis-clipped inside the frame.
@@ -1668,6 +1610,88 @@ describe('S2: one-row key legends', () => {
       assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
       assert.match(legend[0], /↑↓ move/, `width ${width}: the movement keys survive`);
       assert.match(legend[0], /esc close/, `width ${width}: the close key survives`);
+    }
+  });
+});
+
+// S13: the issues frame says each thing once. The search key is named by the
+// search row alone, the issue total by the tab alone, the active bucket by the
+// tab row (never by the header too), and while the box holds the keyboard the
+// footer names its keys once instead of the input and the footer both doing it.
+describe('S13: the issues frame repeats nothing', () => {
+  const rows = [issue(1), issue(2)];
+  const footerOf = (lines) => lines[lines.length - 2];
+  const tokensOf = (footer) => footer.split('·').map((token) => token.trim());
+
+  async function opened(opts = {}) {
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      ...opts,
+    });
+    await tick();
+    return view;
+  }
+
+  test('the active bucket is named by the tab, not by the header too', async () => {
+    const view = await opened();
+    const lines = view.render(80).map(strip);
+    assert.match(lines[0], /◈ Issues/, 'the header names the surface');
+    assert.ok(!lines[0].includes('My issues'), 'the header never repeats the tab below it');
+    assert.match(lines[2], /▸ My issues \(2\)/, 'the tab row marks the active bucket and its count');
+  });
+
+  test('the search key is named by the search row alone, never by the footer', async () => {
+    const view = await opened();
+    const lines = view.render(80).map(strip);
+    const footer = footerOf(lines);
+    assert.match(lines[1], /› Search \(T\)/, 'the search row names its own key');
+    assert.equal(((lines.join('\n')).match(/\(T\)/g) || []).length, 1, 'the search key is named once');
+    assert.ok(!tokensOf(footer).some((token) => /^T\b/.test(token)), `the footer does not repeat T: ${footer}`);
+  });
+
+  test('while searching the footer names the search keys once and the input carries only the query', async () => {
+    const view = await opened();
+    view.handleInput('T');
+    view.handleInput('t');
+    const lines = view.render(80).map(strip);
+    const body = lines.join('\n');
+    assert.match(lines[1], /› t█/, 'the input row carries the live query');
+    assert.ok(!lines[1].includes('enter'), 'the input row repeats no key hint');
+    assert.ok(!lines[1].includes('esc'), 'the input row names no escape key');
+    const footer = footerOf(lines);
+    assert.match(footer, /enter\/esc keep/, 'the footer names the search keys of this interaction');
+    assert.ok(!footer.includes('esc close'), 'the close hint belongs to the reading interaction only');
+    assert.equal((body.match(/esc/g) || []).length, 1, `one escape hint for the current interaction: ${body}`);
+    assert.equal((body.match(/enter/g) || []).length, 1, 'one enter hint for the current interaction');
+  });
+
+  test('leaving the box restores the reading legend with its one escape hint', async () => {
+    const view = await opened();
+    view.handleInput('T');
+    view.handleInput('t');
+    view.handleInput('enter');
+    const lines = view.render(80).map(strip);
+    const footer = footerOf(lines);
+    assert.match(footer, /esc close/, 'the reading legend returns');
+    assert.ok(!footer.includes('enter/esc keep'), 'the search keys leave with the box');
+    assert.equal((lines.join('\n').match(/esc/g) || []).length, 1, 'still one escape hint');
+  });
+
+  test('the issue total lives in the tab, never a second time under the list', async () => {
+    const view = await opened();
+    const body = bodyOf(view, 80);
+    assert.match(body, /My issues \(2\)/, 'the tab carries the total');
+    assert.ok(!/\b2 issues\b/.test(body), 'the list footer does not repeat it');
+    assert.match(body, /page 1\/1/, 'the list footer names the page position instead');
+  });
+
+  test('no chrome row repeats the focused issue title the list and preview already show', async () => {
+    const view = await opened();
+    const lines = view.render(100).map(strip);
+    for (const row of lines.slice(0, 4)) {
+      assert.ok(!row.includes('issue title 1'), `chrome repeats no focused title: ${row}`);
     }
   });
 });
