@@ -5972,33 +5972,38 @@ const WARP_CHANGE_TYPES = [
 // Branch names MUST match the skill's shape: `<type>/<slug>`.
 const WARP_CREATE_BRANCH_RE = /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$/;
 
-// The create panel is the selector's create completion: ONE component
-// holds type, name, issues and odd, then `executeWorktreeCreate` runs — it
-// never prompts, and the type plus the typed name the panel collected is
-// the human intent — and the session warps into the fresh checkout. Empty
-// selections stay OMITTED on the create call — never empty arrays — so the
-// invalid, duplicate, occupied and principal refusals keep their exact
-// shape.
+// The create panel is the selector's create completion: it asks for exactly
+// TWO things — the change type, then the change name (S6) — and then
+// `executeWorktreeCreate` runs. It never prompts, the type plus the typed
+// name the panel collected is the human intent, and the session warps into
+// the fresh checkout. A creation supplies NEITHER `issues` nor `odd`: a
+// brand-new row is born without an association, so the invalid, duplicate,
+// occupied and principal refusals keep their exact shape.
 
-// Injectable seam for the open-issues fetch the panel renders (tests):
-// production leaves it null and the panel's own default reads them.
+// Injectable seams for the ASSOCIATION SOURCES of the panel's editing mode
+// (tests; the create completion consults none of them since S6 removed the
+// Issues/Odd panes from creation). Production leaves them null and the panel
+// reads the real sources itself. Their only caller is `warpPanelSources`,
+// which serves `warpEditCheckout`.
 let warpCreateIssuesFetcher = null;
 
 function setWarpCreateIssuesFetcher(fetcher) {
   warpCreateIssuesFetcher = fetcher;
 }
 
-// Injectable seam for the odd/tasks listing the panel renders (tests):
-// production leaves it null and the panel lists the CURRENT checkout.
+// Injectable seam for the odd/tasks listing the editing panel renders
+// (tests): production leaves it null and the panel lists the CURRENT
+// checkout.
 let warpCreateOddLister = null;
 
 function setWarpCreateOddLister(lister) {
   warpCreateOddLister = lister;
 }
 
-// Injectable seams for the panel's read-only previews (tests): production
-// leaves them null and the panel reads an issue body through `gh` and an
-// odd document from disk. Tests inject stubs so a suite never spawns `gh`.
+// Injectable seams for the editing panel's read-only previews (tests):
+// production leaves them null and the panel reads an issue body through `gh`
+// and an odd document from disk. Tests inject stubs so a suite never spawns
+// `gh`.
 let warpCreateIssuePreviewReader = null;
 
 function setWarpCreateIssuePreviewReader(reader) {
@@ -6239,9 +6244,10 @@ function withWarpDeleteKeys(view, { helpers, done, canDelete }) {
   };
 }
 
-// The panel's injectable sources, shared by the create and the editing
-// mounts so both list and preview the same way. Production leaves every
-// seam null and the panel reads the real sources itself.
+// The EDITING panel's injectable sources (S6: the create completion asks for
+// the type and the name only, so it takes no source at all and never lists a
+// dataset). Production leaves every seam null and the panel reads the real
+// sources itself.
 function warpPanelSources(ctx, cwd, oddRoot) {
   const sources = {};
   if (typeof warpCreateIssuesFetcher === "function") {
@@ -6264,12 +6270,12 @@ function warpPanelSources(ctx, cwd, oddRoot) {
   return sources;
 }
 
-// Create-then-warp: the selector's create completion mounts the SINGLE
-// panel (type, name, issues and odd at once) as an overlay, then runs the
-// SAME creation path `worktree_upsert` uses — which never prompts — and
-// warps the session into the fresh checkout. Empty selections stay OMITTED
-// on the create call — never empty arrays — so the invalid, duplicate,
-// occupied and principal refusals keep their shape.
+// Create-then-warp: the selector's create completion mounts the TWO-STEP
+// panel (S6: the change type, then the change name) as an overlay, then runs
+// the SAME creation path `worktree_upsert` uses — which never prompts — and
+// warps the session into the fresh checkout. The creation carries neither
+// `issues` nor `odd`, so a new row is born without an association and the
+// invalid, duplicate, occupied and principal refusals keep their shape.
 async function warpCreateAndEnter(ctx, git, notify) {
   if (!ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
     notify?.("warp: the host UI cannot open the create panel here; create one with the worktree_upsert tool first, then /herdr-gentle:warp <name>.", "error");
@@ -6293,12 +6299,6 @@ async function warpCreateAndEnter(ctx, git, notify) {
     helpers = null;
   }
   const panelCwd = toolCwd(ctx);
-  let panelRoot = panelCwd;
-  try {
-    panelRoot = git.repoIdentity(panelCwd).root;
-  } catch {
-    panelRoot = panelCwd;
-  }
   let out;
   try {
     out = await ctx.ui.custom(
@@ -6311,7 +6311,6 @@ async function warpCreateAndEnter(ctx, git, notify) {
         theme,
         principalLayout: true,
         rowsAvailable: () => warpOverlayRows(hostTui),
-        ...warpPanelSources(ctx, panelCwd, panelRoot),
         done,
       }),
       WARP_PANEL_OVERLAY,
@@ -6339,8 +6338,6 @@ async function warpCreateAndEnter(ctx, git, notify) {
     return;
   }
   const createParams = { branch };
-  if (Array.isArray(out.issues) && out.issues.length > 0) createParams.issues = out.issues.slice();
-  if (Array.isArray(out.odd) && out.odd.length > 0) createParams.odd = out.odd.slice();
   // S53: the git-only route — a plain git checkout plus the registry row,
   // never a Herdr workspace — reusing the same creation path (validations,
   // refusals, registration), which never prompts. The layout is

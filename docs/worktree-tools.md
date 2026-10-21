@@ -765,8 +765,9 @@ The focused checkout is editable with `e` (S13): the SAME single panel
 opens in editing mode with the type and the name FROZEN — it renders the
 checkout's own branch and path verbatim, never a re-derived one — and the
 Issues and Odd panes open with the checkout's currently assigned values
-pre-selected. `tab`, `space`, the filters and the previews behave exactly
-as in the create panel; `enter`/`ctrl+s` persists BOTH assigned fields in
+pre-selected. `tab`, `space`, the filters, the paging and the previews
+belong to this editing mode (the create surface has none of them);
+`enter`/`ctrl+s` persists BOTH assigned fields in
 ONE registry write through the same guarded saver the odd and issues
 viewers use (a created row takes the checkout's real branch and thread, a
 refusal writes nothing), and `esc` cancels with nothing written. The
@@ -778,22 +779,21 @@ verbatim (issues from `sort:updated-desc`, odd documents from
 re-sorts them (S15). Both datasets render their handed source order unchanged; switching datasets
 preserves each cursor, filter and selection.
 
-The create completion is ONE panel, never a sequence of steps. A dedicated
-`Search Issues:` / `Search Odd:` row sits under the title. The header stacks
-Type above Name, followed by the derived branch, checkout path and selected
-Issues/ODD counts. The content has two panes: the active dataset's list on
-the left and that row's complete read-only preview on the right. There is no
-third list column or `?` help overlay.
+The create completion is a TWO-STEP flow in the same bottom panel (S6),
+never a list of panes: step 1 picks the change type, step 2 types the change
+name, and `enter` on the name creates. The header stacks Type above Name,
+followed by the derived branch and checkout path. There is no Issues pane,
+no Odd pane, no `Search Issues:`/`Search Odd:` row, no association counts
+and no preview column: a brand-new row is born without an association, so
+the create surface asks for exactly those two things. The Issues/Odd panes,
+their selections, filters, paging and previews exist ONLY in the editing
+mode described below.
 
-In the list, `←` selects Issues and `→` selects Odd; `tab` also alternates
-datasets. `↑` on the first row returns to Name, then Type; `↓` walks Type →
-Name → list. On Type, `←`/`→` cycle the type and `enter` opens its list.
-Name retains text editing. `space` toggles the focused association;
-`pgUp`/`pgDn` and `[`/`]` page; `T` or a printable opens the active dataset's
-filter. `enter` confirms the focused field and creates on the last one;
-`ctrl+s` creates from any field; `esc` cancels. An empty pane stays visible and
-says so (`no open issues`, `no odd documents in this checkout`), and an
-unavailable `gh` says so in the Issues pane without blocking creation.
+`↑`/`↓` move Type ↔ Name. On Type, `←`/`→` cycle the type and `enter` opens
+its change-type picker. Name retains text editing and is the last step:
+`enter` there creates, `ctrl+s` creates from any field, and `esc` cancels
+(unwinding the type picker first). `tab` is inert while creating — it is the
+editing mode's dataset toggle — and no `?` help overlay exists.
 The type plus the typed name derives branch `<type>/<slug>` and checkout
 `<type>-<slug>` per the branch-pr skill's
 `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`,
@@ -805,8 +805,9 @@ comes from the current checkout) and warps the session into it. The
 creation plus the warp run exactly once, after a session preflight, so an
 allocated-but-missing session file with nothing in memory refuses before
 any branch, checkout or registry write (a usable file, or valid in-memory
-entries the carry path clones, proceeds). Empty selections stay OMITTED on
-the create call, so the invalid, duplicate, occupied and principal
+entries the carry path clones, proceeds). A creation carries no `issues`
+and no `odd` on the create call — the row is born without an association —
+so the invalid, duplicate, occupied and principal
 refusals keep their exact shape; an empty or unrepresentable name refuses
 with an actionable message, and a duplicate branch refuses with the create
 tool's own message; an

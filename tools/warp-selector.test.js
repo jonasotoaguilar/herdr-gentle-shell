@@ -488,9 +488,10 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const sessionFile = sessionFileIn();
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
       const { commands, mod } = await loadExtension();
-      // Deterministic sources: no `gh`, no filesystem scan.
-      mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: [] }));
-      mod.setWarpCreateOddLister(() => []);
+      // S6: the create panel consults NO issue or odd source, so these two
+      // stubs throw if the creation ever asks for one.
+      mod.setWarpCreateIssuesFetcher(async () => { throw new Error('the create panel must not list issues'); });
+      mod.setWarpCreateOddLister(() => { throw new Error('the create panel must not list odd documents'); });
       let mounts = 0;
       built.ctx.ui.custom = async (factory, options) => {
         mounts += 1;
@@ -530,6 +531,8 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const created = rows.find((row) => row.branch === 'feat/panel-change');
       assert.ok(created, `the payload branch was created and registered (${JSON.stringify(rows)})`);
       assert.equal(created.thread, 'wired-thread');
+      assert.deepEqual(created.issues, [], 'S6: a created row carries no issue association');
+      assert.deepEqual(created.odd, [], 'S6: a created row carries no odd association');
       assert.equal(built.switches.length, 1, 'the session warped into the new worktree');
       assert.deepEqual(built.notes, [], 'creation then warp is silent on success');
     } finally {
@@ -1323,7 +1326,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('inside the creating panel navigating, toggling, filtering, paging and help each add no mutation', async () => {
+  test('inside the creating panel both steps, tab and help each add no mutation', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-create-keys');
@@ -1331,37 +1334,29 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       const before = createdState(root);
       const watcher = watchMutations();
       try {
-        let cursorAfterPage = null;
-        let oddSelected = null;
-        let query = null;
         const driver = multiDriver([['c'], (view) => {
           const step = stepRecorder(view, watcher);
-          step('move from the type field to the name field', (v) => v.handleInput('\x1b[B'));
-          step('enter the Issues pane', (v) => v.handleInput('\r'));
-          step('navigate rows', (v) => v.handleInput('\x1b[B'));
-          assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
-          step('page the focused list', (v) => v.handleInput(']'));
-          cursorAfterPage = view.state.cursor.issues;
-          assert.ok(cursorAfterPage > 1, 'the page key moved the cursor to the next page');
-          step('toggle an issue', (v) => v.handleInput(' '));
-          assert.equal(view.state.selectedIssues.length, 1, 'the issue toggled');
-          step('switch to the Odd pane', (v) => v.handleInput('\t'));
-          step('toggle an odd document', (v) => v.handleInput(' '));
-          oddSelected = view.state.selectedOdd.length;
-          assert.equal(oddSelected, 1, 'the odd document toggled');
-          step('open the pane filter with a printable key', (v) => v.handleInput('w'));
-          step('type in the filter', (v) => v.handleInput('1'));
-          query = view.state.queries.odd;
-          assert.ok(query.length > 0, 'the filter received the typed text');
-          step('close the filter', (v) => v.handleInput('\x1b'));
+          step('open the change-type picker', (v) => v.handleInput('\r'));
+          assert.equal(view.state.typePanelOpen, true, 'the type picker opened');
+          step('move inside the type picker', (v) => v.handleInput('\x1b[B'));
+          step('pick the change type', (v) => v.handleInput('\r'));
+          assert.equal(view.state.focus, 'name', 'step 1 hands over to step 2');
+          step('type the change name', (v) => {
+            for (const char of 'panel-change') v.handleInput(char);
+          });
+          assert.equal(view.state.name, 'panel-change', 'the name field kept the typed value');
+          step('return to the type field', (v) => v.handleInput('\x1b[A'));
+          assert.equal(view.state.focus, 'type');
+          step('press tab', (v) => v.handleInput('\t'));
+          assert.equal(view.state.focus, 'type', 'S6: tab reaches no pane');
+          step('ask for help', (v) => v.handleInput('?'));
+          assert.equal(view.state.focus, 'type', '? opens nothing');
           step('cancel the panel', (v) => v.handleInput('\x1b'));
           assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 10, 'every scripted interaction was measured');
+          assert.ok(step.steps.length >= 8, 'every scripted interaction was measured');
         }]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: manyIssues(20) }));
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
         assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
