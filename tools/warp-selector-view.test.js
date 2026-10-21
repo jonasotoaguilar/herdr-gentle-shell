@@ -97,6 +97,7 @@ function makeView(options = {}) {
       toggles.push(path);
       return options.onToggle(path);
     } : undefined,
+    canDelete: options.canDelete,
     helpers,
     theme: plainTheme,
     now: options.now === undefined ? NOW : options.now,
@@ -866,5 +867,99 @@ describe('S2: one-row key legends', () => {
       assert.match(legend[0], /esc back/, `width ${width}: the back key survives`);
       assert.equal(helpers.visibleWidth(lines[18]), width, `width ${width}: the legend row is cell-exact`);
     }
+  });
+});
+
+// S24: the panel deletes through the SAME marker the extended list already
+// resolves, and the caller keeps owning confirmation and the close. Who may be
+// deleted is the caller's one predicate — the view never invents a second
+// rule, so the principal, the current checkout and every unregistered row stay
+// protected exactly as the extended list protects them.
+describe('S24: Ctrl+D on a deletable panel row', () => {
+  const DELETABLE = '/w/feat-alpha';
+  const registered = (path) => path === DELETABLE;
+
+  test('Ctrl+D on a deletable row resolves { delete: path } exactly once', async () => {
+    const { view, results } = await opened({ canDelete: registered });
+    view.handleInput('down');
+    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'the deletable row is focused');
+    view.handleInput('\x04');
+    assert.deepEqual(results, [{ delete: DELETABLE }], 'the panel resolves the marker with its path');
+    view.handleInput('\x04');
+    view.handleInput('enter');
+    assert.deepEqual(results, [{ delete: DELETABLE }], 'the component resolves once');
+  });
+
+  test('the installed matcher spelling of ctrl+d is the same key', async () => {
+    const { view, results } = await opened({ canDelete: registered });
+    view.handleInput('down');
+    view.handleInput('ctrl+d');
+    assert.deepEqual(results, [{ delete: DELETABLE }]);
+  });
+
+  test('the principal, the current checkout and the offer row resolve nothing', async () => {
+    const asked = [];
+    const canDelete = (path) => {
+      asked.push(path);
+      return path === DELETABLE;
+    };
+    const many = [
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      { name: 'main', path: '/w/herdr', branch: 'main', isPrincipal: true },
+      ...Array.from({ length: 7 }, (_, index) => ({ name: `wt-${index + 1}`, path: `/w/wt-${index + 1}`, branch: `feat/wt-${index + 1}` })),
+    ];
+    const { view, results } = await opened({ checkouts: many, current: { name: 'cur', path: '/w/cur' }, canDelete, rows: 14 });
+    const frame = panel(view);
+    assert.ok(!frame.worktrees.some((row) => row.includes('cur')), 'the current worktree is the header, never a row');
+    assert.ok(!asked.includes('/w/cur'), 'the current checkout is never even offered to the delete rule');
+    assert.match(frame.worktrees[0], /^▸ main /, 'the principal is focused first');
+    const before = JSON.parse(JSON.stringify(view.state));
+    view.handleInput('\x04');
+    assert.deepEqual(results, [], 'Ctrl+D on the principal is inert');
+    assert.deepEqual(view.state, before, 'and it changes no state');
+    for (let i = 0; i < 5; i += 1) view.handleInput('down');
+    assert.match(panel(view).viewAll || '', /^▸ view all worktrees$/, 'the offer row is focused');
+    view.handleInput('\x04');
+    assert.deepEqual(results, [], 'Ctrl+D on the offer row is inert');
+  });
+
+  test('without the deletability option the panel is unchanged and Ctrl+D is inert', async () => {
+    const { view, results } = await opened();
+    view.handleInput('down');
+    const before = JSON.parse(JSON.stringify(view.state));
+    assert.equal(panel(view).legend, '↑↓ move · enter choose · c create · e edit · r reload · esc close');
+    view.handleInput('\x04');
+    assert.deepEqual(results, [], 'no capability, no delete');
+    assert.deepEqual(view.state, before);
+  });
+
+  test('the delete token rides the one-row legend where it fits and drops before esc', async () => {
+    for (const width of [40, 60, 80, 120]) {
+      const { view } = await opened({ canDelete: registered });
+      view.handleInput('down');
+      const frame = panel(view, width);
+      assert.equal(frame.height, 10, `width ${width}: the legend still owns no extra row`);
+      assert.equal(helpers.visibleWidth(frame.lines[frame.lines.length - 2]), width, `width ${width}: the legend row is cell-exact`);
+      assert.ok(!frame.legend.includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${frame.legend}`);
+      assert.match(frame.legend, /esc close/, `width ${width}: the close key outlives the delete key: ${frame.legend}`);
+      assert.equal(/del/.test(frame.legend), width >= 60, `width ${width}: delete is named where it fits: ${frame.legend}`);
+    }
+    const wide = await opened({ canDelete: registered });
+    wide.view.handleInput('down');
+    assert.equal(
+      panel(wide.view, 120).legend,
+      '↑↓ move · enter choose · c create · e edit · del delete · r reload · esc close',
+      'the full legend names the delete key between edit and reload',
+    );
+  });
+
+  test('a row the rule refuses leaves the legend without the delete token', async () => {
+    const { view, results } = await opened({ canDelete: registered });
+    assert.match(panel(view).worktrees[0], /^▸ main /, 'the principal is focused first');
+    assert.ok(!panel(view).legend.includes('del'), `nothing to delete, so nothing is advertised: ${panel(view).legend}`);
+    view.handleInput('down');
+    assert.match(panel(view).legend, /del/, 'moving onto a deletable row names the key');
+    view.handleInput('\x04');
+    assert.deepEqual(results, [{ delete: DELETABLE }]);
   });
 });

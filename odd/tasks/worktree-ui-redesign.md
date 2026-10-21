@@ -161,6 +161,12 @@ T es para seearch, dentro de search luego se repite que salir es con esc. Se
 repite el nombre arriba del focus, podria ir arriba del todo a la derecha de odd
 o sacarlo pues esta el focus. Revisa detalles asi igual en issues comando."
 
+S24. Deleting a worktree is reachable from the warp PANEL, not only from the
+`v` extended list, and the panel legend names it. Verbatim: "falta el borrar
+worktree en warp igual." The principal and the session's own checkout stay
+undeletable, decided by the caller's existing predicate so the view never grows a
+second rule.
+
 S14. Changes must carry tests and docs alongside the behavior, and must keep the
 existing suite green.
 
@@ -336,4 +342,11 @@ user's "sera igual que la vista de issues" and S8's select rule:
 - The odd tab lists every `odd/tasks/*.md`, marks the associated one, and changing
   it is a single-select action, because S8 forbids a second association while the
   entity must stay editable from the detail.
+
+L12. S24 wiring decision. The view resolves `{ delete: path }` (a string), while
+the extended list still emits `{ delete: true, path }`. Two shapes for one action
+is exactly the drift S8 avoids for ODD, so S24b converges on ONE: the string form
+`{ delete: path }`, and the loop's list branch is updated to read it. The view's
+`canDelete(path)` option is the single deletability authority; the extension must
+pass `warpDeletableAt`-equivalent logic through it instead of re-deciding.
 
