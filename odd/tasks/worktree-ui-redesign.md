@@ -96,15 +96,28 @@ que sus issue asignada esten open, si alguna paso a close o se elimino lo saca
 de sus asignada (al entrar al detalle se comprueba eso denuevo para ese worktree
 por si cambio)."
 
-S8. A worktree has exactly one associated ODD document, never several. Verbatim:
-"los worktree solo pueden tener 1 odd asociado no varios, pues la idea es que era
-un worktree por odd a trabajar, si cambia se deberia actualizar el worktree a
-otro odd pero no ponerle varios a la vez." Editing uses a select of the active
-ODD, not a toggle: "en edit de wortree igual no seria un toggle sino como un
-select para cambiar el odd activo si desea."
+S8. ENTITY RULE: a worktree carries AT MOST ONE associated ODD document. This is
+an invariant of the stored worktree entity, not a UI convention: the registry row
+holds a single document reference (or none), never a list, and the registry
+enforces it on every read and every write. Everything else derives from it — the
+agent tool, the edit surface, the commands and any toggle/select inherit the rule
+instead of re-implementing it. Verbatim: "los worktree solo pueden tener 1 odd
+asociado no varios, pues la idea es que era un worktree por odd a trabajar, si
+cambia se deberia actualizar el worktree a otro odd  pero no ponerle varios a la
+vez." Verbatim, on its reach: "eso es regla global del esquema de worktereee
+listado. Edit, comandos, toggle por logica tambien se rigen, es regla de la
+entidad worktree que guardamos."
 
-S8a. The agent tool `worktree_upsert` accepts only one ODD file. Verbatim: "La
-tool del agente de worktree upsert igual solo permite un archivo odd claro."
+S8a. Consequences of S8, each verified rather than assumed: the agent tool
+`worktree_upsert` accepts one odd file and rejects a list; editing offers a
+SELECT of the active document, never a multi-toggle ("en edit de wortree igual no
+seria un toggle sino como un select para cambiar el odd activo si desea"); and no
+other surface may write a second one.
+
+S8b. Migration of an existing row that already stores several: the registry
+normalizes deterministically to the FIRST stored entry and the operation that
+normalizes REPORTS the dropped entries once, so a stored association never
+disappears silently. Reads never fail on a legacy array.
 
 S9. Worktree listings order: principal path first, then the current worktree,
 then the rest. Verbatim: "La del listado de worktree debe mostrar siempre primero
