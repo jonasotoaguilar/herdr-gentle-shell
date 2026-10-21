@@ -328,3 +328,12 @@ running entry script (`process.argv[1]`, walking up to the package), then
 `PI_MANAGED_INSTALL_ROOT/releases/<highest>`, and only then `require.resolve`.
 Recorded because it is the same class of defect as L8: an answer that looks
 authoritative and describes the wrong thing.
+
+L11. Decisions taken to unblock T6/T7 without further questions, both following the
+user's "sera igual que la vista de issues" and S8's select rule:
+- The detail's tabs are ONE AT A TIME with `tab`/`shift+tab` switching, exactly like
+  the issues viewer's pages, left list and right preview.
+- The odd tab lists every `odd/tasks/*.md`, marks the associated one, and changing
+  it is a single-select action, because S8 forbids a second association while the
+  entity must stay editable from the detail.
+
