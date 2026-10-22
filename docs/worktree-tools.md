@@ -1167,28 +1167,38 @@ naming, so neither trigger can fire.
 
 The issues viewer and the worktree detail share ONE open-issue snapshot per
 repository and session, keyed by the repository's shared git common dir.
-Session start takes it with a SINGLE `gh issue list --state open --limit 500`
-fetch (`lib/gh-issues.js`, `wholeResult`): `gh issue list` has no offset flag,
-so paging it would re-download the whole bound once per logical page. Every
-later `/herdr-gentle:issues` open merges only the newest-20-UPDATED margin
-instead of re-listing the repository, and a repeated `session_start` reuses
-the primed snapshot — or the prime still in flight — rather than resetting it.
+Session start takes it in full through GitHub's own cursor pagination
+(`lib/gh-issues.js`, `listAllOpenIssues`): `gh api graphql` asks
+`repository.issues(states: OPEN, first: 100, after: $cursor)` for
+`pageInfo { hasNextPage endCursor }` and `totalCount`, one request per page,
+then a repository lookup plus one request per 100 issues — never a repeated
+download of the whole set, and no fixed issue cutoff. GraphQL is used instead
+of `gh issue list --search` because the search API caps its own result set.
+Every later `/herdr-gentle:issues` open merges only the newest-20-UPDATED
+margin (one `--state all --limit 20` call) instead of re-listing the
+repository, and a repeated `session_start` reuses the primed snapshot — or
+the prime still in flight — rather than resetting it.
 
-Completeness is bounded, and the bound is reported instead of assumed. When
-the fetch fills the 500-issue cap, the snapshot is NOT complete: the prime
-fails with `gh listed 500 open issues and reached the 500-issue snapshot cap;
-the snapshot is unverifiable`, nothing is primed, and each stored assignment
-is re-verified per number with `gh issue view`. An issue leaves a stored
-association only on proof: a successful response reporting it `closed`, or
-`gh` answering with ISSUE-specific wording (`Could not resolve to an Issue
-…`, `no such issue`). Absence from any list is never proof, and a
-repository-level `Not Found (HTTP 404)` — a private, renamed or unreadable
-repository — preserves the assignment byte for byte and is reported as
-unverifiable, exactly like authentication, permission, transport and timeout
-failures. A repository with more than 500 open issues is therefore never
-primed: its associations stay verified one number at a time. These are the
-limits of what `gh` output proves, not a promise that a live call is always
-conclusive.
+Completeness is checked, page by page, and reported instead of assumed. A
+page carrying GraphQL errors, a `hasNextPage` without a new non-empty cursor,
+a repeated cursor, or a terminal page whose distinct issues do not equal the
+reported `totalCount` fails the WHOLE snapshot: nothing is primed, the
+unverifiable read is reported (`cannot list open issues (…); only the
+verified assignment is shown`), and each stored assignment is re-verified per
+number with `gh issue view`. An issue leaves a stored association only on
+proof: a successful response reporting it `closed`, or `gh` answering with
+ISSUE-specific wording (`Could not resolve to an Issue …`, `no such issue`).
+Absence from any list is never proof, and a repository-level `Not Found (HTTP
+404)` — a private, renamed or unreadable repository — preserves the
+assignment byte for byte and is reported as unverifiable, exactly like
+authentication, permission, transport and timeout failures.
+
+These are the limits of what `gh` output proves, not a promise that a live
+call is always conclusive: the loop assumes `totalCount` and `pageInfo`
+describe one consistent connection, so an issue opened or closed while it
+pages shifts the counts and makes that snapshot fail rather than half-apply.
+Each page runs under the runner's bounded timeout (30 s), and a runaway page
+counter stops a connection that never terminates.
 
 ## Known limitations
 

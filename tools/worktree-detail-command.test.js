@@ -219,12 +219,51 @@ function scriptedCtx({ cwd, steps, confirm, notes: seededNotes = [] } = {}) {
 }
 
 // The gh client spawns a real binary otherwise; every detail here answers from
-// this fixture (only the open list and one preview are ever asked for).
+// this fixture (the open snapshot, the cursor pages and one preview are the
+// only reads that happen).
 function stubGh(openNumbers = []) {
   const calls = [];
+  const openPage = (argv) => {
+    const field = (name) => {
+      for (let index = 0; index < argv.length - 1; index += 1) {
+        if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
+      }
+      return null;
+    };
+    const first = Number(field('first'));
+    const cursor = field('cursor');
+    const offset = cursor === null ? 0 : Number(cursor.replace('page-', ''));
+    const rows = openNumbers.map((number) => ({
+      number,
+      title: `issue title ${number}`,
+      state: 'OPEN',
+      stateReason: '',
+      author: { login: 'octo' },
+      labels: { nodes: [] },
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: `2024-01-0${(number % 9) + 1}T00:00:00Z`,
+      url: `https://example.test/issues/${number}`,
+      comments: { totalCount: 0 },
+      reactionGroups: [],
+    }));
+    const nodes = rows.slice(offset, offset + (Number.isFinite(first) ? first : rows.length));
+    const hasNextPage = offset + nodes.length < rows.length;
+    return JSON.stringify({
+      data: {
+        repository: {
+          issues: {
+            totalCount: rows.length,
+            pageInfo: { hasNextPage, endCursor: hasNextPage ? `page-${offset + nodes.length}` : null },
+            nodes,
+          },
+        },
+      },
+    });
+  };
   ghIssues.setGhRunner(async (bin, argv) => {
     calls.push({ bin, argv: argv.slice() });
     if (argv[0] === 'api' && argv[1] === 'user') return { status: 0, stdout: '{"login":"octo"}\n', stderr: '' };
+    if (argv[0] === 'api' && argv[1] === 'graphql') return { status: 0, stdout: `${openPage(argv)}\n`, stderr: '' };
     if (argv[0] === 'repo' && argv[1] === 'view') return { status: 0, stdout: '{"nameWithOwner":"octo/repo"}\n', stderr: '' };
     if (argv[0] === 'issue' && argv[1] === 'list') {
       const state = argv[argv.indexOf('--state') + 1];

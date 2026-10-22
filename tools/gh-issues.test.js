@@ -332,6 +332,203 @@ describe('paging', () => {
   });
 });
 
+describe('listAllOpenIssues: cursor pagination of the whole open set', () => {
+  function pageNode(number) {
+    return {
+      number,
+      title: `issue ${number}`,
+      state: 'OPEN',
+      stateReason: '',
+      author: { login: 'octo' },
+      labels: { nodes: [] },
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: '2024-01-02T00:00:00Z',
+      url: `https://example.test/issues/${number}`,
+      comments: { totalCount: 0 },
+      reactionGroups: [],
+    };
+  }
+
+  function page(numbers, { totalCount = numbers.length, hasNextPage = false, endCursor = null } = {}) {
+    return okJson(JSON.stringify({
+      data: {
+        repository: {
+          issues: {
+            totalCount,
+            pageInfo: { hasNextPage, endCursor },
+            nodes: numbers.map(pageNode),
+          },
+        },
+      },
+    }));
+  }
+
+  const repoView = okJson('{"nameWithOwner":"octo/repo"}\n');
+  const numbers = (from, to) => {
+    const list = [];
+    for (let n = from; n <= to; n += 1) list.push(n);
+    return list;
+  };
+  const graphqlCalls = (calls) => calls.filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql');
+  const variable = (call, name) => call.argv.find((entry) => entry.startsWith(`${name}=`));
+
+  test('250 open issues take three cursor pages, one request each', async () => {
+    const { runner, calls } = makeRunner([
+      repoView,
+      page(numbers(1, 100), { totalCount: 250, hasNextPage: true, endCursor: 'c1' }),
+      page(numbers(101, 200), { totalCount: 250, hasNextPage: true, endCursor: 'c2' }),
+      page(numbers(201, 250), { totalCount: 250 }),
+    ]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, true);
+    assert.equal(res.issues.length, 250, 'every open issue, from a 250-issue repository');
+    assert.equal(res.total, 250);
+    assert.equal(res.pages, 3);
+    assert.equal(calls.length, 4, 'one repository lookup plus one request per page');
+    const pages = graphqlCalls(calls);
+    assert.equal(pages.length, 3);
+    for (const call of pages) {
+      assert.equal(variable(call, 'owner'), 'owner=octo');
+      assert.equal(variable(call, 'name'), 'name=repo');
+      assert.equal(variable(call, 'first'), 'first=100');
+      assert.ok(!call.argv.includes('--search'), 'server pagination, never the search API');
+      const queryAt = call.argv.indexOf('-f');
+      assert.ok(queryAt >= 0, 'the query travels as a raw -f field');
+      const query = call.argv[queryAt + 1];
+      assert.match(query, /^query=/);
+      assert.match(query, /issues\(states: OPEN/);
+      assert.match(query, /after: \$cursor/);
+      assert.match(query, /pageInfo/);
+      assert.match(query, /totalCount/);
+    }
+    assert.equal(variable(pages[0], 'cursor'), undefined, 'the first page starts the connection');
+    assert.equal(variable(pages[1], 'cursor'), 'cursor=c1');
+    assert.equal(variable(pages[2], 'cursor'), 'cursor=c2');
+  });
+
+  test('more than 600 open issues page to the end and all of them arrive', async () => {
+    const script = [repoView];
+    for (let start = 1; start <= 601; start += 100) {
+      const end = Math.min(start + 99, 620);
+      const hasNextPage = end < 620;
+      script.push(page(numbers(start, end), {
+        totalCount: 620,
+        hasNextPage,
+        endCursor: hasNextPage ? `c${end}` : null,
+      }));
+    }
+    const { runner } = makeRunner(script);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, true);
+    assert.equal(res.issues.length, 620, 'no fixed issue cap: the whole connection arrives');
+    assert.equal(res.total, 620);
+    assert.equal(res.pages, 7);
+  });
+
+  test('a repeated cursor fails the whole snapshot', async () => {
+    const { runner } = makeRunner([
+      repoView,
+      page(numbers(1, 100), { totalCount: 250, hasNextPage: true, endCursor: 'stuck' }),
+      page(numbers(101, 200), { totalCount: 250, hasNextPage: true, endCursor: 'stuck' }),
+    ]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, false);
+    assert.match(String(res.error), /repeated the cursor/);
+  });
+
+  test('a page carrying GraphQL errors fails the whole snapshot', async () => {
+    const { runner } = makeRunner([
+      repoView,
+      okJson(JSON.stringify({ errors: [{ message: 'API rate limit exceeded' }] })),
+    ]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, false);
+    assert.match(String(res.error), /API rate limit exceeded/);
+  });
+
+  test('a terminal page short of the reported total fails: no partial snapshot', async () => {
+    const { runner } = makeRunner([
+      repoView,
+      page(numbers(1, 100), { totalCount: 250, hasNextPage: true, endCursor: 'c1' }),
+      page(numbers(101, 200), { totalCount: 250, hasNextPage: false, endCursor: null }),
+    ]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, false);
+    assert.match(String(res.error), /200 of 250 open issues/);
+  });
+
+  test('hasNextPage without a cursor fails instead of looping', async () => {
+    const { runner } = makeRunner([
+      repoView,
+      page(numbers(1, 100), { totalCount: 250, hasNextPage: true, endCursor: null }),
+    ]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, false);
+    assert.match(String(res.error), /without a cursor/);
+  });
+
+  test('a malformed connection and an unresolved repository both fail closed', async () => {
+    const malformed = makeRunner([repoView, okJson(JSON.stringify({ data: { repository: { issues: {} } } }))]);
+    ghIssues.setGhRunner(malformed.runner);
+    const bad = await ghIssues.listAllOpenIssues();
+    assert.equal(bad.ok, false);
+    assert.match(String(bad.error), /unexpected shape/);
+
+    const noRepo = makeRunner({ status: 1, stdout: '', stderr: 'no git remotes found', error: null });
+    ghIssues.setGhRunner(noRepo.runner);
+    const unresolved = await ghIssues.listAllOpenIssues();
+    assert.equal(unresolved.ok, false);
+    assert.match(String(unresolved.error), /no git remotes found/);
+  });
+
+  test('a failing page request reports the transport error', async () => {
+    const { runner } = makeRunner([
+      repoView,
+      { status: null, stdout: '', stderr: '', error: 'gh timed out after 30000ms' },
+    ]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, false);
+    assert.match(String(res.error), /timed out/);
+  });
+
+  test('the row shape matches the list rows the rest of the client returns', async () => {
+    const { runner } = makeRunner([repoView, page([7], { totalCount: 1 })]);
+    ghIssues.setGhRunner(runner);
+
+    const res = await ghIssues.listAllOpenIssues();
+
+    assert.equal(res.ok, true);
+    assert.equal(res.issues[0].number, 7);
+    assert.equal(res.issues[0].state, 'open');
+    assert.equal(res.issues[0].author, 'octo');
+    assert.deepEqual(res.issues[0].labels, []);
+    assert.equal(res.issues[0].commentsCount, 0);
+    assert.equal(res.issues[0].url, 'https://example.test/issues/7');
+    assert.equal(res.issues[0].body, '', 'the snapshot never asks gh for bodies');
+  });
+});
+
 describe('honest totals: one bounded fetch, page sliced in memory', () => {
   function honestIssues(n) {
     const items = [];
@@ -387,26 +584,6 @@ describe('honest totals: one bounded fetch, page sliced in memory', () => {
     assert.equal(notReached.ok, true);
     assert.equal(notReached.total, 24);
     assert.equal(notReached.truncated, false, 'a short fetch is exact');
-  });
-
-  test('wholeResult returns the one bounded fetch instead of a page of it', async () => {
-    const { runner, calls } = makeRunner(okJson(honestIssues(250)));
-    ghIssues.setGhRunner(runner);
-    const res = await ghIssues.listIssues({ state: 'open', wholeResult: true }, { fetchMax: 500 });
-    assert.equal(res.ok, true);
-    assert.equal(calls.length, 1, 'one snapshot fetch, never one per logical page');
-    assert.equal(res.issues.length, 250, 'the whole fetched result, not a page of it');
-    assert.equal(res.total, 250);
-    assert.equal(res.truncated, false);
-  });
-
-  test('a wholeResult fetch that fills the bound is reported truncated', async () => {
-    const { runner } = makeRunner(okJson(honestIssues(500)));
-    ghIssues.setGhRunner(runner);
-    const res = await ghIssues.listIssues({ state: 'open', wholeResult: true }, { fetchMax: 500 });
-    assert.equal(res.ok, true);
-    assert.equal(res.issues.length, 500);
-    assert.equal(res.truncated, true, 'a bound that filled proves nothing about the rest');
   });
 
   test('the list fetch omits body while the detail fetch keeps it', async () => {

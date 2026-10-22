@@ -6494,7 +6494,6 @@ async function warpCreateAndEnter(ctx, git, notify) {
 // ---------------------------------------------------------------------------
 
 const ISSUES_CACHE_PAGE_SIZE = 100; // gh-issues' MAX_PAGE_SIZE
-const ISSUES_CACHE_SNAPSHOT_LIMIT = 500; // gh-issues' LIST_FETCH_MAX
 
 const issuesCaches = new Map();
 // One snapshot per repository and session: the prime in flight is shared so
@@ -6516,27 +6515,17 @@ function issuesCacheFor(repoRoot) {
   return key === null ? null : issuesCaches.get(key) || null;
 }
 
-// Every OPEN issue of the repository, in ONE bounded fetch: `gh issue list`
-// has no offset flag, so paging it page by page would re-download the whole
-// bound per logical page. `wholeResult` (lib/gh-issues.js) takes the fetched
-// set as it is. A fetch that filled the bound cannot prove the repository
-// lists nothing else, so it is reported as unverifiable instead of priming a
-// partial set — an incomplete snapshot would make a later "absent" look like
+// Every OPEN issue of the repository, through GitHub's own cursor pagination
+// (lib/gh-issues.js `listAllOpenIssues`): one request per 100-issue page, so
+// 250 issues cost three requests instead of a repeated whole-set download.
+// The helper fails instead of returning a short set — a page that stalls,
+// repeats a cursor or reports fewer rows than its totalCount is missing
+// evidence, and an incomplete snapshot would make a later "absent" look like
 // a closure (S7d).
 async function fetchAllOpenIssues(gh, cwd) {
-  const res = await gh.listIssues(
-    { state: "open", wholeResult: true },
-    { cwd, fetchMax: ISSUES_CACHE_SNAPSHOT_LIMIT },
-  );
-  if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || "gh issue list failed" };
-  const issues = Array.isArray(res.issues) ? res.issues : [];
-  if (res.truncated === true) {
-    return {
-      ok: false,
-      error: `gh listed ${issues.length} open issues and reached the ${ISSUES_CACHE_SNAPSHOT_LIMIT}-issue snapshot cap; the snapshot is unverifiable`,
-    };
-  }
-  return { ok: true, issues };
+  const res = await gh.listAllOpenIssues({ cwd });
+  if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || "gh api graphql failed" };
+  return { ok: true, issues: Array.isArray(res.issues) ? res.issues : [] };
 }
 
 // The margin: the newest `limit` UPDATED issues of ANY state, so a closure

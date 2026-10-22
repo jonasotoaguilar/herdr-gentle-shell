@@ -148,6 +148,7 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
     nameWithOwner,
     issues,
     mode: 'ok',
+    snapshot: 'ok',
     calls: [],
     set(number, state, updatedAt = '2024-01-05T00:00:00Z') {
       model.issues.set(number, { state, updatedAt });
@@ -183,6 +184,7 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
       return { status: 1, stdout: '', stderr: 'HTTP 401: Bad credentials (https://api.github.com/graphql)' };
     }
     if (argv[0] === 'api' && argv[1] === 'user') return json({ login: 'octo' });
+    if (argv[0] === 'api' && argv[1] === 'graphql') return json(graphqlOpenPage(model, argv));
     if (argv[0] === 'repo' && argv[1] === 'view') return json({ nameWithOwner: model.nameWithOwner });
     if (argv[0] === 'issue' && argv[1] === 'list') {
       const state = argv[argv.indexOf('--state') + 1];
@@ -214,8 +216,64 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
   return model;
 }
 
+// The exact connection shape `listAllOpenIssues` pages through:
+// `repository.issues(states: OPEN, first:, after:)` with totalCount and
+// pageInfo. `model.snapshot` simulates the ways a page can lie.
+function graphqlOpenPage(model, argv) {
+  const variable = (name) => {
+    for (let index = 0; index < argv.length - 1; index += 1) {
+      if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
+    }
+    return null;
+  };
+  if (model.snapshot === 'errors') return { errors: [{ message: 'API rate limit exceeded' }] };
+  const first = Number(variable('first'));
+  const cursor = variable('cursor');
+  const rows = [...model.issues.entries()]
+    .filter(([, record]) => record.state === 'open')
+    .map(([number, record]) => ({ number, record }))
+    .sort((left, right) => {
+      const byTime = Date.parse(right.record.updatedAt) - Date.parse(left.record.updatedAt);
+      return byTime !== 0 ? byTime : right.number - left.number;
+    });
+  const offset = cursor === null ? 0 : Number(String(cursor).replace('page-', ''));
+  let nodes = rows.slice(offset, offset + (Number.isFinite(first) ? first : rows.length));
+  let hasNextPage = offset + nodes.length < rows.length;
+  let endCursor = hasNextPage ? `page-${offset + nodes.length}` : null;
+  if (model.snapshot === 'stuck-cursor') { hasNextPage = true; endCursor = 'page-0'; }
+  // A terminal page that drops a row while still reporting the real total.
+  if (model.snapshot === 'short' && !hasNextPage) nodes = nodes.slice(0, nodes.length - 1);
+  return {
+    data: {
+      repository: {
+        issues: {
+          totalCount: rows.length,
+          pageInfo: { hasNextPage, endCursor },
+          nodes: nodes.map(({ number, record }) => ({
+            number,
+            title: `issue title ${number}`,
+            state: record.state.toUpperCase(),
+            stateReason: '',
+            author: { login: 'octo' },
+            labels: { nodes: [] },
+            createdAt: '2024-01-01T00:00:00Z',
+            updatedAt: record.updatedAt,
+            url: `https://example.test/issues/${number}`,
+            comments: { totalCount: 0 },
+            reactionGroups: [],
+          })),
+        },
+      },
+    },
+  };
+}
+
 function opensOf(calls, state) {
   return calls.filter((argv) => argv[0] === 'issue' && argv[1] === 'list' && argv[argv.indexOf('--state') + 1] === state);
+}
+
+function graphqlPages(calls) {
+  return calls.filter((argv) => argv[0] === 'api' && argv[1] === 'graphql');
 }
 
 // A command context whose one overlay is captured, rendered and returned with
@@ -247,7 +305,7 @@ function sessions(handlers, ctx) {
 }
 
 describe('S10: the complete open snapshot at session start', { concurrency: false }, () => {
-  test('the snapshot is one bounded fetch, and the detail then lists the whole set', async () => {
+  test('250 open issues take three cursor pages, and the detail lists the whole set', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('prime');
@@ -260,14 +318,39 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
       const boot = makeCtx(root);
       await Promise.all(sessions(handlers, boot.ctx));
 
-      const primes = opensOf(model.calls, 'open');
-      assert.equal(primes.length, 1, `one full snapshot fetch, not one per page: ${JSON.stringify(model.calls)}`);
-      const limits = primes.map((argv) => Number(argv[argv.indexOf('--limit') + 1]));
-      assert.ok(limits[0] >= 250, `the single fetch is wide enough for the whole set: ${limits.join(',')}`);
+      const pages = graphqlPages(model.calls);
+      assert.equal(pages.length, 3, `250 rows are three 100-row cursor pages: ${pages.length}`);
+      assert.equal(opensOf(model.calls, 'open').length, 0, 'never a whole-set `issue list` download');
+      for (const argv of pages) {
+        assert.ok(argv.includes('first=100'), 'the page size is the server maximum');
+        assert.ok(!argv.includes('--search'), 'server pagination, never the search API');
+      }
+      assert.ok(!pages[0].some((entry) => entry.startsWith('cursor=')), 'the first page starts the connection');
+      assert.ok(pages[1].some((entry) => entry.startsWith('cursor=')), 'the next page carries the cursor');
 
       const opened = makeCtx(target);
       await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
       assert.match(opened.text(), /Issues \(250\)/, 'the detail inherits the complete primed set');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('concurrent and repeated session_start share the one prime', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('once');
+      addRegisteredWorktree(root, 'feat/once', { issues: [7] });
+      const model = fakeGitHub();
+      for (let number = 1; number <= 250; number += 1) model.set(number, 'open');
+      ghIssues.setGhRunner(model.runner);
+      const { handlers } = await loadExtension();
+
+      await Promise.all([...sessions(handlers, makeCtx(root).ctx), ...sessions(handlers, makeCtx(root).ctx)]);
+      assert.equal(graphqlPages(model.calls).length, 3, 'concurrent starts share the prime in flight');
+
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+      assert.equal(graphqlPages(model.calls).length, 3, 'a repeated start reuses the primed cache');
     } finally {
       restoreEnv();
     }
@@ -416,43 +499,69 @@ describe('S7d: proof, not assumption', { concurrency: false }, () => {
   });
 });
 
-describe('S10: one bounded snapshot per session, never a sampled page as proof', { concurrency: false }, () => {
-  test('a capped snapshot stays unverifiable and no absence ever tombstones a stored issue', async () => {
+describe('S10: every open issue, no snapshot cap', { concurrency: false }, () => {
+  test('more than 600 open issues prime completely and keep a low-numbered assignment', async () => {
     setEnv(stdEnv());
     try {
-      const root = makeRepo('capped');
-      const target = addRegisteredWorktree(root, 'feat/capped', { issues: [1] });
+      const root = makeRepo('big');
+      const target = addRegisteredWorktree(root, 'feat/big', { issues: [1] });
       const model = fakeGitHub();
-      // 600 open issues, ordered newest-number-first: the bounded snapshot can
-      // only ever carry #101..#600, so #1 is absent from every fetched list
-      // while still being open in the repository.
-      for (let number = 1; number <= 600; number += 1) model.set(number, 'open');
+      // #1 is the OLDEST of 620 open issues, so only the cursor walk reaches it.
+      for (let number = 1; number <= 620; number += 1) model.set(number, 'open');
       ghIssues.setGhRunner(model.runner);
       const { commands, handlers } = await loadExtension();
 
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
-      const snapshots = opensOf(model.calls, 'open');
-      assert.ok(snapshots.length >= 1, 'the prime does ask for the open set');
-      for (const argv of snapshots) {
-        const limit = Number(argv[argv.indexOf('--limit') + 1]);
-        assert.ok(limit <= 500, `the snapshot stays inside its bound: ${limit}`);
-      }
+      assert.equal(graphqlPages(model.calls).length, 7, '620 rows are seven 100-row cursor pages');
 
-      // A repeated session_start reuses the session's cache state instead of
-      // resetting it, and the still-unprovable snapshot never tombstones.
-      await Promise.all(sessions(handlers, makeCtx(root).ctx));
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [1], 'no fetch-only absence removes a stored issue');
-
-      // The detail then verifies exactly the number it could not prove open.
       const opened = makeCtx(target);
       await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [1], '#1 survives a truncated list');
+      assert.match(opened.text(), /Issues \(620\)/, 'the whole open set is primed, never capped at 500');
+      assert.deepEqual(registryLib.findByPath(root, target).issues, [1], 'the low-numbered assignment stays');
       assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
         `nothing was dropped: ${JSON.stringify(opened.notes)}`);
     } finally {
       restoreEnv();
     }
   });
+
+  for (const snapshot of ['short', 'stuck-cursor', 'errors']) {
+    test(`a snapshot page that cannot prove completeness (${snapshot}) fails and never tombstones`, async () => {
+      setEnv(stdEnv());
+      try {
+        const root = makeRepo(`page-${snapshot}`);
+        const target = addRegisteredWorktree(root, `feat/page-${snapshot}`, { issues: [1] });
+        const model = fakeGitHub();
+        for (let number = 1; number <= 600; number += 1) model.set(number, 'open');
+        // `short`: the terminal page drops a row while reporting the real
+        // total. `stuck-cursor`: the connection never advances. `errors`: the
+        // page carries GraphQL errors. Each is missing evidence, never a
+        // complete snapshot.
+        model.snapshot = snapshot;
+        ghIssues.setGhRunner(model.runner);
+        const { commands, handlers } = await loadExtension();
+
+        const registryFile = registryLib.registryPath(root);
+        // The first start registers the repository's principal checkout (S28);
+        // after that the failing snapshot is the only thing happening.
+        await Promise.all(sessions(handlers, makeCtx(root).ctx));
+        const before = fs.readFileSync(registryFile);
+        await Promise.all(sessions(handlers, makeCtx(root).ctx));
+        assert.deepEqual(fs.readFileSync(registryFile), before, 'a failed snapshot writes nothing');
+        assert.deepEqual(registryLib.findByPath(root, target).issues, [1], 'no fetch-only absence removes a stored issue');
+
+        const opened = makeCtx(target);
+        await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
+        assert.ok(opened.notes.some(([message]) => /cannot list open issues/.test(message)),
+          `the incomplete snapshot is reported, never passed off as complete: ${JSON.stringify(opened.notes)}`);
+        assert.deepEqual(registryLib.findByPath(root, target).issues, [1], '#1 is verified on its own and kept');
+        assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
+          `nothing was dropped: ${JSON.stringify(opened.notes)}`);
+      } finally {
+        restoreEnv();
+      }
+    });
+  }
 });
 
 describe('S7d: a repository-level 404 proves nothing', { concurrency: false }, () => {
