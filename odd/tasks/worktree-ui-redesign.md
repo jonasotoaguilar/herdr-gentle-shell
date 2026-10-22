@@ -196,12 +196,12 @@ T3 — S3/S4 | done | f9f738a | Bottom warp panel and bounded rows.
 T4 — S5 | done | f9f738a | Extended list keeps always-active search and existing paging.
 T5 — S6 | done | e8b9345 | Creation asks type/name, no association panes.
 T6 — S7/S7a/S7b | checking | fb2245d, b9e4f0a | Shared fullscreen component and reachable commands pass integration tests; PTY smoke did not confirm detail tabs.
-T7 — S7c/S7d/S10 | checking | 6144216, b9e4f0a | Complete prime, margin refresh and guarded revalidation; independent integration audit pending.
-T8 — S8/S8a/S8b | checking | 16af9f1, b9e4f0a | Entity string/null migration verified; visible dropped reporting added in integration, audit pending.
+T7 — S7c/S7d/S10 | done | 6144216, b9e4f0a, a8788a0, b1d57c8, 8d029b1 | Audit findings corrected: safe 404 handling, complete cursor snapshot, cached viewer margins, all final automated tests pass.
+T8 — S8/S8a/S8b | done | 16af9f1, b9e4f0a, 13003df | Entity invariant independently verified; all three omitted migration-warning paths now have public regression tests.
 T9 — S9/S12 | checking | b11ffe0, b9e4f0a | Ordered listing and provenance-based times pass focused/integration suites; live detail rendering not confirmed.
 T10 — S11 | checking | b9e4f0a | Current-worktree command shares fullscreen detail; command integration green, live PTY inconclusive.
 T11 — S13 | done | 1c56f6c | Duplicate chrome removed, 158 viewer/command tests passed.
-T12 — S14 | checking | b9e4f0a | Full isolated suite 1858/1858 passed; final independent audit and real TUI proof pending.
+T12 — S14 | blocked | 8d029b1 | Full final isolated suite 1884/1884 passed; actual fullscreen-detail TUI proof remains unconfirmed and requires human confirmation.
 T13 — S15 | done | 99af4b9 | Scroll variants and preserved lowercase list navigation verified.
 T14 — S16/S16a | done | 7b29997, 62961a5, 74aa451, 413f6b5, b9e4f0a | Trace UI/events, bounded writer and honest support evidence; 115 focused tests passed.
 T15 — S24 | checking | 3253821, b9e4f0a | Panel delete wired to existing guards/confirmation; integration tests green, live smoke pending.
@@ -377,3 +377,39 @@ L15. Local commits after recovery: fb2245d (pure detail component), 413f6b5
 b9e4f0a (reachable commands, cache, revalidation, delete and ordering). No push,
 PR, merge or release was performed. Independent integration verifier
 mvitd0mj-2-tdrg is still running; no final readiness claim is made.
+
+
+L16. Independent integration audit found three missing migration-warning
+propagations and snapshot/404 safety gaps. 13003df fixes the warnings with public
+command regression tests (75/75 focused). a8788a0 preserves stored assignments
+on ambiguous repository 404 and reuses pending/primed state. b1d57c8 replaces
+an interim 500-issue cap with validated GraphQL cursor pagination. Parent ran
+that helper against the actual GitHub repository: ok=true, count=1, total=1,
+exit 0. Fixtures also cover 620 issues across seven cursor pages and malformed,
+short or stalled pages without registry loss.
+
+L17. Parent read executeIssues and found that the refreshed cache was still not
+serving the viewer's three buckets. 8d029b1 fixes that: buckets seed once under
+their existing server queries, then merge bounded 20-row margins. The same unit
+aligns the warp-detail fake with the GraphQL transport rather than suppressing
+real error notifications. Final full command (exit 0):
+
+```
+LC_ALL=C GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null node --test tools/*.test.js
+```
+
+1884 tests, 1884 pass, 0 fail, 0 skipped. Isolation avoids the host's Spanish
+Git messages and global .env.local ignore rule; no production behavior was
+changed to hide those environmental effects. Native ASSESS on the last source
+unit returned medium, reviewDue=false (under_budget), no independent verifier
+required. This is not a native review approval. Prior independent verification
+of migration and recovered integration is recorded above, including its findings.
+
+L18. Remaining functional proof is explicitly NOT passed: the real-PTY probe
+from L14 failed to confirm the Issues/ODD tabs. No automatic replay was made.
+LSP results were too-large/inconclusive, not clean. Manual confirmation needed:
+start one Pi instance with only this package (avoid loading main plus the
+worktree together), open /herdr-gentle:worktree and confirm fullscreen Issues/ODD,
+then verify /herdr-gentle:issues and e in warp. A failed or empty screen needs its
+exact message or screenshot. Source is committed; do not label all functional
+verification complete until that confirmation exists.
