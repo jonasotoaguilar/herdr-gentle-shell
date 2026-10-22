@@ -7,7 +7,8 @@
 //
 // Observable contract under test (the argv that reaches the injected `gh`
 // runner, the registry bytes on disk, and the text the mounted detail renders):
-// - session start lists EVERY open page and never works from a truncated read;
+// - session start lists the open set with ONE bounded fetch and never works
+//   from a truncated or sampled page;
 // - each `/herdr-gentle:issues` open asks only for the newest 20 UPDATED
 //   issues, closed ones included, and requests nothing like the full set;
 // - a closure reported by that margin is merged, so the worktree that still
@@ -192,6 +193,11 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
       return json(rows.slice(0, Number.isFinite(limit) ? limit : rows.length));
     }
     if (argv[0] === 'issue' && argv[1] === 'view') {
+      if (model.mode === 'repo404') {
+        // An inaccessible/private repository: gh answers a GENERIC 404 that
+        // names no issue, so it proves nothing about this number.
+        return { status: 1, stdout: '', stderr: 'HTTP 404: Not Found (https://api.github.com/graphql)' };
+      }
       const number = Number(argv[2]);
       const record = model.issues.get(number);
       if (!record) {
@@ -241,7 +247,7 @@ function sessions(handlers, ctx) {
 }
 
 describe('S10: the complete open snapshot at session start', { concurrency: false }, () => {
-  test('every open page is loaded, and the detail then lists the whole set', async () => {
+  test('the snapshot is one bounded fetch, and the detail then lists the whole set', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('prime');
@@ -255,9 +261,9 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
       await Promise.all(sessions(handlers, boot.ctx));
 
       const primes = opensOf(model.calls, 'open');
-      assert.ok(primes.length >= 3, `the prime pages through every open issue (got ${primes.length} page requests)`);
+      assert.equal(primes.length, 1, `one full snapshot fetch, not one per page: ${JSON.stringify(model.calls)}`);
       const limits = primes.map((argv) => Number(argv[argv.indexOf('--limit') + 1]));
-      assert.ok(Math.max(...limits) >= 250, `the last page is wide enough for the whole set: ${limits.join(',')}`);
+      assert.ok(limits[0] >= 250, `the single fetch is wide enough for the whole set: ${limits.join(',')}`);
 
       const opened = makeCtx(target);
       await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
@@ -404,6 +410,77 @@ describe('S7d: proof, not assumption', { concurrency: false }, () => {
       assert.ok(openedB.notes.some(([message]) => /dropped issue assignment\(s\) #7/.test(message)),
         `B verifies against B: ${JSON.stringify(openedB.notes)}`);
       assert.deepEqual(registryLib.findByPath(rootA, targetA).issues, [7], 'A is untouched');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S10: one bounded snapshot per session, never a sampled page as proof', { concurrency: false }, () => {
+  test('a capped snapshot stays unverifiable and no absence ever tombstones a stored issue', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('capped');
+      const target = addRegisteredWorktree(root, 'feat/capped', { issues: [1] });
+      const model = fakeGitHub();
+      // 600 open issues, ordered newest-number-first: the bounded snapshot can
+      // only ever carry #101..#600, so #1 is absent from every fetched list
+      // while still being open in the repository.
+      for (let number = 1; number <= 600; number += 1) model.set(number, 'open');
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+      const snapshots = opensOf(model.calls, 'open');
+      assert.ok(snapshots.length >= 1, 'the prime does ask for the open set');
+      for (const argv of snapshots) {
+        const limit = Number(argv[argv.indexOf('--limit') + 1]);
+        assert.ok(limit <= 500, `the snapshot stays inside its bound: ${limit}`);
+      }
+
+      // A repeated session_start reuses the session's cache state instead of
+      // resetting it, and the still-unprovable snapshot never tombstones.
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+      assert.deepEqual(registryLib.findByPath(root, target).issues, [1], 'no fetch-only absence removes a stored issue');
+
+      // The detail then verifies exactly the number it could not prove open.
+      const opened = makeCtx(target);
+      await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
+      assert.deepEqual(registryLib.findByPath(root, target).issues, [1], '#1 survives a truncated list');
+      assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
+        `nothing was dropped: ${JSON.stringify(opened.notes)}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S7d: a repository-level 404 proves nothing', { concurrency: false }, () => {
+  test('the stored assignment keeps its bytes and is reported unverifiable', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('repo404');
+      const target = addRegisteredWorktree(root, 'feat/repo404', { issues: [999] });
+      const model = fakeGitHub();
+      model.set(7, 'open');
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+
+      const registryFile = registryLib.registryPath(root);
+      const before = fs.readFileSync(registryFile);
+      // Private or inaccessible repository: every issue view answers the
+      // generic `HTTP 404: Not Found`, which names no issue.
+      model.mode = 'repo404';
+      const opened = makeCtx(target);
+      await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
+
+      assert.deepEqual(fs.readFileSync(registryFile), before, 'a generic 404 writes nothing');
+      assert.deepEqual(registryLib.findByPath(root, target).issues, [999], 'the assignment is preserved');
+      assert.ok(opened.notes.some(([message]) => /could not verify issue assignment\(s\) #999/.test(message)),
+        `the failure is reported: ${JSON.stringify(opened.notes)}`);
+      assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
+        'a 404 for the repository never drops the issue');
     } finally {
       restoreEnv();
     }

@@ -6494,10 +6494,12 @@ async function warpCreateAndEnter(ctx, git, notify) {
 // ---------------------------------------------------------------------------
 
 const ISSUES_CACHE_PAGE_SIZE = 100; // gh-issues' MAX_PAGE_SIZE
-const ISSUES_CACHE_MIN_FETCH = 500; // gh-issues' LIST_FETCH_MAX
-const ISSUES_CACHE_MAX_PAGES = 50;
+const ISSUES_CACHE_SNAPSHOT_LIMIT = 500; // gh-issues' LIST_FETCH_MAX
 
 const issuesCaches = new Map();
+// One snapshot per repository and session: the prime in flight is shared so
+// concurrent session_start handlers never download it twice.
+const issuesCachePrimes = new Map();
 
 function issuesCacheKey(repoRoot) {
   try {
@@ -6514,27 +6516,27 @@ function issuesCacheFor(repoRoot) {
   return key === null ? null : issuesCaches.get(key) || null;
 }
 
-// Every OPEN issue of the repository. `gh issue list` has no offset flag, so
-// this pages the in-memory result and REFUSES a truncated answer instead of
-// priming a partial set — an incomplete snapshot would make a later "absent"
-// look like a closure.
-async function fetchAllOpenIssues(gh, cwd, pageSize) {
-  const size = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : ISSUES_CACHE_PAGE_SIZE;
-  const collected = new Map();
-  let total = 0;
-  for (let page = 1; page <= ISSUES_CACHE_MAX_PAGES; page += 1) {
-    const fetchMax = Math.max(ISSUES_CACHE_MIN_FETCH, page * size);
-    const res = await gh.listIssues({ state: "open", page, pageSize: size }, { cwd, fetchMax });
-    if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || "gh issue list failed" };
-    for (const row of Array.isArray(res.issues) ? res.issues : []) {
-      if (row && Number.isInteger(row.number)) collected.set(row.number, row);
-    }
-    total = Number.isFinite(res.total) ? res.total : collected.size;
-    // A bounded read hid issues: ask once more with a wider bound.
-    if (res.truncated === true) continue;
-    if (collected.size >= total) return { ok: true, issues: [...collected.values()] };
+// Every OPEN issue of the repository, in ONE bounded fetch: `gh issue list`
+// has no offset flag, so paging it page by page would re-download the whole
+// bound per logical page. `wholeResult` (lib/gh-issues.js) takes the fetched
+// set as it is. A fetch that filled the bound cannot prove the repository
+// lists nothing else, so it is reported as unverifiable instead of priming a
+// partial set — an incomplete snapshot would make a later "absent" look like
+// a closure (S7d).
+async function fetchAllOpenIssues(gh, cwd) {
+  const res = await gh.listIssues(
+    { state: "open", wholeResult: true },
+    { cwd, fetchMax: ISSUES_CACHE_SNAPSHOT_LIMIT },
+  );
+  if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || "gh issue list failed" };
+  const issues = Array.isArray(res.issues) ? res.issues : [];
+  if (res.truncated === true) {
+    return {
+      ok: false,
+      error: `gh listed ${issues.length} open issues and reached the ${ISSUES_CACHE_SNAPSHOT_LIMIT}-issue snapshot cap; the snapshot is unverifiable`,
+    };
   }
-  return { ok: false, error: `could not load every open issue: gh listed ${total} and stopped` };
+  return { ok: true, issues };
 }
 
 // The margin: the newest `limit` UPDATED issues of ANY state, so a closure
@@ -6550,21 +6552,38 @@ async function fetchRecentUpdatedIssues(gh, cwd, limit) {
 
 // Create (once per repository) and prime the session's cache. Both fetchers
 // are bound to the checkout that asked, so a worktree and its principal read
-// the same repository.
+// the same repository. The snapshot is taken ONCE per repository and session:
+// a later session_start reuses the primed cache, or the prime already in
+// flight, instead of re-listing — and never resets what the cache holds.
 async function primeIssuesCache(gh, cwd) {
   const key = issuesCacheKey(cwd);
   if (key === null) return { ok: false, error: "not a repository checkout" };
-  let cache = issuesCaches.get(key);
+  const existing = issuesCaches.get(key);
+  if (existing && existing.stats().primed === true) {
+    return { ok: true, count: existing.stats().size, reused: true };
+  }
+  const inFlight = issuesCachePrimes.get(key);
+  if (inFlight) return await inFlight;
+  let cache = existing;
   if (!cache) {
     const cacheLib = libRequire("issues-cache.js");
     cache = cacheLib.createIssuesCache({
-      pageSize: ISSUES_CACHE_PAGE_SIZE,
-      fetchAll: ({ pageSize }) => fetchAllOpenIssues(gh, cwd, pageSize),
+      fetchAll: () => fetchAllOpenIssues(gh, cwd),
       fetchRecent: ({ limit }) => fetchRecentUpdatedIssues(gh, cwd, limit),
     });
     issuesCaches.set(key, cache);
   }
-  return await cache.prime();
+  const run = (async () => {
+    try {
+      return await cache.prime();
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || "cannot load the open issues" };
+    } finally {
+      issuesCachePrimes.delete(key);
+    }
+  })();
+  issuesCachePrimes.set(key, run);
+  return await run;
 }
 
 // S10: each `/issues` open merges ONLY the margin. With no primed snapshot

@@ -1163,6 +1163,33 @@ document now being edited. Both triggers sit behind the worktree-tools
 toggle: with it off the handler reads the mode first and returns before any
 naming, so neither trigger can fire.
 
+## Issue snapshot cache (S10/S7d)
+
+The issues viewer and the worktree detail share ONE open-issue snapshot per
+repository and session, keyed by the repository's shared git common dir.
+Session start takes it with a SINGLE `gh issue list --state open --limit 500`
+fetch (`lib/gh-issues.js`, `wholeResult`): `gh issue list` has no offset flag,
+so paging it would re-download the whole bound once per logical page. Every
+later `/herdr-gentle:issues` open merges only the newest-20-UPDATED margin
+instead of re-listing the repository, and a repeated `session_start` reuses
+the primed snapshot — or the prime still in flight — rather than resetting it.
+
+Completeness is bounded, and the bound is reported instead of assumed. When
+the fetch fills the 500-issue cap, the snapshot is NOT complete: the prime
+fails with `gh listed 500 open issues and reached the 500-issue snapshot cap;
+the snapshot is unverifiable`, nothing is primed, and each stored assignment
+is re-verified per number with `gh issue view`. An issue leaves a stored
+association only on proof: a successful response reporting it `closed`, or
+`gh` answering with ISSUE-specific wording (`Could not resolve to an Issue
+…`, `no such issue`). Absence from any list is never proof, and a
+repository-level `Not Found (HTTP 404)` — a private, renamed or unreadable
+repository — preserves the assignment byte for byte and is reported as
+unverifiable, exactly like authentication, permission, transport and timeout
+failures. A repository with more than 500 open issues is therefore never
+primed: its associations stay verified one number at a time. These are the
+limits of what `gh` output proves, not a promise that a live call is always
+conclusive.
+
 ## Known limitations
 
 - **Closing normally needs `force: true`.** `git worktree remove`

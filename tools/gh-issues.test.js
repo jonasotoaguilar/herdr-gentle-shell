@@ -389,6 +389,26 @@ describe('honest totals: one bounded fetch, page sliced in memory', () => {
     assert.equal(notReached.truncated, false, 'a short fetch is exact');
   });
 
+  test('wholeResult returns the one bounded fetch instead of a page of it', async () => {
+    const { runner, calls } = makeRunner(okJson(honestIssues(250)));
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.listIssues({ state: 'open', wholeResult: true }, { fetchMax: 500 });
+    assert.equal(res.ok, true);
+    assert.equal(calls.length, 1, 'one snapshot fetch, never one per logical page');
+    assert.equal(res.issues.length, 250, 'the whole fetched result, not a page of it');
+    assert.equal(res.total, 250);
+    assert.equal(res.truncated, false);
+  });
+
+  test('a wholeResult fetch that fills the bound is reported truncated', async () => {
+    const { runner } = makeRunner(okJson(honestIssues(500)));
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.listIssues({ state: 'open', wholeResult: true }, { fetchMax: 500 });
+    assert.equal(res.ok, true);
+    assert.equal(res.issues.length, 500);
+    assert.equal(res.truncated, true, 'a bound that filled proves nothing about the rest');
+  });
+
   test('the list fetch omits body while the detail fetch keeps it', async () => {
     const { runner, calls } = makeRunner(okJson(honestIssues(3)));
     ghIssues.setGhRunner(runner);
@@ -403,6 +423,34 @@ describe('honest totals: one bounded fetch, page sliced in memory', () => {
     assert.equal(detail.ok, true);
     const detailAt = view.calls[0].argv.indexOf('--json');
     assert.ok(view.calls[0].argv[detailAt + 1].split(',').includes('body'), 'the detail pane keeps body');
+  });
+});
+
+describe('proof of a missing issue (S7d)', () => {
+  test('issue-specific "could not resolve to an Issue" is proof', async () => {
+    const { runner } = makeRunner({
+      status: 1,
+      stdout: '',
+      stderr: 'GraphQL: Could not resolve to an Issue with the number of 999. (repository.issue)',
+      error: null,
+    });
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.getIssue(999);
+    assert.equal(res.ok, false);
+    assert.equal(res.notFound, true);
+  });
+
+  test('a repository-level "Not Found (HTTP 404)" is not proof', async () => {
+    const { runner } = makeRunner({
+      status: 1,
+      stdout: '',
+      stderr: 'HTTP 404: Not Found (https://api.github.com/graphql)',
+      error: null,
+    });
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.getIssue(999);
+    assert.equal(res.ok, false);
+    assert.equal(res.notFound, false, 'an inaccessible repository says nothing about this number');
   });
 });
 
