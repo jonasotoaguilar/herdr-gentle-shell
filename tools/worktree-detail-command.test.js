@@ -606,3 +606,58 @@ describe('S9: worktree_list ordering', { concurrency: false }, () => {
     }
   });
 });
+
+
+describe('S8b: migration warnings cross command boundaries', { concurrency: false }, () => {
+  function seedLegacy(root, target) {
+    const file = registryLib.registryPath(root);
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    doc.worktrees.find((row) => row.path === target).odd = ['odd/tasks/a.md', 'odd/tasks/b.md'];
+    fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+  }
+
+  test('discovery names discarded legacy associations on session start', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('legacy-discovery');
+      const target = addRegisteredWorktree(root, 'feat/legacy-discovery');
+      seedLegacy(root, target);
+      stubGh([]);
+      const { handlers } = await loadExtension();
+      const boot = scriptedCtx({ cwd: root, steps: [] });
+      await Promise.all((handlers.get('session_start') || []).map((handler) => handler({}, boot.ctx)));
+      const raw = JSON.parse(fs.readFileSync(registryLib.registryPath(root), 'utf8'));
+      const stored = raw.worktrees.find((row) => row.path === target).odd;
+      assert.ok(Array.isArray(stored) || boot.notes.some(([message]) => message.includes('odd/tasks/b.md')),
+        'discovery must preserve the old association or name its discarded document');
+    } finally { restoreEnv(); }
+  });
+
+  for (const operation of ['worktree_upsert', 'worktree_close']) {
+    test(`${operation} names associations discarded by its registry write`, async () => {
+      setEnv(stdEnv());
+      try {
+        const root = makeRepo(`legacy-${operation}`);
+        const branch = 'feat/legacy-command';
+        let target;
+        if (operation === 'worktree_upsert') {
+          target = track(require('../lib/worktree-git.js').worktreePath(root, branch));
+          git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
+          registryLib.upsertWorktree(root, { branch, path: target, thread: 'another-thread', issues: [], odd: null });
+        } else {
+          target = addRegisteredWorktree(root, branch);
+        }
+        seedLegacy(root, target);
+        stubGh([]);
+        const { tools } = await loadExtension();
+        const boot = scriptedCtx({ cwd: root, steps: [] });
+        const params = operation === 'worktree_upsert' ? { branch, issues: [] } : { branch, force: true };
+        const result = await tools.get(operation).execute('migration', params, undefined, undefined, boot.ctx);
+        assert.notEqual(result.isError, true, JSON.stringify(result));
+        const output = (result.content || []).filter((item) => item.type === 'text').map((item) => item.text).join('\n');
+        assert.ok(output.includes('odd/tasks/b.md') || boot.notes.some(([message]) => message.includes('odd/tasks/b.md')),
+          'the public command must expose its discarded document');
+      } finally { restoreEnv(); }
+    });
+  }
+});

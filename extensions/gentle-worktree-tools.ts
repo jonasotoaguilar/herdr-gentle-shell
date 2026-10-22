@@ -744,9 +744,12 @@ async function executeWorktreeCreate(params, ctx, opts) {
           const updated = registry.updateWorktree(repo.root, row.path, patch);
           if (updated.ok) {
             const stored = updated.entry;
+            const migration = Array.isArray(updated.dropped) && updated.dropped.length > 0
+              ? [droppedOddWarning(updated.dropped)] : [];
             return textResult(
-              createSuccessText(branch, stored.path, stored.issues, "updated", stored.odd),
-              { path: stored.path, branch, issues: stored.issues, odd: stored.odd, created: false, updated: true },
+              [createSuccessText(branch, stored.path, stored.issues, "updated", stored.odd), ...migration].join("\n"),
+              { path: stored.path, branch, issues: stored.issues, odd: stored.odd, created: false, updated: true,
+                ...(migration.length > 0 ? { warnings: migration, droppedOdd: updated.dropped } : {}) },
               false,
             );
           }
@@ -2743,6 +2746,9 @@ async function executeWorktreeClose(params, ctx, opts) {
   // workspace step — while the removed/branch-kept contract stays
   // byte-identical on every path that never warped.
   const successLines = [closeSuccessText(branch, true)];
+  if (Array.isArray(dropped.dropped) && dropped.dropped.length > 0) {
+    successLines.push(droppedOddWarning(dropped.dropped));
+  }
   if (preRemoval.warp !== null) successLines.push("session warped to principal");
   for (const notice of preRemoval.notices) successLines.push(notice);
   const successDetails = { path: target, branch, removed: true, branchKept: true, thread: owner };
@@ -9096,7 +9102,10 @@ export default function (pi) {
               principalId = null;
             }
             if (typeof registry.registerMissingWorktrees === "function") {
-              registry.registerMissingWorktrees(scanned.repo.root, scanned.live, principalId);
+              const discovered = registry.registerMissingWorktrees(scanned.repo.root, scanned.live, principalId);
+              if (discovered?.ok && Array.isArray(discovered.dropped) && discovered.dropped.length > 0) {
+                ctx?.ui?.notify?.(droppedOddWarning(discovered.dropped), "info");
+              }
             }
           } catch {
             // Discovery registration is best-effort: the warp cache above
