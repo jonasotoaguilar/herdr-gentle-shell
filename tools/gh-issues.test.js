@@ -586,6 +586,26 @@ describe('honest totals: one bounded fetch, page sliced in memory', () => {
     assert.equal(notReached.truncated, false, 'a short fetch is exact');
   });
 
+  test('wholeResult returns the one bounded fetch instead of a page of it', async () => {
+    const { runner, calls } = makeRunner(okJson(honestIssues(250)));
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.listIssues({ state: 'open', wholeResult: true }, { fetchMax: 251 });
+    assert.equal(res.ok, true);
+    assert.equal(calls.length, 1, 'one bounded read, never one per logical page');
+    assert.equal(res.issues.length, 250, 'the whole fetched result, not a page of it');
+    assert.equal(res.total, 250);
+    assert.equal(res.truncated, false);
+  });
+
+  test('a wholeResult fetch that fills the bound is reported truncated', async () => {
+    const { runner } = makeRunner(okJson(honestIssues(45)));
+    ghIssues.setGhRunner(runner);
+    const res = await ghIssues.listIssues({ state: 'open', wholeResult: true }, { fetchMax: 45 });
+    assert.equal(res.ok, true);
+    assert.equal(res.issues.length, 45);
+    assert.equal(res.truncated, true, 'a bound that filled proves nothing about the rest');
+  });
+
   test('the list fetch omits body while the detail fetch keeps it', async () => {
     const { runner, calls } = makeRunner(okJson(honestIssues(3)));
     ghIssues.setGhRunner(runner);

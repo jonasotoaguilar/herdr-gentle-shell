@@ -186,14 +186,55 @@ function openComponent(factory, host) {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
 
+// The cursor-paged GraphQL snapshot the session cache primes through, built
+// from the rows the list seam answers with.
+function graphqlSnapshotOf(argv, rows) {
+  const field = (name) => {
+    for (let index = 0; index < argv.length - 1; index += 1) {
+      if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
+    }
+    return null;
+  };
+  const first = Number(field('first'));
+  const cursor = field('cursor');
+  const offset = cursor === null ? 0 : Number(cursor.replace('page-', ''));
+  const page = rows.slice(offset, offset + (Number.isFinite(first) ? first : rows.length));
+  const hasNextPage = offset + page.length < rows.length;
+  return JSON.stringify({
+    data: {
+      repository: {
+        issues: {
+          totalCount: rows.length,
+          pageInfo: { hasNextPage, endCursor: hasNextPage ? `page-${offset + page.length}` : null },
+          nodes: page.map((row) => ({
+            number: row.number,
+            title: row.title,
+            state: String(row.state || 'OPEN').toUpperCase(),
+            stateReason: '',
+            author: { login: (row.author && row.author.login) || 'someone' },
+            labels: { nodes: [] },
+            createdAt: row.createdAt,
+            updatedAt: row.updatedAt,
+            url: row.url,
+            comments: { totalCount: 0 },
+            reactionGroups: [],
+          })),
+        },
+      },
+    },
+  });
+}
+
 // Pattern-matching `gh` runner over the captured real-`gh` fixtures:
 // answers by argv shape and records every call, so the action tests can
 // pin the exact fixed argv each write reaches `gh` with.
 function makeIssuesRunner({ failComment = false } = {}) {
   const calls = [];
   const ok = (stdout) => ({ status: 0, stdout, stderr: '', error: null });
+  const rows = JSON.parse(fixture('gh-issue-list.json'));
   const runner = async (bin, argv) => {
     calls.push({ bin, argv: argv.slice() });
+    if (argv[0] === 'api' && argv[1] === 'graphql') return ok(graphqlSnapshotOf(argv, rows));
     if (argv[0] === 'api') return ok(fixture('gh-api-user.json'));
     if (argv[0] === 'repo') return ok(fixture('gh-repo-view.json'));
     if (argv[0] === 'issue' && argv[1] === 'list') return ok(fixture('gh-issue-list.json'));
@@ -349,11 +390,13 @@ describe('/herdr-gentle:issues overlay', () => {
     // S10/S16: the source asks gh for last-update ordering, so each page's
     // query carries the sort; Involved excludes the viewer's own issues so
     // the two buckets are disjoint at the source, before any client filter.
-    assert.deepEqual(searches, [
+    const BUCKET_SEARCHES = [
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-    ]);
+    ];
+    assert.deepEqual(searches, [...BUCKET_SEARCHES, ...BUCKET_SEARCHES],
+      'each bucket is read once at prime and then merged by its own 20-row margin');
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues/, 'first page tab');
     assert.match(body, /Assigned/, 'second page tab');
@@ -614,6 +657,7 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
     const ok = (stdout) => ({ status: 0, stdout, stderr: '', error: null });
     const runner = async (bin, argv) => {
       calls.push({ bin, argv: argv.slice() });
+      if (argv[0] === 'api' && argv[1] === 'graphql') return ok(graphqlSnapshotOf(argv, manyListIssues(n)));
       if (argv[0] === 'api') return ok(fixture('gh-api-user.json'));
       if (argv[0] === 'repo') return ok(fixture('gh-repo-view.json'));
       if (argv[0] === 'issue' && argv[1] === 'list') {
@@ -641,12 +685,15 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
     assert.ok(!body.includes('+ issues'), 'an under-bound fetch never carries the + marker');
   });
 
-  test('a bound-reached fetch carries the truncated flag into the view tab', async () => {
+  test('a bucket that holds every open issue is complete, never marked truncated', async () => {
     const root = makeRepo({ tag: 'issues-trunc' });
     const { runner } = makeBoundedRunner(500);
     const { component } = await openIssues(root, { runner });
     const body = clean(component.render(110).join('\n'));
-    assert.match(body, /My issues \(500\+\)/, 'the tab names the bounded total');
+    // The bucket's read is bounded by the snapshot count + 1, so 500 rows out
+    // of 500 open issues proves the page complete: no bound marker.
+    assert.match(body, /My issues \(500\)/, 'the tab names the proven-complete total');
+    assert.ok(!/My issues \(500\+\)/.test(body), 'S16: a proven-complete page carries no bound marker');
     assert.ok(!/\d+\+ issues/.test(body), 'S13: the bound is never repeated below the list');
   });
 });
@@ -682,7 +729,7 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
     assert.equal(callsAtMount.filter((line) => line.includes('issue list')).length, 0, 'no list fetch before mount');
     assert.equal(callsAtMount.filter((line) => line.includes('label list')).length, 0, 'no label fetch before mount');
     const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
-    assert.equal(lists.length, 3, 'three buckets fetched after mount');
+    assert.equal(lists.length, 6, 'three buckets primed and three margin-refreshed after mount');
     for (const call of lists) {
       const at = call.argv.indexOf('--state');
       assert.equal(call.argv[at + 1], 'open', `open state requested: ${call.argv.join(' ')}`);
@@ -696,15 +743,19 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
     const states = () => calls
       .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
       .map((call) => call.argv[call.argv.indexOf('--state') + 1]);
-    assert.deepEqual(states(), ['open', 'open', 'open'], 'the default fetch is open');
+    const primed = states();
+    assert.deepEqual(primed, ['open', 'open', 'open', 'open', 'open', 'open'],
+      'the three buckets are primed and then margin-refreshed, all as open');
     const before = clean(component.render(110).join('\n'));
     component.handleInput('f');
     await tick();
-    assert.deepEqual(states(), ['open', 'open', 'open'], 'f fetches nothing: no other state is asked for');
+    assert.deepEqual(states(), primed, 'f fetches nothing: no other state is asked for');
     assert.equal(clean(component.render(110).join('\n')), before, 'f repaints nothing');
     component.handleInput('r');
     await tick();
-    assert.deepEqual(states().slice(3), ['open', 'open', 'open'], 'a reload asks for open again');
+    const reloaded = states().slice(primed.length);
+    assert.equal(reloaded.filter((state) => state === 'open').length, 3,
+      'a reload asks for the three open buckets again');
     assert.equal(states().includes('closed'), false, 'the closed state is never requested');
   });
 });
@@ -876,7 +927,8 @@ describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => 
     const { runner, calls } = makeIssuesRunner();
     await openIssues(root, { runner });
     const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
-    assert.equal(lists.length, 3, 'three buckets fetched');
+    // Each bucket is read once at prime and then merged by its 20-row margin.
+    assert.equal(lists.length, 6, 'three buckets primed, then merged by their margins');
     for (const call of lists) {
       const at = call.argv.indexOf('--state');
       assert.ok(at >= 0, `every list call names its state: ${call.argv.join(' ')}`);
@@ -886,6 +938,9 @@ describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => 
     const involved = lists
       .map((call) => call.argv[call.argv.indexOf('--search') + 1])
       .filter((query) => query.startsWith('involves:'));
-    assert.deepEqual(involved, ['involves:@me -author:@me sort:updated-desc'], 'Involved excludes authored issues at the source');
+    assert.deepEqual(involved, [
+      'involves:@me -author:@me sort:updated-desc',
+      'involves:@me -author:@me sort:updated-desc',
+    ], 'Involved excludes authored issues at the source, in its prime and its margin');
   });
 });

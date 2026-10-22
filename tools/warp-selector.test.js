@@ -942,8 +942,34 @@ const ghIssues = require('../lib/gh-issues.js');
 // number it does not know, so no test ever spawns the binary.
 function stubDetailGh(openNumbers = [2, 7]) {
   const calls = [];
+  // The same cursor-paged connection the production prime reads: the detail's
+  // open-issue snapshot arrives through it, never through a live binary.
+  const graphqlSnapshot = () => JSON.stringify({
+    data: {
+      repository: {
+        issues: {
+          totalCount: openNumbers.length,
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: openNumbers.map((number) => ({
+            number,
+            title: `issue title ${number}`,
+            state: 'OPEN',
+            stateReason: '',
+            author: { login: 'octo' },
+            labels: { nodes: [] },
+            createdAt: '2024-01-01T00:00:00Z',
+            updatedAt: '2024-01-02T00:00:00Z',
+            url: `https://example.test/issues/${number}`,
+            comments: { totalCount: 0 },
+            reactionGroups: [],
+          })),
+        },
+      },
+    },
+  });
   ghIssues.setGhRunner(async (bin, argv) => {
     calls.push(argv.slice());
+    if (argv[0] === 'api' && argv[1] === 'graphql') return { status: 0, stdout: graphqlSnapshot(), stderr: '' };
     if (argv[0] === 'api' && argv[1] === 'user') return { status: 0, stdout: '{"login":"octo"}', stderr: '' };
     if (argv[0] === 'repo' && argv[1] === 'view') return { status: 0, stdout: '{"nameWithOwner":"octo/repo"}', stderr: '' };
     if (argv[0] === 'issue' && argv[1] === 'list') {

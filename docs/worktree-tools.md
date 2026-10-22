@@ -1179,6 +1179,20 @@ margin (one `--state all --limit 20` call) instead of re-listing the
 repository, and a repeated `session_start` reuses the primed snapshot — or
 the prime still in flight — rather than resetting it.
 
+The viewer's three pages (`My issues`, `Assigned`, `Involved`) are cached the
+same way and in the same startup read. Their full read is bounded by the
+snapshot's own count: a bucket is a SUBSET of the open issues, so asking gh
+for `count + 1` rows proves the bucket arrived whole whenever fewer come
+back, and a fetch that fills that bound is a failed proof, not a page
+(`cannot prove the … page is complete`) — no heuristic re-categorization is
+ever used to fill a page. Each open then merges the bucket's own newest 20
+rows and keeps everything older, so a follow-up open costs three 20-row
+requests and one shared margin, never a 500-row re-download. The margin the
+shared cache just fetched also decides which cached rows may have left a
+query: a number it reports that the bucket no longer returns (closed,
+unassigned, edited away) is removed, while numbers outside that 20-issue
+window are left alone rather than guessed at.
+
 Completeness is checked, page by page, and reported instead of assumed. A
 page carrying GraphQL errors, a `hasNextPage` without a new non-empty cursor,
 a repeated cursor, or a terminal page whose distinct issues do not equal the

@@ -6575,17 +6575,162 @@ async function primeIssuesCache(gh, cwd) {
   return await run;
 }
 
-// S10: each `/issues` open merges ONLY the margin. With no primed snapshot
-// there is nothing to merge into, and the viewer's own fetch is already the
-// complete read, so nothing extra is asked for.
+// S10: each `/issues` open merges ONLY the margin, into both the open-issue
+// cache and the viewer's cached buckets. With no primed snapshot there is
+// nothing to merge into, and nothing extra is asked for.
 async function refreshIssuesCache(repoRoot) {
   const cache = issuesCacheFor(repoRoot);
   if (!cache || cache.stats().primed !== true) return { ok: false, primed: false };
   try {
-    return { ...(await cache.refresh()), primed: true };
+    const result = await cache.refresh();
+    return {
+      ...result,
+      primed: true,
+      // The margin this refresh actually saw. It is the only evidence a view
+      // merge may invalidate cached rows with, so a failed refresh passes
+      // nothing rather than a stale earlier margin.
+      recent: result.ok === true && typeof cache.recentlySeen === "function" ? cache.recentlySeen() : null,
+    };
   } catch (err) {
     return { ok: false, primed: true, error: (err && err.message) || "cannot refresh issues" };
   }
+}
+
+// ---------------------------------------------------------------------------
+// S10/S16: the viewer's three buckets, cached per canonical repository.
+//
+// The full read happens ONCE per session, right after the open snapshot: a
+// bucket is a SUBSET of those issues, so asking gh for `snapshot count + 1`
+// rows and getting fewer back proves the bucket arrived whole. A fetch that
+// fills that bound is a failed proof, never a page. Afterwards each
+// `/herdr-gentle:issues` open merges only the bucket's newest 20 rows, and the
+// margin the shared cache just fetched says which stored rows may have left
+// the query (closed, unassigned, edited away). Nothing older than that window
+// is guessed at, and the source order is kept: the margin rows are the newest,
+// so they simply lead the stored ones.
+// ---------------------------------------------------------------------------
+
+const ISSUES_BUCKET_MARGIN = 20; // the window the open-issue cache merges
+const issuesViewStates = new Map();
+
+function issuesViewStateFor(key) {
+  let state = issuesViewStates.get(key);
+  if (!state) {
+    state = { primed: false, priming: null, rows: new Map() };
+    issuesViewStates.set(key, state);
+  }
+  return state;
+}
+
+function issuesEmptyPages() {
+  return ISSUES_PAGE_QUERIES.map((spec) => ({ id: spec.id, label: spec.label, issues: [], total: 0, truncated: false }));
+}
+
+function issuesCachedPages(key) {
+  const state = issuesViewStates.get(key);
+  return ISSUES_PAGE_QUERIES.map((spec) => {
+    const rows = state && state.rows.has(spec.id) ? state.rows.get(spec.id) : [];
+    // Every seeded bucket was proven complete against the open snapshot, so a
+    // cached page is never a truncated one.
+    return { id: spec.id, label: spec.label, issues: rows.slice(), total: rows.length, truncated: false };
+  });
+}
+
+// One full read per bucket, shared by every concurrent caller, keyed by the
+// canonical repository so a worktree and its principal share it.
+async function primeIssuesViewBuckets(gh, cwd, key, openCount) {
+  const state = issuesViewStateFor(key);
+  if (state.primed === true) return { ok: true, reused: true };
+  if (state.priming) return await state.priming;
+  const limit = Math.max(0, Number.isFinite(openCount) ? Math.floor(openCount) : 0) + 1;
+  const run = (async () => {
+    const outcomes = await Promise.all(ISSUES_PAGE_QUERIES.map(async (spec) => {
+      try {
+        const res = await gh.listIssues(
+          { query: spec.query, state: "open", wholeResult: true },
+          { cwd, fetchMax: limit },
+        );
+        if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || "gh issue list failed" };
+        const rows = Array.isArray(res.issues) ? res.issues : [];
+        if (rows.length >= limit) {
+          return {
+            ok: false,
+            error: `cannot prove the ${spec.label} page is complete: gh returned ${rows.length} rows for at most ${limit - 1} open issues`,
+          };
+        }
+        return { ok: true, id: spec.id, rows };
+      } catch (err) {
+        return { ok: false, error: (err && err.message) || "gh issue list failed" };
+      }
+    }));
+    const failed = outcomes.find((outcome) => outcome.ok !== true);
+    // All or nothing: a partly seeded set would render as "this bucket has no
+    // more issues" instead of "it could not be read".
+    if (failed) return { ok: false, error: failed.error };
+    state.rows = new Map(outcomes.map((outcome) => [outcome.id, outcome.rows]));
+    state.primed = true;
+    return { ok: true };
+  })();
+  state.priming = run;
+  try {
+    return await run;
+  } finally {
+    state.priming = null;
+  }
+}
+
+// Merge each bucket's newest 20 rows. A stored row the margin proves touched,
+// and that the bucket no longer returns, leaves the page; a bucket that fails
+// to refresh keeps exactly what it had and reports why.
+async function refreshIssuesViewBuckets(gh, cwd, key, recentNumbers) {
+  const state = issuesViewStates.get(key);
+  if (!state || state.primed !== true) {
+    return { ok: false, error: "the issue pages are not cached", pages: issuesEmptyPages() };
+  }
+  const recent = Array.isArray(recentNumbers) && recentNumbers.length > 0 ? new Set(recentNumbers) : null;
+  const outcomes = await Promise.all(ISSUES_PAGE_QUERIES.map(async (spec) => {
+    try {
+      const res = await gh.listIssues(
+        { query: spec.query, state: "open", page: 1, pageSize: ISSUES_BUCKET_MARGIN },
+        { cwd, fetchMax: ISSUES_BUCKET_MARGIN },
+      );
+      if (!res || res.ok !== true) return { ok: false, error: (res && res.error) || "gh issue list failed" };
+      const newest = Array.isArray(res.issues) ? res.issues : [];
+      const fresh = new Set(newest.map((row) => row && row.number).filter(Number.isInteger));
+      const kept = (state.rows.get(spec.id) || []).filter((row) => {
+        if (!row || !Number.isInteger(row.number)) return false;
+        if (fresh.has(row.number)) return false;
+        return !(recent && recent.has(row.number));
+      });
+      state.rows.set(spec.id, [...newest, ...kept]);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || "gh issue list failed" };
+    }
+  }));
+  const firstError = outcomes.find((outcome) => outcome.ok !== true);
+  return { ok: true, pages: issuesCachedPages(key), loadError: firstError ? firstError.error : null };
+}
+
+// The viewer's open pages: the session's cache. The one full read happened at
+// startup (or here, once, if startup never primed); every later open merges
+// the margins only.
+async function issuesViewPages(gh, cwd, recentNumbers) {
+  const key = issuesCacheKey(cwd);
+  if (key === null) return { ok: false, error: "not a repository checkout", pages: issuesEmptyPages() };
+  const cache = issuesCaches.get(key);
+  let openCount = cache && cache.stats().primed === true ? cache.stats().size : null;
+  if (openCount === null) {
+    const primed = await primeIssuesCache(gh, cwd);
+    if (primed.ok !== true) return { ok: false, error: primed.error, pages: issuesEmptyPages() };
+    openCount = primed.count;
+  }
+  const state = issuesViewStates.get(key);
+  if (!state || state.primed !== true) {
+    const primed = await primeIssuesViewBuckets(gh, cwd, key, openCount);
+    if (primed.ok !== true) return { ok: false, error: primed.error, pages: issuesEmptyPages() };
+  }
+  return await refreshIssuesViewBuckets(gh, cwd, key, recentNumbers);
 }
 
 // S7d/S10: an assignment leaves the registry only on PROOF — the shared cache
@@ -8769,8 +8914,19 @@ function issuesWrapFailure(promise, what) {
 // the network. Partial failure keeps the successful pages and reports the
 // first error in `loadError`; when every bucket fails the result is
 // `{ok:false, error}` so the view paints the honest error, never fake rows.
-async function issuesFetchPages(gh, cwd, state = "open") {
+// S10: an `open` request answers from the session's cached buckets — the one
+// full read happened at startup, and `options.recent` is the margin that load
+// already fetched. `closed` has no snapshot to answer from, so it keeps the
+// direct read.
+async function issuesFetchPages(gh, cwd, state = "open", options = {}) {
   const requestState = state === "closed" ? "closed" : "open";
+  if (requestState === "open") {
+    try {
+      return await issuesViewPages(gh, cwd, options && options.recent);
+    } catch (err) {
+      return { ok: false, error: (err && err.message) || "gh issue list failed", pages: issuesEmptyPages() };
+    }
+  }
   const outcomes = await Promise.all(ISSUES_PAGE_QUERIES.map(async (spec) => {
     const empty = { id: spec.id, label: spec.label, issues: [], total: 0, truncated: false };
     try {
@@ -8825,16 +8981,17 @@ async function executeIssues(rawArgs, ctx) {
     if (typeof notify === "function") notify(`issues: cannot load the gh client: ${(err && err.message) || err}`, "error");
     return;
   }
-  // S10: each open merges only the newest margin into the shared snapshot,
-  // so the cache stays current without a second full listing. A failed or
-  // impossible refresh changes nothing in the cache — the viewer's own pages
-  // still load below.
-  await refreshIssuesCache(repoRoot);
+  // S10: each open merges only the newest margin into the shared snapshot —
+  // and that same margin decides which cached viewer rows may have changed
+  // membership. A failed or impossible refresh changes nothing in the cache
+  // and invalidates nothing.
+  const refreshed = await refreshIssuesCache(repoRoot);
+  const recent = refreshed.ok === true && Array.isArray(refreshed.recent) ? refreshed.recent : null;
   // S19: mount the viewer FIRST, with no eager page or label fetch. The view
   // asks for its (open) pages through `loadPages({state})` and its labels
   // through `loadLabels()` on first use, so the first frame paints a loading
   // state instead of waiting on `gh`.
-  const loadPages = ({ state } = {}) => issuesFetchPages(gh, checkoutRoot, state);
+  const loadPages = ({ state } = {}) => issuesFetchPages(gh, checkoutRoot, state, { recent });
   const loadLabels = () => gh.listLabels({ cwd: checkoutRoot });
   const assigned = issuesStoredAssignment(repoRoot, checkoutRoot);
   const checkoutName = path.basename(checkoutRoot);
@@ -8848,7 +9005,7 @@ async function executeIssues(rawArgs, ctx) {
   if (!helpers || !ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
     // No interactive host: fetch once so the one-line notice states the real
     // total, then say the viewer needs an interactive session.
-    const loaded = await issuesFetchPages(gh, checkoutRoot, "open");
+    const loaded = await issuesFetchPages(gh, checkoutRoot, "open", { recent });
     const pages = Array.isArray(loaded.pages) ? loaded.pages : [];
     if (typeof notify === "function") {
       if (loaded.ok !== true) {
@@ -8878,7 +9035,11 @@ async function executeIssues(rawArgs, ctx) {
     openBrowser: (number) => issuesOpenInBrowser(checkoutRoot, number),
     reload: async ({ state } = {}) => {
       try {
-        return await issuesFetchPages(gh, checkoutRoot, state);
+        // A reload is a fresh merge, so it refreshes the margin itself instead
+        // of reusing the one the mount happened to see.
+        const reloaded = await refreshIssuesCache(repoRoot);
+        const recentNow = reloaded.ok === true && Array.isArray(reloaded.recent) ? reloaded.recent : null;
+        return await issuesFetchPages(gh, checkoutRoot, state, { recent: recentNow });
       } catch (err) {
         return { ok: false, error: (err && err.message) || "cannot reload issues" };
       }
@@ -8947,7 +9108,15 @@ async function checkIssuesGate(pi, ctx) {
       // failed prime leaves no cache and is reported by the first surface that
       // needed it, never as a false "no open issues".
       try {
-        await primeIssuesCache(gh, cwd);
+        const primed = await primeIssuesCache(gh, cwd);
+        // S10/S16: the viewer's three buckets are seeded from the SAME startup
+        // read, bounded by the snapshot's own count. A failure here leaves
+        // them unprimed — the viewer retries once per open and reports the
+        // unprovable read — instead of pretending a page is complete.
+        if (primed.ok === true) {
+          const key = issuesCacheKey(cwd);
+          if (key !== null) await primeIssuesViewBuckets(gh, cwd, key, primed.count);
+        }
       } catch {
         // Best effort: the viewer and the detail prime on demand instead.
       }

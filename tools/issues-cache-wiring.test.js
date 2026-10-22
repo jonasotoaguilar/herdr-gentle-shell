@@ -124,6 +124,7 @@ async function loadExtension() {
   process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
   const mod = await import(pathToFileURL(copy).href);
   mod.default(pi);
+  if (typeof mod.setIssuesTuiLoader === 'function') await mod.setIssuesTuiLoader(async () => stubTui);
   return { commands, handlers, mod };
 }
 
@@ -141,14 +142,30 @@ function addRegisteredWorktree(root, branch, { issues = [], odd = null } = {}) {
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text), bold: (text) => String(text) };
 const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
 
+// The viewer renders through the injectable TUI seam; these helpers are the
+// only TUI surface it uses (width, truncation and key matching).
+const stubTui = {
+  visibleWidth: (text) => [...String(text)].length,
+  truncateToWidth: (text, width) => {
+    const chars = [...String(text)];
+    return chars.length > width ? chars.slice(0, Math.max(0, width - 1)).join('') + '…' : String(text);
+  },
+  matchesKey: (key, name) => key === name,
+  isKeyRelease: (key) => key === 'release',
+};
+
 // A mutable stand-in for one GitHub repository. `issues` maps number ->
-// {state, updatedAt}; `mode` simulates the ways a read can fail.
+// {state, updatedAt}; `buckets` maps each viewer query to the numbers it
+// matches (null = every open issue, the simplest faithful case); `mode` and
+// `snapshot` simulate the ways a read can fail or lie.
 function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
   const model = {
     nameWithOwner,
     issues,
+    buckets: { mine: null, assigned: null, involved: null },
     mode: 'ok',
     snapshot: 'ok',
+    listOverdelivers: false,
     calls: [],
     set(number, state, updatedAt = '2024-01-05T00:00:00Z') {
       model.issues.set(number, { state, updatedAt });
@@ -187,12 +204,21 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
     if (argv[0] === 'api' && argv[1] === 'graphql') return json(graphqlOpenPage(model, argv));
     if (argv[0] === 'repo' && argv[1] === 'view') return json({ nameWithOwner: model.nameWithOwner });
     if (argv[0] === 'issue' && argv[1] === 'list') {
-      const state = argv[argv.indexOf('--state') + 1];
-      const limit = Number(argv[argv.indexOf('--limit') + 1]);
+      const at = (flag) => argv[argv.indexOf(flag) + 1];
+      const state = at('--state');
+      const search = typeof at('--search') === 'string' ? at('--search') : '';
+      const limit = Number(at('--limit'));
+      const bucket = search.startsWith('involves:@me -author:@me') ? 'involved'
+        : (search.startsWith('assignee:@me') ? 'assigned'
+          : (search.startsWith('author:@me') ? 'mine' : null));
+      const members = bucket === null ? null : model.buckets[bucket];
       const rows = sorted([...model.issues.entries()]
         .filter(([, record]) => state === 'all' || record.state === state)
+        .filter(([number]) => members === null || members.has(number))
         .map(([number, record]) => fixture(number, record)));
-      return json(rows.slice(0, Number.isFinite(limit) ? limit : rows.length));
+      const served = Number.isFinite(limit) ? rows.slice(0, limit) : rows;
+      if (model.listOverdelivers === true) return json([...served, ...served]);
+      return json(served);
     }
     if (argv[0] === 'issue' && argv[1] === 'view') {
       if (model.mode === 'repo404') {
@@ -276,6 +302,13 @@ function graphqlPages(calls) {
   return calls.filter((argv) => argv[0] === 'api' && argv[1] === 'graphql');
 }
 
+// The viewer mounts first and paints after its cached pages settle, so its
+// frame is rendered again once the load has landed.
+async function viewerFrame(opened) {
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  return clean(opened.mounted.component.render(110).join('\n'));
+}
+
 // A command context whose one overlay is captured, rendered and returned with
 // every notification, so an assertion reads the frame a reader would see.
 function makeCtx(cwd) {
@@ -320,7 +353,13 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
 
       const pages = graphqlPages(model.calls);
       assert.equal(pages.length, 3, `250 rows are three 100-row cursor pages: ${pages.length}`);
-      assert.equal(opensOf(model.calls, 'open').length, 0, 'never a whole-set `issue list` download');
+      // The only `issue list` reads at startup are the viewer's three buckets,
+      // each bounded by the snapshot count + 1 — never a whole-set download.
+      const seeded = opensOf(model.calls, 'open');
+      assert.equal(seeded.length, 3, 'one bucket read each');
+      for (const argv of seeded) {
+        assert.equal(Number(argv[argv.indexOf('--limit') + 1]), 251, 'bounded by the snapshot count + 1');
+      }
       for (const argv of pages) {
         assert.ok(argv.includes('first=100'), 'the page size is the server maximum');
         assert.ok(!argv.includes('--search'), 'server pagination, never the search API');
@@ -562,6 +601,153 @@ describe('S10: every open issue, no snapshot cap', { concurrency: false }, () =>
       }
     });
   }
+});
+
+describe('S10: the viewer pages come from the session cache', { concurrency: false }, () => {
+  // The viewer's three buckets, seeded from fixtures: `mine` holds #1..#3,
+  // `assigned` #7..#9, `involved` #11, so a bucket that answered for another
+  // query would be visible in the counts.
+  function seededModel() {
+    const model = fakeGitHub();
+    model.buckets.mine = new Set([1, 2, 3]);
+    model.buckets.assigned = new Set([7, 8, 9]);
+    model.buckets.involved = new Set([11]);
+    for (const number of [1, 2, 3]) model.set(number, 'open', `2024-01-0${number}T00:00:00Z`);
+    for (const number of [7, 8, 9]) model.set(number, 'open', `2024-02-0${number - 6}T00:00:00Z`);
+    model.set(11, 'open', '2024-03-01T00:00:00Z');
+    return model;
+  }
+
+  function listLimits(calls, state) {
+    return opensOf(calls, state).map((argv) => Number(argv[argv.indexOf('--limit') + 1]));
+  }
+
+  test('the prime seeds all three buckets and an open only asks the 20-row margins', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('viewer');
+      const model = fakeGitHub();
+      for (let number = 1; number <= 45; number += 1) model.set(number, 'open');
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+      const seeded = opensOf(model.calls, 'open');
+      assert.equal(seeded.length, 3, 'one full read per bucket at startup');
+      assert.deepEqual(listLimits(model.calls, 'open'), [46, 46, 46], 'bounded by the snapshot count + 1');
+
+      const before = model.calls.length;
+      const opened = makeCtx(root);
+      await commands.get('herdr-gentle:issues').handler('', opened.ctx);
+      const after = model.calls.slice(before);
+
+      assert.equal(graphqlPages(after).length, 0, 'the snapshot is never re-primed');
+      assert.deepEqual(listLimits(after, 'open'), [20, 20, 20], 'each bucket merges only its newest 20 rows');
+      assert.equal(opensOf(after, 'all').length, 1, 'the shared margin, once');
+      assert.deepEqual(listLimits(after, 'all'), [20]);
+      for (const argv of [...opensOf(after, 'open'), ...opensOf(after, 'all')]) {
+        assert.ok(Number(argv[argv.indexOf('--limit') + 1]) <= 20, `no full re-download after startup: ${argv.join(' ')}`);
+      }
+      assert.match(await viewerFrame(opened), /My issues \(45\)/, 'the cached page holds every row, not the 20-row margin');
+
+      // A second open asks the same margins again and still never re-primes.
+      const beforeSecond = model.calls.length;
+      const second = makeCtx(root);
+      await commands.get('herdr-gentle:issues').handler('', second.ctx);
+      const again = model.calls.slice(beforeSecond);
+      assert.equal(graphqlPages(again).length, 0, 'never a second snapshot');
+      assert.deepEqual(listLimits(again, 'open'), [20, 20, 20]);
+      assert.match(await viewerFrame(second), /My issues \(45\)/, 'rows older than the margin stay cached');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a closed or no-longer-matching issue leaves the cached bucket, and nothing else does', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('membership');
+      const model = seededModel();
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+
+      const first = makeCtx(root);
+      await commands.get('herdr-gentle:issues').handler('', first.ctx);
+      assert.match(await viewerFrame(first), /Assigned \(3\)/, 'the seeded bucket lists its three issues');
+
+      // #8 closes and #9 stops matching the query; both are touched after the
+      // prime, so both are in the margin the next open merges.
+      model.set(8, 'closed', '2024-04-01T00:00:00Z');
+      model.set(9, 'open', '2024-04-02T00:00:00Z');
+      model.buckets.assigned.delete(9);
+
+      const second = makeCtx(root);
+      await commands.get('herdr-gentle:issues').handler('', second.ctx);
+      const body = await viewerFrame(second);
+      assert.match(body, /Assigned \(1\)/, 'only #7 still matches the query');
+      assert.match(body, /My issues \(3\)/, 'the untouched bucket keeps every row');
+      assert.match(body, /Involved \(1\)/, 'and so does the smallest one');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('one repository\'s viewer cache never answers for another', async () => {
+    setEnv(stdEnv());
+    try {
+      const rootA = makeRepo('viewer-a');
+      const modelA = fakeGitHub({ nameWithOwner: 'octo/a' });
+      modelA.buckets.mine = new Set([1, 2]);
+      modelA.set(1, 'open');
+      modelA.set(2, 'open');
+      const rootB = makeRepo('viewer-b');
+      const modelB = fakeGitHub({ nameWithOwner: 'octo/b' });
+      modelB.buckets.mine = new Set([5, 6, 7]);
+      for (const number of [5, 6, 7]) modelB.set(number, 'open');
+      const router = fakeGitHub({ nameWithOwner: 'octo/router' });
+      router.byCwd = new Map([[rootA, modelA], [rootB, modelB]]);
+      ghIssues.setGhRunner(router.runner);
+      const { commands, handlers } = await loadExtension();
+
+      await Promise.all(sessions(handlers, makeCtx(rootA).ctx));
+      await Promise.all(sessions(handlers, makeCtx(rootB).ctx));
+
+      const openedB = makeCtx(rootB);
+      await commands.get('herdr-gentle:issues').handler('', openedB.ctx);
+      const bodyB = await viewerFrame(openedB);
+      assert.match(bodyB, /My issues \(3\)/, 'B answers from B');
+      assert.match(bodyB, /#5/, 'B lists its own issue');
+
+      const openedA = makeCtx(rootA);
+      await commands.get('herdr-gentle:issues').handler('', openedA.ctx);
+      assert.match(await viewerFrame(openedA), /My issues \(2\)/, 'A is untouched by B');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a bucket read that fills the snapshot bound is a failed proof, never a page', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('overfull');
+      const model = fakeGitHub();
+      for (let number = 1; number <= 45; number += 1) model.set(number, 'open');
+      // gh returns more rows than the open snapshot can possibly hold: the
+      // bound no longer proves completeness, so no page may be primed.
+      model.listOverdelivers = true;
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+      const opened = makeCtx(root);
+      await commands.get('herdr-gentle:issues').handler('', opened.ctx);
+      assert.match(await viewerFrame(opened), /failed to load issues: .*cannot prove the My issues page is complete/,
+        'the unprovable read is reported, never rendered as a page');
+    } finally {
+      restoreEnv();
+    }
+  });
 });
 
 describe('S7d: a repository-level 404 proves nothing', { concurrency: false }, () => {
