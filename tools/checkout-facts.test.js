@@ -46,21 +46,55 @@ function git(cwd, args) {
   return (result.stdout || '').trim();
 }
 
+function gitAt(cwd, args, iso) {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'C', GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso },
+  });
+  assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
+  return (result.stdout || '').trim();
+}
+
 function slug(text) {
   return String(text).replace(/[^a-z0-9]+/gi, '-');
 }
 
-// Principal checkout with one commit on `defaultBranch`.
-function makeRepo(tag, defaultBranch = 'main') {
+// An initialized repository with NO commit: git records no beginning yet.
+function makeEmptyRepo(tag, defaultBranch = 'main') {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `checkout-facts-${slug(tag)}-`)));
   git(dir, ['init', '-b', defaultBranch]);
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['config', 'commit.gpgsign', 'false']);
+  return fs.realpathSync(dir);
+}
+
+// Principal checkout with one commit on `defaultBranch`.
+function makeRepo(tag, defaultBranch = 'main') {
+  const dir = makeEmptyRepo(tag, defaultBranch);
   fs.writeFileSync(path.join(dir, 'base.txt'), 'base\n');
   git(dir, ['add', '.']);
   git(dir, ['commit', '-m', 'init']);
-  return fs.realpathSync(dir);
+  return dir;
+}
+
+// A principal whose history carries TWO root commits (an unrelated branch
+// merged in), the older one dated 2020-01-01.
+function makeTwoRootRepo(tag) {
+  const root = makeRepo(tag);
+  git(root, ['checkout', '--orphan', 'side']);
+  git(root, ['rm', '-rf', '.']);
+  gitAt(root, ['commit', '--allow-empty', '-m', 'side root'], '2020-01-01T00:00:00Z');
+  git(root, ['checkout', 'main']);
+  gitAt(root, ['merge', '--allow-unrelated-histories', '--no-ff', '-m', 'merge side', 'side'], '2022-01-01T00:00:00Z');
+  return root;
+}
+
+// The EARLIEST root-commit timestamp of a checkout, read with git itself.
+function rootCommitsMs(cwd) {
+  return Math.min(...git(cwd, ['log', '--max-parents=0', '--format=%ct', 'HEAD'])
+    .split('\n').map((line) => Number(line.trim()) * 1000));
 }
 
 // Linked worktree on a new branch cut from the principal's HEAD.
@@ -132,6 +166,45 @@ describe('worktree-git lastCommitTime', { concurrency: false }, () => {
     assert.equal(result.ok, false);
     assert.equal(typeof result.error, 'string');
     assert.equal(result.timestampMs, undefined);
+  });
+});
+
+describe('worktree-git firstCommitTime', { concurrency: false }, () => {
+  test('reads the root commit timestamp, not the last commit', async () => {
+    const root = makeRepo('first-commit');
+    const rootMs = rootCommitsMs(root);
+    // Dated explicitly so the two timestamps cannot collide by sharing a second.
+    gitAt(root, ['commit', '--allow-empty', '-m', 'second'], '2022-06-01T00:00:00Z');
+    const result = await gitLib.firstCommitTime(root);
+    assert.equal(result.ok, true);
+    assert.equal(result.timestampMs, rootMs);
+    assert.equal(result.committedAt, new Date(result.timestampMs).toISOString());
+    assert.notEqual(result.timestampMs, Number(git(root, ['log', '-1', '--format=%ct'])) * 1000);
+  });
+
+  test('several root commits answer the earliest one deterministically', async () => {
+    const root = makeTwoRootRepo('first-commit-multi');
+    assert.equal(git(root, ['rev-list', '--max-parents=0', 'HEAD']).split('\n').length, 2,
+      'the fixture really carries two root commits');
+    const result = await gitLib.firstCommitTime(root);
+    assert.equal(result.ok, true);
+    assert.equal(result.timestampMs, Date.parse('2020-01-01T00:00:00Z'));
+  });
+
+  test('never throws on a directory that is not a checkout', async () => {
+    const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-firstcommit-')));
+    const result = await gitLib.firstCommitTime(notRepo);
+    assert.equal(result.ok, false);
+    assert.equal(typeof result.error, 'string');
+    assert.equal(result.timestampMs, undefined);
+  });
+
+  test('a repository with no commit is an error, never a zero time', async () => {
+    const empty = makeEmptyRepo('first-commit-empty');
+    const result = await gitLib.firstCommitTime(empty);
+    assert.equal(result.ok, false);
+    assert.equal(result.timestampMs, undefined);
+    assert.match(result.error, /first commit/i);
   });
 });
 
@@ -588,5 +661,108 @@ describe('checkout-facts', { concurrency: false }, () => {
     const diffCalls = runner.calls.filter((call) => call.includes('git diff')).length;
     assert.equal(diffCalls, 1, runner.calls.join('\n'));
     assert.equal(a.changes.value.files, b.changes.value.files);
+  });
+
+  // --- S12: honest created/modified per checkout KIND --------------------
+
+  test('the principal reports the git beginning as created, never its registration', async () => {
+    const root = makeRepo('principal-created');
+    // A registration time far from the history's beginning proves the
+    // principal's creation comes from git, not from its registry row.
+    writeRow(root, fullRow(root, 'main'));
+    commit(root, 'later work', { 'later.txt': 'l\n' });
+    const firstMs = rootCommitsMs(root);
+    const lastMs = Number(git(root, ['log', '-1', '--format=%ct', 'HEAD'])) * 1000;
+    const got = await makeFacts(root).facts(root);
+    assert.deepEqual(got.createdAt, {
+      available: true, value: new Date(firstMs).toISOString(), reason: null, source: 'root-commit',
+    });
+    assert.notEqual(got.createdAt.value, '2024-01-02T03:04:05.000Z', 'a registration time is never the creation');
+    assert.deepEqual(got.lastActivity, {
+      available: true, value: new Date(lastMs).toISOString(), reason: null, source: 'commit',
+    });
+    // The unrelated facts keep reporting this checkout's own data.
+    assert.deepEqual(got.branch, { available: true, value: 'main', reason: null, detached: false });
+    assert.equal(got.changes.value.files, 0);
+    assert.deepEqual(got.aheadBehind.value, { ahead: 0, behind: 0, base: 'main', baseSource: 'conventional' });
+  });
+
+  test('a principal whose history began twice still reports the earliest root commit', async () => {
+    const root = makeTwoRootRepo('principal-multi-root');
+    const got = await makeFacts(root).facts(root);
+    assert.deepEqual(got.createdAt, {
+      available: true, value: '2020-01-01T00:00:00.000Z', reason: null, source: 'root-commit',
+    });
+  });
+
+  test('the principal is the checkout git lists first, never the calling directory or its branch', async () => {
+    const root = makeRepo('principal-identity');
+    const wt = addWorktree(root, 'feat/principal-identity');
+    writeRow(root, fullRow(wt, 'feat/principal-identity'));
+    // Read from INSIDE the linked worktree: the principal is still the
+    // principal, because git lists the main worktree first.
+    const principal = await makeFacts(wt).facts(root);
+    assert.equal(principal.createdAt.source, 'root-commit', JSON.stringify(principal.createdAt));
+    // ...and the calling checkout itself keeps its own creation.
+    const linked = await makeFacts(wt).facts(wt);
+    assert.deepEqual(linked.createdAt, {
+      available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry',
+    });
+  });
+
+  test('a principal with no history reports an honest unavailable creation, never a birth time', async () => {
+    const root = makeEmptyRepo('principal-empty');
+    const got = await makeFacts(root, { fs: birthFs(1_700_000_000_000) }).facts(root);
+    assert.equal(got.createdAt.available, false, JSON.stringify(got.createdAt));
+    assert.equal(got.createdAt.value, null);
+    assert.equal(got.createdAt.source, null);
+    assert.match(got.createdAt.reason, /first commit/i);
+    assert.equal(got.lastActivity.available, false, JSON.stringify(got.lastActivity));
+    assert.equal(got.lastActivity.value, null);
+  });
+
+  test('a linked worktree with an unreadable registry createdAt still reports its directory birth time', async () => {
+    const root = makeRepo('created-row-invalid');
+    const wt = addWorktree(root, 'feat/created-row-invalid');
+    writeRow(root, { ...fullRow(wt, 'feat/created-row-invalid'), createdAt: 'sometime last week' });
+    const birth = 1_700_000_000_000;
+    const got = await makeFacts(root, { fs: birthFs(birth) }).facts(wt);
+    assert.deepEqual(got.createdAt, {
+      available: true, value: new Date(birth).toISOString(), reason: null, source: 'birthtime',
+    });
+  });
+
+  test('a linked worktree reports the newest uncommitted file as its modification', async () => {
+    const root = makeRepo('worktree-dirty-modified');
+    const wt = addWorktree(root, 'feat/worktree-dirty-modified');
+    writeRow(root, fullRow(wt, 'feat/worktree-dirty-modified'));
+    const commitMs = Number(git(wt, ['log', '-1', '--format=%ct'])) * 1000;
+    const dirty = path.join(wt, 'wip.txt');
+    fs.writeFileSync(dirty, 'wip\n');
+    // Pin the mtime past the commit so the assertion never depends on how
+    // fast the fixture ran.
+    const dirtyMs = commitMs + 3_600_000;
+    fs.utimesSync(dirty, new Date(dirtyMs), new Date(dirtyMs));
+    const got = await makeFacts(root).facts(wt);
+    assert.equal(got.lastActivity.source, 'dirty', JSON.stringify(got.lastActivity));
+    assert.equal(Date.parse(got.lastActivity.value), dirtyMs);
+  });
+
+  // PRESERVE: S8 migrated the row to ONE odd document while the fact keeps
+  // the LIST shape its consumers count.
+  test('the odd fact still derives a one-element list from a single stored document', async () => {
+    const root = makeRepo('odd-single');
+    const wt = addWorktree(root, 'feat/odd-single');
+    writeRow(root, { ...fullRow(wt, 'feat/odd-single'), odd: 'odd/tasks/one.md' });
+    const got = await makeFacts(root).facts(wt);
+    assert.deepEqual(got.odd, { available: true, value: ['odd/tasks/one.md'], reason: null });
+  });
+
+  test('a registered checkout with no odd document reports an empty list, never unavailable', async () => {
+    const root = makeRepo('odd-none');
+    const wt = addWorktree(root, 'feat/odd-none');
+    writeRow(root, { ...fullRow(wt, 'feat/odd-none'), odd: null });
+    const got = await makeFacts(root).facts(wt);
+    assert.deepEqual(got.odd, { available: true, value: [], reason: null });
   });
 });
