@@ -508,7 +508,157 @@ describe('perf trace state dir resolution', { concurrency: false }, () => {
     ]);
     assert.equal(trace.FLAG_NAME, 'gentle-perf-trace.json');
     assert.equal(trace.LOG_NAME, 'perf-trace.jsonl');
-    assert.deepEqual([...trace.RENDER_VIEWS], ['warp', 'odd', 'issues', 'create']);
+    assert.deepEqual([...trace.RENDER_VIEWS], ['warp', 'odd', 'issues', 'create', 'detail']);
     assert.deepEqual([...trace.SUPPORT_STATES], ['declared', 'absent', 'unknown']);
+  });
+});
+
+// S16: the flag is written by the panel (Pi) and read by the daemon (another
+// process). A verdict cached without re-checking the file would freeze the
+// first read and leave tracing inert until a restart, so every entry point
+// re-validates the flag against the bytes on disk.
+describe('perf trace cross-process flag changes', { concurrency: false }, () => {
+  test('a flag another process wrote is noticed without a restart', () => {
+    const { dir, env } = scratchEnv();
+    const flag = path.join(dir, trace.FLAG_NAME);
+    assert.equal(trace.writeTraceMode(true, env).ok, true);
+
+    assert.equal(trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, env).written, true);
+
+    // The panel switching tracing OFF: the bytes change, this process's writer
+    // never runs, so only a re-validation of the file can notice.
+    fs.writeFileSync(flag, '{"version":1,"enabled":false}\n');
+    const off = trace.traceEvent('daemon', { ms: 2, panes: 1, tokens: 1 }, env);
+    assert.equal(off.written, false, 'the next event is not written');
+    assert.equal(off.reason, 'disabled');
+
+    // And back ON: the daemon must not stay stuck on its first verdict.
+    fs.writeFileSync(flag, '{"version":1,"enabled":true}\n');
+    assert.equal(trace.traceEvent('daemon', { ms: 3, panes: 1, tokens: 1 }, env).written, true);
+
+    assert.deepEqual(readLines(path.join(dir, trace.LOG_NAME)).map((line) => line.ms), [1, 3]);
+  });
+
+  test('readTraceMode reports a flag another process just wrote', () => {
+    const { dir, env } = scratchEnv();
+    const flag = path.join(dir, trace.FLAG_NAME);
+    assert.equal(trace.readTraceMode(env).enabled, false);
+
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(flag, '{"version":1,"enabled":true}\n');
+    assert.equal(trace.readTraceMode(env).enabled, true, 'an enable written elsewhere is seen');
+
+    fs.writeFileSync(flag, '{"version":1,"enabled":false}\n');
+    assert.equal(trace.readTraceMode(env).enabled, false, 'a disable written elsewhere is seen');
+
+    fs.rmSync(flag);
+    assert.deepEqual(trace.readTraceMode(env), {
+      enabled: false,
+      path: flag,
+      reason: 'missing',
+    }, 'a removed flag reads as missing again');
+  });
+});
+
+// The S16 session snapshot: what a run is, written before its events. Only
+// while tracing is on — the support scan reads the whole installed package, so
+// a disabled trace must never pay for it.
+describe('perf trace session snapshot', { concurrency: false }, () => {
+  function snapshotEnv() {
+    const root = scratch('perf-trace-session-');
+    const stateDir = path.join(root, 'state');
+    const agentDir = path.join(root, 'agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+    return { root, stateDir, agentDir, env: { GENTLE_STATUS_STATE_DIR: stateDir, PI_CODING_AGENT_DIR: agentDir } };
+  }
+
+  test('a disabled trace writes no snapshot and never runs the scan', () => {
+    const { root, stateDir, env } = snapshotEnv();
+    let scans = 0;
+    const result = trace.traceSession(env, { scan: () => { scans += 1; return { keys: {} }; } });
+    assert.deepEqual(result, {
+      written: false,
+      path: path.join(stateDir, trace.LOG_NAME),
+      reason: 'missing',
+    });
+    assert.equal(scans, 0, 'the installed package is never scanned while tracing is off');
+    assert.equal(fs.existsSync(stateDir), false, 'no state dir, no log');
+    assert.deepEqual(fs.readdirSync(root), ['agent'], 'nothing is written');
+  });
+
+  test('an enabled snapshot records the four switches, the Pi version and per-key evidence', () => {
+    const { agentDir, env } = snapshotEnv();
+    fs.writeFileSync(path.join(agentDir, 'settings.json'), '{"heightIndex":true,"incrementalSearchCorpus":true}\n');
+    trace.writeTraceMode(true, env);
+
+    const result = trace.traceSession(env, {
+      scan: () => ({
+        ok: true,
+        piVersion: '1.3.0',
+        keys: {
+          heightIndex: { state: 'declared', evidence: 'dist/x.js (2 matches)' },
+          evictOffscreenLines: { state: 'absent', evidence: 'no match in 700 scanned files' },
+          expandRecentToolOutput: { state: 'unknown', evidence: 'scan failed: byte budget' },
+          incrementalSearchCorpus: { state: 'declared', evidence: 'dist/x.js (1 match)' },
+        },
+      }),
+    });
+    assert.equal(result.written, true, result.reason);
+
+    const [line] = readLines(result.path);
+    assert.deepEqual(Object.keys(line), ['at', 'kind', 'piVersion', 'perf', 'support']);
+    assert.equal(line.kind, 'session');
+    assert.equal(line.piVersion, '1.3.0');
+    assert.deepEqual(line.perf, {
+      heightIndex: true,
+      evictOffscreenLines: false,
+      expandRecentToolOutput: false,
+      incrementalSearchCorpus: true,
+    }, 'an unset setting is the OFF default, so both runs stay comparable');
+    assert.deepEqual(line.support, {
+      heightIndex: 'declared',
+      evictOffscreenLines: 'absent',
+      expandRecentToolOutput: 'unknown',
+      incrementalSearchCorpus: 'declared',
+    }, 'evidence is the three states only, never a speed claim');
+
+    const raw = fs.readFileSync(result.path, 'utf8');
+    for (const leaked of ['dist/x.js', 'no match in', 'scan failed', 'byte budget']) {
+      assert.equal(raw.includes(leaked), false, `${leaked} is evidence detail, not log content`);
+    }
+  });
+
+  test('a scan that cannot run still records the switches and marks the evidence unknown', () => {
+    const { env } = snapshotEnv();
+    trace.writeTraceMode(true, env);
+    const result = trace.traceSession(env, {
+      scan: () => ({
+        ok: false,
+        error: 'cannot resolve the installed package',
+        keys: Object.fromEntries(PERF_KEYS.map((key) => [key, { state: 'unknown', evidence: 'scan failed' }])),
+      }),
+    });
+    assert.equal(result.written, true);
+    const [line] = readLines(result.path);
+    assert.equal(line.kind, 'session');
+    assert.equal(line.piVersion, undefined, 'a failed scan claims no version');
+    assert.deepEqual(line.perf, {
+      heightIndex: false,
+      evictOffscreenLines: false,
+      expandRecentToolOutput: false,
+      incrementalSearchCorpus: false,
+    });
+    assert.deepEqual(Object.values(line.support), ['unknown', 'unknown', 'unknown', 'unknown']);
+  });
+
+  test('a scanner that throws leaves the snapshot without evidence instead of failing', () => {
+    const { env } = snapshotEnv();
+    trace.writeTraceMode(true, env);
+    const result = trace.traceSession(env, { scan: () => { throw new Error('boom'); } });
+    assert.equal(result.written, true);
+    const [line] = readLines(result.path);
+    assert.equal(line.kind, 'session');
+    assert.equal('support' in line, false, 'no invented evidence');
+    assert.equal('piVersion' in line, false);
   });
 });

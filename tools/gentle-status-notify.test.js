@@ -309,3 +309,67 @@ describe('adaptive poll (P1)', () => {
 });
 
 
+
+// S16/S16a: the daemon records its own frame timing and pane/token COUNTS, only
+// while the trace is enabled, and picks up a flag another process wrote between
+// frames (the panel lives in Pi, not here).
+describe('performance trace frames', () => {
+  function traceFile() {
+    return path.join(sandbox.stateDir, 'perf-trace.jsonl');
+  }
+  function readTrace() {
+    if (!fs.existsSync(traceFile())) return [];
+    return fs.readFileSync(traceFile(), 'utf8').split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l));
+  }
+  function writeFlag(enabled) {
+    fs.writeFileSync(
+      path.join(sandbox.stateDir, 'gentle-perf-trace.json'),
+      `${JSON.stringify({ version: 1, enabled })}\n`,
+    );
+  }
+
+  it('writes one daemon frame line per frame while tracing is on, and nothing while it is off', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'a'))]);
+
+    runOnce(sandbox);
+    assert.deepEqual(readTrace(), [], 'a disabled trace writes no daemon line');
+
+    writeFlag(true);
+    runOnce(sandbox);
+
+    const lines = readTrace();
+    assert.equal(lines.length, 1, 'exactly one line for one frame');
+    const [line] = lines;
+    assert.deepEqual(Object.keys(line).slice(0, 2), ['at', 'kind']);
+    assert.equal(line.kind, 'daemon');
+    assert.equal(typeof line.ms, 'number');
+    assert.ok(line.ms >= 0, 'a frame duration');
+    assert.equal(line.panes, 1, 'one owned pane was reduced');
+    assert.equal(typeof line.tokens, 'number');
+    assert.ok(line.tokens > 0, 'the frame published the owned family');
+    for (const key of Object.keys(line)) {
+      assert.ok(['at', 'kind', 'ms', 'panes', 'tokens'].includes(key), `${key} is allowlisted`);
+    }
+    // Counts only: no pane id, session path or token value may reach the log.
+    const raw = fs.readFileSync(traceFile(), 'utf8');
+    for (const leaked of ['pane-1', sessionPath(sandbox, 'a'), 'gentle_work_v1', sandbox.workDir]) {
+      assert.equal(raw.includes(leaked), false, `${leaked} never reaches the log`);
+    }
+  });
+
+  it('notices a toggle another process wrote between frames', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'b'))]);
+
+    writeFlag(true);
+    runOnce(sandbox);
+    assert.equal(readTrace().length, 1);
+
+    writeFlag(false);
+    runOnce(sandbox);
+    assert.equal(readTrace().length, 1, 'a frame after the disable writes nothing');
+
+    writeFlag(true);
+    runOnce(sandbox);
+    assert.equal(readTrace().length, 2, 'and a re-enable is picked up again without a restart');
+  });
+});

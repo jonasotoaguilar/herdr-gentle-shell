@@ -498,6 +498,34 @@ async function reportChunked(source, paneId, tokens) {
 
 const lastSent = new Map(); // paneId -> JSON of last published family
 
+/* ------------------------------------------------------------ trace */
+
+// S16/S16a: optional frame trace. The writer lives in the package's lib/
+// directory one level above the plugin root (herdr-plugin/bin → ../..); a
+// plugin installed without it records nothing, and tracing never breaks a
+// frame. The flag is written by the Pi-side panel in ANOTHER process, so it is
+// re-read per frame (one stat while off) instead of cached at startup — a
+// cached-at-startup verdict would leave the feature inert until a restart.
+let perfTraceModule;
+function perfTrace() {
+  if (perfTraceModule !== undefined) return perfTraceModule;
+  try {
+    perfTraceModule = require(path.join(__dirname, '..', '..', 'lib', 'perf-trace.js'));
+  } catch {
+    perfTraceModule = null;
+  }
+  return perfTraceModule;
+}
+
+function traceEnabled(trace) {
+  if (!trace) return false;
+  try {
+    return trace.readTraceMode(process.env).enabled === true;
+  } catch {
+    return false;
+  }
+}
+
 // Single scoped sweeper (R3-orphan + R4-live-loop): the owned gentle_*
 // family only, cleared under this daemon's own source tag. Foreign tokens
 // (pi-tree, native, other plugins) are never touched. All sweep paths —
@@ -515,6 +543,10 @@ async function clearOwnedFamily(paneId) {
 }
 
 async function frame(state, opts = {}) {
+  // Off path: one flag stat, no clock read, no object built.
+  const trace = perfTrace();
+  const tracing = traceEnabled(trace);
+  const started = tracing ? process.hrtime.bigint() : 0n;
   const now = Date.now();
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
@@ -619,6 +651,22 @@ async function frame(state, opts = {}) {
   if (opts.persistInterruptions === true) {
     try {
       await trackInterruptions(state, sightings, now);
+    } catch (error) {
+      logError(error);
+    }
+  }
+  // Counts only, never pane ids, cwd, tokens or their values: `panes` is the
+  // owned panes this frame reduced and `tokens` the token NAMES it published
+  // (0 when nothing changed or the native sidebar is selected).
+  if (tracing) {
+    let tokens = 0;
+    for (const job of publishJobs) tokens += Object.keys(job.patch).length;
+    try {
+      trace.traceEvent('daemon', {
+        ms: Number(process.hrtime.bigint() - started) / 1e6,
+        panes: Object.keys(sightings).length,
+        tokens,
+      }, process.env);
     } catch (error) {
       logError(error);
     }
