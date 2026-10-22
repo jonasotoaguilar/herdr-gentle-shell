@@ -480,7 +480,7 @@ describe('H2: one liveness predicate everywhere in the list', { concurrency: fal
   });
 });
 
-describe('S19: principal checkout distinguished, session checkout first', { concurrency: false }, () => {
+describe('S19/S9: principal checkout distinguished, then the session checkout, then the rest', { concurrency: false }, () => {
   function principalBranch(root) {
     return git(root, ['branch', '--show-current']);
   }
@@ -540,7 +540,7 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
     }
   });
 
-  test('session inside a registered worktree: that worktree first, then principal, then the rest', async () => {
+  test('session inside a registered worktree: principal first, then that worktree, then the rest', async () => {
     const root = makeRepo('s19-session-worktree');
     setEnv(stdEnv());
     try {
@@ -553,18 +553,18 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       assert.equal(
         text,
-        `worktree list: feat-two feat/two thread=thread-2 issues=35,7\n`
-        + `${principalLine(root)}\n`
+        `${principalLine(root)}\n`
+        + `worktree list: feat-two feat/two thread=thread-2 issues=35,7\n`
         + `worktree list: feat-one feat/one thread=thread-1 issues=35`,
       );
-      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['agent', 'principal', 'agent']);
-      assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'agent', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, second, first]);
     } finally {
       restoreEnv();
     }
   });
 
-  test('session in an unregistered checkout with all:true: session checkout first, then principal', async () => {
+  test('session in an unregistered checkout with all:true: principal first, then that checkout', async () => {
     const root = makeRepo('s19-session-ghost');
     setEnv(stdEnv());
     try {
@@ -575,19 +575,19 @@ describe('S19: principal checkout distinguished, session checkout first', { conc
       const result = await tools.get('worktree_list').execute('call-1', { all: true }, undefined, undefined, makeCtx(ghost));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      // F2: S19's session-first rule covers the unregistered session
-      // checkout too — it leads, the principal follows immediately.
+      // S9: the principal leads, then the session's own unregistered
+      // checkout, then the rest.
       assert.equal(
         text,
-        `worktree list: feat-ghost feat/ghost unregistered\n`
-        + `${principalLine(root)}\n`
+        `${principalLine(root)}\n`
+        + `worktree list: feat-ghost feat/ghost unregistered\n`
         + `worktree list: feat-known feat/known thread=thread-1 issues=35`,
       );
       const ghostItem = result.details.worktrees.find((item) => item.path === ghost);
       assert.ok(ghostItem, 'the session checkout is still reported');
       assert.equal(ghostItem.status, 'unregistered');
       assert.equal(ghostItem.kind, 'unregistered');
-      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['unregistered', 'principal', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'unregistered', 'agent']);
     } finally {
       restoreEnv();
     }
@@ -719,7 +719,7 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
     }
   });
 
-  test('symlink cwd to a registered worktree puts that worktree first, principal second', async () => {
+  test('symlink cwd to a registered worktree puts the principal first, that worktree second', async () => {
     const root = makeRepo('f1-symlink-worktree');
     setEnv(stdEnv());
     try {
@@ -733,17 +733,17 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const lines = text.split('\n');
-      assert.equal(lines[0], `worktree list: feat-two feat/two thread=thread-2 issues=7`);
-      assert.equal(lines[1], `worktree list: principal ${principalBranch(root)} principal`);
+      assert.equal(lines[0], `worktree list: principal ${principalBranch(root)} principal`);
+      assert.equal(lines[1], `worktree list: feat-two feat/two thread=thread-2 issues=7`);
       assert.ok(lines[2].includes('feat/one'), `remaining row follows: ${text}`);
-      assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
-      assert.equal(result.details.worktrees[0].kind, 'agent');
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, second, first]);
+      assert.equal(result.details.worktrees[1].kind, 'agent');
     } finally {
       restoreEnv();
     }
   });
 
-  test('symlink cwd to a worktree subdirectory keeps that worktree first', async () => {
+  test('symlink cwd to a worktree subdirectory keeps that worktree second', async () => {
     const root = makeRepo('f1-symlink-sub');
     setEnv(stdEnv());
     try {
@@ -759,9 +759,9 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const lines = text.split('\n');
-      assert.equal(lines[0], `worktree list: feat-two feat/two thread=thread-2 issues=7`);
-      assert.equal(lines[1], `worktree list: principal ${principalBranch(root)} principal`);
-      assert.deepEqual(result.details.worktrees.map((item) => item.path), [second, root, first]);
+      assert.equal(lines[0], `worktree list: principal ${principalBranch(root)} principal`);
+      assert.equal(lines[1], `worktree list: feat-two feat/two thread=thread-2 issues=7`);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, second, first]);
     } finally {
       restoreEnv();
     }
@@ -805,7 +805,7 @@ describe('F1: symlink spellings resolve through the same identity rule', { concu
   });
 });
 
-describe('F2: unregistered session checkout is first with all:true', { concurrency: false }, () => {
+describe('F2: an unregistered session checkout follows the principal with all:true', { concurrency: false }, () => {
   function principalBranch(root) {
     return git(root, ['branch', '--show-current']);
   }
@@ -818,7 +818,7 @@ describe('F2: unregistered session checkout is first with all:true', { concurren
     return fs.realpathSync(target);
   }
 
-  test('session inside its own unregistered checkout sees it first, then the principal', async () => {
+  test('session inside its own unregistered checkout sees the principal first, then itself', async () => {
     const root = makeRepo('f2-unregistered-first');
     setEnv(stdEnv());
     try {
@@ -829,12 +829,12 @@ describe('F2: unregistered session checkout is first with all:true', { concurren
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const lines = text.split('\n');
-      assert.equal(lines[0], `worktree list: feat-ghost feat/ghost unregistered`);
-      assert.equal(lines[1], `worktree list: principal ${principalBranch(root)} principal`);
+      assert.equal(lines[0], `worktree list: principal ${principalBranch(root)} principal`);
+      assert.equal(lines[1], `worktree list: feat-ghost feat/ghost unregistered`);
       assert.ok(lines[2].includes('feat/known'), `registered row follows: ${text}`);
-      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['unregistered', 'principal', 'agent']);
-      assert.deepEqual(result.details.worktrees.map((item) => item.path), [ghost, root, known]);
-      assert.equal(result.details.worktrees[0].status, 'unregistered');
+      assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal', 'unregistered', 'agent']);
+      assert.deepEqual(result.details.worktrees.map((item) => item.path), [root, ghost, known]);
+      assert.equal(result.details.worktrees[1].status, 'unregistered');
     } finally {
       restoreEnv();
     }
@@ -1055,7 +1055,7 @@ describe('S10: canonical principal registration', { concurrency: false }, () => 
       assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'createdAt'), false, 'registration time never claims the birth date');
       assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'registeredAt'), true);
       assert.deepEqual(rows[0].issues, []);
-      assert.deepEqual(rows[0].odd, []);
+      assert.equal(rows[0].odd, null);
     } finally {
       restoreEnv();
     }
@@ -1092,7 +1092,7 @@ describe('S10: canonical principal registration', { concurrency: false }, () => 
       const principalPath = fs.realpathSync(root);
       const branch = git(root, ['branch', '--show-current']);
       const existing = registryLib().upsertWorktree(root, {
-        branch, path: principalPath, thread: 'thread-1', issues: [12], odd: ['odd/tasks/x.md'],
+        branch, path: principalPath, thread: 'thread-1', issues: [12], odd: 'odd/tasks/x.md',
       });
       assert.equal(existing.ok, true);
       const { result } = discover(root);
@@ -1101,7 +1101,7 @@ describe('S10: canonical principal registration', { concurrency: false }, () => 
       const rows = registryLib().readRegistry(root).worktrees;
       assert.equal(rows.length, 1, 'no duplicate principal row');
       assert.deepEqual(rows[0].issues, [12], 'the stored associations survive');
-      assert.deepEqual(rows[0].odd, ['odd/tasks/x.md']);
+      assert.equal(rows[0].odd, 'odd/tasks/x.md');
     } finally {
       restoreEnv();
     }

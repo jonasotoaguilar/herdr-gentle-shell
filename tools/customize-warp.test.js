@@ -365,7 +365,16 @@ describe('herdr-gentle:warp command (S11)', { concurrency: false }, () => {
       modeLib().writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.ok(!commands.has('herdr-gentle:warp'), `warp is hidden while disabled, got ${JSON.stringify([...commands.keys()])}`);
-      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
+      // S11: the registered worktree name is the eager read detail, not the
+      // removed mode toggle — it refuses the old verbs and never rewrites the
+      // mode file, so a disabled mode cannot be flipped from it.
+      const detail = commands.get('herdr-gentle:worktree');
+      assert.ok(detail, `the S11 detail stays registered while disabled, got ${JSON.stringify([...commands.keys()])}`);
+      const modeBefore = fs.readFileSync(modeLib().modePath(process.env), 'utf8');
+      const detailNotes = [];
+      await detail.handler('enabled', { ui: { notify: (message, level) => detailNotes.push([message, level]) } });
+      assert.deepEqual(detailNotes, [['Unknown option "enabled". Use /herdr-gentle:worktree.', 'error']], 'the removed toggle verbs are refused');
+      assert.equal(fs.readFileSync(modeLib().modePath(process.env), 'utf8'), modeBefore, 'the detail command never writes the mode');
       for (const name of ['herdr-gentle:customize', 'herdr-gentle:odd', 'herdr-gentle:issues']) {
         assert.ok(commands.has(name), `${name} stays registered so reading and re-enabling work`);
       }
@@ -1067,7 +1076,7 @@ describe('S14 startup discovery + unregistered warp (T7 RED)', { concurrency: fa
       const principalReal = fs.realpathSync(root);
       const principalBranch = git(root, ['branch', '--show-current']);
       assert.equal(registryLib.upsertWorktree(root, {
-        branch: principalBranch, path: principalReal, thread: 'seed-thread', issues: [9], odd: ['odd/tasks/keep.md'],
+        branch: principalBranch, path: principalReal, thread: 'seed-thread', issues: [9], odd: 'odd/tasks/keep.md',
       }).ok, true);
       const { handlers } = await loadExtension();
       assert.ok(handlers.has('session_start'), 'the extension observes session_start for startup discovery');
@@ -1081,7 +1090,7 @@ describe('S14 startup discovery + unregistered warp (T7 RED)', { concurrency: fa
       assert.equal(read.worktrees[0].path, principalReal, 'the principal is the first metadata row');
       assert.equal(read.worktrees[0].thread, 'seed-thread', 'the principal row is preserved, not rewritten');
       assert.deepEqual(read.worktrees[0].issues, [9], 'the principal associations survive discovery');
-      assert.deepEqual(read.worktrees[0].odd, ['odd/tasks/keep.md']);
+      assert.equal(read.worktrees[0].odd, 'odd/tasks/keep.md');
       assert.equal(read.worktrees.filter((row) => row.path === principalReal).length, 1, 'the principal is registered exactly once');
       const entry = registryLib.findByBranch(root, 'feat/s14-unreg');
       assert.ok(entry, 'the missing worktree is registered');

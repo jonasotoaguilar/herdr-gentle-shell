@@ -246,7 +246,7 @@ function addRegisteredWorktree(root, branch) {
   track(target);
   git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
   const real = fs.realpathSync(target);
-  const upserted = registryLib.upsertWorktree(root, { branch, path: real, thread: 'thread-1', issues: [], odd: [] });
+  const upserted = registryLib.upsertWorktree(root, { branch, path: real, thread: 'thread-1', issues: [], odd: null });
   assert.equal(upserted.ok, true, `registry upsert failed: ${upserted.error}`);
   return real;
 }
@@ -532,7 +532,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       assert.ok(created, `the payload branch was created and registered (${JSON.stringify(rows)})`);
       assert.equal(created.thread, 'wired-thread');
       assert.deepEqual(created.issues, [], 'S6: a created row carries no issue association');
-      assert.deepEqual(created.odd, [], 'S6: a created row carries no odd association');
+      assert.equal(created.odd, null, 'S6: a created row carries no odd association');
       assert.equal(built.switches.length, 1, 'the session warped into the new worktree');
       assert.deepEqual(built.notes, [], 'creation then warp is silent on success');
     } finally {
@@ -935,6 +935,53 @@ function panelSources(mod) {
   }
 }
 
+const ghIssues = require('../lib/gh-issues.js');
+
+// The worktree detail lists the checkout's OPEN issues and previews them
+// through the shared gh client; this stub answers both, and answers 404 for a
+// number it does not know, so no test ever spawns the binary.
+function stubDetailGh(openNumbers = [2, 7]) {
+  const calls = [];
+  ghIssues.setGhRunner(async (bin, argv) => {
+    calls.push(argv.slice());
+    if (argv[0] === 'api' && argv[1] === 'user') return { status: 0, stdout: '{"login":"octo"}', stderr: '' };
+    if (argv[0] === 'repo' && argv[1] === 'view') return { status: 0, stdout: '{"nameWithOwner":"octo/repo"}', stderr: '' };
+    if (argv[0] === 'issue' && argv[1] === 'list') {
+      const rows = openNumbers.map((number) => ({
+        number,
+        title: `issue title ${number}`,
+        state: 'open',
+        author: { login: 'octo' },
+        labels: [],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+      }));
+      return { status: 0, stdout: JSON.stringify(rows), stderr: '' };
+    }
+    if (argv[0] === 'issue' && argv[1] === 'view') {
+      const number = Number(argv[2]);
+      if (!openNumbers.includes(number)) {
+        return { status: 1, stdout: '', stderr: `GraphQL: Could not resolve to an Issue with the number of ${number}. (repository.issue)` };
+      }
+      return {
+        status: 0,
+        stdout: JSON.stringify({ number, title: `issue title ${number}`, state: 'open', body: `body ${number}`, comments: [] }),
+        stderr: '',
+      };
+    }
+    return { status: 0, stdout: '{}', stderr: '' };
+  });
+  return calls;
+}
+
+// An odd document inside the checkout the detail reads.
+function writeOddDoc(target, name) {
+  const file = path.join(target, 'odd', 'tasks', `${name}.md`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `# ${name}\n\nspecs\n`);
+  return file;
+}
+
 // Drive the registry's write seam: the count and the patch are what prove
 // "both fields, exactly one write". The extension requires the same module
 // object, so a local wrapper observes every save without touching git.
@@ -955,36 +1002,42 @@ function watchRegistryWrites() {
 // row (S6), so the first row is already the focused checkout.
 const EDIT_KEYS = ['e'];
 
-describe('T12: editing the focused checkout (S13)', { concurrency: false }, () => {
-  test('e opens the panel in editing mode with the checkout REAL branch and path, frozen and pre-selected from the registry', async () => {
+describe('T12: `e` opens the worktree detail (S7, S13)', { concurrency: false }, () => {
+  test('e mounts the full-screen detail with the checkout real branch, path and stored assignment', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('edited-open');
       const target = addRegisteredWorktree(root, 'feat/real-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const driver = multiDriver([EDIT_KEYS, (view) => {
-        view.handleInput('\x1b[B'); // frozen type -> frozen name
-        for (const char of 'zz') view.handleInput(char); // inert typing
+      writeOddDoc(target, 'w1-a');
+      writeOddDoc(target, 'w1-b');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
+      let rendered = '';
+      let oddRendered = '';
+      const driver = multiDriver([['e'], (view) => {
+        rendered = clean(view.render(120).join('\n'));
+        view.handleInput('tab');
+        oddRendered = clean(view.render(120).join('\n'));
         view.handleInput('\x1b');
       }, ['\x1b']]);
       const built = wiredCtx(root, driver);
-      const { commands, mod } = await loadExtension();
-      panelSources(mod);
+      const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      assert.equal(driver.mounts(), 3, 'the selector, the edit panel, then the selector again');
-      const text = clean(driver.views[1].render(160).join('\n'));
-      assert.match(text, /Edit worktree/, 'the panel opened in editing mode');
-      assert.ok(text.includes(`checkout branch: feat/real-target`), `the checkout's OWN branch renders verbatim\n${text}`);
-      assert.ok(text.includes(`checkout path: ${target}`), `the checkout's OWN path renders verbatim\n${text}`);
-      assert.match(text, /Type: Feature \(feat\) \[frozen\]/, 'the type is frozen');
-      assert.match(text, /Name: real-target \[frozen\]/, 'the name is frozen and never re-derived');
-      assert.ok(!text.includes('preview branch:'), 'no invented create-time branch');
-      assert.match(text, /\[x\] #2/, 'the assigned issue arrives pre-selected');
-      // The panel shows one dataset at a time; the summary line is the
-      // visible proof the assigned odd document is pre-selected too.
-      assert.match(text, /selected: 1 issue · 1 odd/, 'the assigned odd document arrives pre-selected');
+      assert.equal(driver.mounts(), 3, 'the selector, the detail, then the selector again');
+      // S7: full screen, never the old centred create/edit popup.
+      assert.deepEqual(built.customs[1], {
+        overlay: true,
+        overlayOptions: { anchor: 'center', width: '100%', maxHeight: '100%', margin: 0 },
+      });
+      assert.ok(rendered.includes(target), `the detail names the checkout path\n${rendered}`);
+      assert.match(rendered, /feat-real-target/, 'the checkout name');
+      assert.match(rendered, /branch feat\/real-target/, 'the REAL branch, read from git');
+      assert.match(rendered, /\[x\] #2/, 'the stored issue arrives pre-selected');
+      assert.match(oddRendered, /● w1-a/, 'the stored odd document is the active one (one, never a list)');
+      assert.match(oddRendered, /○ w1-b/, 'and the other document is offered but not selected');
       assert.deepEqual(built.notes, [], 'Esc is silent');
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
@@ -994,54 +1047,66 @@ describe('T12: editing the focused checkout (S13)', { concurrency: false }, () =
     try {
       const root = makeRepo('edited-esc');
       const target = addRegisteredWorktree(root, 'feat/esc-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      writeOddDoc(target, 'w1-a');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
       const registryFile = registryLib.registryPath(root);
       const before = fs.readFileSync(registryFile, 'utf8');
       const watcher = watchRegistryWrites();
       try {
         const driver = multiDriver([EDIT_KEYS, (view) => view.handleInput('\x1b'), ['\x1b']]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(driver.mounts(), 3, 'the selector reopened after the cancel');
         assert.deepEqual(watcher.writes, [], 'Esc performed no registry write');
         const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
         assert.deepEqual(row.issues, [2], 'the assigned issues are untouched');
-        assert.deepEqual(row.odd, ['w1-a'], 'the assigned odd documents are untouched');
+        assert.equal(row.odd, 'w1-a', 'the assigned odd document is untouched');
         assert.equal(fs.readFileSync(registryFile, 'utf8'), before, 'the registry file is byte for byte unchanged');
         assert.deepEqual(built.notes, [], 'a cancel notifies nothing');
       } finally {
         watcher.restore();
       }
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
 
-  test('confirming writes BOTH fields exactly once, and the selector reopens with the fresh values', async () => {
+  test('ctrl+s writes BOTH fields exactly once, and the selector reopens with the fresh values', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('edited-save');
       const target = addRegisteredWorktree(root, 'feat/save-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      writeOddDoc(target, 'w1-a');
+      writeOddDoc(target, 'w1-b');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
       const watcher = watchRegistryWrites();
       try {
         const driver = multiDriver([
           EDIT_KEYS,
           (view) => {
-            view.handleInput('\t'); // issues pane
-            view.handleInput(' '); // toggle #7 on
-            view.handleInput('\t'); // odd pane
-            view.handleInput('\x1b[B'); // second document
-            view.handleInput(' '); // toggle w1-b on
-            view.handleInput('\x13'); // ctrl+s saves
+            // ODD tab: filter down to the second document and select it.
+            view.handleInput('tab');
+            view.handleInput('T');
+            for (const char of 'w1-b') view.handleInput(char);
+            view.handleInput('\r');
+            view.handleInput(' ');
+            // Issues tab: filter to #7 and assign it.
+            view.handleInput('tab');
+            view.handleInput('T');
+            view.handleInput('7');
+            view.handleInput('\r');
+            view.handleInput(' ');
+            view.handleInput('\x13');
+            view.handleInput('\x1b');
           },
-          ['\x1b[B', '\x1b'], // focus the checkout row, then close
+          ['\x1b'],
         ]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(watcher.writes.length, 1, 'exactly ONE registry write carries both fields');
         assert.equal(watcher.writes[0].key, target, 'the write targets the edited checkout');
@@ -1052,13 +1117,10 @@ describe('T12: editing the focused checkout (S13)', { concurrency: false }, () =
         );
         const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
         assert.deepEqual(row.issues, [2, 7], 'the selected issues were saved');
-        // The panel echoes a stored bare name unchanged and adds a toggled
-        // document by its absolute path (its documented row identity), so
-        // the saver stores both spellings sorted.
-        assert.deepEqual(row.odd, ['/fixtures/odd/w1-b.md', 'w1-a'], 'the selected odd documents were saved');
+        // S8a: the ODD control is a SELECT, so choosing the second document
+        // REPLACES the stored one instead of adding to it.
+        assert.equal(row.odd, 'odd/tasks/w1-b.md', 'the chosen odd document replaced the stored one, never joined it');
         assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
-        // S1: the popup reads the focused row's facts after the mount; wait
-        // for the async read instead of assuming it was pre-fetched.
         const reopened = await waitForFactsFooter(driver.views[2]);
         assert.match(reopened, /issues 2/, `the reopened popup shows the saved issue count\n${reopened}`);
         assert.deepEqual(built.notes, [], 'a successful save is silent');
@@ -1066,73 +1128,75 @@ describe('T12: editing the focused checkout (S13)', { concurrency: false }, () =
         watcher.restore();
       }
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
 
-  test('a refusing registry surfaces its error and changes nothing displayed', async () => {
+  test('a refusing registry surfaces its error in the detail and changes nothing stored', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('edited-refuse');
       const target = addRegisteredWorktree(root, 'feat/refuse-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      writeOddDoc(target, 'w1-a');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
       const original = registryLib.updateWorktree;
       registryLib.updateWorktree = () => ({ ok: false, error: 'registry is read-only' });
       try {
-        const driver = multiDriver([
-          EDIT_KEYS,
-          (view) => {
-            view.handleInput('\t');
-            view.handleInput(' '); // try to add #7
-            view.handleInput('\x13');
-          },
-          ['\x1b[B', '\x1b'],
-        ]);
+        let rendered = '';
+        const driver = multiDriver([EDIT_KEYS, async (view) => {
+          view.handleInput('T');
+          view.handleInput('7');
+          view.handleInput('\r');
+          view.handleInput(' ');
+          view.handleInput('\x13');
+          await tick();
+          rendered = clean(view.render(120).join('\n'));
+          view.handleInput('\x1b');
+        }, ['\x1b']]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
-        assert.deepEqual(
-          built.notes,
-          [['warp: cannot save the assignment: registry is read-only', 'error']],
-          'the refusing registry surfaces its own error',
-        );
-        const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-        assert.deepEqual(row.issues, [2], 'the refused write changed nothing');
-        assert.deepEqual(row.odd, ['w1-a'], 'the refused write changed nothing');
-        const reopened = await waitForFactsFooter(driver.views[2]);
-        assert.match(reopened, /issues 1/, `the reopened popup still shows the old assignment\n${reopened}`);
-        assert.ok(!reopened.includes('#7'), 'nothing optimistic is displayed');
+        assert.match(rendered, /save failed: registry is read-only/, 'the refusing registry surfaces its own error');
+        assert.deepEqual(built.notes, [], 'the failure is shown in the surface, not announced');
       } finally {
         registryLib.updateWorktree = original;
       }
+      const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
+      assert.deepEqual(row.issues, [2], 'the refused write changed nothing');
+      assert.equal(row.odd, 'w1-a', 'the refused write changed nothing');
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
 });
 
 describe('T12: the popup and its panes keep the SOURCE order (S15)', { concurrency: false }, () => {
-  test('the Issues pane renders the source order verbatim, not a numeric or alphabetical re-sort', async () => {
+  test('the Issues tab lists assigned first, then descending number, and only open issues', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('edited-order');
       const target = addRegisteredWorktree(root, 'feat/order-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [], odd: [] }).ok, true);
-      const driver = multiDriver([EDIT_KEYS, (view) => view.handleInput('\x1b'), ['\x1b']]);
+      writeOddDoc(target, 'w1-a');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: null }).ok, true);
+      stubDetailGh([2, 7, 9]);
+      let rendered = '';
+      const driver = multiDriver([EDIT_KEYS, (view) => {
+        rendered = clean(view.render(160).join('\n'));
+        view.handleInput('\x1b');
+      }, ['\x1b']]);
       const built = wiredCtx(root, driver);
-      const { commands, mod } = await loadExtension();
-      panelSources(mod);
+      const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      const lines = driver.views[1].render(160).map(clean);
-      const at = (needle) => lines.findIndex((line) => line.includes(needle));
-      const newest = at('#7 newest update');
-      const middle = at('#2 middle update');
-      const oldest = at('#9 oldest update');
-      assert.ok(newest >= 0 && middle >= 0 && oldest >= 0, `all three rows render\n${lines.join('\n')}`);
-      assert.ok(newest < middle, `insertion (recency) order wins over the numeric order\n${lines.join('\n')}`);
-      assert.ok(middle < oldest, `insertion (recency) order wins over the numeric order\n${lines.join('\n')}`);
+      const order = [...rendered.matchAll(/#(\d+)/g)].map((match) => Number(match[1]));
+      const at = (number) => order.indexOf(number);
+      assert.ok(at(2) >= 0 && at(9) >= 0 && at(7) >= 0, `all three open issues render\n${rendered}`);
+      assert.ok(at(2) < at(9), `the assigned issue comes first\n${rendered}`);
+      assert.ok(at(9) < at(7), `then descending issue number\n${rendered}`);
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
@@ -1291,12 +1355,14 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('opening the editing panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
+  test('opening the worktree detail performs no registry write and no checkout creation, and Esc creates no state', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-open-edit');
       const target = addRegisteredWorktree(root, 'feat/real-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      writeOddDoc(target, 'w1-a');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
       const before = createdState(root);
       const registryFile = registryLib.registryPath(root);
       const registryBytes = fs.readFileSync(registryFile, 'utf8');
@@ -1304,14 +1370,13 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       try {
         const driver = multiDriver([EDIT_KEYS, (view) => {
           view.render(160);
-          assert.equal(watcher.events.length, 0, 'drawing the edit panel mutated nothing');
+          assert.equal(watcher.events.length, 0, 'drawing the detail mutated nothing');
           view.handleInput('\x1b'); // cancel
         }, ['\x1b']]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 3, 'the popup, the edit panel, then the popup again');
+        assert.equal(driver.mounts(), 3, 'the popup, the detail, then the popup again');
         assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) wrote nothing');
         assert.equal(watcher.writes().length, 0, 'zero registry writes');
         assert.equal(watcher.creations().length, 0, 'zero checkout creations');
@@ -1322,6 +1387,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         watcher.restore();
       }
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
@@ -1370,45 +1436,46 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('inside the editing panel navigating, toggling, filtering, paging, help and typing in a frozen field each add no mutation', async () => {
+  test('inside the worktree detail navigating, filtering and selecting each add no mutation', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-edit-keys');
       const target = addRegisteredWorktree(root, 'feat/real-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      writeOddDoc(target, 'w1-a');
+      writeOddDoc(target, 'w1-b');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
       const before = createdState(root);
       const watcher = watchMutations();
       try {
         const driver = multiDriver([EDIT_KEYS, (view) => {
           const step = stepRecorder(view, watcher);
-          step('move from the frozen type to the frozen name', (v) => v.handleInput('\x1b[B'));
-          step('type in the frozen name field', (v) => {
-            for (const char of 'zz') v.handleInput(char);
-          });
-          assert.equal(view.state.name, '', 'the frozen name field accepted no text');
-          step('enter the Issues pane', (v) => v.handleInput('\r'));
-          step('navigate rows', (v) => v.handleInput('\x1b[B'));
+          step('navigate the issue rows', (v) => v.handleInput('down'));
           assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
-          step('page the focused list', (v) => v.handleInput(']'));
-          assert.ok(view.state.cursor.issues > 1, 'the page key moved the cursor to the next page');
-          step('toggle an unassigned issue', (v) => v.handleInput(' '));
-          assert.equal(view.state.selectedIssues.length, 2, 'exactly the toggled issue was added');
-          step('switch to the Odd pane', (v) => v.handleInput('\t'));
-          step('navigate the odd rows to an unassigned document', (v) => v.handleInput('\x1b[B'));
-          step('toggle an odd document', (v) => v.handleInput(' '));
-          assert.equal(view.state.selectedOdd.length, 2, 'exactly the toggled document was added');
-          step('open the pane filter with a printable key', (v) => v.handleInput('w'));
-          step('type in the filter', (v) => v.handleInput('1'));
-          assert.ok(view.state.queries.odd.length > 0, 'the filter received the typed text');
-          step('close the filter', (v) => v.handleInput('\x1b'));
-          step('cancel the panel', (v) => v.handleInput('\x1b'));
+          step('filter the issues', (v) => {
+            v.handleInput('T');
+            for (const char of '7') v.handleInput(char);
+            v.handleInput('\r');
+          });
+          assert.deepEqual(view.state.issues, [2], 'filtering selects nothing');
+          step('assign the filtered issue', (v) => v.handleInput(' '));
+          assert.deepEqual(view.state.issues, [2, 7], 'exactly the toggled issue was added');
+          step('switch to the ODD tab', (v) => v.handleInput('tab'));
+          step('filter the documents', (v) => {
+            v.handleInput('T');
+            for (const char of 'w1-b') v.handleInput(char);
+            v.handleInput('\r');
+          });
+          step('select that document', (v) => v.handleInput(' '));
+          assert.match(String(view.state.odd), /w1-b/, 'the chosen document REPLACED the active one');
+          assert.equal(Array.isArray(view.state.odd), false, 'never a list');
+          step('scroll the preview', (v) => v.handleInput('ctrl+j'));
+          step('cancel the detail', (v) => v.handleInput('\x1b'));
           assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 13, 'every scripted interaction was measured');
+          assert.ok(step.steps.length >= 8, 'every scripted interaction was measured');
         }, ['\x1b']]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: manyIssues(20) }));
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
         assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
@@ -1418,6 +1485,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         watcher.restore();
       }
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
@@ -1427,23 +1495,31 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     try {
       const root = makeRepo('first-mutation-edit');
       const target = addRegisteredWorktree(root, 'feat/save-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
+      writeOddDoc(target, 'w1-a');
+      writeOddDoc(target, 'w1-b');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
+      stubDetailGh([2, 7]);
       const watcher = watchMutations();
       try {
         let confirmedAt = 0;
         const driver = multiDriver([EDIT_KEYS, (view) => {
-          view.handleInput('\t');
-          view.handleInput(' '); // toggle #7 on
-          view.handleInput('\t');
-          view.handleInput('\x1b[B');
-          view.handleInput(' '); // toggle the second odd document on
+          view.handleInput('tab');
+          view.handleInput('T');
+          for (const char of 'w1-b') view.handleInput(char);
+          view.handleInput('\r');
+          view.handleInput(' '); // choose the second odd document (replaces)
+          view.handleInput('tab');
+          view.handleInput('T');
+          view.handleInput('7');
+          view.handleInput('\r');
+          view.handleInput(' '); // assign #7
           assert.deepEqual(watcher.kinds(), [], 'every selection before the confirm wrote nothing');
           confirmedAt = watcher.events.length;
           view.handleInput('\x13'); // the explicit confirm
-        }, ['\x1b[B', '\x1b']]);
+          view.handleInput('\x1b');
+        }, ['\x1b']]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
         assert.deepEqual(watcher.kinds(), ['registry-write'], 'confirming is the first and only mutation');
@@ -1457,6 +1533,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         watcher.restore();
       }
     } finally {
+      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });

@@ -287,14 +287,23 @@ describe('customize command registration', { concurrency: false }, () => {
     }
   });
 
-  test('the three old commands are gone and the two new ones are registered (S7)', async () => {
+  test('the old toggles are gone and the S11 detail reuses the worktree name', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const hadSlot = setSlot(undefined);
     try {
       modeLib().writeMode(true, process.env);
       const { commands } = await loadExtension();
-      assert.ok(!commands.has('herdr-gentle:worktree'), 'the worktree toggle is removed outright (S7)');
+      // S11 reuses the removed toggle's name for the full-screen detail of the
+      // current checkout, so presence alone proves nothing: the old mode verbs
+      // must be refused and the mode file left byte-identical.
+      const detail = commands.get('herdr-gentle:worktree');
+      assert.ok(detail, `the S11 detail command is registered eagerly, got ${JSON.stringify([...commands.keys()])}`);
+      const modeBefore = modeBytes();
+      const { ctx: detailCtx, notes: detailNotes } = makeCtx();
+      await detail.handler('enabled', detailCtx);
+      assert.deepEqual(detailNotes, [['Unknown option "enabled". Use /herdr-gentle:worktree.', 'error']], 'the removed toggle verbs are refused');
+      assert.equal(modeBytes(), modeBefore, 'the detail command never writes the mode');
       assert.ok(commands.has('herdr-gentle:warp'), 'warp stays registered');
       assert.ok(commands.has('herdr-gentle:customize'), 'customize stays registered');
     } finally {
@@ -1676,6 +1685,7 @@ describe('customize performance rows', { concurrency: false }, () => {
         'Height index + eviction · OFF',
         'Recent tool output expansion · OFF',
         'Incremental search corpus · OFF',
+        'Performance trace · OFF',
       ], 'every fallback row carries its own state');
       assert.deepEqual(readPerfSettings(env), { expandRecentToolOutput: true }, 'the fallback writes the single key');
       assert.deepEqual(notes, [[
@@ -1702,5 +1712,235 @@ describe('customize performance rows', { concurrency: false }, () => {
     } finally {
       lib.setDescriptions({});
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S16/S16a: the Performance trace option, inside the same Performance section.
+//
+// Contract under test (observable behavior only — the flag bytes, the log, the
+// notified text, whether ctx.reload ran, and what the panel renders):
+// - the option is OFF by default and opening the panel writes nothing;
+// - Enter writes the flag through the real writer and names the ACTUAL log
+//   path, and enabling writes the session snapshot immediately (no restart);
+// - Enter again disables it and keeps the log;
+// - a malformed flag is left byte-identical and the row says why;
+// - the three optimization rows keep their own ON/OFF/PARTIAL state, and the
+//   installed-Pi evidence is shown as evidence only — and only while tracing,
+//   because the scan is expensive.
+// ---------------------------------------------------------------------------
+
+function traceLib() {
+  return require('../lib/perf-trace.js');
+}
+
+function traceFlagPath(env) {
+  return path.join(env.GENTLE_STATUS_STATE_DIR, traceLib().FLAG_NAME);
+}
+
+function traceLogPath(env) {
+  return path.join(env.GENTLE_STATUS_STATE_DIR, traceLib().LOG_NAME);
+}
+
+// A stand-in for the installed-Pi scan: the real one reads a whole package, so
+// every test that can reach it injects this and counts the calls instead.
+function fakeScan({ declared = [], unknown = [] } = {}) {
+  const keys = {};
+  for (const key of perfLib().PERF_KEYS) {
+    const state = declared.includes(key) ? 'declared' : unknown.includes(key) ? 'unknown' : 'absent';
+    keys[key] = { state, evidence: 'test evidence' };
+  }
+  return { ok: true, piVersion: '1.3.0', root: '/test/pi', keys };
+}
+
+async function withScan(scanner, fn) {
+  const lib = perfLib();
+  lib.setSupportScanner(scanner);
+  try {
+    return await fn();
+  } finally {
+    lib.setSupportScanner(null);
+  }
+}
+
+// sidebar, moshi, worktree, performance, then into the rows and down to the
+// trace option (LAST in the section, so the optimization rows keep their
+// positions).
+const TO_TRACE = [...TO_PERF, 'right', 'down', 'down', 'down'];
+const TO_RESET = ['down', 'down', 'down', 'down'];
+
+describe('customize performance trace option', { concurrency: false }, () => {
+  test('the trace option is OFF by default, and opening the panel writes nothing', async () => {
+    const env = scratchStateEnv();
+    const { component } = await runPanel({ env, inputs: TO_TRACE });
+    const text = flatCard(component);
+    assert.ok(text.includes('Performance trace · OFF'), 'the option is present and OFF');
+    assert.ok(text.includes(traceLogPath(env)), 'the real log path is named before enabling');
+    assert.ok(text.includes('Keep it ON for BOTH runs'), 'the A/B instruction keeps tracing on');
+    assert.ok(
+      !/(turn|switch|shut) (it|tracing) off|disable (it|tracing)/i.test(text),
+      'nothing asks the user to stop tracing during the baseline',
+    );
+    assert.ok(text.includes('never Pi\'s renderer'), 'the limit is stated in the panel');
+    assert.equal(fs.existsSync(traceFlagPath(env)), false, 'opening the panel writes no flag');
+    assert.equal(fs.existsSync(traceLogPath(env)), false, 'opening the panel writes no log');
+  });
+
+  test('Enter enables tracing, writes the flag, names the log and snapshots the run now', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan({ declared: ['heightIndex'] }), async () => {
+      const { notes, seq } = await runPanel({ env, inputs: TO_TRACE, confirm: 'enter' });
+      assert.deepEqual(JSON.parse(fs.readFileSync(traceFlagPath(env), 'utf8')), { version: 1, enabled: true });
+      const log = traceLogPath(env);
+      assert.deepEqual(notes, [[
+        `Performance trace enabled. Writing to ${log}. Keep it on for both runs: one with the optimizations OFF, then one with them ON.`,
+        'info',
+      ]]);
+      assert.deepEqual(seq, [`notify:Performance trace enabled. Writing to ${log}. Keep it on for both runs: one with the optimizations OFF, then one with them ON.`],
+        'no reload: enabling the trace applies immediately');
+
+      const lines = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      assert.equal(lines.length, 1, 'the snapshot is written without a restart');
+      assert.equal(lines[0].kind, 'session');
+      assert.equal(lines[0].piVersion, '1.3.0');
+      assert.equal(lines[0].support.heightIndex, 'declared');
+      assert.deepEqual(lines[0].perf, {
+        heightIndex: false,
+        evictOffscreenLines: false,
+        expandRecentToolOutput: false,
+        incrementalSearchCorpus: false,
+      }, 'the run starts with every optimization OFF');
+    });
+  });
+
+  test('Enter again disables tracing and keeps the log', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan(), async () => {
+      traceLib().writeTraceMode(true, env);
+      traceLib().traceEvent('render', { view: 'odd', ms: 1, width: 80, height: 24, rows: 20 }, env);
+      assert.equal(fs.existsSync(traceLogPath(env)), true);
+
+      const { notes, seq } = await runPanel({ env, inputs: TO_TRACE, confirm: 'enter' });
+      assert.deepEqual(JSON.parse(fs.readFileSync(traceFlagPath(env), 'utf8')), { version: 1, enabled: false });
+      assert.deepEqual(notes, [[
+        `Performance trace disabled. The log at ${traceLogPath(env)} is kept; nothing was deleted.`,
+        'info',
+      ]]);
+      assert.ok(!seq.includes('reload'));
+      assert.equal(fs.existsSync(traceLogPath(env)), true, 'the recorded run is kept');
+      assert.equal(traceLib().traceEvent('render', { view: 'odd', ms: 1 }, env).written, false, 'and tracing really stopped');
+    });
+  });
+
+  test('a malformed flag is left byte-identical and the row reports why', async () => {
+    const env = scratchStateEnv();
+    fs.mkdirSync(env.GENTLE_STATUS_STATE_DIR, { recursive: true });
+    const flag = traceFlagPath(env);
+    const garbage = '{"version":1,"enabled":';
+    fs.writeFileSync(flag, garbage);
+
+    const { notes, seq, component } = await runPanel({
+      env,
+      inputs: TO_TRACE,
+      inspect: (opened) => {
+        const text = flatCard(opened);
+        assert.ok(text.includes('Performance trace · OFF'), 'an unusable flag is not reported as ON');
+        assert.ok(text.includes('Not a valid trace flag'), 'the row explains what to fix');
+      },
+      confirm: 'enter',
+    });
+    assert.equal(fs.readFileSync(flag, 'utf8'), garbage, 'the bytes are untouched');
+    assert.equal(notes.length, 1);
+    assert.equal(notes[0][1], 'error');
+    assert.match(notes[0][0], /^Performance trace not changed\. /);
+    assert.match(notes[0][0], /refusing to overwrite/);
+    assert.ok(!seq.includes('reload'));
+  });
+
+  test('the trace option never changes the three optimization states', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: false });
+    traceLib().writeTraceMode(true, env);
+    await withScan(() => fakeScan(), async () => {
+      const { component } = await runPanel({ env, inputs: TO_TRACE });
+      const text = flatCard(component);
+      assert.ok(text.includes('Performance trace · ON'), 'the trace row reads its own flag');
+      assert.ok(text.includes('Height index + eviction · PARTIAL'), 'the fused row keeps its mixed state');
+      assert.ok(text.includes('Recent tool output expansion · OFF'), 'the other rows keep their state');
+      assert.ok(text.includes('Incremental search corpus · OFF'));
+      assert.ok(!/Height index \+ eviction · (ON|UNKNOWN)/.test(text), 'support evidence never rewrites a row state');
+    });
+  });
+
+  test('the installed-Pi evidence is evidence only, and only while tracing', async () => {
+    const env = scratchStateEnv();
+    let scans = 0;
+    await withScan(() => {
+      scans += 1;
+      return fakeScan({ declared: ['heightIndex'], unknown: ['evictOffscreenLines'] });
+    }, async () => {
+      const off = await runPanel({ env, inputs: TO_TRACE });
+      assert.equal(scans, 0, 'a disabled trace never scans the installed package');
+      assert.ok(!flatCard(off.component).includes('support evidence'), 'no evidence is claimed without a scan');
+
+      traceLib().writeTraceMode(true, env);
+      const on = await runPanel({ env, inputs: TO_TRACE });
+      const text = flatCard(on.component);
+      assert.equal(scans, 1, 'an enabled trace scans once per panel render');
+      assert.ok(text.includes('Evidence (Pi 1.3.0): 1 declared, 2 absent, 1 unknown'));
+      assert.ok(
+        perfLib().panelModel(env).rows.at(-1).detail.includes('evidence only, never proof of speedup'),
+        'the claim is bounded in the row detail',
+      );
+      assert.ok(!text.includes('test evidence'), 'raw per-key evidence stays out of the UI');
+    });
+  });
+
+  test('the trace row message reports a no-change and a refusal honestly', () => {
+    const lib = perfLib();
+    const base = { trace: true, label: 'Performance trace', path: '/state/perf-trace.jsonl' };
+    assert.equal(
+      lib.applyRowMessage({ ...base, ok: true, changed: false, enabled: true }),
+      'Performance trace already enabled; nothing was changed.',
+    );
+    assert.equal(
+      lib.applyRowMessage({ ...base, ok: true, changed: false, enabled: false }),
+      'Performance trace already disabled; nothing was changed.',
+    );
+    assert.equal(
+      lib.applyRowMessage({ ...base, ok: false, changed: false, enabled: false, error: 'cannot write trace flag /state/gentle-perf-trace.json: EACCES' }),
+      'Performance trace not changed. cannot write trace flag /state/gentle-perf-trace.json: EACCES',
+    );
+  });
+
+  test('a switch change under an enabled trace starts a new identified run', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan(), async () => {
+      traceLib().writeTraceMode(true, env);
+
+      // Run 1: the row is OFF, then switched ON — the run that starts now is
+      // recorded with the switches in effect.
+      await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
+      let sessions = fs.existsSync(traceLogPath(env))
+        ? fs.readFileSync(traceLogPath(env), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).filter((line) => line.kind === 'session')
+        : [];
+      assert.equal(sessions.length, 1, 'the switch change writes one snapshot');
+      assert.equal(sessions[0].perf.expandRecentToolOutput, true, 'the ON run is identified');
+      assert.equal(sessions[0].perf.heightIndex, false, 'and every other switch is recorded as it is');
+
+      // Run 2: back OFF — a second boundary, not a silent continuation.
+      await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
+      sessions = fs.readFileSync(traceLogPath(env), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).filter((line) => line.kind === 'session');
+      assert.equal(sessions.length, 2, 'the second change writes a second snapshot');
+      assert.equal(sessions[1].perf.expandRecentToolOutput, false, 'the OFF run is identified too');
+    });
+  });
+
+  test('the reset returns the trace to its OFF default', async () => {
+    const env = scratchStateEnv();
+    traceLib().writeTraceMode(true, env);
+    const { notes } = await runPanel({ env, inputs: TO_RESET, confirm: 'enter' });
+    assert.equal(traceLib().readTraceMode(env).enabled, false, 'the trace is an option and returns to OFF');
+    assert.match(notes[0][0], /^Defaults saved\./);
   });
 });

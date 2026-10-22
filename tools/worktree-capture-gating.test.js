@@ -207,7 +207,11 @@ describe('worktree odd-capture mode gating', { concurrency: false }, () => {
         for (const value of returns) assert.equal(value, undefined);
       }
       assert.deepEqual(registryBytes(root), before, 'a disabled mode produces no registry write at all');
-      assert.deepEqual(require('../lib/worktree-registry.js').findByBranch(root, branch).odd, []);
+      assert.equal(
+        require('../lib/worktree-registry.js').findByBranch(root, branch).odd,
+        null,
+        'S8: no association is recorded, and "none" is null',
+      );
     } finally {
       restoreEnv();
     }
@@ -229,7 +233,11 @@ describe('worktree odd-capture mode gating', { concurrency: false }, () => {
       );
       for (const value of returns) assert.equal(value, undefined);
       assert.deepEqual(registryBytes(root), before, 'a malformed mode never enables the capture');
-      assert.deepEqual(require('../lib/worktree-registry.js').findByBranch(root, branch).odd, []);
+      assert.equal(
+        require('../lib/worktree-registry.js').findByBranch(root, branch).odd,
+        null,
+        'S8: no association is recorded, and "none" is null',
+      );
     } finally {
       restoreEnv();
     }
@@ -249,9 +257,10 @@ describe('worktree odd-capture mode gating', { concurrency: false }, () => {
         ctxFor(target),
       );
       for (const value of returns) assert.equal(value, undefined);
-      assert.deepEqual(
+      assert.equal(
         require('../lib/worktree-registry.js').findByBranch(root, branch).odd,
-        ['odd/notes.md'],
+        'odd/notes.md',
+        'S8: the captured document is the ONE association, stored as a path string',
       );
     } finally {
       restoreEnv();

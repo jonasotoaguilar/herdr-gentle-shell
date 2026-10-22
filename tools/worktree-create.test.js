@@ -287,7 +287,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const entry = registryLib.findByBranch(root, 'feat/create-ok');
       assert.deepEqual({ ...entry, createdAt: 'T', updatedAt: 'T' }, {
         branch: 'feat/create-ok', path: target, thread: 'thread-1',
-        issues: [35], odd: [], createdAt: 'T', updatedAt: 'T',
+        issues: [35], odd: null, createdAt: 'T', updatedAt: 'T',
       });
       assert.equal(
         registryLib.registryPath(root),
@@ -2253,9 +2253,10 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
 describe('S46: the registry tolerates the stored older odd shape', { concurrency: false }, () => {
   const registryLib = require('../lib/worktree-registry.js');
 
-  // Hand-write a legacy registry file: the row predates the odd field
-  // (or carries it as the single-path string the public tool accepts),
-  // exactly what an older version stored.
+  // Hand-write a legacy registry file: the row predates the odd field, or
+  // carries the old `odd[]` array / the single-path string an older version
+  // stored. S8 keeps ONE document, so every legacy shape normalizes to a
+  // single path or null.
   function writeLegacyFile(root, row) {
     const file = registryLib.registryPath(root);
     fs.writeFileSync(file, `${JSON.stringify({ version: 1, worktrees: [row] }, null, 2)}\n`);
@@ -2268,34 +2269,34 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
     return { root, target: fs.realpathSync(target) };
   }
 
-  test('a row without odd reads as an empty list', async () => {
+  test('a row without odd reads as no association', async () => {
     const { root, target } = legacyRoot('read');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       writeLegacyFile(root, { branch: 'feat/legacy', path: target, thread: 't', issues: [3] });
       const read = registryLib.readRegistry(root);
       assert.equal(read.ok, true, `expected ok, got ${read.error}`);
-      assert.deepEqual(read.worktrees.map((row) => row.odd), [[]], 'missing odd normalizes to []');
+      assert.deepEqual(read.worktrees.map((row) => row.odd), [null], 'missing odd normalizes to null');
       assert.deepEqual(read.worktrees.map((row) => row.issues), [[3]], 'issues are untouched');
     } finally {
       restoreEnv();
     }
   });
 
-  test('a row with the single-path odd string reads as a one-element list', async () => {
+  test('a row with the single-path odd string reads as that one document', async () => {
     const { root, target } = legacyRoot('str');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       writeLegacyFile(root, { branch: 'feat/legacy', path: target, thread: 't', issues: [], odd: 'odd/notes.md' });
       const read = registryLib.readRegistry(root);
       assert.equal(read.ok, true, `expected ok, got ${read.error}`);
-      assert.deepEqual(read.worktrees.map((row) => row.odd), [['odd/notes.md']]);
+      assert.deepEqual(read.worktrees.map((row) => row.odd), ['odd/notes.md']);
     } finally {
       restoreEnv();
     }
   });
 
-  test('upserting over a legacy row keeps its odd documents instead of crashing', async () => {
+  test('upserting over a legacy row stays single-document instead of crashing', async () => {
     const { root, target } = legacyRoot('upsert');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -2305,13 +2306,13 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
       });
       assert.equal(stored.ok, true, `expected ok, got ${stored.error}`);
       const reread = registryLib.readRegistry(root);
-      assert.deepEqual(reread.worktrees.map((row) => row.odd), [[]], 'normalized, never crashed');
+      assert.deepEqual(reread.worktrees.map((row) => row.odd), [null], 'normalized, never crashed');
     } finally {
       restoreEnv();
     }
   });
 
-  test('updating a legacy row writes arrays without crashing', async () => {
+  test('updating a legacy row writes ONE document without crashing', async () => {
     const { root, target } = legacyRoot('update');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -2319,10 +2320,12 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
       const updated = registryLib.updateWorktree(root, target, { issues: [4] });
       assert.equal(updated.ok, true, `expected ok, got ${updated.error}`);
       assert.deepEqual(updated.entry.issues, [4], 'the supplied field is replaced');
-      assert.deepEqual(updated.entry.odd, ['odd/notes.md'], 'the string shape survives as a list');
+      assert.equal(updated.entry.odd, 'odd/notes.md', 'the string shape survives as the one document');
+      // S8: associating another document REPLACES it — never a second one.
       const added = registryLib.addOddDoc(root, target, 'odd/other.md');
       assert.equal(added.ok, true, `expected ok, got ${added.error}`);
-      assert.deepEqual(added.entry.odd, ['odd/notes.md', 'odd/other.md']);
+      assert.equal(added.entry.odd, 'odd/other.md');
+      assert.equal(added.replaced, 'odd/notes.md', 'the replaced association is reported');
     } finally {
       restoreEnv();
     }

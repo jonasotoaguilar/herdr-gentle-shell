@@ -238,7 +238,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       require('../lib/worktree-mode.js').writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.deepEqual([...tools.keys()], [], 'no worktree tool is registered while disabled');
-      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
+      assert.ok(commands.has('herdr-gentle:worktree'), 'the current-worktree detail command stays discoverable (S11)');
     } finally {
       restoreEnv();
     }
@@ -950,7 +950,7 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
         ['branch', 'force', 'name', 'path'],
       );
       assert.ok(tools.get('worktree_list'), 'worktree_list stays registered');
-      assert.ok(!commands.has('herdr-gentle:worktree'), 'the mode command is removed outright (S7)');
+      assert.ok(commands.has('herdr-gentle:worktree'), 'the current-worktree detail command stays discoverable (S11)');
       // List still answers the principal line when nothing else is registered.
       const listResult = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       assert.equal(listResult.isError, undefined);

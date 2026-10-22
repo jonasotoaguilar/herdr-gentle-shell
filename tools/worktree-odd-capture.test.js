@@ -13,10 +13,10 @@
 // (real `git init` + one commit), a real linked worktree (`git worktree
 // add -b`), a registry entry for that worktree, and a principal `odd/`
 // directory symlinked into the worktree exactly like the creation hooks do.
-// Only observable behavior is asserted: the registry `odd` array inside the
-// git common dir, and the handler's return value (nothing). The user's real
-// checkouts are never touched; only the fixture dirs tracked in `roots` are
-// removed.
+// Only observable behavior is asserted: the registry row's single `odd`
+// association inside the git common dir, and the handler's return value
+// (nothing). The user's real checkouts are never touched; only the fixture
+// dirs tracked in `roots` are removed.
 
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -99,7 +99,7 @@ function makeRepoWithWorktree(tag, { branch = 'feat/odd', docs = ['notes.md'] } 
 
   const registryLib = require('../lib/worktree-registry.js');
   const stored = registryLib.upsertWorktree(realRoot, {
-    branch, path: realTarget, thread: 'thread-1', issues: [35], odd: [],
+    branch, path: realTarget, thread: 'thread-1', issues: [35], odd: null,
   });
   assert.equal(stored.ok, true);
   return { root: realRoot, target: realTarget, branch, principalOdd };
@@ -173,7 +173,7 @@ async function dispatch(handlers, eventName, event, ctx) {
 }
 
 describe('worktree odd capture', { concurrency: false }, () => {
-  test('a read/edit/write of an odd/*.md inside a registered worktree records it idempotently', async () => {
+  test('a read/edit/write of an odd/*.md inside a registered worktree records the FIRST document once', async () => {
     const { root, target, branch } = makeRepoWithWorktree('capture');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -188,13 +188,16 @@ describe('worktree odd capture', { concurrency: false }, () => {
           assert.equal(value, undefined, 'the handler returns nothing and never blocks the pipeline');
         }
       }
-      assert.deepEqual(oddOf(root, branch).slice().sort(), ['odd/notes.md', 'odd/tasks/plan.md']);
-      // A second identical wave adds nothing.
-      const before = oddOf(root, branch).slice().sort();
+      // S8: ONE document. The capture associates the first document it
+      // observes and never replaces it, because swapping the active document
+      // is an explicit act (the edit select) and S8b forbids losing a stored
+      // association silently.
+      assert.equal(oddOf(root, branch), 'odd/notes.md', 'the first observed document is the association');
+      // A second identical wave changes nothing.
       await dispatch(handlers, 'tool_call', toolEvent('read', path.join(target, 'odd', 'notes.md')), ctx);
       await dispatch(handlers, 'tool_call', toolEvent('edit', path.join(target, 'odd', 'notes.md')), ctx);
       await dispatch(handlers, 'tool_call', toolEvent('write', path.join(target, 'odd', 'tasks/plan.md')), ctx);
-      assert.deepEqual(oddOf(root, branch).slice().sort(), before, 'already-recorded docs are not added again');
+      assert.equal(oddOf(root, branch), 'odd/notes.md', 'a second document never replaces the stored one');
     } finally {
       restoreEnv();
     }
@@ -212,7 +215,7 @@ describe('worktree odd capture', { concurrency: false }, () => {
         ctxFor(root),
       );
       for (const value of returns) assert.equal(value, undefined);
-      assert.deepEqual(oddOf(root, branch), [], 'the principal checkout associates nothing');
+      assert.equal(oddOf(root, branch), null, 'the principal checkout associates nothing');
       assert.ok(!fs.existsSync(path.join(target, 'odd', 'notes.md')) || true);
     } finally {
       restoreEnv();
@@ -235,7 +238,7 @@ describe('worktree odd capture', { concurrency: false }, () => {
       fs.writeFileSync(outside, 'console.log(1)\n');
       await dispatch(handlers, 'tool_call', toolEvent('edit', outside), ctx);
       await dispatch(handlers, 'tool_call', toolEvent('write', outside), ctx);
-      assert.deepEqual(oddOf(root, branch), [], 'only .md documents inside odd/ are captured');
+      assert.equal(oddOf(root, branch), null, 'only .md documents inside odd/ are captured');
     } finally {
       restoreEnv();
     }
@@ -254,7 +257,7 @@ describe('worktree odd capture', { concurrency: false }, () => {
       for (const value of returns) assert.equal(value, undefined);
       // The re-scan complements the hook: the pre-existing notes.md the
       // registry never saw is recorded even though the bash argv is opaque.
-      assert.deepEqual(oddOf(root, branch), ['odd/notes.md']);
+      assert.equal(oddOf(root, branch), 'odd/notes.md');
     } finally {
       restoreEnv();
     }
@@ -282,14 +285,14 @@ describe('worktree odd capture', { concurrency: false }, () => {
       assert.equal(threw, null, 'the handler never throws');
       assert.ok(returns, 'expected dispatch returns');
       for (const value of returns) assert.equal(value, undefined, 'the pipeline is never blocked');
-      assert.deepEqual(oddOf(root, branch), [], 'a failed write leaves stored data unchanged');
+      assert.equal(oddOf(root, branch), null, 'a failed write leaves stored data unchanged');
     } finally {
       fs.chmodSync(commonDir, 0o755);
       restoreEnv();
     }
   });
 
-  test('the re-scan records an odd/*.md that was never observed', async () => {
+  test('the re-scan records ONE document when nothing is associated yet, and never a second', async () => {
     const { root, target, branch } = makeRepoWithWorktree('rescan', { docs: ['observed.md', 'unseen.md'] });
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -299,10 +302,10 @@ describe('worktree odd capture', { concurrency: false }, () => {
         toolEvent('read', path.join(target, 'odd', 'observed.md')),
         ctxFor(target),
       );
-      assert.deepEqual(
-        oddOf(root, branch).slice().sort(),
-        ['odd/observed.md', 'odd/unseen.md'],
-        'the bounded re-scan complements the per-call capture',
+      assert.equal(
+        oddOf(root, branch),
+        'odd/observed.md',
+        'the bounded re-scan complements the per-call capture without adding a second document',
       );
     } finally {
       restoreEnv();
@@ -317,9 +320,9 @@ describe('worktree odd capture', { concurrency: false }, () => {
       const ctx = ctxFor(target);
       const full = path.join(target, 'odd', 'notes.md');
       await dispatch(handlers, 'tool_result', { toolName: 'read', input: { path: full } }, ctx);
-      assert.deepEqual(oddOf(root, branch), ['odd/notes.md']);
+      assert.equal(oddOf(root, branch), 'odd/notes.md');
       await dispatch(handlers, 'tool_result', { toolName: 'read', input: { path: full } }, ctx);
-      assert.deepEqual(oddOf(root, branch), ['odd/notes.md'], 'repeat results add nothing');
+      assert.equal(oddOf(root, branch), 'odd/notes.md', 'repeat results add nothing');
     } finally {
       restoreEnv();
     }

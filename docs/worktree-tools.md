@@ -45,7 +45,7 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
-| `worktree_upsert` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the odd `.md` to associate, must exist, exactly like supplied `issues`) | None — a create touches no existing data: the checkout and its registry row are both new, so it never asks, exactly as the panel's create path never did | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
+| `worktree_upsert` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the ONE odd `.md` to associate, must exist, exactly like supplied `issues`; a LIST is refused with an error that names the rule, never silently reduced to one) | None — a create touches no existing data: the checkout and its registry row are both new, so it never asks, exactly as the panel's create path never did | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
 | `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`), naming pending changes as `Pending changes: N files, +N/-N` when dirty and nothing when clean; waived only when gentle-shell YOLO is active for this live session AND the checkout is proven clean — a dirty checkout and an unreadable summary both keep asking. A refusal keeps checkout and entry, and `force` still comes only from the caller | `removed: <name> · <branch>` / `branch kept` (`branch deleted` when the branch went with it), plus `session warped to principal` when a live session was warped out first, plus `herdr workspace step skipped (…)` when the Herdr workspace step was skipped (see the close sequence) |
 | `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `opened: <worktree> · <session-id>` / `path: <path>` (`resumed` instead of the path line when an existing session is resumed) |
@@ -140,11 +140,14 @@ worktree list: <name> <branch> thread=<thread> issues=<n,n> missing
 worktree list: <name> <branch> unregistered        # only with all: true
 ```
 
-Every agent row carries the checkout's odd document (`odd=` suffix, only
-when the checkout holds any): the stored names plus whatever `odd/*.md`
-the worktree holds right now, auto-detected from inside that worktree —
-no manual bookkeeping. `details.worktrees[].odd` carries the same array,
-alongside the absolute checkout `path` every row keeps.
+Every agent row carries the checkout's odd documents (`odd=` suffix, only
+when the checkout holds any): the ONE associated document first, then
+whatever `odd/*.md` the worktree holds right now, auto-detected from
+inside that worktree — no manual bookkeeping. This is a LISTING of what
+the checkout offers, never the entity's field: the row itself holds at
+most one document (see *One odd document per worktree*). The listing
+carries the same list in `details.worktrees[].odd`, alongside the
+absolute checkout `path` every row keeps.
 
 The FIRST column is the NAME (S24): the flattened branch slug
 (`feat/worktree-warp` → `feat-worktree-warp`), or `principal` for the
@@ -224,9 +227,40 @@ git still records cannot reappear as `unregistered` on the next call, and
 'pi-worktrees.json'` in `lib/worktree-registry.js`, resolved through `git
 rev-parse --git-common-dir`). That is inside `.git`: it never lives in a
 working tree, is never committed, and is shared by every checkout of the
-repository. Entries carry `{branch, path, thread, issues[], odd[], updatedAt}`
+repository. Entries carry `{branch, path, thread, issues[], odd, updatedAt}`
 and an optional creation timestamp `createdAt` or discovery timestamp
 `registeredAt`. Discovery time is not checkout creation time.
+
+### One odd document per worktree
+
+`odd` is ONE odd document path (`odd/tasks/<file>`, exactly as the capture
+records it) or `null` when the worktree has none — never a list. This is
+an invariant of the stored entity, not a UI convention: a worktree is a
+checkout for one ODD document at a time, so changing the work means
+changing *which* document is associated, not adding a second one. The
+registry enforces it on every read and every write, so no caller — agent
+tool, edit surface, command or capture hook — can reintroduce a second
+association, and every consumer inherits the rule instead of
+re-implementing it.
+
+* **Reads** normalize `odd` through `normalizeOddDoc` and never fail on an
+  older row.
+* **Writes** store the single value. `addOddDoc` is a *select*: associating
+  another document REPLACES the stored one and its result names it in
+  `replaced`, so an association that changed is reportable instead of
+  vanishing. `updateWorktree` accepts a path, `null` (clear) or an omitted
+  field (leave untouched), and `upsertWorktree` keeps the stored value when
+  the incoming entry says nothing about `odd`.
+* **Migration (S8b)**: a row written by an older version may still carry
+  the old `odd[]` array. It normalizes deterministically to its FIRST
+  entry, and the write that collapses it reports the entries left behind
+  once, as `dropped: [...]` in the write result — a stored association
+  never disappears silently, and later writes report nothing because the
+  file already holds a single document.
+* **The agent tool** accepts one `odd` path and REFUSES a list with a clear
+  error (`odd accepts ONE document, not a list`), before any checkout or
+  registry write.
+* **Capture** (below) associates a document only while the row has none.
 
 Discovery registers the canonical principal once and places its row first.
 Repeated discovery preserves its associations and leaves unchanged registry
@@ -440,10 +474,11 @@ create-or-update on the same branch: when the branch owns no live
 checkout the worktree is created in that sibling layout; when it already
 owns a live checkout and the caller supplied `issues` and/or `odd`, the
 stored values are updated instead — a supplied `issues` (including `[]`)
-and a supplied `odd` (including an empty value) REPLACE what was stored,
-while an omitted field stays untouched, so removal and replacement are
-the same operation and an update never wipes data the caller did not
-mention. Updates report `updated: <name> · <branch>` with
+and a supplied `odd` (a path, or `null`/`""` to clear it) REPLACE what was
+stored, while an omitted field stays untouched, so removal and replacement
+are the same operation and an update never wipes data the caller did not
+mention. `odd` names ONE document: a list is refused here rather than
+reduced to its first entry. Updates report `updated: <name> · <branch>` with
 `{created: false, updated: true}` and never destroy the branch, the path,
 or unsupplied values. The principal checkout is editable the same way
 (its record is created on demand) but is never created by this tool and
@@ -559,7 +594,11 @@ from the caller's checkout.
 
 ## Mode switch (`/herdr-gentle:customize` — `Worktree tools` rows)
 
-`Enabled` / `Disabled` in the customize panel flip the shared mode file (the old `/herdr-gentle:worktree enabled|disabled|status` command is removed; `customize status` is its read-only replacement and writes nothing). Writing the mode refuses a symlinked or
+`Enabled` / `Disabled` in the customize panel flip the shared mode file. The old
+`/herdr-gentle:worktree enabled|disabled|status` verbs are removed;
+`customize status` replaces their status read. `/herdr-gentle:worktree` now opens
+the current checkout's fullscreen detail and never changes the mode.
+Writing the mode refuses a symlinked or
 non-regular mode path with a clear error and touches nothing (the normal
 path stays atomic: a sibling temp file created exclusively with an
 unpredictable suffix and renamed into place, retrying a new name a
@@ -576,10 +615,10 @@ sidebar's. Missing means **enabled**; malformed never enables.
 
 Gating is two-level: at load, the tools and `/herdr-gentle:warp` register
 only when the mode reads enabled. Customize stays registered so the mode can
-be flipped back. ODD and Issues stay available for reading, but their
-worktree-assignment controls and shortcuts are hidden and disabled while the
-mode is disabled or malformed; their save callbacks re-read the mode before
-writing. At execution, each worktree tool re-reads the mode and fails with
+be flipped back. ODD and Issues are always read-only with respect to worktree
+associations. The current-worktree detail stays discoverable for reading;
+its association save re-reads the mode and refuses while disabled or malformed.
+At execution, each worktree tool re-reads the mode and fails with
 `worktree tools are disabled; open /herdr-gentle:customize and apply the
 Worktree tools Enabled row to enable them` when disabled. One switch covers
 all five tools — create, list, close, warp, and session open share the same gate
@@ -737,7 +776,9 @@ every checkout of the project, with an always-active filter (`T` or `/`
 opens it empty, any other printable opens it with that character, and once
 open every printable — space included — is text), pagination with
 `pgUp`/`pgDn`, and `esc` to step back to the panel. Both data lines are
-honest: branch, the registry's assigned issues and odd documents, the
+honest: branch, the registry's assigned issues and its one odd document
+(the `odd` count is therefore 0 or 1 — see *One odd document per
+worktree*), the
 change size as LINE counts (`changes +A −D` — the tracked diff plus the
 lines each untracked file adds), the commits ahead/behind `main` and both
 ages (`created <age> · modified <age>`). Creation uses an actual recorded
@@ -766,8 +807,13 @@ opens in editing mode with the type and the name FROZEN — it renders the
 checkout's own branch and path verbatim, never a re-derived one — and the
 Issues and Odd panes open with the checkout's currently assigned values
 pre-selected. `tab`, `space`, the filters, the paging and the previews
-belong to this editing mode (the create surface has none of them);
-`enter`/`ctrl+s` persists BOTH assigned fields in
+belong to this editing mode (the create surface has none of them). The Odd
+pane is a SELECT, not a multi-toggle: `space` marks the focused document as
+the active one and REPLACES whatever was marked before, marking the active
+document again clears the association, and two documents can never be
+marked at once (`selected: <n> odd` is therefore always 0 or 1). The
+issues pane keeps its toggle, because a worktree may carry several
+issues; `enter`/`ctrl+s` persists BOTH assigned fields in
 ONE registry write through the same guarded saver the odd and issues
 viewers use (a created row takes the checkout's real branch and thread, a
 refusal writes nothing), and `esc` cancels with nothing written. The
@@ -1050,17 +1096,23 @@ INACTIVE while the session runs in the principal checkout (S30): no odd
 is detected for or assigned there, so the many documents created in the
 root checkout never pile up — detection stays active inside agent
 worktrees. A call running in the principal checkout itself
-associates nothing; associations are idempotent (`addOddDoc` records each
-`odd/<rel>` once, same relative name from every worktree).
+associates nothing. A worktree carries ONE odd document (S8), so the
+capture only associates while the row has none: the first document it
+observes (per call) or finds (re-scan) becomes the association, later
+documents are ignored, and an existing association is never replaced —
+switching the active document is an explicit act in the edit panel's
+select, and replacing it here would drop a stored association silently.
+Associating the same document again is idempotent.
 
 `bash` commands touching `odd/` are not reliably parseable (arbitrary
 shell text, redirections, quoting), so the per-call capture is
 complemented by a bounded re-scan of the worktree's own `odd/` directory
 (`.md` only, at most 500 files, depth 10, 5000 entries) on **every**
 pipeline event — including `bash` calls, which skip the per-call leg
-entirely and still converge through the scan. The hook never throws and
-never blocks the pipeline: any failure is swallowed after a best-effort
-attempt.
+entirely and still converge through the scan. The scan is subject to the
+same one-document rule: it can fill an empty association, never replace
+one. The hook never throws and never blocks the pipeline: any failure is
+swallowed after a best-effort attempt.
 
 ## Automatic session naming
 

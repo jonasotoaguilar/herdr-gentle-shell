@@ -134,7 +134,7 @@ function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
 }
 
-function addRegistered(root, branch, { thread = 'thread-1', issues = [], odd = [] } = {}) {
+function addRegistered(root, branch, { thread = 'thread-1', issues = [], odd = null } = {}) {
   const slug = branch.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree';
   const target = path.join(path.dirname(root), `${path.basename(root)}-ou-${slug}`);
   try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
@@ -198,8 +198,36 @@ describe('T19/S26: create accepts an optional validated odd path', { concurrency
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const entry = require('../lib/worktree-registry.js').findByBranch(root, 'feat/with-odd');
       assert.ok(entry, 'registered');
-      assert.ok(Array.isArray(entry.odd) && entry.odd.length > 0, `odd stored: ${JSON.stringify(entry)}`);
+      assert.equal(typeof entry.odd, 'string', `one odd document is stored, never a list: ${JSON.stringify(entry.odd)}`);
+      assert.ok(entry.odd.endsWith('odd-doc.md'), `the stored document names the supplied file: ${JSON.stringify(entry.odd)}`);
       assert.ok(path.isAbsolute(result.details.path), 'create output keeps the checkout path');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a LIST of odd files is refused instead of silently taking one', async () => {
+    const root = makeRepo('create-odd-list');
+    setEnv(stdEnv());
+    try {
+      const first = path.join(root, 'first-odd.md');
+      const second = path.join(root, 'second-odd.md');
+      fs.writeFileSync(first, '# first\n');
+      fs.writeFileSync(second, '# second\n');
+      const { tools } = await loadExtension();
+      for (const odd of [[first], [first, second]]) {
+        const result = await tools.get('worktree_upsert').execute(
+          'c1', { branch: 'feat/list-odd', odd }, undefined, undefined, makeCtx(root, 'thread-odd-list'),
+        );
+        assert.equal(result.isError, true, `a list of ${odd.length} document(s) is refused`);
+        assert.match(resultText(result), /one document/i, `the refusal says ONE document: ${resultText(result)}`);
+        assert.match(resultText(result), /list/i, `the refusal names the list: ${resultText(result)}`);
+      }
+      assert.equal(
+        require('../lib/worktree-registry.js').findByBranch(root, 'feat/list-odd'),
+        null,
+        'a refused list writes no row',
+      );
     } finally {
       restoreEnv();
     }
@@ -238,7 +266,7 @@ describe('T19/S27+S31: create updates an existing worktree instead of duplicatin
       const realTarget = fs.realpathSync(target);
       const registryLib = require('../lib/worktree-registry.js');
       assert.equal(registryLib.upsertWorktree(root, {
-        branch, path: realTarget, thread: 'thread-upd', issues: [1], odd: [],
+        branch, path: realTarget, thread: 'thread-upd', issues: [1], odd: null,
       }).ok, true);
       const doc = path.join(root, 'upd-odd.md');
       fs.writeFileSync(doc, '# u\n');
@@ -253,7 +281,7 @@ describe('T19/S27+S31: create updates an existing worktree instead of duplicatin
       assert.equal(first.details.path, realTarget, 'the checkout path is reported');
       let entry = registryLib.findByBranch(root, branch);
       assert.deepEqual(entry.issues, [1], 'omitted issues untouched');
-      assert.ok(entry.odd.length > 0, 'supplied odd stored');
+      assert.equal(typeof entry.odd, 'string', `supplied odd stored as ONE document: ${JSON.stringify(entry.odd)}`);
       assert.equal(entry.path, realTarget, 'the path is never rewritten');
       // Supply empty issues: removal is the same operation as replacement.
       const second = await tools.get('worktree_upsert').execute(
@@ -262,7 +290,7 @@ describe('T19/S27+S31: create updates an existing worktree instead of duplicatin
       assert.equal(second.isError, undefined, `empty update succeeds, got: ${resultText(second)}`);
       entry = registryLib.findByBranch(root, branch);
       assert.deepEqual(entry.issues, [], 'empty issues removes');
-      assert.ok(entry.odd.length > 0, 'omitted odd untouched');
+      assert.equal(typeof entry.odd, 'string', 'omitted odd untouched');
     } finally {
       restoreEnv();
     }
@@ -366,7 +394,7 @@ describe('T22/S30: the odd detector is inactive in the principal checkout', { co
         assert.equal(value, undefined, 'the handler never blocks the pipeline');
       }
       const entry = require('../lib/worktree-registry.js').findByBranch(root, 'feat/det');
-      assert.deepEqual(entry.odd, [], 'no detection and no assignment from the principal session');
+      assert.equal(entry.odd, null, 'no detection and no assignment from the principal session');
       // The same event inside the worktree still captures.
       for (const handler of calls) {
         await handler(
@@ -375,7 +403,7 @@ describe('T22/S30: the odd detector is inactive in the principal checkout', { co
         );
       }
       const after = require('../lib/worktree-registry.js').findByBranch(root, 'feat/det');
-      assert.ok(after.odd.length > 0, 'detection stays active inside agent worktrees');
+      assert.equal(typeof after.odd, 'string', 'detection stays active inside agent worktrees');
     } finally {
       restoreEnv();
     }

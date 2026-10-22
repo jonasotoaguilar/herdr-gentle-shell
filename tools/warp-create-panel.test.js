@@ -334,7 +334,7 @@ describe('S6: creation asks for the type and the name, nothing else', { concurre
     const { view, finished } = openPanel({
       initialName: 'new-change',
       initialIssues: [12],
-      initialOdd: ['/odd/alpha.md'],
+      initialOdd: '/odd/alpha.md',
     });
     view.handleInput('\x13');
     assert.equal(finished.length, 1);
@@ -482,7 +482,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
       branch: 'feat/odd-viewer',
       path: checkout,
       initialIssues: [12],
-      initialOdd: ['/odd/alpha.md'],
+      initialOdd: '/odd/alpha.md',
     });
     const lines = boxLines(view, 100, 24);
     const text = allText(lines);
@@ -499,7 +499,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     focusOdd(view);
     assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/, 'the assigned odd document is pre-selected');
     assert.deepEqual(view.state.selectedIssues, [12]);
-    assert.deepEqual(view.state.selectedOdd, ['/odd/alpha.md']);
+    assert.equal(view.state.selectedOdd, '/odd/alpha.md');
   });
 
   test('a checkout whose branch is not conventional renders it without inventing a type', () => {
@@ -542,7 +542,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     });
     assert.equal(view.state.message, '', 'editing shows no refusal');
     view.handleInput('\x13');
-    assert.deepEqual(finished, [{ ok: true, mode: 'edit', type: null, name: 'main', issues: [], odd: [] }]);
+    assert.deepEqual(finished, [{ ok: true, mode: 'edit', type: null, name: 'main', issues: [], odd: null }]);
   });
 
   test('freezing ignores printable input, backspace and the ←/→ cycle', () => {
@@ -580,7 +580,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
   });
 
   test('the edit header carries the checkout summary and the preselected association counts', () => {
-    const { view } = editPanel({ initialIssues: [12], initialOdd: ['/odd/alpha.md'] });
+    const { view } = editPanel({ initialIssues: [12], initialOdd: '/odd/alpha.md' });
     let lines = boxLines(view, 100, 24);
     let text = allText(lines);
     findLine(lines, 'checkout branch: feat/old-change');
@@ -593,12 +593,12 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
   });
 
   test('an empty pre-selection stays empty and saving carries the empty sets', () => {
-    const { view, finished } = editPanel({ initialIssues: [], initialOdd: [] });
+    const { view, finished } = editPanel({ initialIssues: [], initialOdd: null });
     assert.deepEqual(view.state.selectedIssues, []);
-    assert.deepEqual(view.state.selectedOdd, []);
+    assert.equal(view.state.selectedOdd, null);
     assert.ok(!allText(boxLines(view, 100, 24)).includes('[x]'));
     view.handleInput('\x13');
-    assert.deepEqual(finished, [{ ok: true, mode: 'edit', type: 'feat', name: 'old-change', issues: [], odd: [] }]);
+    assert.deepEqual(finished, [{ ok: true, mode: 'edit', type: 'feat', name: 'old-change', issues: [], odd: null }]);
   });
 
   test('a pre-selected row outside the visible page stays selected and toggling changes the saved sets', () => {
@@ -611,7 +611,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
       pageSize: 1,
       fetchIssues: () => ({ ok: true, issues }),
       initialIssues: [3],
-      initialOdd: ['/odd/beta.md'],
+      initialOdd: '/odd/beta.md',
     });
     assert.deepEqual(view.state.selectedIssues, [3]);
     const text = allText(boxLines(view, 100, 24));
@@ -623,17 +623,48 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.match(allText(boxLines(view, 100, 24)), /\[x\] #12 Crash on empty/);
     view.handleInput('\x13');
     assert.deepEqual(finished, [{
-      ok: true, mode: 'edit', type: 'feat', name: 'old-change', issues: [3, 12], odd: ['/odd/beta.md'],
+      ok: true, mode: 'edit', type: 'feat', name: 'old-change', issues: [3, 12], odd: '/odd/beta.md',
     }]);
   });
 
   test('a stored odd assignment named by its relative path still marks its document', () => {
-    const { view, finished } = editPanel({ initialOdd: ['odd/tasks/alpha.md'] });
-    assert.deepEqual(view.state.selectedOdd, ['odd/tasks/alpha.md'], 'the caller value is preserved');
+    const { view, finished } = editPanel({ initialOdd: 'odd/tasks/alpha.md' });
+    assert.equal(view.state.selectedOdd, 'odd/tasks/alpha.md', 'the caller value is preserved');
     focusOdd(view);
     assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/);
     view.handleInput('\x13');
-    assert.deepEqual(finished[0].odd, ['odd/tasks/alpha.md']);
+    assert.equal(finished[0].odd, 'odd/tasks/alpha.md');
+  });
+
+  test('the Odd control is a SINGLE SELECT: choosing another document replaces the active one', () => {
+    const { view, finished } = editPanel({ initialOdd: '/odd/alpha.md' });
+    focusOdd(view);
+    const text = allText(boxLines(view, 100, 24));
+    assert.match(text, /\[x\] alpha/, 'the active document is marked');
+    assert.match(text, /\[ \] beta/, 'the other one is not');
+
+    view.handleInput('\x1b[B'); // second document
+    view.handleInput(' '); // choose it
+    assert.equal(view.state.selectedOdd, '/odd/beta.md', 'choosing REPLACES the active document');
+    const after = allText(boxLines(view, 100, 24));
+    assert.match(after, /\[ \] alpha/, 'the previous document is no longer selected');
+    assert.match(after, /\[x\] beta/, 'and the chosen one is');
+    assert.equal(after.split('[x]').length - 1, 1, `exactly one document can be selected\n${after}`);
+    assert.match(after, /selected: 0 issues · 1 odd/, 'the header counts one document, never two');
+
+    view.handleInput('\x13');
+    assert.equal(finished[0].odd, '/odd/beta.md', 'the saved payload carries the single choice');
+    assert.equal(Array.isArray(finished[0].odd), false, 'the payload never carries a list');
+  });
+
+  test('choosing the active document again clears the association (never a second one)', () => {
+    const { view, finished } = editPanel({ initialOdd: '/odd/alpha.md' });
+    focusOdd(view);
+    view.handleInput(' '); // the already-selected document
+    assert.equal(view.state.selectedOdd, null, 'the association is cleared, nothing is duplicated');
+    assert.ok(!allText(boxLines(view, 100, 24)).includes('[x]'), 'no document stays marked');
+    view.handleInput('\x13');
+    assert.equal(finished[0].odd, null, 'the saved payload carries no association');
   });
 
   test('enter on the last field saves the edit with the mode marker', () => {
@@ -641,7 +672,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
       initialType: 'fix',
       branch: 'fix/old-change',
       initialIssues: [12],
-      initialOdd: ['/odd/alpha.md'],
+      initialOdd: '/odd/alpha.md',
     });
     view.handleInput('\t'); // issues
     view.handleInput(' '); // toggle #12 off
@@ -649,7 +680,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.equal(view.state.focus, 'odd');
     view.handleInput('enter'); // last field -> save
     assert.deepEqual(finished, [{
-      ok: true, mode: 'edit', type: 'fix', name: 'old-change', issues: [], odd: ['/odd/alpha.md'],
+      ok: true, mode: 'edit', type: 'fix', name: 'old-change', issues: [], odd: '/odd/alpha.md',
     }]);
   });
 
