@@ -190,21 +190,21 @@ quizas revisarlo y si es eso agregar variante para linux".
 
 ## Tasks
 
-T1 — S1. Reproduce and fix the `/herdr-gentle:issues` failure. Commit: see Log.
-T2 — S2. One-row key legends in customize, odd, issues and warp. Commit: see Log.
-T3 — S3/S4. Warp as a bottom panel with the S4 layout. Commit: see Log.
-T4 — S5. `view all` list with always-active search. Commit: see Log.
-T5 — S6. Create by `c` hotkey with type + name steps only. Commit: see Log.
-T6 — S7/S7a/S7b. Full-screen worktree detail with issues/odd tabs. Commit: see Log.
-T7 — S7c/S7d/S10. Open-issues cache, assignment revalidation, open-only listing. Commit: see Log.
-T8 — S8/S8a. Single ODD association in the registry, the select, and `worktree_upsert`. Commit: see Log.
-T9 — S9/S12. Listing order and relative created/modified. Commit: see Log.
-T10 — S11. `/herdr-gentle:worktree` command. Commit: see Log.
-T11 — S13. Odd/issues duplicated-data cleanup. Commit: see Log.
-T12 — S14. Full suite and docs.
-T14 — S16/S16a. Performance trace option and log.
-T13 — S15. Preview scrolling works with `ctrl+j`/`ctrl+k` plus a platform
-variant. Commit: see Log.
+T1 — S1 | checking | b9e4f0a | Eager issues registration and command tests pass; original live symptom not reproduced.
+T2 — S2 | done | 4d9c643, 1c56f6c | One-row legends, verified across view suites.
+T3 — S3/S4 | done | f9f738a | Bottom warp panel and bounded rows.
+T4 — S5 | done | f9f738a | Extended list keeps always-active search and existing paging.
+T5 — S6 | done | e8b9345 | Creation asks type/name, no association panes.
+T6 — S7/S7a/S7b | checking | fb2245d, b9e4f0a | Shared fullscreen component and reachable commands pass integration tests; PTY smoke did not confirm detail tabs.
+T7 — S7c/S7d/S10 | checking | 6144216, b9e4f0a | Complete prime, margin refresh and guarded revalidation; independent integration audit pending.
+T8 — S8/S8a/S8b | checking | 16af9f1, b9e4f0a | Entity string/null migration verified; visible dropped reporting added in integration, audit pending.
+T9 — S9/S12 | checking | b11ffe0, b9e4f0a | Ordered listing and provenance-based times pass focused/integration suites; live detail rendering not confirmed.
+T10 — S11 | checking | b9e4f0a | Current-worktree command shares fullscreen detail; command integration green, live PTY inconclusive.
+T11 — S13 | done | 1c56f6c | Duplicate chrome removed, 158 viewer/command tests passed.
+T12 — S14 | checking | b9e4f0a | Full isolated suite 1858/1858 passed; final independent audit and real TUI proof pending.
+T13 — S15 | done | 99af4b9 | Scroll variants and preserved lowercase list navigation verified.
+T14 — S16/S16a | done | 7b29997, 62961a5, 74aa451, 413f6b5, b9e4f0a | Trace UI/events, bounded writer and honest support evidence; 115 focused tests passed.
+T15 — S24 | checking | 3253821, b9e4f0a | Panel delete wired to existing guards/confirmation; integration tests green, live smoke pending.
 
 ## Delivery
 
@@ -350,3 +350,30 @@ is exactly the drift S8 avoids for ODD, so S24b converges on ONE: the string for
 `canDelete(path)` option is the single deletability authority; the extension must
 pass `warpDeletableAt`-equivalent logic through it instead of re-deciding.
 
+
+
+L13. Recovery and verification evidence. The oversized integration worker was
+canceled after the user reported a stall. Its uncommitted changes were preserved,
+then inspected and corrected. A recovered full run found 1850 pass / 8 fail.
+Four expectations still required the removed mode-command absence, one omitted
+the new detail trace kind, and the listing incorrectly promoted every
+unregistered checkout rather than only the current one. The other two failures
+were host effects already reproduced on main: Spanish Git diagnostic text and a
+global ignore rule for .env.local. With LC_ALL=C, GIT_CONFIG_GLOBAL=/dev/null and
+GIT_CONFIG_SYSTEM=/dev/null, the full suite passed 1858/1858 (exit 0).
+
+L14. Actual TUI smoke limitation. A real Pi PTY session in an isolated temporary
+Git repository loaded the extension without a detected load error and produced
+warp output. It did NOT confirm the expected Issues/ODD tabs after invoking
+/herdr-gentle:worktree (detail_tabs=false), so the smoke command exited 1. Raw
+terminal output was not retained by that probe. This is missing functional
+proof, not a passed check or a confirmed cause. LSP checks also could not confirm
+clean status: the 9190-line extension exceeded the 5000-line diagnostic limit,
+and the two JS checks were inconclusive. The deterministic 1858-test pass does
+not replace those unavailable/inconclusive checks.
+
+L15. Local commits after recovery: fb2245d (pure detail component), 413f6b5
+(performance controls/events), 16af9f1 (single-ODD entity), b11ffe0 (checkout times),
+b9e4f0a (reachable commands, cache, revalidation, delete and ordering). No push,
+PR, merge or release was performed. Independent integration verifier
+mvitd0mj-2-tdrg is still running; no final readiness claim is made.
