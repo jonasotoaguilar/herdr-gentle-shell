@@ -137,6 +137,18 @@ function issueNumbers(text) {
   return [...String(text).matchAll(/#(\d+)/g)].map((match) => Number(match[1]));
 }
 
+// S3: the left list carries the checkbox and the title, never the number, so a
+// wrapped title is read as rows of `[ ] title` (continuations do not match).
+function listRows(rendered) {
+  return leftOf(rendered).split('\n')
+    .map((row) => {
+      const match = row.match(/\[([ x])\]\s(.*?)\s*$/);
+      return match ? { assigned: match[1] === 'x', title: match[2] } : null;
+    })
+    .filter(Boolean);
+}
+const listTitles = (rendered) => listRows(rendered).map((row) => row.title);
+
 function assertExactFrame(rendered, width, rows) {
   assert.equal(rendered.length, rows, `expected ${rows} rows, got ${rendered.length}`);
   for (const line of rendered) {
@@ -236,10 +248,20 @@ describe('issues tab listing', () => {
       issues: [issue(2), issue(9, { state: 'closed' }), issue(5), issue(12), issue(7)],
       assignedIssues: [5, 9],
     });
-    const left = leftOf(lines(view));
-    assert.deepEqual(issueNumbers(left), [5, 12, 7, 2]);
-    assert.doesNotMatch(strip(lines(view).join('\n')), /#9\b/);
-    assert.match(strip(lines(view).join('\n')), /Issues \(4\)/);
+    const rendered = lines(view);
+    const left = leftOf(rendered);
+    assert.deepEqual(listTitles(rendered), [
+      'issue title 5',
+      'issue title 12',
+      'issue title 7',
+      'issue title 2',
+    ], 'assigned first, then descending number');
+    assert.deepEqual(listRows(rendered).map((row) => row.assigned), [true, false, false, false]);
+    assert.doesNotMatch(left, /#/, 'S3: the left list carries no issue number');
+    const body = strip(rendered.join('\n'));
+    assert.doesNotMatch(body, /#9\b/);
+    assert.match(body, /Issues \(4\)/);
+    assert.match(rightOf(rendered), /#5/, 'the preview still names the number');
     // S7d: an assigned issue that is closed is dropped from the selection.
     assert.deepEqual(view.state.issues, [5]);
   });
@@ -251,19 +273,23 @@ describe('issues tab listing', () => {
       assignedIssues: [],
       save,
     });
-    assert.deepEqual(issueNumbers(leftOf(lines(view))), [11, 8, 3]);
+    assert.deepEqual(listTitles(lines(view)), ['issue title 11', 'issue title 8', 'issue title 3']);
 
     view.handleInput('down');
     view.handleInput('down');
     view.handleInput('space');
-    let left = leftOf(lines(view));
-    assert.deepEqual(issueNumbers(left), [3, 11, 8], 'the assigned issue moves to the front');
-    assert.match(left, /▸ \[x\] #3/);
+    let rendered = lines(view);
+    assert.deepEqual(listTitles(rendered), [
+      'issue title 3',
+      'issue title 11',
+      'issue title 8',
+    ], 'the assigned issue moves to the front');
+    assert.match(leftOf(rendered), /▸ \[x\] issue title 3/);
 
     view.handleInput('down');
     view.handleInput('space');
-    left = leftOf(lines(view));
-    assert.deepEqual(issueNumbers(left), [11, 3, 8]);
+    rendered = lines(view);
+    assert.deepEqual(listTitles(rendered), ['issue title 11', 'issue title 3', 'issue title 8']);
     assert.deepEqual(view.state.issues.slice().sort((a, b) => a - b), [3, 11]);
 
     view.handleInput('ctrl+s');
@@ -274,7 +300,7 @@ describe('issues tab listing', () => {
     const { view } = makeView({ issues: [issue(4)], assignedIssues: [4] });
     view.handleInput('space');
     assert.deepEqual(view.state.issues, []);
-    assert.match(leftOf(lines(view)), /▸ \[ \] #4/);
+    assert.match(leftOf(lines(view)), /▸ \[ \] issue title 4/);
   });
 
   test('preview shows the focused issue while j/k move the list', () => {
@@ -287,7 +313,8 @@ describe('issues tab listing', () => {
     view.handleInput('j');
     right = rightOf(lines(view));
     assert.match(right, /#7 issue title 7/);
-    assert.match(leftOf(lines(view)), /#12/);
+    assert.match(leftOf(lines(view)), /issue title 12/);
+    assert.doesNotMatch(leftOf(lines(view)), /#/, 'the number stays in the preview only');
   });
 });
 
@@ -453,7 +480,7 @@ describe('saving', () => {
     const body = strip(lines(view).join('\n'));
     assert.match(body, /save failed: registry locked/);
     assert.deepEqual(view.state.issues, [9], 'nothing is rolled back or dropped');
-    assert.match(leftOf(lines(view)), /\[x\] #9/);
+    assert.match(leftOf(lines(view)), /\[x\] issue title 9/);
     assert.match(body, /unsaved/);
 
     view.handleInput('ctrl+s');
@@ -545,7 +572,7 @@ describe('closing, empty, loading and error states', () => {
     view.handleInput('2');
     assert.match(strip(lines(view).join('\n')), /› 12█/);
     view.handleInput('enter');
-    assert.deepEqual(issueNumbers(leftOf(lines(view))), [12]);
+    assert.deepEqual(listTitles(lines(view)), ['issue title 12']);
 
     view.handleInput('tab');
     const left = leftOf(lines(view));
@@ -573,23 +600,259 @@ describe('footer legend', () => {
     }
   });
 
-  test('compacts to the short form when the full legend does not fit', () => {
+  test('compacts to one row keeping the spelled distinctions when the full legend does not fit', () => {
     const { view } = makeView({ issues: [issue(12)] });
+    // 40 columns leave 36 inner cells: the spelled `tab Issues/ODD` and
+    // `←/→ page` pair (plus esc) is what must survive, because that pair is the
+    // reported confusion. 36 cells cannot also hold space and ctrl+s.
     const footer = strip(view.render(40)[22]);
-    assert.match(footer, /space/);
-    assert.match(footer, /ctrl\+s/);
-    assert.doesNotMatch(footer, /scroll/);
+    assert.match(footer, /tab Issues\/ODD/, 'the Tab distinction replaces the bare `tab` token');
+    assert.match(footer, /←\/→ page/, 'the paging distinction replaces the bare `←/→` token');
+    assert.match(footer, /esc/, 'the close key survives compaction');
+    assert.doesNotMatch(footer, /move|assign|search|scroll|refresh|save/, 'the verbose hints gave way');
+
+    // The full legend still fits the common wide terminal, verbs included.
     const wide = strip(view.render(120)[22]);
     assert.match(wide, /space assign/);
     assert.match(wide, /T search/);
     assert.match(wide, /ctrl\+j\/k scroll/);
+    assert.match(wide, /ctrl\+s save/);
+    assert.match(wide, /tab Issues\/ODD/);
+    assert.match(wide, /←\/→ page/);
   });
 });
 
 describe('purity', () => {
-  test('requires nothing but the odd markdown renderer', () => {
+  test('requires only the pure odd renderer and the shared layout helper', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'worktree-detail-view.js'), 'utf8');
     const requires = [...source.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((match) => match[1]);
-    assert.deepEqual(requires, ['./odd-markdown.js'], 'no filesystem, network or registry dependency');
+    assert.deepEqual(requires, ['./odd-markdown.js', './view-layout.js'], 'no filesystem, network or registry dependency');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worktree-ui-feedback T2/T5: S1 (real host input), S3 (shared expanded left
+// panel and full wrapped titles), S10 (`r` refreshes the preview), S11 (Tab
+// switches tabs, ←/→ page the active list, three header data rows) and S15
+// (concise facts only).
+// ---------------------------------------------------------------------------
+describe('worktree detail feedback round (S1,S3,S10,S11,S15,D3)', () => {
+  const manyIssues = (count) => Array.from({ length: count }, (_unused, at) => issue(100 - at));
+  const manyDocs = (count) => Array.from({ length: count }, (_unused, at) => document(`doc-${String(at + 1).padStart(2, '0')}`, { text: 'body\n' }));
+
+  test('S3: the left panel takes about half the inner width at every normal size', () => {
+    const { view } = makeView({ issues: [issue(12)], documents: [document('alpha')] });
+    for (const width of [80, 120, 200]) {
+      const rendered = lines(view, width);
+      const plain = strip(rendered[8]);
+      const dividerAt = plain.indexOf('│', 1);
+      const leftPane = dividerAt - 2;
+      const inner = width - 4;
+      assert.ok(Math.abs(leftPane - inner / 2) <= 3, `${width}: left pane ${leftPane} is about half of ${inner}`);
+      assert.ok(leftPane > 36, `${width}: the removed 34/36 cap no longer applies, got ${leftPane}`);
+    }
+  });
+
+  test('S3: a long issue title wraps over the rows it needs, never truncated, and carries no number', () => {
+    const title = 'a very long issue title that needs to wrap inside the left panel';
+    const { view } = makeView({ issues: [issue(77, { title })], loadIssue: (n) => ({ ok: true, issue: issue(n, { title }) }) });
+    const rendered = lines(view, 100);
+    const left = leftOf(rendered).replace(/[│▸ ]/g, ' ').replace(/\s+/g, ' ');
+    assert.ok(!leftOf(rendered).includes('…'), 'no ellipsis truncation in the list');
+    assert.ok(left.includes('wrap inside'), 'the middle of the title survives');
+    assert.ok(left.includes('left panel'), 'the end of the title survives');
+    assert.ok(!leftOf(rendered).includes('#77'), 'the issue number is not on the left');
+    assert.match(rightOf(rendered), /#77/, 'the preview still names the number');
+  });
+
+  test('S11: the footer spells Tab and the paging arrows apart', () => {
+    const { view } = makeView({ issues: manyIssues(3), documents: [document('alpha')] });
+    const footer = strip(lines(view, 120)[22]);
+    assert.match(footer, /tab Issues\/ODD/, 'the footer names what Tab does');
+    assert.match(footer, /←\/→ page/, 'the footer names what the arrows do');
+  });
+
+  test('S11/D3: Tab never pages; ←/→ page the active list and never switch tabs', () => {
+    const { view } = makeView({ issues: manyIssues(20), documents: manyDocs(3), rows: 16 });
+    const pageOf = (rendered) => (strip(rendered.join('\n')).match(/page (\d+)\/(\d+)/) || [])[1];
+    assert.equal(view.state.tab, 'issues');
+    const first = lines(view, 100);
+    assert.equal(pageOf(first), '1');
+    view.handleInput('right');
+    assert.equal(view.state.tab, 'issues', '→ never switches tabs');
+    assert.equal(pageOf(lines(view, 100)), '2', '→ pages the active list');
+    view.handleInput('left');
+    assert.equal(pageOf(lines(view, 100)), '1', '← pages back');
+    view.handleInput('tab');
+    assert.equal(view.state.tab, 'odd', 'Tab switches the dataset');
+    const oddFirst = lines(view, 100);
+    assert.equal(oddFirst.length, 16, 'the frame still fills the rows');
+    view.handleInput('right');
+    assert.equal(view.state.tab, 'odd', '→ never switches tabs on the ODD tab either');
+    view.handleInput('shift+tab');
+    assert.equal(view.state.tab, 'issues', 'Shift+Tab switches back');
+  });
+
+  test('S3/S5: paging capacity follows the wrapped rows and the body budget, and skips no issue', () => {
+    const tall = manyIssues(12, (at) => at);
+    const longTitles = Array.from({ length: 12 }, (_unused, at) => issue(90 - at, {
+      title: `issue ${90 - at} with a title long enough to take two rows in the panel`,
+    }));
+    const { view } = makeView({ issues: longTitles, rows: 20 });
+    const counts = [];
+    for (let page = 0; page < 12; page += 1) {
+      const rendered = lines(view, 100);
+      const rows = leftOf(rendered).split('\n').filter((row) => /issue \d/.test(row));
+      counts.push(rows.length);
+      view.handleInput('right');
+    }
+    const unique = new Set(counts);
+    assert.ok(unique.size >= 1, `every page renders rows: ${[...unique]}`);
+    assert.ok(Math.max(...counts) <= 8, `a page never exceeds the body budget: ${[...counts]}`);
+    const seen = new Set();
+    const again = makeView({ issues: longTitles, rows: 20 });
+    for (let step = 0; step < longTitles.length; step += 1) {
+      // The focused LIST row, not the tab row (which also carries `▸`).
+      const focused = (leftOf(lines(again.view, 100)).split('\n').find((row) => row.includes('▸ [')) || '');
+      const number = (focused.match(/issue (\d+)/) || [])[1];
+      if (number) seen.add(number);
+      again.view.handleInput('down');
+    }
+    assert.equal(seen.size, longTitles.length, '↓ reaches every issue across page boundaries');
+    assert.ok(tall.length === 12);
+  });
+
+  test('S11: the header separates the details, the assigned ODD and the assigned numbers', () => {
+    const { view } = makeView({
+      issues: manyIssues(6),
+      assignedIssues: [97, 98, 99, 100],
+      documents: [document('alpha'), document('beta')],
+      odd: '/repo/worktrees/w1/odd/tasks/alpha.md',
+      rows: 24,
+    });
+    view.render(100);
+    const plain = strip(lines(view, 100).join('\n'));
+    const details = plain.split('\n').find((line) => /branch feat\/w1/.test(line)) || '';
+    const oddRow = plain.split('\n').find((line) => /odd /.test(line)) || '';
+    const numbersRow = plain.split('\n').find((line) => /issues /.test(line)) || '';
+    assert.match(details, /3 changes/, 'the first row carries the worktree details');
+    assert.match(oddRow, /alpha/, 'the second row names the assigned ODD');
+    assert.match(oddRow, /odd\/tasks\/alpha\.md/, 'and its path');
+    assert.match(numbersRow, /97, 98, 99, 100|97,98,99,100/, 'the third row lists the assigned numbers comma-separated');
+    assert.notEqual(details, oddRow, 'three logical rows, not one');
+    assert.notEqual(oddRow, numbersRow);
+  });
+
+  test('S11: many assigned numbers wrap onto extra rows instead of truncating, and the budget still fits', () => {
+    const numbers = Array.from({ length: 20 }, (_unused, at) => 700 + at);
+    const { view } = makeView({
+      // Real rows for every assignment: an id with no matching open issue is
+      // dropped by the initial-selection rule, so the fixture must be valid.
+      issues: numbers.map((number) => issue(number)),
+      assignedIssues: numbers,
+      documents: [document('alpha')],
+      odd: '/repo/worktrees/w1/odd/tasks/alpha.md',
+      rows: 24,
+    });
+    const rendered = lines(view, 80);
+    assertExactFrame(rendered, 80, 24);
+    const plain = strip(rendered.join('\n'));
+    for (const number of numbers) assert.ok(plain.includes(String(number)), `${number} survives the wrap`);
+    assert.match(plain, /odd alpha ─/, 'the second logical row still names the assigned ODD');
+    const numberRows = plain.split('\n')
+      .filter((line) => /^\│\s+issues /.test(line) || /^\│\s+\d+, /.test(line));
+    assert.ok(numberRows.length >= 2, `the numbers wrap onto extra rows, got ${numberRows.length}`);
+    assert.ok(!plain.includes('…'), 'nothing is truncated');
+    assert.match(plain, /tab Issues\/ODD/, 'the footer still fits below the wrapped header');
+    // The wrapped header is counted against the real height: body rows remain.
+    const listBody = listTitles(rendered);
+    assert.ok(listBody.length > 0, 'at least one list row survives the wrapped header');
+  });
+
+  test('S15: a verbose fact reason renders as a brief unavailable value', () => {
+    const { view } = makeView({
+      worktree: {
+        name: 'w',
+        path: '/repo/w',
+        branch: 'main',
+        modified: 'no activity since the checkout was created',
+      },
+      issues: [issue(4)],
+    });
+    const plain = strip(lines(view).join('\n'));
+    assert.ok(!plain.includes('no activity since the checkout was created'), 'the verbose reason never renders');
+    assert.match(plain, /modified —/, 'a brief unavailable value replaces it');
+  });
+
+  test('S10: r refetches the focused issue and the focused document with a refresh request', async () => {
+    const issueCalls = [];
+    const docCalls = [];
+    const { view } = makeView({
+      issues: [issue(12, { title: 'before refresh' })],
+      documents: [document('alpha')],
+      loadIssue: (number, opts) => {
+        issueCalls.push([number, opts]);
+        const refreshed = (opts && opts.refresh) === true;
+        return { ok: true, issue: issue(number, { title: refreshed ? 'after refresh' : 'before refresh', body: refreshed ? 'new body' : 'old body' }), comments: [] };
+      },
+      loadDocument: (id, opts) => {
+        docCalls.push([id, opts]);
+        return { ok: true, text: `# ${(opts && opts.refresh) === true ? 'fresh' : 'stale'}` };
+      },
+    });
+    view.render(100);
+    assert.match(rightOf(lines(view)), /before refresh/);
+    view.handleInput('r');
+    await tick();
+    assert.equal(issueCalls.at(-1)[1] && issueCalls.at(-1)[1].refresh, true, 'the issue read asks for fresh data');
+    assert.match(rightOf(lines(view)), /after refresh/, 'the refreshed detail replaces the cached one');
+    view.handleInput('tab');
+    await tick();
+    view.handleInput('r');
+    await tick();
+    assert.equal(docCalls.at(-1)[1] && docCalls.at(-1)[1].refresh, true, 'the document read asks for fresh data');
+    assert.match(rightOf(lines(view)), /fresh/);
+  });
+
+  test('S10: a failed refresh is visible and never claims fresh data', async () => {
+    let fail = false;
+    const { view } = makeView({
+      issues: [issue(12, { title: 'kept title' })],
+      loadIssue: (number) => (fail
+        ? { ok: false, error: 'gh timed out' }
+        : { ok: true, issue: issue(number, { title: 'kept title' }), comments: [] }),
+    });
+    view.render(100);
+    assert.match(rightOf(lines(view)), /kept title/);
+    fail = true;
+    view.handleInput('r');
+    await tick();
+    const plain = strip(lines(view).join('\n'));
+    assert.match(plain, /refresh failed: gh timed out/, 'the failure is reported');
+    assert.match(rightOf(lines(view)), /unreadable: gh timed out/, 'the stale preview is not presented as fresh');
+  });
+
+  test('S1: ctrl+j scrolls the preview through the real host matcher, where the byte is also Enter', { skip: !realHelpers }, () => {
+    const text = Array.from({ length: 60 }, (_unused, at) => `- item ${String(at + 1).padStart(2, '0')}`).join('\n');
+    const { view } = makeView({
+      rows: 16,
+      helpers: realHelpers,
+      documents: [document('alpha', { text })],
+    });
+    assert.equal(realHelpers.matchesKey('\n', 'ctrl+j'), true);
+    assert.equal(realHelpers.matchesKey('\n', 'enter'), true, 'the host also reports the byte as Enter');
+    view.handleInput('tab');
+    view.render(100);
+    view.handleInput('\n');
+    assert.ok(view.state.scroll.odd > 0, 'ctrl+j scrolls instead of being swallowed as Enter');
+    assert.equal(view.state.odd, null, 'the ambiguous byte never selected a document');
+    view.handleInput('\x1b[107;5u'); // Kitty ctrl+k press
+    assert.equal(view.state.scroll.odd, 0, 'the Kitty encoding scrolls back');
+    view.handleInput('\x0b');
+    assert.equal(view.state.scroll.odd, 0, 'the legacy control byte clamps at the top');
+    view.handleInput('\x1b[106;5:2u'); // Kitty ctrl+j repeat
+    assert.ok(view.state.scroll.odd > 0, 'a Kitty key repeat also scrolls');
+    view.handleInput('\r'); // a real Enter still selects
+    assert.equal(view.state.odd, '/repo/worktrees/w1/odd/tasks/alpha.md', 'genuine Enter still selects the document');
   });
 });

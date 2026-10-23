@@ -1058,7 +1058,22 @@ describe('T12: `e` opens the worktree detail (S7, S13)', { concurrency: false },
       assert.ok(rendered.includes(target), `the detail names the checkout path\n${rendered}`);
       assert.match(rendered, /feat-real-target/, 'the checkout name');
       assert.match(rendered, /branch feat\/real-target/, 'the REAL branch, read from git');
-      assert.match(rendered, /\[x\] #2/, 'the stored issue arrives pre-selected');
+      assert.match(rendered, /\[x\] issue title 2/, 'the stored issue arrives pre-selected');
+      assert.match(rendered, /\[ \] issue title 7/, 'the unassigned issue arrives unchecked');
+      // S3: the left rows carry the exact titles alone — the number belongs to
+      // the preview and the header — so both the order and the marks are read
+      // from the list cells, never from a private row shape.
+      const issueRows = rendered.split('\n').filter((row) => /\[[x ]\]/.test(row));
+      assert.deepEqual(
+        issueRows.map((row) => row.match(/\[[x ]\] (issue title \d+)/)[1]),
+        ['issue title 2', 'issue title 7'],
+        'the left list shows the exact titles in source order',
+      );
+      assert.ok(
+        issueRows.every((row) => !(row.split('│')[1] || '').includes('#')),
+        'S3: the issue number stays out of the left list',
+      );
+      assert.match(rendered, /issues 2/, 'the header still carries the assigned numbers');
       assert.match(oddRendered, /● w1-a/, 'the stored odd document is the active one (one, never a list)');
       assert.match(oddRendered, /○ w1-b/, 'and the other document is offered but not selected');
       assert.deepEqual(built.notes, [], 'Esc is silent');
@@ -1216,11 +1231,16 @@ describe('T12: the popup and its panes keep the SOURCE order (S15)', { concurren
       const built = wiredCtx(root, driver);
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      const order = [...rendered.matchAll(/#(\d+)/g)].map((match) => Number(match[1]));
-      const at = (number) => order.indexOf(number);
-      assert.ok(at(2) >= 0 && at(9) >= 0 && at(7) >= 0, `all three open issues render\n${rendered}`);
-      assert.ok(at(2) < at(9), `the assigned issue comes first\n${rendered}`);
-      assert.ok(at(9) < at(7), `then descending issue number\n${rendered}`);
+      const issueRows = rendered.split('\n').filter((row) => /\[[x ]\]/.test(row));
+      assert.deepEqual(
+        issueRows.map((row) => row.match(/\[[x ]\] (issue title \d+)/)[1]),
+        ['issue title 2', 'issue title 9', 'issue title 7'],
+        `assigned first, then descending number, open only\n${rendered}`,
+      );
+      assert.ok(
+        issueRows.every((row) => !(row.split('│')[1] || '').includes('#')),
+        'S3: no issue number renders in the left list',
+      );
     } finally {
       ghIssues.setGhRunner(null);
       restoreEnv();
