@@ -500,12 +500,12 @@ const lastSent = new Map(); // paneId -> JSON of last published family
 
 /* ------------------------------------------------------------ trace */
 
-// S16/S16a: optional frame trace. The writer lives in the package's lib/
-// directory one level above the plugin root (herdr-plugin/bin → ../..); a
-// plugin installed without it records nothing, and tracing never breaks a
-// frame. The flag is written by the Pi-side panel in ANOTHER process, so it is
-// re-read per frame (one stat while off) instead of cached at startup — a
-// cached-at-startup verdict would leave the feature inert until a restart.
+// S18: optional frame trace. The writer lives in the package's lib/ directory
+// one level above the plugin root (herdr-plugin/bin → ../..); a plugin
+// installed without it records nothing, and tracing never breaks a frame.
+// Activation is the GENTLE_PERF_TRACE environment variable and nothing else, so
+// this daemon reads the same shell-level switch as the extension: no flag file
+// is written, read or stat'ed here.
 let perfTraceModule;
 function perfTrace() {
   if (perfTraceModule !== undefined) return perfTraceModule;
@@ -520,7 +520,7 @@ function perfTrace() {
 function traceEnabled(trace) {
   if (!trace) return false;
   try {
-    return trace.readTraceMode(process.env).enabled === true;
+    return trace.isTraceEnabled(process.env) === true;
   } catch {
     return false;
   }
@@ -543,7 +543,7 @@ async function clearOwnedFamily(paneId) {
 }
 
 async function frame(state, opts = {}) {
-  // Off path: one flag stat, no clock read, no object built.
+  // Off path: one environment check, no clock read, no object built.
   const trace = perfTrace();
   const tracing = traceEnabled(trace);
   const started = tracing ? process.hrtime.bigint() : 0n;

@@ -442,7 +442,10 @@ assert.ok(worktreeStubbed !== worktreeSrcText, 'expected both worktree package i
 
 const LIB_DIR = path.resolve(__dirname, '../lib');
 const RESET_ROW = 'Reset every option to its default';
-const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Worktree tools', 'Performance', 'Reset'];
+// S22: the panel's categories are sidebar, moshi, worktree and reset — there is
+// no Performance section, so the reset row is reached as the fourth and last
+// category.
+const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Worktree tools', 'Reset'];
 
 async function loadWorktreeExtension() {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-reset-')));
@@ -588,7 +591,7 @@ describe('customize reset to defaults', { concurrency: false }, () => {
       const { ctx, notes, selects, reloads } = resetCtx();
       await commands.get('herdr-gentle:customize').handler('', ctx);
       assert.deepEqual(selects[1][1], [RESET_ROW]);
-      assert.deepEqual(notes, [['Nothing to reset: sidebar, moshi, worktree and performance switches already match their defaults.', 'info']]);
+      assert.deepEqual(notes, [['Nothing to reset: sidebar, moshi and worktree already match their defaults.', 'info']]);
       assert.ok(!fs.existsSync(flagPath(fix, 'gentle-sidebar-mode.json')), 'nothing to reset creates no sidebar flag');
       assert.ok(!fs.existsSync(flagPath(fix, 'gentle-moshi.json')), 'nothing to reset creates no moshi flag');
       assert.ok(!fs.existsSync(flagPath(fix, 'gentle-worktree-mode.json')), 'nothing to reset creates no worktree flag');
@@ -718,49 +721,58 @@ describe('customize reset to defaults', { concurrency: false }, () => {
     }
   });
 
-  test('the reset enumerates all four pi performance keys and returns them to OFF', async () => {
+  // The reset owns the sidebar, moshi and worktree modes and the Pi exclusions
+  // they imply. Every other line of settings.json belongs to the user or to Pi,
+  // so this package's reset must leave those bytes exactly as they are.
+  test('a settings file holding settings this package does not own is left byte-identical', async () => {
     const fix = resetFixture();
     setResetEnv(fix);
     takeSlot();
     try {
-      const keys = ['heightIndex', 'evictOffscreenLines', 'expandRecentToolOutput', 'incrementalSearchCorpus'];
-      const on = Object.fromEntries(keys.map((key) => [key, true]));
-      fs.writeFileSync(
-        path.join(fix.agentDir, 'settings.json'),
-        `${JSON.stringify({ ...on, theme: 'gentle' }, null, 2)}\n`,
-      );
+      const foreign = { theme: 'gentle', tuiMode: 'fullscreen', foreignPluginSetting: true };
+      const bytes = `${JSON.stringify(foreign, null, 2)}\n`;
+      fs.writeFileSync(path.join(fix.agentDir, 'settings.json'), bytes);
       await loadExtension();
       const { commands } = await loadWorktreeExtension();
-      const { ctx, notes, reloads } = resetCtx();
+      const { ctx, notes } = resetCtx();
       await commands.get('herdr-gentle:customize').handler('', ctx);
-      const settings = readJson(path.join(fix.agentDir, 'settings.json'));
-      for (const key of keys) {
-        assert.equal(settings[key], false, `${key} returns to its OFF default`);
-      }
-      assert.equal(settings.theme, 'gentle', 'unrelated settings survive the performance reset');
-      assert.match(notes[0][0], /^Defaults saved\./, 'the switches were something to reset, and it succeeded');
-      assert.equal(reloads.length, 1, 'changing a performance switch needs a reload and the reset performs it');
+      assert.deepEqual(
+        notes,
+        [['Nothing to reset: sidebar, moshi and worktree already match their defaults.', 'info']],
+        'the summary names only the options this package owns',
+      );
+      assert.equal(
+        fs.readFileSync(path.join(fix.agentDir, 'settings.json'), 'utf8'),
+        bytes,
+        'not a byte of the file changed',
+      );
     } finally {
       takeSlot();
       restoreEnv();
     }
   });
 
-  test('a performance switch alone is something to reset, and is named when its write fails', async () => {
+  test('a reset that does run still leaves the settings it does not own alone', async () => {
     const fix = resetFixture();
     setResetEnv(fix);
     takeSlot();
     try {
-      // A malformed file: the performance writer refuses it, the row must say
-      // so, and the other option's reset must not claim the switches changed.
-      fs.writeFileSync(path.join(fix.agentDir, 'settings.json'), '{ "heightIndex": tru');
+      fs.mkdirSync(fix.stateDir, { recursive: true });
+      fs.writeFileSync(flagPath(fix, 'gentle-worktree-mode.json'), '{"version":1,"enabled":false}\n');
+      const foreign = { theme: 'gentle', tuiMode: 'fullscreen', foreignPluginSetting: true };
+      const bytes = `${JSON.stringify(foreign, null, 2)}\n`;
+      fs.writeFileSync(path.join(fix.agentDir, 'settings.json'), bytes);
       await loadExtension();
       const { commands } = await loadWorktreeExtension();
       const { ctx, notes } = resetCtx();
       await commands.get('herdr-gentle:customize').handler('', ctx);
-      assert.equal(fs.readFileSync(path.join(fix.agentDir, 'settings.json'), 'utf8'), '{ "heightIndex": tru');
-      assert.match(notes[0][0], /^Partial reset: /);
-      assert.match(notes[0][0], /invalid JSON/, 'the failure names the real obstacle');
+      assert.deepEqual(notes, [['Defaults saved.', 'info']], 'the reset ran and named no foreign setting');
+      assert.deepEqual(readJson(flagPath(fix, 'gentle-worktree-mode.json')), { version: 1, enabled: true }, 'the option it owns was reset');
+      assert.equal(
+        fs.readFileSync(path.join(fix.agentDir, 'settings.json'), 'utf8'),
+        bytes,
+        'every setting this package does not own keeps its bytes',
+      );
     } finally {
       takeSlot();
       restoreEnv();

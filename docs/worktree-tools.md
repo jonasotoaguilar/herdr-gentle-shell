@@ -672,66 +672,13 @@ same message, which names the concrete install command (without an explicit
 Disabling never runs
 this gate — a missing prerequisite may block turning a feature ON, never OFF.
 
-### Performance (`/herdr-gentle:customize` — `Performance` rows)
-
-A row exists only when the installed Pi build DECLARES the setting it writes.
-The four optimisations below live on an unmerged Pi branch
-(`perf/fullscreen-long-sessions`); a released Pi declares none of them, so the
-section shows one honest line — `No supported display performance settings ·
-none declared` — and no switches. The panel never offers an option the host
-ignores: writing a key nothing reads was the defect this gate removes.
-
-On a build that declares them, the rows are each shipped OFF, each turning on
-one pi render optimisation for long fullscreen sessions. pi itself keeps four
-individual settings; row 1 writes two of them because eviction has no effect
-without the index it lives inside. A build that declares only some of the four
-shows only the rows it fully declares — the fused row needs BOTH its keys.
-
-- **Height index + eviction** writes `heightIndex` and `evictOffscreenLines`.
-  A mixed state reached through pi's own `/settings` (one key on, the other
-  off) is shown as `PARTIAL` and the next toggle normalizes both keys to one
-  value — the row never claims they were already equal.
-- **Recent tool output expansion** writes `expandRecentToolOutput`, one key.
-  ON is a mode: the last 10 turns of tool output render in full and older
-  turns collapse to a one-line stub; Ctrl+O toggles that mode for the session
-  and it survives a new prompt. With the mode OFF, Ctrl+O behaves exactly as
-  it does today.
-- **Incremental search corpus** writes `incrementalSearchCorpus`, one key.
-
-Each row explains what it activates, what improves, and what the user gives
-up in plain language. The panel has no benchmark figures or `?` detail view;
-host setting descriptions cannot replace that concise copy with raw benchmark
-text. The settings behavior is unchanged.
-
-Benchmark evidence remains in `odd/tasks/pi-fullscreen-perf.md` and the
-pi-side `packages/tui/test/perf/RESULTS.md` referenced there. Those measurements
-use synthetic transcripts; they are not a promise for the current session. Our
-own results recommend only `expandRecentToolOutput` and
-`incrementalSearchCorpus`: with the first one on, the height index is
-net-negative and regresses Ctrl+F, and eviction is only reachable through it.
-
-Writes go through `lib/pi-perf-settings.js`: the four keys are merged into
-`<agent-dir>/settings.json` without disturbing any other key, atomically and
-with the previous mode preserved. A settings file that is malformed, not an
-object, or unreadable is NEVER overwritten — the row says `<row> not
-changed. <reason>` and leaves the bytes untouched. A successful change asks
-for a reload so it applies without a restart; a failed one never reloads.
-
 ### Reset every option to its defaults (`/herdr-gentle:customize` — `Reset` row)
 
 The panel's `Reset` row returns the user-visible options to the
 defaults their own read sites define — `sidebar` Gentle **when the Herdr plugin
-is installed and usable and OFF when it is not** (see below), `moshi` off,
-`worktree` enabled, and the performance keys the installed build declares
-(`heightIndex`, `evictOffscreenLines`, `expandRecentToolOutput`,
-`incrementalSearchCorpus`) OFF — by writing each default THROUGH the same
-writer the corresponding row uses, never by deleting a flag file. A key the
-build does not declare is never written, so a reset cannot resurrect a setting
-the host ignores. The
-performance keys go through `lib/pi-perf-settings.js`, in one atomic merge
-that leaves every other setting alone, and the summary names each of them
-by its own label; a reset that had nothing to do with them keeps its summary
-unchanged. The moshi reset
+is installed and usable and OFF when it is not** (see below), `moshi` off and
+`worktree` enabled — by writing each default THROUGH the same writer the
+corresponding row uses, never by deleting a flag file. The moshi reset
 therefore also clears its Pi `settings.json` exclusion, and the sidebar reset
 lets its Herdr `config.toml` managed rows and ownership marker converge
 exactly as choosing `Gentle` would. Per-option outcomes are reported: a full
@@ -739,8 +686,8 @@ run notifies `Defaults saved.`; a failure notifies `Partial reset: <option>
 changed|unchanged, …`, naming the failed option as unchanged together with
 its reason, and a run where nothing succeeds says nothing was changed. When
 every option already matches the default that applies in the current state the row
-notifies `Nothing to reset: the sidebar is already OFF by default, and moshi,
-worktree and performance switches already match their defaults.` and writes
+notifies `Nothing to reset: the sidebar is already OFF by default, and moshi
+and worktree already match their defaults.` and writes
 nothing at all.
 
 The row never depends on the Herdr plugin being installed: the reset is always

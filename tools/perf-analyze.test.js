@@ -10,9 +10,8 @@
 // - each run summary carries the identity, the per-view render percentiles, the
 //   append cost, the event-loop utilization, the process memory and the process
 //   CPU that the log actually holds;
-// - `compareRuns` names the comparability it checked (pi version, a differing
-//   switch snapshot, tui mode, a minimum frame count) and only then reports
-//   deltas;
+// - `compareRuns` names the comparability it checked (pi version, tui mode, a
+//   minimum frame count) and only then reports deltas;
 // - nothing in the comparison is a host renderer measurement;
 // - the report CLI reads the real log plus the rotated log from the resolved
 //   plugin state dir, writes nothing, and fails loudly when there is no log.
@@ -49,18 +48,6 @@ function sessionLine(run, at, extra = {}) {
     kind: 'session',
     run,
     piVersion: '1.4.0',
-    perf: {
-      heightIndex: false,
-      evictOffscreenLines: false,
-      expandRecentToolOutput: false,
-      incrementalSearchCorpus: false,
-    },
-    support: {
-      heightIndex: 'absent',
-      evictOffscreenLines: 'absent',
-      expandRecentToolOutput: 'absent',
-      incrementalSearchCorpus: 'absent',
-    },
     pid: 4242,
     uptimeMs: 1200.5,
     tuiMode: 'fullscreen',
@@ -100,8 +87,8 @@ function at(second) {
 // One complete run: session, 40 odd renders and 40 issues renders, 40 observer
 // samples and three resource samples. Values are chosen so the expected
 // percentiles and means are checkable by hand.
-function fullRun(run, secondBase, overrides = {}) {
-  const lines = [sessionLine(run, at(secondBase), overrides.session || {})];
+function fullRun(run, secondBase) {
+  const lines = [sessionLine(run, at(secondBase))];
   for (let i = 1; i <= 40; i += 1) {
     lines.push(renderLine(run, at(secondBase + i), 'odd', i));
     lines.push(renderLine(run, at(secondBase + i), 'issues', i / 4));
@@ -193,18 +180,6 @@ describe('analyzeLog run summary', { concurrency: false }, () => {
     assert.equal(summary.durationMs, 43000);
     assert.equal(summary.piVersion, '1.4.0');
     assert.equal(summary.tuiMode, 'fullscreen');
-    assert.deepEqual(summary.perf, {
-      heightIndex: false,
-      evictOffscreenLines: false,
-      expandRecentToolOutput: false,
-      incrementalSearchCorpus: false,
-    });
-    assert.deepEqual(summary.support, {
-      heightIndex: 'absent',
-      evictOffscreenLines: 'absent',
-      expandRecentToolOutput: 'absent',
-      incrementalSearchCorpus: 'absent',
-    });
     assert.equal(summary.frames, 80, 'one counted frame per render line');
 
     assert.deepEqual(summary.views.odd, { n: 40, p50: 20, p95: 38, max: 40, mean: 20.5 });
@@ -280,16 +255,7 @@ describe('analyzeLog run summary', { concurrency: false }, () => {
 describe('compareRuns comparability guards', { concurrency: false }, () => {
   function runs() {
     const off = analyze.analyzeLog(fullRun('run-off', 0).join('')).runs[0];
-    const on = analyze.analyzeLog(fullRun('run-on', 200, {
-      session: {
-        perf: {
-          heightIndex: true,
-          evictOffscreenLines: false,
-          expandRecentToolOutput: true,
-          incrementalSearchCorpus: true,
-        },
-      },
-    }).join('')).runs[0];
+    const on = analyze.analyzeLog(fullRun('run-on', 200).join('')).runs[0];
     return { off, on };
   }
 
@@ -326,13 +292,6 @@ describe('compareRuns comparability guards', { concurrency: false }, () => {
     assert.match(result.reasons[0], /1\.5\.0/);
   });
 
-  test('the same switch snapshot blocks the comparison: nothing was switched', () => {
-    const { off, on } = runs();
-    const result = analyze.compareRuns(off, { ...on, perf: { ...off.perf } });
-    assert.equal(result.verdict, 'not-conclusive');
-    assert.match(result.reasons.join(' '), /identical-perf-snapshot/);
-  });
-
   test('a different tui mode blocks the comparison', () => {
     const { off, on } = runs();
     const result = analyze.compareRuns(off, { ...on, tuiMode: 'regular' });
@@ -360,10 +319,10 @@ describe('compareRuns comparability guards', { concurrency: false }, () => {
       frames: 1,
     });
     assert.equal(result.verdict, 'not-conclusive');
-    assert.equal(result.reasons.length, 4, 'pi version, snapshot, tui mode and frames are each named');
+    assert.equal(result.reasons.length, 3, 'pi version, tui mode and frames are each named');
     assert.deepEqual(
       result.reasons.map((reason) => reason.slice(0, reason.indexOf(':'))),
-      ['different-pi-version', 'identical-perf-snapshot', 'different-tui-mode', 'insufficient-frames'],
+      ['different-pi-version', 'different-tui-mode', 'insufficient-frames'],
     );
   });
 
@@ -397,16 +356,7 @@ describe('gentle-perf-report', { concurrency: false }, () => {
   test('two runs across the rotated and current log are printed with a verdict', () => {
     const dir = stateDir({
       rotated: fullRun('run-off', 0).join(''),
-      current: fullRun('run-on', 200, {
-        session: {
-          perf: {
-            heightIndex: true,
-            evictOffscreenLines: false,
-            expandRecentToolOutput: true,
-            incrementalSearchCorpus: true,
-          },
-        },
-      }).join(''),
+      current: fullRun('run-on', 200).join(''),
     });
 
     const result = runReport(dir);
@@ -428,16 +378,7 @@ describe('gentle-perf-report', { concurrency: false }, () => {
   test('--json prints the analyzer output, including the comparison', () => {
     const dir = stateDir({
       rotated: fullRun('run-off', 0).join(''),
-      current: fullRun('run-on', 200, {
-        session: {
-          perf: {
-            heightIndex: true,
-            evictOffscreenLines: false,
-            expandRecentToolOutput: true,
-            incrementalSearchCorpus: true,
-          },
-        },
-      }).join(''),
+      current: fullRun('run-on', 200).join(''),
     });
 
     const result = runReport(dir, ['--json']);

@@ -1,10 +1,14 @@
 'use strict';
-// Tests for lib/perf-trace.js: the writer half of the S16 Performance trace.
+// Tests for lib/perf-trace.js: the writer half of the performance trace
+// (S18/S24).
 //
 // Contract under test (observable behavior only — the bytes on disk, which
 // files exist, the returned verdicts; never internal helper names):
-// - a missing, malformed, unreadable or explicitly-disabled flag writes
-//   nothing and creates no log;
+// - activation is GENTLE_PERF_TRACE and nothing else: exactly `1` or `true`
+//   switches the trace on; absent, empty, `0`, garbage and every other casing
+//   leave it OFF;
+// - the disabled path writes nothing at all: no log, no state directory, no
+//   scratch file, and no process or host read;
 // - an enabled trace appends one parseable JSON line per event and never lets
 //   a field outside the per-kind allowlist reach the file;
 // - every record carries the one run id of this process, which a caller cannot
@@ -12,21 +16,21 @@
 //   uptime and the host tui mode read from settings.json;
 // - the frame observer adds process resource samples: a baseline on the first
 //   traced frame, then at most one per interval, with real or absent numbers;
-// - writeTraceMode is atomic and refuses to replace a malformed flag;
 // - the log rotates to exactly one previous file and stays inside its cap;
 // - an over-long line is truncated with a marker instead of being dropped;
 // - every entry point returns instead of throwing when the state dir cannot be
 //   written;
-// - the state directory is the one lib/worktree-mode.js already resolves.
+// - the state directory is the one lib/worktree-mode.js already resolves;
+// - no flag file, flag name, trace-mode reader/writer or test cache survives
+//   (S24): the switch is a shell-level act, not a package-owned file.
 
-const { test, describe, after, beforeEach } = require('node:test');
+const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
 const modeLib = require('../lib/worktree-mode.js');
-const { PERF_KEYS } = require('../lib/pi-perf-settings.js');
 const trace = require('../lib/perf-trace.js');
 
 const roots = [];
@@ -41,11 +45,18 @@ function scratch(prefix = 'perf-trace-') {
 }
 
 // A root with the state dir as its only child, so "never writes outside the
-// state directory" is checkable by listing the parent.
+// state directory" is checkable by listing the parent. The returned env carries
+// NO GENTLE_PERF_TRACE: tracing is off until a test asks for `on(env)`.
 function scratchEnv() {
   const root = scratch();
   const dir = path.join(root, 'state');
   return { root, dir, env: { GENTLE_STATUS_STATE_DIR: dir } };
+}
+
+// The two literals that switch tracing on. Everything else is covered by the
+// activation cases below.
+function on(env) {
+  return { ...env, GENTLE_PERF_TRACE: '1' };
 }
 
 function statOrNull(file) {
@@ -68,115 +79,101 @@ function assertIsoDate(value) {
   assert.equal(new Date(value).toISOString(), value, 'at round-trips through Date');
 }
 
-beforeEach(() => {
-  trace.resetTraceCacheForTests();
-});
+describe('perf trace activation', { concurrency: false }, () => {
+  test('exactly `1` and `true` switch the trace on', () => {
+    for (const value of ['1', 'true']) {
+      assert.equal(trace.isTraceEnabled({ GENTLE_PERF_TRACE: value }), true, `${value} enables`);
+    }
+  });
 
-describe('perf trace disabled state', { concurrency: false }, () => {
-  test('a missing flag reads disabled and writes nothing', () => {
+  test('every other value leaves the trace off', () => {
+    const off = [
+      undefined,
+      null,
+      '',
+      '0',
+      'false',
+      'TRUE',
+      'True',
+      'yes',
+      'on',
+      ' 1',
+      '1 ',
+      '01',
+      'garbage',
+      1,
+      true,
+    ];
+    for (const value of off) {
+      const env = value === undefined ? {} : { GENTLE_PERF_TRACE: value };
+      assert.equal(trace.isTraceEnabled(env), false, `${JSON.stringify(value)} is off`);
+    }
+    assert.equal(trace.isTraceEnabled(process.env), false, 'the trace is off unless the shell asks for it');
+  });
+
+  test('the activation check never throws and never writes', () => {
+    const { root, env } = scratchEnv();
+    for (const hostile of [null, undefined, 42, 'env', [], { get GENTLE_PERF_TRACE() { throw new Error('boom'); } }]) {
+      let verdict;
+      assert.doesNotThrow(() => { verdict = trace.isTraceEnabled(hostile); });
+      assert.equal(verdict, false, `${String(hostile)} is off`);
+    }
+    assert.deepEqual(fs.readdirSync(root), [], 'the check touches no file');
+    assert.equal(trace.isTraceEnabled(env), false);
+  });
+
+  test('the disabled path writes nothing and creates no file', () => {
     const { root, dir, env } = scratchEnv();
 
-    assert.deepEqual(trace.readTraceMode(env), {
-      enabled: false,
-      path: path.join(dir, trace.FLAG_NAME),
-      reason: 'missing',
-    });
-
-    const result = trace.traceEvent('render', { view: 'warp', ms: 3, width: 80, height: 24, rows: 12 }, env);
-    assert.deepEqual(result, { written: false, path: path.join(dir, trace.LOG_NAME), reason: 'missing' });
-
-    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false, 'no log is created while disabled');
-    assert.equal(fs.existsSync(dir), false, 'a disabled trace never creates the state dir');
-    assert.deepEqual(fs.readdirSync(root), [], 'nothing is written outside the state directory');
-  });
-
-  test('an explicit disabled flag reads disabled and writes nothing', () => {
-    const { dir, env } = scratchEnv();
-    assert.deepEqual(trace.writeTraceMode(false, env), {
-      ok: true,
-      changed: true,
-      path: path.join(dir, trace.FLAG_NAME),
-      error: null,
-    });
-
-    assert.deepEqual(trace.readTraceMode(env), {
-      enabled: false,
-      path: path.join(dir, trace.FLAG_NAME),
-      reason: 'disabled',
-    });
-
-    for (const kind of ['session', 'render', 'daemon']) {
-      const result = trace.traceEvent(kind, { piVersion: '1.3.0', view: 'warp', ms: 1, panes: 1, tokens: 1 }, env);
-      assert.equal(result.written, false, `${kind} is not written while disabled`);
-      assert.equal(result.reason, 'disabled');
+    for (const kind of ['session', 'render', 'observer', 'resource', 'daemon']) {
+      const result = trace.traceEvent(kind, { view: 'warp', ms: 1, piVersion: '1.3.0', panes: 1, tokens: 1 }, env);
+      assert.deepEqual(result, { written: false, path: path.join(dir, trace.LOG_NAME), reason: 'disabled' });
     }
 
-    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false, 'the disabled trace writes no log');
-    assert.deepEqual(fs.readdirSync(dir), [trace.FLAG_NAME], 'only the flag exists');
+    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false, 'no log is created while off');
+    assert.equal(fs.existsSync(dir), false, 'a disabled trace never creates the state dir');
+    assert.deepEqual(fs.readdirSync(root), [], 'nothing is written outside the state directory either');
   });
 
-  test('writeTraceMode reports changed only when the flag value changes', () => {
+  test('a record names the log it appended to', () => {
     const { dir, env } = scratchEnv();
-    assert.equal(trace.writeTraceMode(true, env).changed, true);
-    assert.deepEqual(trace.writeTraceMode(true, env), {
-      ok: true,
-      changed: false,
-      path: path.join(dir, trace.FLAG_NAME),
-      error: null,
-    });
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, trace.FLAG_NAME), 'utf8')), {
-      version: 1,
-      enabled: true,
-    });
-    assert.equal(trace.writeTraceMode(false, env).changed, true);
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, trace.FLAG_NAME), 'utf8')), {
-      version: 1,
-      enabled: false,
-    });
+    const result = trace.traceEvent('render', { view: 'warp', ms: 1 }, on(env));
+    assert.deepEqual(result, { written: true, path: path.join(dir, trace.LOG_NAME), reason: 'written' });
+    assert.equal(readLines(path.join(dir, trace.LOG_NAME)).length, 1);
   });
 });
 
 describe('perf trace events', { concurrency: false }, () => {
   test('an enabled trace appends one parseable line per event with allowlisted fields only', () => {
     const { root, dir, env } = scratchEnv();
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
+    const live = on(env);
 
     const written = [
       trace.traceEvent(
         'session',
         {
           piVersion: '1.3.0',
-          perf: {
-            heightIndex: true,
-            evictOffscreenLines: false,
-            expandRecentToolOutput: true,
-            incrementalSearchCorpus: false,
-            renamedSetting: true,
-          },
-          support: {
-            heightIndex: 'declared',
-            evictOffscreenLines: 'absent',
-            expandRecentToolOutput: 'unknown',
-            incrementalSearchCorpus: 'declared',
-            renamedSetting: 'absent',
-          },
+          pid: 4242,
+          uptimeMs: 1200.5,
+          tuiMode: 'fullscreen',
           prompt: 'secret user text',
           cwd: '/home/jona/private-repo',
+          renamedSetting: true,
         },
-        env,
+        live,
       ),
       trace.traceEvent(
         'render',
         { view: 'odd', ms: 12, width: 120, height: 40, rows: 30, title: 'secret document body', file: '/tmp/secret.md' },
-        env,
+        live,
       ),
       trace.traceEvent(
         'daemon',
         { ms: 5, panes: 3, tokens: 99, stdout: 'secret daemon output' },
-        env,
+        live,
       ),
-      trace.traceEvent('render', { view: 'settings', ms: 7 }, env),
-      trace.traceEvent('daemon', 'not an object', env),
+      trace.traceEvent('render', { view: 'settings', ms: 7 }, live),
+      trace.traceEvent('daemon', 'not an object', live),
     ];
 
     for (const result of written) {
@@ -194,20 +191,15 @@ describe('perf trace events', { concurrency: false }, () => {
 
     const [session, render, daemon, unknownView, garbageFields] = lines;
 
-    assert.deepEqual(Object.keys(session), ['at', 'kind', 'piVersion', 'perf', 'support', 'run']);
+    assert.deepEqual(
+      Object.keys(session),
+      ['at', 'kind', 'piVersion', 'pid', 'uptimeMs', 'tuiMode', 'run'],
+      'the session line carries the run identity and nothing else',
+    );
     assert.equal(session.piVersion, '1.3.0');
-    assert.deepEqual(session.perf, {
-      heightIndex: true,
-      evictOffscreenLines: false,
-      expandRecentToolOutput: true,
-      incrementalSearchCorpus: false,
-    });
-    assert.deepEqual(session.support, {
-      heightIndex: 'declared',
-      evictOffscreenLines: 'absent',
-      expandRecentToolOutput: 'unknown',
-      incrementalSearchCorpus: 'declared',
-    });
+    assert.equal(session.pid, 4242);
+    assert.equal(session.uptimeMs, 1200.5);
+    assert.equal(session.tuiMode, 'fullscreen');
 
     assert.deepEqual(Object.keys(render), ['at', 'kind', 'view', 'ms', 'width', 'height', 'rows', 'run']);
     assert.deepEqual(
@@ -228,15 +220,15 @@ describe('perf trace events', { concurrency: false }, () => {
       assert.equal(raw.includes(leaked), false, `${leaked} never reaches the log`);
     }
 
-    assert.deepEqual(fs.readdirSync(dir).sort(), [trace.FLAG_NAME, trace.LOG_NAME].sort(), 'only the flag and the log');
+    assert.deepEqual(fs.readdirSync(dir), [trace.LOG_NAME], 'the log is the only file the trace owns');
     assert.deepEqual(fs.readdirSync(root), ['state'], 'nothing is written outside the state directory');
   });
 
   test('an unknown kind writes nothing', () => {
     const { dir, env } = scratchEnv();
-    trace.writeTraceMode(true, env);
+    const live = on(env);
 
-    const result = trace.traceEvent('keypress', { ms: 1, sequence: 'secret' }, env);
+    const result = trace.traceEvent('keypress', { ms: 1, sequence: 'secret' }, live);
     assert.equal(result.written, false);
     assert.equal(result.reason, 'unknown-kind');
     assert.equal(result.path, path.join(dir, trace.LOG_NAME));
@@ -244,63 +236,10 @@ describe('perf trace events', { concurrency: false }, () => {
   });
 });
 
-describe('perf trace malformed flag', { concurrency: false }, () => {
-  test('a malformed flag reads disabled and is never overwritten', () => {
-    const { dir, env } = scratchEnv();
-    fs.mkdirSync(dir, { recursive: true });
-    const flag = path.join(dir, trace.FLAG_NAME);
-    const garbage = '{"version":1,"enabled":';
-    fs.writeFileSync(flag, garbage);
-
-    assert.deepEqual(trace.readTraceMode(env), { enabled: false, path: flag, reason: 'malformed' });
-
-    const event = trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, env);
-    assert.deepEqual(event, { written: false, path: path.join(dir, trace.LOG_NAME), reason: 'malformed' });
-    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false, 'a broken flag never starts writing');
-
-    const write = trace.writeTraceMode(true, env);
-    assert.equal(write.ok, false);
-    assert.equal(write.changed, false);
-    assert.equal(write.path, flag);
-    assert.match(write.error, /refusing|invalid|malformed/i, 'the refusal explains itself');
-    assert.equal(fs.readFileSync(flag, 'utf8'), garbage, 'the malformed bytes are untouched');
-    assert.deepEqual(fs.readdirSync(dir), [trace.FLAG_NAME], 'no temp file survives the refusal');
-  });
-
-  test('every shape that is not a version 1 boolean flag reads disabled', () => {
-    const { dir, env } = scratchEnv();
-    fs.mkdirSync(dir, { recursive: true });
-    const flag = path.join(dir, trace.FLAG_NAME);
-
-    const rejected = [
-      'null',
-      '[]',
-      '{"version":1}',
-      '{"version":2,"enabled":true}',
-      '{"version":1,"enabled":"yes"}',
-      '{"version":1,"enabled":1}',
-      'not json at all',
-    ];
-    for (const payload of rejected) {
-      fs.writeFileSync(flag, payload);
-      const mode = trace.readTraceMode(env);
-      assert.equal(mode.enabled, false, `${payload} means disabled`);
-      assert.equal(mode.reason, 'malformed', `${payload} is reported as malformed`);
-
-      const write = trace.writeTraceMode(true, env);
-      assert.equal(write.ok, false, `${payload} is refused`);
-      assert.equal(fs.readFileSync(flag, 'utf8'), payload, `${payload} stays on disk`);
-    }
-
-    fs.writeFileSync(flag, '{"version":1,"enabled":true}\n');
-    assert.equal(trace.readTraceMode(env).enabled, true, 'a valid flag still enables');
-  });
-});
-
 describe('perf trace log bounds', { concurrency: false }, () => {
   test('the log rotates to exactly one previous file and stays inside its cap', () => {
     const { dir, env } = scratchEnv();
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
+    const live = on(env);
 
     const log = path.join(dir, trace.LOG_NAME);
     const rotated = path.join(dir, trace.ROTATED_NAME);
@@ -311,7 +250,7 @@ describe('perf trace log bounds', { concurrency: false }, () => {
     let lastRotatedMtime = null;
     let sent = 0;
     while (rotations < 2 && sent < 20000) {
-      const result = trace.traceEvent('daemon', { ms: sent, panes: 2, tokens: 3 }, env);
+      const result = trace.traceEvent('daemon', { ms: sent, panes: 2, tokens: 3 }, live);
       assert.equal(result.written, true, `event ${sent} was written`);
       sent += 1;
 
@@ -344,10 +283,10 @@ describe('perf trace log bounds', { concurrency: false }, () => {
 
   test('an over-long line is truncated with a marker instead of being dropped', () => {
     const { dir, env } = scratchEnv();
-    trace.writeTraceMode(true, env);
+    const live = on(env);
 
     const oversize = 'v'.repeat(8000);
-    const result = trace.traceEvent('session', { piVersion: oversize, perf: { heightIndex: true } }, env);
+    const result = trace.traceEvent('session', { piVersion: oversize }, live);
     assert.equal(result.written, true, 'the event is still recorded');
 
     const file = path.join(dir, trace.LOG_NAME);
@@ -372,33 +311,24 @@ describe('perf trace unwritable state dir', { concurrency: false }, () => {
     const root = scratch();
     const notADir = path.join(root, 'not-a-dir');
     fs.writeFileSync(notADir, 'keep me');
-    const env = { GENTLE_STATUS_STATE_DIR: notADir };
-
-    let mode;
-    assert.doesNotThrow(() => {
-      mode = trace.readTraceMode(env);
-    });
-    assert.equal(mode.enabled, false);
-    assert.equal(mode.reason, 'unreadable');
-    assert.equal(mode.path, path.join(notADir, trace.FLAG_NAME));
+    const env = on({ GENTLE_STATUS_STATE_DIR: notADir });
 
     let event;
     assert.doesNotThrow(() => {
       event = trace.traceEvent('render', { view: 'warp', ms: 1, width: 1, height: 1, rows: 1 }, env);
     });
     assert.equal(event.written, false);
-    assert.equal(event.reason, 'unreadable');
+    assert.match(event.reason, /^write-failed: /);
     assert.equal(event.path, path.join(notADir, trace.LOG_NAME));
-
-    let write;
-    assert.doesNotThrow(() => {
-      write = trace.writeTraceMode(true, env);
-    });
-    assert.equal(write.ok, false);
-    assert.equal(write.changed, false);
-    assert.equal(typeof write.error, 'string');
     assert.equal(fs.readFileSync(notADir, 'utf8'), 'keep me', 'nothing replaced the file in the state dir position');
     assert.deepEqual(fs.readdirSync(root), ['not-a-dir']);
+
+    let session;
+    assert.doesNotThrow(() => {
+      session = trace.traceSession(env);
+    });
+    assert.equal(session.written, false);
+    assert.equal(fs.readFileSync(notADir, 'utf8'), 'keep me');
   });
 
   test('a read-only state dir never throws', () => {
@@ -410,28 +340,16 @@ describe('perf trace unwritable state dir', { concurrency: false }, () => {
     }
 
     const { root, dir, env } = scratchEnv();
+    const live = on(env);
     fs.mkdirSync(dir, { recursive: true });
     fs.chmodSync(dir, 0o500);
     try {
-      let mode;
-      assert.doesNotThrow(() => {
-        mode = trace.readTraceMode(env);
-      });
-      assert.equal(mode.enabled, false, 'no flag reads as missing, which is disabled');
-
-      let write;
-      assert.doesNotThrow(() => {
-        write = trace.writeTraceMode(true, env);
-      });
-      assert.equal(write.ok, false);
-      assert.equal(write.changed, false);
-      assert.match(write.error, /cannot write|EACCES|EPERM/i);
-
       let event;
       assert.doesNotThrow(() => {
-        event = trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, env);
+        event = trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, live);
       });
       assert.equal(event.written, false);
+      assert.match(event.reason, /^write-failed: /);
       assert.deepEqual(fs.readdirSync(dir), [], 'a refused write leaves no temp file behind');
     } finally {
       fs.chmodSync(dir, 0o700);
@@ -440,13 +358,6 @@ describe('perf trace unwritable state dir', { concurrency: false }, () => {
   });
 
   test('a missing env is a refusal, not a crash', () => {
-    let mode;
-    assert.doesNotThrow(() => {
-      mode = trace.readTraceMode(null);
-    });
-    assert.equal(mode.enabled, false);
-    assert.equal(mode.reason, 'unresolved');
-
     let event;
     assert.doesNotThrow(() => {
       event = trace.traceEvent('daemon', { ms: 1 }, null);
@@ -454,12 +365,12 @@ describe('perf trace unwritable state dir', { concurrency: false }, () => {
     assert.equal(event.written, false);
     assert.equal(event.reason, 'unresolved');
 
-    let write;
+    let session;
     assert.doesNotThrow(() => {
-      write = trace.writeTraceMode(true, null);
+      session = trace.traceSession(null);
     });
-    assert.equal(write.ok, false);
-    assert.equal(write.changed, false);
+    assert.equal(session.written, false);
+    assert.equal(session.reason, 'unresolved');
 
     let resolvedPath;
     assert.doesNotThrow(() => {
@@ -470,12 +381,11 @@ describe('perf trace unwritable state dir', { concurrency: false }, () => {
 });
 
 describe('perf trace state dir resolution', { concurrency: false }, () => {
-  test('the flag and log live in the dir lib/worktree-mode.js already resolves', () => {
+  test('the log lives in the dir lib/worktree-mode.js already resolves', () => {
     const { dir, env } = scratchEnv();
     assert.equal(modeLib.stateDir(env), dir);
-    assert.deepEqual(fs.existsSync(dir), false, 'resolving a path writes nothing');
+    assert.equal(fs.existsSync(dir), false, 'resolving a path writes nothing');
     assert.equal(trace.tracePath(env), path.join(modeLib.stateDir(env), trace.LOG_NAME));
-    assert.equal(trace.readTraceMode(env).path, path.join(modeLib.stateDir(env), trace.FLAG_NAME));
   });
 
   test('the XDG state fallback is the shared one, not a second resolver', () => {
@@ -486,35 +396,26 @@ describe('perf trace state dir resolution', { concurrency: false }, () => {
       trace.tracePath(env),
       path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents', trace.LOG_NAME),
     );
-    assert.equal(trace.readTraceMode(env).path, path.join(modeLib.stateDir(env), trace.FLAG_NAME));
     assert.deepEqual(fs.readdirSync(xdg), [], 'resolving never creates the state dir');
   });
 
-  // The flag only earns its own state dir when that dir is recognised as
-  // ours; otherwise an injected dir wins and a trace switched on here reads
-  // as missing there.
-  test('a stored dir holding only the trace flag is recognised as ours', () => {
-    const xdg = scratch('perf-trace-only-flag-');
-    const stored = path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents');
-    fs.mkdirSync(stored, { recursive: true });
-    fs.writeFileSync(path.join(stored, trace.FLAG_NAME), JSON.stringify({ version: 1, enabled: true }));
-    const injected = scratch('perf-trace-injected-');
-    const env = { XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected };
-    assert.equal(modeLib.stateDir(env), stored);
-    assert.equal(trace.readTraceMode(env).enabled, true, 'the flag in the stored dir is the one that counts');
+  test('the module exports the documented names', () => {
+    assert.equal(trace.LOG_NAME, 'perf-trace.jsonl');
+    assert.equal(trace.ROTATED_NAME, 'perf-trace.1.jsonl');
+    assert.equal(trace.MAX_LOG_BYTES, 256 * 1024);
+    assert.equal(typeof trace.MAX_LINE_BYTES, 'number');
+    assert.deepEqual([...trace.RENDER_VIEWS], ['warp', 'odd', 'issues', 'create', 'detail']);
+    assert.deepEqual([...trace.CAPABILITY_STATES], ['declared', 'absent', 'unknown']);
+    assert.deepEqual([...trace.HOST_TUI_MODES], ['fullscreen', 'regular']);
+    assert.deepEqual([...trace.KINDS], ['session', 'render', 'observer', 'resource', 'daemon']);
+    assert.equal(typeof trace.isTraceEnabled, 'function');
+    assert.equal(typeof trace.RUN_ID, 'string');
   });
 
-  test('the module exports the documented names', () => {
-    assert.deepEqual([...PERF_KEYS], [
-      'heightIndex',
-      'evictOffscreenLines',
-      'expandRecentToolOutput',
-      'incrementalSearchCorpus',
-    ]);
-    assert.equal(trace.FLAG_NAME, 'gentle-perf-trace.json');
-    assert.equal(trace.LOG_NAME, 'perf-trace.jsonl');
-    assert.deepEqual([...trace.RENDER_VIEWS], ['warp', 'odd', 'issues', 'create', 'detail']);
-    assert.deepEqual([...trace.SUPPORT_STATES], ['declared', 'absent', 'unknown']);
+  test('no trace-mode writer, flag name or test cache survives', () => {
+    for (const gone of ['FLAG_NAME', 'TRACE_VERSION', 'readTraceMode', 'writeTraceMode', 'resetTraceCacheForTests']) {
+      assert.equal(gone in trace, false, `${gone} is gone: the switch is the environment, not a file`);
+    }
   });
 });
 
@@ -522,15 +423,14 @@ describe('perf trace state dir resolution', { concurrency: false }, () => {
 // SEPARATE observer sample. The append cost a sample carries is the cost of
 // writes that already finished (the previous sample's), so no line contains a
 // fabricated duration for the write that produces it. The host contributes a
-// public counter with its support state, and the event loop a bounded
+// public counter with its capability state, and the event loop a bounded
 // process-level interval — never a relabelled component or host duration.
 describe('perf trace frame observer', { concurrency: false }, () => {
   const quietHost = { terminal: { rows: 24 } };
 
   function framesEnv() {
     const { dir, env } = scratchEnv();
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
-    return { dir, env };
+    return { dir, env: on(env) };
   }
 
   function logLines(dir) {
@@ -700,13 +600,41 @@ describe('perf trace frame observer', { concurrency: false }, () => {
     assert.doesNotThrow(() => nowhere.frame({ ms: 2, width: 80, rows: 3 }));
   });
 
-  test('nothing is written, and nothing is logged, while tracing is off', () => {
+  test('nothing is written, sampled or created while the trace is off', () => {
     const { dir, env } = scratchEnv();
-    const observer = trace.createFrameObserver({ view: 'odd', env, host: quietHost });
+    let sampled = 0;
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      sampleMemory: () => { sampled += 1; return { rss: 1000 }; },
+      sampleCpu: () => { sampled += 1; return { user: 1, system: 1 }; },
+      sampleLoop: () => { sampled += 1; return { active: 1, idle: 1 }; },
+    });
     observer.frame({ ms: 1, width: 80, rows: 1 });
     observer.frame({ ms: 1, width: 80, rows: 1 });
+
+    assert.equal(sampled, 0, 'no host or process read happens for a frame the log will not describe');
     assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false, 'the disabled trace writes no log');
     assert.equal(fs.existsSync(dir), false, 'and creates no state directory');
+  });
+
+  test('an unwritable log ends the frame without sampling and without throwing', () => {
+    const root = scratch();
+    const notADir = path.join(root, 'not-a-dir');
+    fs.writeFileSync(notADir, 'keep me');
+    let sampled = 0;
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env: on({ GENTLE_STATUS_STATE_DIR: notADir }),
+      host: quietHost,
+      sampleMemory: () => { sampled += 1; return { rss: 1000 }; },
+      sampleCpu: () => { sampled += 1; return { user: 1, system: 1 }; },
+      sampleLoop: () => { sampled += 1; return { active: 1, idle: 1 }; },
+    });
+    assert.doesNotThrow(() => observer.frame({ ms: 1, width: 80, rows: 1 }));
+    assert.equal(sampled, 0, 'no sampler runs for a frame the log could not describe');
+    assert.equal(fs.readFileSync(notADir, 'utf8'), 'keep me');
   });
 
   test('an observer event reduces unlisted and out-of-range fields to nothing', () => {
@@ -730,7 +658,7 @@ describe('perf trace frame observer', { concurrency: false }, () => {
 
     const [line] = readLines(path.join(dir, trace.LOG_NAME));
     assert.equal(line.measuredAppends, 7, 'an in-range count lands');
-    assert.equal(line.hostRenderMsState, 'declared', 'a support state is one of the three values');
+    assert.equal(line.hostRenderMsState, 'declared', 'a capability state is one of the three values');
     assert.equal('frame' in line, false, 'a negative sample index is dropped');
     assert.equal('prevAppendMs' in line, false, 'a negative cost is dropped');
     assert.equal('hostFullRedraws' in line, false, 'an over-cap counter is dropped');
@@ -746,56 +674,8 @@ describe('perf trace frame observer', { concurrency: false }, () => {
   });
 });
 
-// S16: the flag is written by the panel (Pi) and read by the daemon (another
-// process). A verdict cached without re-checking the file would freeze the
-// first read and leave tracing inert until a restart, so every entry point
-// re-validates the flag against the bytes on disk.
-describe('perf trace cross-process flag changes', { concurrency: false }, () => {
-  test('a flag another process wrote is noticed without a restart', () => {
-    const { dir, env } = scratchEnv();
-    const flag = path.join(dir, trace.FLAG_NAME);
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
-
-    assert.equal(trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, env).written, true);
-
-    // The panel switching tracing OFF: the bytes change, this process's writer
-    // never runs, so only a re-validation of the file can notice.
-    fs.writeFileSync(flag, '{"version":1,"enabled":false}\n');
-    const off = trace.traceEvent('daemon', { ms: 2, panes: 1, tokens: 1 }, env);
-    assert.equal(off.written, false, 'the next event is not written');
-    assert.equal(off.reason, 'disabled');
-
-    // And back ON: the daemon must not stay stuck on its first verdict.
-    fs.writeFileSync(flag, '{"version":1,"enabled":true}\n');
-    assert.equal(trace.traceEvent('daemon', { ms: 3, panes: 1, tokens: 1 }, env).written, true);
-
-    assert.deepEqual(readLines(path.join(dir, trace.LOG_NAME)).map((line) => line.ms), [1, 3]);
-  });
-
-  test('readTraceMode reports a flag another process just wrote', () => {
-    const { dir, env } = scratchEnv();
-    const flag = path.join(dir, trace.FLAG_NAME);
-    assert.equal(trace.readTraceMode(env).enabled, false);
-
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(flag, '{"version":1,"enabled":true}\n');
-    assert.equal(trace.readTraceMode(env).enabled, true, 'an enable written elsewhere is seen');
-
-    fs.writeFileSync(flag, '{"version":1,"enabled":false}\n');
-    assert.equal(trace.readTraceMode(env).enabled, false, 'a disable written elsewhere is seen');
-
-    fs.rmSync(flag);
-    assert.deepEqual(trace.readTraceMode(env), {
-      enabled: false,
-      path: flag,
-      reason: 'missing',
-    }, 'a removed flag reads as missing again');
-  });
-});
-
-// The S16 session snapshot: what a run is, written before its events. Only
-// while tracing is on — the support scan reads the whole installed package, so
-// a disabled trace must never pay for it.
+// The session snapshot: what a run is, written before its events. Only while
+// tracing is on.
 describe('perf trace session snapshot', { concurrency: false }, () => {
   function snapshotEnv() {
     const root = scratch('perf-trace-session-');
@@ -805,94 +685,48 @@ describe('perf trace session snapshot', { concurrency: false }, () => {
     return { root, stateDir, agentDir, env: { GENTLE_STATUS_STATE_DIR: stateDir, PI_CODING_AGENT_DIR: agentDir } };
   }
 
-  test('a disabled trace writes no snapshot and never runs the scan', () => {
+  test('a disabled trace writes no snapshot', () => {
     const { root, stateDir, env } = snapshotEnv();
-    let scans = 0;
-    const result = trace.traceSession(env, { scan: () => { scans += 1; return { keys: {} }; } });
+    const result = trace.traceSession(env);
     assert.deepEqual(result, {
       written: false,
       path: path.join(stateDir, trace.LOG_NAME),
-      reason: 'missing',
+      reason: 'disabled',
     });
-    assert.equal(scans, 0, 'the installed package is never scanned while tracing is off');
     assert.equal(fs.existsSync(stateDir), false, 'no state dir, no log');
     assert.deepEqual(fs.readdirSync(root), ['agent'], 'nothing is written');
   });
 
-  test('an enabled snapshot records the four switches, the Pi version and per-key evidence', () => {
+  test('an enabled snapshot records the run identity the caller supplies', () => {
     const { agentDir, env } = snapshotEnv();
-    fs.writeFileSync(path.join(agentDir, 'settings.json'), '{"heightIndex":true,"incrementalSearchCorpus":true}\n');
-    trace.writeTraceMode(true, env);
+    fs.writeFileSync(path.join(agentDir, 'settings.json'), '{"tuiMode":"fullscreen"}\n');
 
-    const result = trace.traceSession(env, {
-      scan: () => ({
-        ok: true,
-        piVersion: '1.3.0',
-        keys: {
-          heightIndex: { state: 'declared', evidence: 'dist/x.js (2 matches)' },
-          evictOffscreenLines: { state: 'absent', evidence: 'no match in 700 scanned files' },
-          expandRecentToolOutput: { state: 'unknown', evidence: 'scan failed: byte budget' },
-          incrementalSearchCorpus: { state: 'declared', evidence: 'dist/x.js (1 match)' },
-        },
-      }),
-    });
+    const result = trace.traceSession(on(env), { piVersion: '1.3.0' });
     assert.equal(result.written, true, result.reason);
 
     const [line] = readLines(result.path);
-    assert.deepEqual(Object.keys(line), ['at', 'kind', 'piVersion', 'perf', 'support', 'pid', 'uptimeMs', 'run']);
+    assert.deepEqual(
+      Object.keys(line),
+      ['at', 'kind', 'piVersion', 'pid', 'uptimeMs', 'tuiMode', 'run'],
+      'the snapshot carries the run identity only',
+    );
     assert.equal(line.kind, 'session');
     assert.equal(line.piVersion, '1.3.0');
-    assert.deepEqual(line.perf, {
-      heightIndex: true,
-      evictOffscreenLines: false,
-      expandRecentToolOutput: false,
-      incrementalSearchCorpus: true,
-    }, 'an unset setting is the OFF default, so both runs stay comparable');
-    assert.deepEqual(line.support, {
-      heightIndex: 'declared',
-      evictOffscreenLines: 'absent',
-      expandRecentToolOutput: 'unknown',
-      incrementalSearchCorpus: 'declared',
-    }, 'evidence is the three states only, never a speed claim');
+    assert.equal(line.pid, process.pid);
+    assert.equal(line.tuiMode, 'fullscreen');
+    assert.equal(fs.readFileSync(path.join(agentDir, 'settings.json'), 'utf8'), '{"tuiMode":"fullscreen"}\n');
+  });
 
-    const raw = fs.readFileSync(result.path, 'utf8');
-    for (const leaked of ['dist/x.js', 'no match in', 'scan failed', 'byte budget']) {
-      assert.equal(raw.includes(leaked), false, `${leaked} is evidence detail, not log content`);
+  test('a piVersion that is not a non-empty string is left out', () => {
+    const { env } = snapshotEnv();
+    for (const piVersion of [42, '', null, { version: '1.3.0' }]) {
+      const result = trace.traceSession(on(env), { piVersion });
+      assert.equal(result.written, true);
+      const line = readLines(result.path).at(-1);
+      assert.equal(line.kind, 'session');
+      assert.equal('piVersion' in line, false, `${String(piVersion)} is not a version`);
+      assert.equal(line.pid, process.pid, 'the rest of the identity still lands');
     }
-  });
-
-  test('a scan that cannot run still records the switches and marks the evidence unknown', () => {
-    const { env } = snapshotEnv();
-    trace.writeTraceMode(true, env);
-    const result = trace.traceSession(env, {
-      scan: () => ({
-        ok: false,
-        error: 'cannot resolve the installed package',
-        keys: Object.fromEntries(PERF_KEYS.map((key) => [key, { state: 'unknown', evidence: 'scan failed' }])),
-      }),
-    });
-    assert.equal(result.written, true);
-    const [line] = readLines(result.path);
-    assert.equal(line.kind, 'session');
-    assert.equal(line.piVersion, undefined, 'a failed scan claims no version');
-    assert.deepEqual(line.perf, {
-      heightIndex: false,
-      evictOffscreenLines: false,
-      expandRecentToolOutput: false,
-      incrementalSearchCorpus: false,
-    });
-    assert.deepEqual(Object.values(line.support), ['unknown', 'unknown', 'unknown', 'unknown']);
-  });
-
-  test('a scanner that throws leaves the snapshot without evidence instead of failing', () => {
-    const { env } = snapshotEnv();
-    trace.writeTraceMode(true, env);
-    const result = trace.traceSession(env, { scan: () => { throw new Error('boom'); } });
-    assert.equal(result.written, true);
-    const [line] = readLines(result.path);
-    assert.equal(line.kind, 'session');
-    assert.equal('support' in line, false, 'no invented evidence');
-    assert.equal('piVersion' in line, false);
   });
 });
 
@@ -902,7 +736,7 @@ describe('perf trace session snapshot', { concurrency: false }, () => {
 // and which TUI the host was running. The tui mode is READ from settings.json
 // and never written: the trace has no business editing host configuration.
 describe('perf trace run identity', { concurrency: false }, () => {
-  const settings = require('../lib/pi-perf-settings.js');
+  const hostSettings = require('../lib/host-settings.js');
 
   function identityEnv(settingsText) {
     const root = scratch('perf-trace-identity-');
@@ -921,12 +755,12 @@ describe('perf trace run identity', { concurrency: false }, () => {
 
   test('every record carries the run id, and a caller cannot override it', () => {
     const { stateDir, env } = identityEnv('{"tuiMode":"regular"}\n');
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
-    assert.equal(trace.traceSession(env, { scan: () => ({ keys: {} }) }).written, true);
-    trace.traceEvent('render', { view: 'odd', ms: 1, width: 80, height: 24, rows: 1, run: 'caller-chosen' }, env);
-    trace.traceEvent('observer', { view: 'odd', frame: 1, run: 'caller-chosen' }, env);
-    trace.traceEvent('resource', { frames: 1, rssMB: 10, run: 'caller-chosen' }, env);
-    trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, env);
+    const live = on(env);
+    assert.equal(trace.traceSession(live).written, true);
+    trace.traceEvent('render', { view: 'odd', ms: 1, width: 80, height: 24, rows: 1, run: 'caller-chosen' }, live);
+    trace.traceEvent('observer', { view: 'odd', frame: 1, run: 'caller-chosen' }, live);
+    trace.traceEvent('resource', { frames: 1, rssMB: 10, run: 'caller-chosen' }, live);
+    trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, live);
 
     const lines = readLines(path.join(stateDir, trace.LOG_NAME));
     assert.deepEqual(lines.map((line) => line.kind), ['session', 'render', 'observer', 'resource', 'daemon']);
@@ -939,25 +773,25 @@ describe('perf trace run identity', { concurrency: false }, () => {
   });
 
   test('the session snapshot identifies the run: pid, uptime and the host tui mode', () => {
-    const { file, env } = identityEnv('{"tuiMode":"regular","heightIndex":true}\n');
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
-    assert.equal(trace.traceSession(env, { scan: () => ({ keys: {} }) }).written, true);
+    const { file, env } = identityEnv('{"tuiMode":"regular"}\n');
+    const live = on(env);
+    assert.equal(trace.traceSession(live).written, true);
 
-    const [line] = readLines(trace.tracePath(env));
+    const [line] = readLines(trace.tracePath(live));
     assert.equal(line.pid, process.pid);
     assert.equal(typeof line.uptimeMs, 'number');
     assert.ok(line.uptimeMs >= 0 && line.uptimeMs <= 1e10, 'a bounded uptime');
     assert.equal(line.tuiMode, 'regular', 'the host mode comes from settings.json');
-    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":"regular","heightIndex":true}\n', 'settings.json is read, never written');
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":"regular"}\n', 'settings.json is read, never written');
   });
 
   test('an unusable tui mode is left out instead of guessed', () => {
-    const cases = [null, '{"tuiMode":"split"}\n', '{"tuiMode":true}\n', 'not json at all\n', '{"heightIndex":true}\n'];
+    const cases = [null, '{"tuiMode":"split"}\n', '{"tuiMode":true}\n', 'not json at all\n', '{}\n'];
     for (const settingsText of cases) {
       const { env } = identityEnv(settingsText);
-      assert.equal(trace.writeTraceMode(true, env).ok, true);
-      assert.equal(trace.traceSession(env, { scan: () => ({ keys: {} }) }).written, true);
-      const [line] = readLines(trace.tracePath(env));
+      const live = on(env);
+      assert.equal(trace.traceSession(live).written, true);
+      const [line] = readLines(trace.tracePath(live));
       assert.equal('tuiMode' in line, false, `${settingsText} yields no tui mode`);
       assert.equal(line.pid, process.pid, 'the rest of the identity still lands');
       assert.equal(typeof line.uptimeMs, 'number');
@@ -967,19 +801,27 @@ describe('perf trace run identity', { concurrency: false }, () => {
 
   test('readHostValues reports the host tui mode and creates nothing', () => {
     const { file, env } = identityEnv(null);
-    assert.deepEqual(settings.readHostValues(env), { ok: true, path: file, values: {} });
+    assert.deepEqual(hostSettings.readHostValues(env), { ok: true, path: file, values: {} });
     assert.equal(fs.existsSync(file), false, 'reading a missing settings file never creates it');
     assert.deepEqual(fs.readdirSync(path.dirname(file)), []);
 
-    fs.writeFileSync(file, '{"tuiMode":"fullscreen","heightIndex":true}\n');
-    assert.deepEqual(settings.readHostValues(env), { ok: true, path: file, values: { tuiMode: 'fullscreen' } });
-    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":"fullscreen","heightIndex":true}\n');
+    fs.writeFileSync(file, '{"tuiMode":"fullscreen"}\n');
+    assert.deepEqual(hostSettings.readHostValues(env), { ok: true, path: file, values: { tuiMode: 'fullscreen' } });
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":"fullscreen"}\n');
 
     fs.writeFileSync(file, '{"tuiMode":"split"}\n');
-    assert.deepEqual(settings.readHostValues(env), { ok: true, path: file, values: {} }, 'an unknown mode is not a value');
+    assert.deepEqual(hostSettings.readHostValues(env), { ok: true, path: file, values: {} }, 'an unknown mode is not a value');
+
+    for (const notAnObject of ['[]\n', 'null\n', '"fullscreen"\n']) {
+      fs.writeFileSync(file, notAnObject);
+      const rejected = hostSettings.readHostValues(env);
+      assert.equal(rejected.ok, false, `${notAnObject.trim()} is not a settings object`);
+      assert.deepEqual(rejected.values, {});
+      assert.equal(fs.readFileSync(file, 'utf8'), notAnObject, 'the refused file is untouched');
+    }
 
     fs.writeFileSync(file, '{"tuiMode":\n');
-    const broken = settings.readHostValues(env);
+    const broken = hostSettings.readHostValues(env);
     assert.equal(broken.ok, false, 'a file that cannot be parsed is reported as unreadable');
     assert.equal(broken.path, file);
     assert.deepEqual(broken.values, {});
@@ -987,18 +829,17 @@ describe('perf trace run identity', { concurrency: false }, () => {
   });
 });
 
-// S18: collecting render timings alone cannot answer "what did enabling the
-// switches cost this Pi process". The observer therefore samples the process
-// itself: memory and CPU, bounded and rounded, once immediately so even a short
-// run has a baseline, then at most once per interval. A sampler that fails
-// writes no numbers rather than a zero someone would average later.
+// S18: collecting render timings alone cannot answer "what did this session
+// cost". The observer therefore samples the process itself: memory and CPU,
+// bounded and rounded, once immediately so even a short run has a baseline,
+// then at most once per interval. A sampler that fails writes no numbers rather
+// than a zero someone would average later.
 describe('perf trace resource samples', { concurrency: false }, () => {
   const quietHost = { terminal: { rows: 24 } };
 
   function framesEnv() {
     const { dir, env } = scratchEnv();
-    assert.equal(trace.writeTraceMode(true, env).ok, true);
-    return { dir, env };
+    return { dir, env: on(env) };
   }
 
   function logLines(dir) {
@@ -1090,51 +931,6 @@ describe('perf trace resource samples', { concurrency: false }, () => {
     for (const key of ['rssMB', 'heapUsedMB', 'heapTotalMB', 'externalMB', 'cpuUserMs', 'cpuSystemMs']) {
       assert.equal(key in outOfRange, false, `${key} is dropped when it is not a real reading`);
     }
-  });
-
-  test('a disabled trace samples nothing at all', () => {
-    const { dir, env } = scratchEnv();
-    let calls = 0;
-    const observer = trace.createFrameObserver({
-      view: 'odd',
-      env,
-      host: quietHost,
-      nowMs: () => 1000,
-      sampleMemory: () => { calls += 1; return { rss: 1000 }; },
-      sampleCpu: () => { calls += 1; return { user: 1, system: 1 }; },
-    });
-    observer.frame({ ms: 1, width: 80, rows: 1 });
-    observer.frame({ ms: 1, width: 80, rows: 1 });
-
-    assert.equal(calls, 0, 'nothing is sampled for a frame the log will not describe');
-    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false);
-    assert.equal(fs.existsSync(dir), false);
-  });
-
-  test('a write that fails in the same frame ends the resource sampling too', () => {
-    // The panel (another process) switching tracing off between the render line
-    // and the observer line is a real race; the frame must then stop sampling
-    // instead of writing a resource line for a frame it could not describe.
-    const { dir, env } = framesEnv();
-    const flag = path.join(dir, trace.FLAG_NAME);
-    let clockReads = 0;
-    let calls = 0;
-    const observer = trace.createFrameObserver({
-      view: 'odd',
-      env,
-      host: quietHost,
-      nowMs: () => {
-        clockReads += 1;
-        if (clockReads === 3) fs.writeFileSync(flag, '{"version":1,"enabled":false}\n');
-        return 1000 + clockReads;
-      },
-      sampleMemory: () => { calls += 1; return { rss: 1000 }; },
-      sampleCpu: () => { calls += 1; return { user: 1, system: 1 }; },
-    });
-
-    observer.frame({ ms: 1, width: 80, rows: 1 });
-    assert.deepEqual(logLines(dir).map((line) => line.kind), ['render'], 'only the line that already succeeded is written');
-    assert.equal(calls, 0, 'no sampler runs after a failed append');
   });
 
   test('an unbalanced resource event is reduced to its allowlisted fields', () => {

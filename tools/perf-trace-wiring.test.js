@@ -1,16 +1,17 @@
 'use strict';
-// S16/S16a wiring tests: the Performance trace as the extension actually uses
+// S16/S16a wiring tests: the performance trace as the extension actually uses
 // it — the session snapshot hook and the render timing around this package's
-// own view factories.
+// own view factories. Tracing is switched on by GENTLE_PERF_TRACE and by
+// nothing else, so every case here is an environment case.
 //
 // Contract under test (observable behavior only — the JSONL bytes on disk, the
 // values the real views render, and whether a failure propagates; never
 // internal helper names):
-// - session start writes ONE snapshot carrying the four switches and the
-//   installed-Pi evidence, and writes nothing at all while tracing is off;
+// - session start writes ONE snapshot while tracing is on, and writes nothing
+//   at all while it is off;
 // - a traced view writes one `render` line per frame with a numeric duration
 //   and size, for warp, odd, issues and create;
-// - a disabled trace writes no render line;
+// - a disabled trace writes no render line and creates no file;
 // - a view that throws still throws, and its frame is not recorded;
 // - no rendered text, path or credential ever reaches the log.
 
@@ -114,7 +115,14 @@ function scratchEnv() {
     PI_CODING_AGENT_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-perf-wire-agent-'))),
     GENTLE_PI_AGENT_HOME: undefined,
     GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+    // Off unless a case asks for `on(env)`: the variable is the only switch.
+    GENTLE_PERF_TRACE: undefined,
   };
+}
+
+// The ON environment: `1` is one of the two literals the trace accepts.
+function on(env) {
+  return { ...env, GENTLE_PERF_TRACE: '1' };
 }
 
 function setEnv(vars) {
@@ -233,7 +241,7 @@ describe('perf trace session hook', { concurrency: false }, () => {
     assert.deepEqual(readLog(env), [], 'a disabled trace writes no snapshot');
     assert.deepEqual(fs.readdirSync(env.GENTLE_STATUS_STATE_DIR), [], 'and writes nothing into the state dir');
 
-    assert.equal(traceLib().writeTraceMode(true, env).ok, true);
+    setEnv({ GENTLE_PERF_TRACE: '1' });
     await traceHook({}, { cwd: process.cwd() });
 
     const lines = readLog(env);
@@ -242,31 +250,19 @@ describe('perf trace session hook', { concurrency: false }, () => {
     assert.deepEqual(Object.keys(line).slice(0, 2), ['at', 'kind']);
     assert.equal(line.kind, 'session');
     for (const key of Object.keys(line)) {
-      assert.ok(['at', 'kind', 'run', 'pid', 'uptimeMs', 'tuiMode', 'piVersion', 'perf', 'support'].includes(key), `${key} is allowlisted`);
+      assert.ok(['at', 'kind', 'run', 'pid', 'uptimeMs', 'tuiMode', 'piVersion'].includes(key), `${key} is allowlisted`);
     }
-    assert.deepEqual(line.perf, {
-      heightIndex: false,
-      evictOffscreenLines: false,
-      expandRecentToolOutput: false,
-      incrementalSearchCorpus: false,
-    }, 'a fresh settings file is the all-OFF run');
-    if (line.piVersion !== undefined) assert.equal(typeof line.piVersion, 'string');
-    if (line.support !== undefined) {
-      for (const [key, state] of Object.entries(line.support)) {
-        assert.ok(['heightIndex', 'evictOffscreenLines', 'expandRecentToolOutput', 'incrementalSearchCorpus'].includes(key));
-        assert.ok(['declared', 'absent', 'unknown'].includes(state), `${state} is one of the three evidence states`);
-      }
-    }
+    assert.equal(line.pid, process.pid, 'the snapshot identifies the run process');
+    assert.equal(typeof line.uptimeMs, 'number');
   });
 });
 
 describe('perf trace render instrumentation', { concurrency: false }, () => {
   test('the odd view records one line per frame and never the rendered text', async () => {
-    const env = scratchEnv();
+    const env = on(scratchEnv());
     setEnv(env);
     const repo = makeRepo();
     const { commands } = await loadExtension();
-    traceLib().writeTraceMode(true, env);
 
     const { ctx, opened } = mountingCtx({ cwd: repo, afterMount: (component) => component.render(80) });
     await command(commands, 'herdr-gentle:odd').handler('', ctx);
@@ -295,7 +291,7 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
     }
   });
 
-  test('a disabled trace writes no render line for the same view', async () => {
+  test('a disabled trace writes no render line and creates no file', async () => {
     const env = scratchEnv();
     setEnv(env);
     const repo = makeRepo();
@@ -306,14 +302,14 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
     opened[0].render(80);
 
     assert.deepEqual(readLog(env), [], 'nothing is recorded while tracing is off');
+    assert.equal(fs.existsSync(logPath(env)), false, 'and no log file is created');
   });
 
   test('the issues viewer is traced as its own view', async () => {
-    const env = scratchEnv();
+    const env = on(scratchEnv());
     setEnv(env);
     const repo = makeRepo();
     const { commands } = await loadExtension();
-    traceLib().writeTraceMode(true, env);
 
     // The invocation gate and the page read go through the stub, so this test
     // mounts the real view without a credential or a live GitHub read.
@@ -332,11 +328,10 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
   });
 
   test('the warp panel and its create panel are traced as warp and create', async () => {
-    const env = scratchEnv();
+    const env = on(scratchEnv());
     setEnv(env);
     const repo = makeRepo();
     const { commands } = await loadExtension();
-    traceLib().writeTraceMode(true, env);
 
     // First mount: the warp panel, where `c` opens the create panel; second
     // mount: the create panel itself, cancelled with null.
@@ -362,7 +357,7 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
   });
 
   test('a view that throws still throws, and its frame is not recorded', async () => {
-    const env = scratchEnv();
+    const env = on(scratchEnv());
     // A lib copy whose odd view throws from render, the way a real renderer
     // failure would; every other module stays the real one.
     const libCopy = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-perf-lib-')));
@@ -374,7 +369,6 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
     setEnv({ ...env, GENTLE_WORKTREE_LIB_DIR: libCopy });
     const repo = makeRepo();
     const { commands } = await loadExtension();
-    traceLib().writeTraceMode(true, env);
 
     const { ctx, opened } = mountingCtx({ cwd: repo });
     await command(commands, 'herdr-gentle:odd').handler('', ctx);

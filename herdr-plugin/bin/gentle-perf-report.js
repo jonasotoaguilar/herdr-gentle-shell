@@ -11,7 +11,7 @@
 // span the session that rotated out.
 //
 // Never writes, never touches the network and never reads or changes any live
-// setting: the tui mode and the switch snapshot come from the log itself.
+// setting: the pi version and the tui mode come from the log itself.
 //
 // Exit codes: 0 the trace was read; 1 no trace log or unreadable library;
 // 2 invalid CLI args (rejected before any read).
@@ -113,29 +113,12 @@ function signed(value, digits) {
   return `${value > 0 ? '+' : '-'}${text}`;
 }
 
-function switches(perf) {
-  if (!perf || typeof perf !== 'object') return 'not recorded';
-  const keys = Object.keys(perf).sort();
-  if (keys.length === 0) return 'not recorded';
-  return keys.map((key) => `${key}=${perf[key] ? 'on' : 'off'}`).join(' ');
-}
-
-function evidence(support) {
-  if (!support || typeof support !== 'object') return null;
-  const keys = Object.keys(support).sort();
-  if (keys.length === 0) return null;
-  return keys.map((key) => `${key}=${support[key]}`).join(' ');
-}
-
 function runLines(run, index) {
   const lines = [];
   const identity = [`Pi ${run.piVersion || 'unknown'}`, `tui ${run.tuiMode || 'unrecorded'}`];
   lines.push(`run ${index + 1}  ${run.run}`);
   lines.push(`  window     ${run.startedAt || 'unknown'} -> ${run.endedAt || 'unknown'} (${number((run.durationMs || 0) / 1000, 1)} s)`);
   lines.push(`  identity   ${identity.join(' · ')}`);
-  lines.push(`  switches   ${switches(run.perf)}`);
-  const support = evidence(run.support);
-  if (support) lines.push(`  evidence   ${support} (declared/absent/unknown per key; evidence, not a verdict)`);
   lines.push(`  frames     ${number(run.frames, 0)} traced package frames`);
 
   const views = Object.keys(run.views || {}).sort();
@@ -284,7 +267,7 @@ function main() {
   }
   if (found === 0) {
     process.stderr.write(
-      `no perf trace log found: looked for ${files.join(' and ')}. Turn on /herdr-gentle:customize -> Performance -> Performance trace and run a session first.\n`,
+      `no perf trace log found: looked for ${files.join(' and ')}. Export GENTLE_PERF_TRACE=1 before starting Pi, run a session, and try again.\n`,
     );
     return 1;
   }

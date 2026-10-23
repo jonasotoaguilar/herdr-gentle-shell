@@ -93,8 +93,8 @@ function restoreEnv() {
 }
 
 function scratchStateEnv() {
-  // A scratch agent dir too: the performance rows read and write
-  // `<agent-dir>/settings.json`, and no test may touch the real one.
+  // A scratch agent dir too: the moshi exclusion and the whole panel write
+  // under Pi's agent home, and no test may touch the real one.
   return {
     GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-state-'))),
     GENTLE_PI_AGENT_HOME: undefined,
@@ -1467,213 +1467,76 @@ describe('customize key consistency (K1/K3)', { concurrency: false }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// customize-perf-rows (perf-switches S2-S6, T1-T4): the three performance rows.
-//
-// Contract under test (observable behavior only — the bytes of
-// `<agent-dir>/settings.json`, the notified text, whether ctx.reload ran, and
-// what the panel renders; never internal function names):
-// - the panel carries a fourth category with three rows, all OFF with no
-//   settings file, and opening it writes nothing;
-// - each row's footer note states what it improves AND what it worsens with
-//   its SYNTHETIC measured numbers, while the full measured detail sits
-//   behind the help key;
-// - row 2 writes the single key `expandRecentToolOutput`, row 3 the single
-//   key `incrementalSearchCorpus`, row 1 both `heightIndex` and
-//   `evictOffscreenLines`;
-// - a fused row whose keys disagree reads PARTIAL and normalizes both keys on
-//   the next toggle, never claiming they were already equal;
-// - an unreadable or malformed settings file is left byte-identical and the
-//   row says nothing changed.
+// S22: the panel has no Performance section at all. Its categories are sidebar,
+// moshi, worktree and reset — in that order — and no performance row, no
+// optimisation switch and no trace toggle is reachable from it. The trace is
+// switched on by the GENTLE_PERF_TRACE environment variable instead (S24), so
+// nothing in this panel may name it.
 // ---------------------------------------------------------------------------
+describe('customize has no performance category (S22)', { concurrency: false }, () => {
+  const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Worktree tools', 'Reset'];
 
-function perfLib() {
-  return require('../lib/customize-perf-rows.js');
-}
+  test('the card offers exactly four categories and names no performance option', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_PERF_TRACE: undefined, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    const customs = [];
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const { ctx } = makeCtx({
+        customImpl: async (factory) => { customs.push(factory); },
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(customs.length, 1, 'the panel opened');
 
-function perfSettingsFile(env) {
-  return path.join(env.PI_CODING_AGENT_DIR, 'settings.json');
-}
+      const host = makeHostTui();
+      const { component, done } = openComponent(customs[0], host);
+      const seen = () => component.render(100).map((line) => String(line)).join('\n');
 
-function writePerfSettings(env, doc) {
-  fs.mkdirSync(path.dirname(perfSettingsFile(env)), { recursive: true });
-  fs.writeFileSync(perfSettingsFile(env), `${JSON.stringify(doc, null, 2)}\n`);
-}
+      for (let index = 0; index < CATEGORY_TITLES.length; index += 1) {
+        assert.ok(seen().includes(`▸ ${CATEGORY_TITLES[index]}`), `focused category ${index} is ${CATEGORY_TITLES[index]}`);
+        component.handleInput('down');
+      }
+      assert.ok(seen().includes('▸ Herdr Sidebar'), 'the fourth entry wraps back to the first category');
+      assert.equal(done(), 'pending', 'walking the categories never applies anything');
 
-function readPerfSettings(env) {
-  return JSON.parse(fs.readFileSync(perfSettingsFile(env), 'utf8'));
-}
-
-// One flattened view of the card: assertions about copy survive the wrapping
-// the panel applies to notes and help lines.
-function flatCard(component, width = 100) {
-  return component.render(width).map((line) => String(line)).join('\n').replace(/\s+/g, ' ');
-}
-
-// Drive the REAL panel through the command: `inputs` are the navigation keys,
-// `inspect` renders the state they reached, and `confirm` is the key that
-// finishes the overlay and reaches the single apply path exactly like a user's
-// Enter would.
-async function runPanel({ env, inputs = [], inspect, confirm = null }) {
-  setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...env });
-  const hadSlot = setSlot(stubSlot().slot);
-  const host = makeHostTui();
-  try {
-    modeLib().writeMode(true, process.env);
-    const { commands, mod } = await loadExtension();
-    installTuiLoader(mod, async () => stubTui);
-    let component = null;
-    const { ctx, notes, seq } = makeCtx({
-      customImpl: async (factory) => {
-        const opened = openComponent(factory, host);
-        component = opened.component;
-        for (const input of inputs) component.handleInput(input);
-        if (typeof inspect === 'function') inspect(component);
-        if (confirm !== null) component.handleInput(confirm);
-        return opened.done() === 'pending' ? null : opened.done();
-      },
-    });
-    await customizeDef(commands).handler('', ctx);
-    return { component, notes, seq, host };
-  } finally {
-    setSlot(hadSlot);
-    restoreEnv();
-  }
-}
-
-// sidebar, moshi, worktree, performance: three downs reach the perf category.
-const TO_PERF = ['down', 'down', 'down'];
-const TO_PERF_ROW_2 = [...TO_PERF, 'right', 'down'];
-const TO_PERF_ROW_3 = [...TO_PERF, 'right', 'down', 'down'];
-
-describe('customize performance rows', { concurrency: false }, () => {
-  // S17: these rows exist only on a build that DECLARES their settings, so the
-  // row contract is exercised against a host that declares all four. The
-  // absent/partial cases live in their own describe below.
-  beforeEach(() => perfLib().setSupportScanner(declareAllScan));
-  afterEach(() => perfLib().setSupportScanner(null));
-
-  test('the three switches read OFF with no settings file, and opening the panel writes nothing', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF });
-    const text = flatCard(component);
-    for (const copy of [
-      'Performance',
-      'Height index + eviction · OFF',
-      'Recent tool output expansion · OFF',
-      'Incremental search corpus · OFF',
-    ]) {
-      assert.ok(text.includes(copy), `panel copy missing: ${copy}`);
+      const card = seen();
+      assert.ok(!/Performance/i.test(card), 'no performance category, row or trace toggle is rendered');
+      assert.ok(!/trace/i.test(card), 'the trace is not advertised from the panel');
+      assert.ok(!/optimis|optimiz/i.test(card), 'no optimisation wording survives');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
     }
-    assert.ok(!text.includes('→ Height index'), 'three independent switches claim no single active value');
-    assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'opening the panel writes no settings file');
   });
 
-  test('the fused row states behaviour, benefit and tradeoff in plain language', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF });
-    const text = flatCard(component);
-    assert.ok(text.includes('Caches row heights and unloads far rows'), 'behaviour is stated');
-    assert.ok(text.includes('repaint faster with less memory'), 'the benefit is stated');
-    assert.ok(text.includes('stale height until you scroll back'), 'the tradeoff is stated');
-    assert.ok(!/\d+\.\d+|\bMB\b|SYNTHETIC/.test(text), 'no benchmark apparatus in the UI');
+  test('the headless fallback menu offers the same four categories and nothing else', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_PERF_TRACE: undefined, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => null);
+      const { ctx, notes, selects } = makeCtx({ selectImpl: () => null });
+      await customizeDef(commands).handler('', ctx);
+      assert.deepEqual(selects[0][1], CATEGORY_TITLES, 'the category menu carries exactly these four entries');
+      assert.deepEqual(notes, [], 'cancelling writes and notifies nothing');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
   });
 
-  test('the recent-output row states its cost: a stub is not searchable and not copyable', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
-    const text = flatCard(component);
-    assert.ok(text.includes('Preview · Recent tool output expansion · OFF'));
-    assert.ok(text.includes('Collapses older tool output to expandable stubs'), 'behaviour is stated');
-    assert.ok(text.includes('long transcripts stay compact'), 'the benefit is stated');
-    assert.ok(text.includes('not searchable or copyable until you expand'), 'the cost is stated plainly');
-    assert.ok(!/\d+\.\d+|\bMB\b|SYNTHETIC/.test(text), 'no benchmark apparatus in the UI');
-  });
-
-  test('? shows no benchmark detail: the panel is unchanged', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
-    const footer = flatCard(component);
-    component.handleInput('?');
-    assert.equal(flatCard(component), footer, '? changes nothing on the panel');
-    assert.ok(!footer.includes('load 5.7-6.4'), 'no benchmark apparatus is reachable');
-  });
-
-  test('Enter on the recent-output row writes the single key, keeps other settings and reloads', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { theme: 'gentle', expandRecentToolOutput: false });
-    const { notes, seq } = await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', expandRecentToolOutput: true });
-    assert.deepEqual(notes, [[
-      'Recent tool output expansion enabled. Reloading now to apply the change.',
-      'info',
-    ]]);
-    assert.deepEqual(seq, [
-      'notify:Recent tool output expansion enabled. Reloading now to apply the change.',
-      'reload',
-    ], 'the panel closes, then the notice, then the reload');
-  });
-
-  test('Enter again turns the mode off and writes nothing else', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { theme: 'gentle', expandRecentToolOutput: true });
-    const { notes } = await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', expandRecentToolOutput: false });
-    assert.deepEqual(notes, [[
-      'Recent tool output expansion disabled. Reloading now to apply the change.',
-      'info',
-    ]]);
-  });
-
-  test('the search row writes its own single key and no other', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { theme: 'gentle' });
-    await runPanel({ env, inputs: TO_PERF_ROW_3, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', incrementalSearchCorpus: true });
-  });
-
-  test('the fused row writes both keys and reads PARTIAL while they disagree', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: false });
-    const { notes } = await runPanel({
-      env,
-      inputs: TO_PERF,
-      inspect: (component) => {
-        const text = flatCard(component);
-        assert.ok(text.includes('Height index + eviction · PARTIAL'), 'a mixed state is reported as partial');
-        assert.ok(!text.includes('Height index + eviction · ON'), 'it never claims the keys were already equal');
-      },
-      confirm: 'enter',
-    });
-    assert.deepEqual(readPerfSettings(env), { heightIndex: true, evictOffscreenLines: true }, 'both keys normalize to one value');
-    assert.deepEqual(notes, [[
-      'Height index + eviction enabled. Both keys were out of step and now match. Reloading now to apply the change.',
-      'info',
-    ]]);
-  });
-
-  test('the fused row turns both keys off together', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: true, theme: 'gentle' });
-    await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { heightIndex: false, evictOffscreenLines: false, theme: 'gentle' });
-  });
-
-  test('a malformed settings file is left byte-identical and the row says nothing changed', async () => {
-    const env = scratchStateEnv();
-    fs.mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true });
-    fs.writeFileSync(perfSettingsFile(env), '{ "heightIndex": tru');
-    const { notes, seq } = await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
-    assert.equal(fs.readFileSync(perfSettingsFile(env), 'utf8'), '{ "heightIndex": tru');
-    assert.equal(notes.length, 1);
-    assert.match(notes[0][0], /^Height index \+ eviction not changed\. /);
-    assert.match(notes[0][0], /invalid JSON/, 'the reason names the real obstacle');
-    assert.ok(!seq.includes('reload'), 'a failed write never reloads');
-  });
-
-  test('the headless fallback menu reaches the same rows and writes the same key', async () => {
-    const env = scratchStateEnv();
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...env });
-    const hadSlot = setSlot(stubSlot().slot);
+  test('the reset summary names only the options this package owns', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_PERF_TRACE: undefined, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
     try {
       modeLib().writeMode(true, process.env);
       const { commands, mod } = await loadExtension();
@@ -1682,380 +1545,19 @@ describe('customize performance rows', { concurrency: false }, () => {
       const { ctx, notes } = makeCtx({
         selectImpl: (title, options) => {
           picked.push([title, options]);
-          return title === 'Customize · Herdr Gentle Shell' ? 'Performance' : options[1];
+          return title === 'Customize · Herdr Gentle Shell' ? 'Reset' : options[0];
         },
       });
       await customizeDef(commands).handler('', ctx);
-      assert.equal(picked[0][1][3], 'Performance', 'the category keeps its place in the fallback menu');
-      assert.deepEqual(picked[1][1], [
-        'Height index + eviction · OFF',
-        'Recent tool output expansion · OFF',
-        'Incremental search corpus · OFF',
-        'Performance trace · OFF',
-      ], 'every fallback row carries its own state');
-      assert.deepEqual(readPerfSettings(env), { expandRecentToolOutput: true }, 'the fallback writes the single key');
-      assert.deepEqual(notes, [[
-        'Recent tool output expansion enabled. Reloading now to apply the change.',
-        'info',
-      ]]);
+      assert.deepEqual(picked[0][1], CATEGORY_TITLES, 'the reset is reached as its own category');
+      assert.deepEqual(
+        notes,
+        [['Nothing to reset: sidebar, moshi and worktree already match their defaults.', 'info']],
+        'the all-default run names the three options and no performance switch',
+      );
     } finally {
       setSlot(hadSlot);
       restoreEnv();
     }
-  });
-
-  test('a host setting description never reaches the UI', async () => {
-    const lib = perfLib();
-    const filler = 'Filler sentence that only exists to overflow the footer area. '.repeat(3);
-    lib.setDescriptions({ heightIndex: `Pi benchmark 3.36 -> 1.84 ms. ${filler}APPENDIX-TAIL.` });
-    try {
-      const env = scratchStateEnv();
-      const { component } = await runPanel({ env, inputs: TO_PERF });
-      const footer = flatCard(component);
-      assert.ok(!footer.includes('APPENDIX-TAIL'), 'the host description is ignored');
-      assert.ok(!/3\.36|\bms\b/.test(footer), 'no host benchmark text reaches the UI');
-      assert.ok(footer.includes('Caches row heights and unloads far rows'), 'the concise pinned copy renders');
-    } finally {
-      lib.setDescriptions({});
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// S16/S16a: the Performance trace option, inside the same Performance section.
-//
-// Contract under test (observable behavior only — the flag bytes, the log, the
-// notified text, whether ctx.reload ran, and what the panel renders):
-// - the option is OFF by default and opening the panel writes nothing;
-// - Enter writes the flag through the real writer and names the ACTUAL log
-//   path, and enabling writes the session snapshot immediately (no restart);
-// - Enter again disables it and keeps the log;
-// - a malformed flag is left byte-identical and the row says why;
-// - the three optimization rows keep their own ON/OFF/PARTIAL state, and the
-//   installed-Pi evidence is shown as evidence only — and only while tracing,
-//   because the scan is expensive.
-// ---------------------------------------------------------------------------
-
-function traceLib() {
-  return require('../lib/perf-trace.js');
-}
-
-function traceFlagPath(env) {
-  return path.join(env.GENTLE_STATUS_STATE_DIR, traceLib().FLAG_NAME);
-}
-
-function traceLogPath(env) {
-  return path.join(env.GENTLE_STATUS_STATE_DIR, traceLib().LOG_NAME);
-}
-
-// A stand-in for the installed-Pi scan: the real one reads a whole package, so
-// every test that can reach it injects this and counts the calls instead.
-function fakeScan({ declared = [], unknown = [] } = {}) {
-  const keys = {};
-  for (const key of perfLib().PERF_KEYS) {
-    const state = declared.includes(key) ? 'declared' : unknown.includes(key) ? 'unknown' : 'absent';
-    keys[key] = { state, evidence: 'test evidence' };
-  }
-  return { ok: true, piVersion: '1.3.0', root: '/test/pi', keys };
-}
-
-// S17: a switch exists only when the installed build declares its setting. The
-// four settings ship on an unmerged Pi branch, so most users' host declares
-// none of them and the section must say so instead of offering dead toggles.
-function declareAllScan() {
-  return fakeScan({ declared: [...perfLib().PERF_KEYS] });
-}
-
-async function withScan(scanner, fn) {
-  const lib = perfLib();
-  lib.setSupportScanner(scanner);
-  try {
-    return await fn();
-  } finally {
-    lib.setSupportScanner(null);
-  }
-}
-
-// sidebar, moshi, worktree, performance, then into the rows and down to the
-// trace option (LAST in the section, so the optimization rows keep their
-// positions).
-const TO_TRACE = [...TO_PERF, 'right', 'down', 'down', 'down'];
-const TO_RESET = ['down', 'down', 'down', 'down'];
-
-// ---------------------------------------------------------------------------
-// S17: no dead option. A performance row is offered only when the installed
-// build declares every setting it writes; the four settings ship only on a Pi
-// branch, so a released host declares none and the section says so.
-//
-// Contract under test (observable behavior only — what the panel renders, the
-// settings.json bytes, and the notified text):
-// - a build that declares none of the four shows no ON/OFF row and one honest
-//   sentence naming the version;
-// - Enter on that sentence changes nothing and writes no settings file;
-// - a build that declares a subset shows exactly the rows it declares;
-// - the fused row needs BOTH of its keys, never half a switch;
-// - applyRow refuses an undeclared row by id, so a caller cannot write a key
-//   the host ignores;
-// - the reset never resurrects an undeclared key.
-// ---------------------------------------------------------------------------
-
-describe('customize performance rows are gated on host support (S17)', { concurrency: false }, () => {
-  test('a build that declares none shows no switches, and says why', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan(), async () => {
-      const { component } = await runPanel({ env, inputs: TO_PERF });
-      const text = flatCard(component);
-      assert.ok(!/Height index \+ eviction · (ON|OFF|PARTIAL)/.test(text), 'no dead optimization row is offered');
-      assert.ok(!/Recent tool output expansion · (ON|OFF)/.test(text), 'no dead optimization row is offered');
-      assert.ok(!/Incremental search corpus · (ON|OFF)/.test(text), 'no dead optimization row is offered');
-      assert.ok(text.includes('No supported display performance settings · none declared'), 'the section states the fact');
-      assert.ok(text.includes('Pi 1.3.0 declares none of the four display performance settings'), 'the build is named');
-      assert.ok(
-        perfLib().panelModel(env).rows[0].detail.includes('there is nothing to toggle here'),
-        'the consequence is stated (the card clips the sentence, the detail keeps it whole)',
-      );
-      assert.ok(text.includes('Performance trace · OFF'), 'the trace is ours and stays available');
-      assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'opening the panel still writes nothing');
-    });
-  });
-
-  test('Enter on the "nothing to toggle" row is refused and writes no settings', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan(), async () => {
-      const { notes, seq } = await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
-      assert.equal(notes.length, 1, 'the refusal is reported, not swallowed');
-      assert.match(notes[0][0], /^No supported display performance settings not changed\. /);
-      assert.match(notes[0][0], /declares none of the four display performance settings, so there is nothing to toggle/);
-      assert.ok(!seq.includes('reload'), 'a refusal never reloads');
-      assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'a refusal writes no settings file');
-    });
-  });
-
-  test('a build that declares a subset shows exactly the rows it declares', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan({ declared: ['expandRecentToolOutput', 'incrementalSearchCorpus'] }), async () => {
-      const text = flatCard((await runPanel({ env, inputs: TO_PERF })).component);
-      assert.ok(text.includes('Recent tool output expansion · OFF'), 'the declared row is offered');
-      assert.ok(text.includes('Incremental search corpus · OFF'), 'the declared row is offered');
-      assert.ok(!/Height index \+ eviction · (ON|OFF|PARTIAL)/.test(text), 'the undeclared fused row is absent');
-      assert.ok(!text.includes('none declared'), 'a declared build is never told it has nothing');
-    });
-  });
-
-  test('the fused row needs both keys: one declared key is not enough', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan({ declared: ['evictOffscreenLines'] }), async () => {
-      const text = flatCard((await runPanel({ env, inputs: TO_PERF })).component);
-      assert.ok(!text.includes('Height index + eviction'), 'half a switch is never offered');
-      assert.ok(text.includes('none declared'), 'with nothing fully declared the section says so');
-    });
-  });
-
-  test('applyRow refuses an undeclared row by id and writes nothing', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan(), async () => {
-      const result = perfLib().applyRow('recent-output-expansion', env);
-      assert.equal(result.ok, false, 'the write is refused');
-      assert.equal(result.changed, false);
-      assert.match(result.error, /Pi 1\.3\.0 does not declare expandRecentToolOutput/);
-      assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'no settings file is created');
-      assert.equal(
-        perfLib().applyRowMessage(result),
-        'Recent tool output expansion not changed. Recent tool output expansion is not offered: Pi 1.3.0 does not declare expandRecentToolOutput, so the switch would change a setting nothing reads.',
-      );
-    });
-  });
-
-  test('the reset never resurrects an undeclared key', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { heightIndex: true, expandRecentToolOutput: true });
-    const before = fs.readFileSync(perfSettingsFile(env), 'utf8');
-    await withScan(() => fakeScan(), async () => {
-      const result = perfLib().resetToDefaults(env);
-      assert.equal(result.ok, true, 'a reset with nothing declared is not a failure');
-      assert.equal(result.changed, false, 'nothing was written');
-      assert.deepEqual(result.entries, [], 'no undeclared key is named');
-    });
-    assert.equal(fs.readFileSync(perfSettingsFile(env), 'utf8'), before, 'the file is byte-identical');
-  });
-});
-
-describe('customize performance trace option', { concurrency: false }, () => {
-  // The optimization rows still sit above the trace row on a host that
-  // declares them, so the navigation constants keep their meaning here.
-  beforeEach(() => perfLib().setSupportScanner(declareAllScan));
-  afterEach(() => perfLib().setSupportScanner(null));
-
-  test('the trace option is OFF by default, and opening the panel writes nothing', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_TRACE });
-    const text = flatCard(component);
-    assert.ok(text.includes('Performance trace · OFF'), 'the option is present and OFF');
-    assert.ok(text.includes(traceLogPath(env)), 'the real log path is named before enabling');
-    assert.ok(text.includes('Keep it ON for BOTH runs'), 'the A/B instruction keeps tracing on');
-    assert.ok(
-      !/(turn|switch|shut) (it|tracing) off|disable (it|tracing)/i.test(text),
-      'nothing asks the user to stop tracing during the baseline',
-    );
-    assert.ok(text.includes('never Pi\'s renderer'), 'the limit is stated in the panel');
-    assert.equal(fs.existsSync(traceFlagPath(env)), false, 'opening the panel writes no flag');
-    assert.equal(fs.existsSync(traceLogPath(env)), false, 'opening the panel writes no log');
-  });
-
-  test('Enter enables tracing, writes the flag, names the log and snapshots the run now', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan({ declared: ['heightIndex'] }), async () => {
-      const { notes, seq } = await runPanel({ env, inputs: TO_TRACE, confirm: 'enter' });
-      assert.deepEqual(JSON.parse(fs.readFileSync(traceFlagPath(env), 'utf8')), { version: 1, enabled: true });
-      const log = traceLogPath(env);
-      assert.deepEqual(notes, [[
-        `Performance trace enabled. Writing to ${log}. Keep it on for both runs: one with the optimizations OFF, then one with them ON.`,
-        'info',
-      ]]);
-      assert.deepEqual(seq, [`notify:Performance trace enabled. Writing to ${log}. Keep it on for both runs: one with the optimizations OFF, then one with them ON.`],
-        'no reload: enabling the trace applies immediately');
-
-      const lines = fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-      assert.equal(lines.length, 1, 'the snapshot is written without a restart');
-      assert.equal(lines[0].kind, 'session');
-      assert.equal(lines[0].piVersion, '1.3.0');
-      assert.equal(lines[0].support.heightIndex, 'declared');
-      assert.deepEqual(lines[0].perf, {
-        heightIndex: false,
-        evictOffscreenLines: false,
-        expandRecentToolOutput: false,
-        incrementalSearchCorpus: false,
-      }, 'the run starts with every optimization OFF');
-    });
-  });
-
-  test('Enter again disables tracing and keeps the log', async () => {
-    const env = scratchStateEnv();
-    await withScan(() => fakeScan(), async () => {
-      traceLib().writeTraceMode(true, env);
-      traceLib().traceEvent('render', { view: 'odd', ms: 1, width: 80, height: 24, rows: 20 }, env);
-      assert.equal(fs.existsSync(traceLogPath(env)), true);
-
-      const { notes, seq } = await runPanel({ env, inputs: TO_TRACE, confirm: 'enter' });
-      assert.deepEqual(JSON.parse(fs.readFileSync(traceFlagPath(env), 'utf8')), { version: 1, enabled: false });
-      assert.deepEqual(notes, [[
-        `Performance trace disabled. The log at ${traceLogPath(env)} is kept; nothing was deleted.`,
-        'info',
-      ]]);
-      assert.ok(!seq.includes('reload'));
-      assert.equal(fs.existsSync(traceLogPath(env)), true, 'the recorded run is kept');
-      assert.equal(traceLib().traceEvent('render', { view: 'odd', ms: 1 }, env).written, false, 'and tracing really stopped');
-    });
-  });
-
-  test('a malformed flag is left byte-identical and the row reports why', async () => {
-    const env = scratchStateEnv();
-    fs.mkdirSync(env.GENTLE_STATUS_STATE_DIR, { recursive: true });
-    const flag = traceFlagPath(env);
-    const garbage = '{"version":1,"enabled":';
-    fs.writeFileSync(flag, garbage);
-
-    const { notes, seq } = await runPanel({
-      env,
-      inputs: TO_TRACE,
-      inspect: (opened) => {
-        const text = flatCard(opened);
-        assert.ok(text.includes('Performance trace · OFF'), 'an unusable flag is not reported as ON');
-        assert.ok(text.includes('Not a valid trace flag'), 'the row explains what to fix');
-      },
-      confirm: 'enter',
-    });
-    assert.equal(fs.readFileSync(flag, 'utf8'), garbage, 'the bytes are untouched');
-    assert.equal(notes.length, 1);
-    assert.equal(notes[0][1], 'error');
-    assert.match(notes[0][0], /^Performance trace not changed\. /);
-    assert.match(notes[0][0], /refusing to overwrite/);
-    assert.ok(!seq.includes('reload'));
-  });
-
-  test('the trace option never changes the three optimization states', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: false });
-    traceLib().writeTraceMode(true, env);
-    await withScan(declareAllScan, async () => {
-      const { component } = await runPanel({ env, inputs: TO_TRACE });
-      const text = flatCard(component);
-      assert.ok(text.includes('Performance trace · ON'), 'the trace row reads its own flag');
-      assert.ok(text.includes('Height index + eviction · PARTIAL'), 'the fused row keeps its mixed state');
-      assert.ok(text.includes('Recent tool output expansion · OFF'), 'the other rows keep their state');
-      assert.ok(text.includes('Incremental search corpus · OFF'));
-      assert.ok(!/Height index \+ eviction · (ON|UNKNOWN)/.test(text), 'support evidence never rewrites a row state');
-    });
-  });
-
-  test('the installed-Pi evidence is shown only while tracing, and the gate scan always runs', async () => {
-    const env = scratchStateEnv();
-    let scans = 0;
-    await withScan(() => {
-      scans += 1;
-      return fakeScan({ declared: ['heightIndex'], unknown: ['evictOffscreenLines'] });
-    }, async () => {
-      const off = await runPanel({ env, inputs: TO_TRACE });
-      assert.ok(scans >= 1, 'S17: the scan decides which rows exist, so it runs even with the trace off');
-      assert.ok(!flatCard(off.component).includes('support evidence'), 'no evidence is claimed without the trace');
-
-      traceLib().writeTraceMode(true, env);
-      const on = await runPanel({ env, inputs: TO_TRACE });
-      const text = flatCard(on.component);
-      assert.ok(text.includes('Evidence (Pi 1.3.0): 1 declared, 2 absent, 1 unknown'));
-      assert.ok(
-        perfLib().panelModel(env).rows.at(-1).detail.includes('evidence only, never proof of speedup'),
-        'the claim is bounded in the row detail',
-      );
-      assert.ok(!text.includes('test evidence'), 'raw per-key evidence stays out of the UI');
-    });
-  });
-
-  test('the trace row message reports a no-change and a refusal honestly', () => {
-    const lib = perfLib();
-    const base = { trace: true, label: 'Performance trace', path: '/state/perf-trace.jsonl' };
-    assert.equal(
-      lib.applyRowMessage({ ...base, ok: true, changed: false, enabled: true }),
-      'Performance trace already enabled; nothing was changed.',
-    );
-    assert.equal(
-      lib.applyRowMessage({ ...base, ok: true, changed: false, enabled: false }),
-      'Performance trace already disabled; nothing was changed.',
-    );
-    assert.equal(
-      lib.applyRowMessage({ ...base, ok: false, changed: false, enabled: false, error: 'cannot write trace flag /state/gentle-perf-trace.json: EACCES' }),
-      'Performance trace not changed. cannot write trace flag /state/gentle-perf-trace.json: EACCES',
-    );
-  });
-
-  test('a switch change under an enabled trace starts a new identified run', async () => {
-    const env = scratchStateEnv();
-    await withScan(declareAllScan, async () => {
-      traceLib().writeTraceMode(true, env);
-
-      // Run 1: the row is OFF, then switched ON — the run that starts now is
-      // recorded with the switches in effect.
-      await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
-      let sessions = fs.existsSync(traceLogPath(env))
-        ? fs.readFileSync(traceLogPath(env), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).filter((line) => line.kind === 'session')
-        : [];
-      assert.equal(sessions.length, 1, 'the switch change writes one snapshot');
-      assert.equal(sessions[0].perf.expandRecentToolOutput, true, 'the ON run is identified');
-      assert.equal(sessions[0].perf.heightIndex, false, 'and every other switch is recorded as it is');
-
-      // Run 2: back OFF — a second boundary, not a silent continuation.
-      await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
-      sessions = fs.readFileSync(traceLogPath(env), 'utf8').trim().split('\n').map((line) => JSON.parse(line)).filter((line) => line.kind === 'session');
-      assert.equal(sessions.length, 2, 'the second change writes a second snapshot');
-      assert.equal(sessions[1].perf.expandRecentToolOutput, false, 'the OFF run is identified too');
-    });
-  });
-
-  test('the reset returns the trace to its OFF default', async () => {
-    const env = scratchStateEnv();
-    traceLib().writeTraceMode(true, env);
-    const { notes } = await runPanel({ env, inputs: TO_RESET, confirm: 'enter' });
-    assert.equal(traceLib().readTraceMode(env).enabled, false, 'the trace is an option and returns to OFF');
-    assert.match(notes[0][0], /^Defaults saved\./);
   });
 });

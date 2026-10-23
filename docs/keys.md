@@ -89,9 +89,12 @@ page movement, plus `ctrl+d`/`ctrl+u` and uppercase `J`/`K` for half pages.
 Lowercase `j`/`k` always select list rows. The alternate pairs are useful when
 a terminal or multiplexer intercepts the original shortcuts.
 
-## Customize and performance
+## Customize
 
 Use `tab` or `←`/`→` to switch panes, `↑`/`↓` to move and `enter` to apply.
-Escape closes. Performance trace is OFF by default; leave tracing ON for both
-comparison runs and change only the optimization switches between runs.
-See [Performance trace](performance-trace.md) for its measured scope and limits.
+Escape closes. The panel offers four categories — sidebar, moshi, worktree and
+reset — and no performance switch of any kind.
+
+The performance trace is not a panel option: it is switched on by exporting
+`GENTLE_PERF_TRACE=1` before starting Pi. See
+[Performance trace](performance-trace.md) for its measured scope and limits.

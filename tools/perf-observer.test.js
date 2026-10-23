@@ -4,6 +4,9 @@
 // observer sample in another, and the observer reads only the PUBLIC root host
 // surface (the full-redraw counter), never a private one.
 //
+// Tracing is switched on by GENTLE_PERF_TRACE, the same shell-level variable the
+// library reads, so these cases set the environment and nothing else.
+//
 // Contract under test (observable behavior only — the JSONL bytes on disk:
 // which lines exist, their allowlisted fields, and whether a disabled trace
 // writes anything at all):
@@ -11,9 +14,10 @@
 //   first traced frame also writes the `resource` baseline (S18);
 // - the component duration stays on the render line, the observer line carries
 //   the trailing append cost of the writes that already finished;
-// - the host counter is a snapshot plus its support state, and the host
+// - the host counter is a snapshot plus its capability state, and the host
 //   render duration is reported as absent rather than guessed from a counter;
-// - a disabled trace writes no log and mounts the view unchanged;
+// - a disabled trace writes no log, creates no file and mounts the view
+//   unchanged;
 // - no rendered text reaches the log.
 
 const { test, describe, after, beforeEach } = require('node:test');
@@ -97,12 +101,14 @@ function stubbedLibDir() {
   return dir;
 }
 
-function scratchEnv(libDir) {
+function scratchEnv(libDir, { trace = false } = {}) {
   return {
     GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-perf-obs-state-'))),
     PI_CODING_AGENT_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-perf-obs-agent-'))),
     GENTLE_PI_AGENT_HOME: undefined,
     GENTLE_WORKTREE_LIB_DIR: libDir,
+    // The one switch: `1` traces, an explicitly deleted variable does not.
+    GENTLE_PERF_TRACE: trace ? '1' : undefined,
   };
 }
 
@@ -184,11 +190,10 @@ beforeEach(() => {
 describe('perfTraceView observer samples', { concurrency: false }, () => {
   test('a traced frame writes the component duration and a separate observer sample', async () => {
     const libDir = stubbedLibDir();
-    const env = scratchEnv(libDir);
+    const env = scratchEnv(libDir, { trace: true });
     setEnv(env);
     const repo = makeRepo();
     const { commands } = await loadExtension();
-    assert.equal(traceLib().writeTraceMode(true, env).ok, true);
 
     const host = makeHostTui();
     const { ctx, opened } = mountingCtx({ cwd: repo, host });
@@ -235,7 +240,7 @@ describe('perfTraceView observer samples', { concurrency: false }, () => {
     // The process-level event-loop metric is reported with its own state: this
     // Node build reports idle/active as 0 forever, so 'absent' is the honest
     // verdict here and a numeric interval would be evidence that it works.
-    assert.ok(['declared', 'absent', 'unknown'].includes(second.processLoopState), 'the loop metric carries a support state');
+    assert.ok(['declared', 'absent', 'unknown'].includes(second.processLoopState), 'the loop metric carries a capability state');
     if (second.processLoopState === 'declared') {
       assert.ok(second.processLoopWindowMs > 0, 'a declared interval is real');
       assert.ok(second.processLoopUtilization >= 0 && second.processLoopUtilization <= 1);

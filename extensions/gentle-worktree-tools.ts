@@ -41,10 +41,11 @@ function libRequire(name) {
 // one allowlisted `render` event per frame. Pi's own transcript renderer is not
 // reachable from here and is never claimed to be measured.
 //
-// The trace is OFF by default and its disabled path adds no wrapper, no clock
-// read and no write: mounting a view costs one flag stat, never a per-frame
-// cost. Render return values and exceptions pass through untouched, and the
-// rendered lines are never logged.
+// The trace is switched on by the GENTLE_PERF_TRACE environment variable (S24)
+// and its disabled path adds no wrapper, no clock read and no write: mounting a
+// view costs one environment check, never a per-frame cost. Render return values
+// and exceptions pass through untouched, and the rendered lines are never
+// logged.
 let perfTraceModule;
 
 function perfTraceLib() {
@@ -62,7 +63,7 @@ function perfTraceView(view, component, hostTui) {
   const lib = perfTraceLib();
   if (!lib || !component || typeof component.render !== "function") return component;
   try {
-    if (lib.readTraceMode(process.env).enabled !== true) return component;
+    if (lib.isTraceEnabled(process.env) !== true) return component;
   } catch {
     return component;
   }
@@ -7564,13 +7565,6 @@ const CUSTOMIZE_CATEGORIES = [
     ],
   },
   {
-    id: "perf",
-    title: "Performance",
-    // Rows, setting names and note text live in lib/customize-perf-rows.js
-    // (perf-switches S2-S6): this file delegates and carries no copy.
-    rows: [],
-  },
-  {
     id: "reset",
     title: "Reset",
     rows: [
@@ -7612,43 +7606,19 @@ function customizeWorktreeValue() {
   }
 }
 
-// The performance rows are the one part of the panel that is NOT written
-// here: lib/customize-perf-rows.js owns their labels, their setting keys, the
-// fused row's partial state and every note string. This file only asks it for
-// a model and hands it the user's choice, so the standing rule (new logic goes
-// in new modules, not into this 8000-line file) holds.
-function customizePerfModule() {
-  try {
-    return libRequire("customize-perf-rows.js");
-  } catch {
-    return null;
-  }
-}
-
-function customizePerfPanel() {
-  const module = customizePerfModule();
-  if (!module || typeof module.panelModel !== "function") {
-    return { available: false, active: null, rows: [] };
-  }
-  try {
-    return module.panelModel(process.env);
-  } catch {
-    return { available: false, active: null, rows: [] };
-  }
-}
-
+// The performance rows are gone (S22/S24): the customize panel offers no
+// optimisation switch and no trace toggle at all. The trace is switched on by
+// the GENTLE_PERF_TRACE environment variable, never from here.
 function customizePanelModel() {
   const slot = customizeReadSlot();
   const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
   const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
   const worktreeActive = customizeWorktreeValue();
-  const perf = customizePerfPanel();
   const byId = (id) => CUSTOMIZE_CATEGORIES.find((entry) => entry.id === id);
   return [
     { ...byId("sidebar"), available: sidebar.available, active: sidebar.active },
     { ...byId("moshi"), available: moshi.available, active: moshi.active },
     { ...byId("worktree"), available: true, active: worktreeActive },
-    { ...byId("perf"), available: perf.available, active: perf.active, rows: perf.rows },
     // The reset row never depends on the provider slot or the Herdr plugin: it
     // is always offered, and reports per option whatever it can actually reach.
     { ...byId("reset"), available: true, active: null },
@@ -7967,20 +7937,9 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const previewTitle = `Preview · ${current.row ? current.row.label : current.category.title}`;
     const previewSample = current.row ? current.row.detail : "unavailable";
     if (previewLines === 3) {
-      const wrapped = current.row && typeof current.row.noteLines === "function"
-        ? current.row.noteLines(inner)
-        : null;
-      // Two wrapped note lines fit the height the preview block already
-      // budgets; with one, the blank separator and the old single line stand
-      // so every other category's card is byte-identical.
-      if (wrapped && wrapped.length > 1) {
-        lines.push(paint(previewTitle, inner, "accent"));
-        for (const line of wrapped.slice(0, previewLines - 1)) lines.push(paint(line, inner, "muted"));
-      } else {
-        lines.push("");
-        lines.push(paint(previewTitle, inner, "accent"));
-        lines.push(paint(wrapped && wrapped.length === 1 ? wrapped[0] : previewSample, inner, "muted"));
-      }
+      lines.push("");
+      lines.push(paint(previewTitle, inner, "accent"));
+      lines.push(paint(previewSample, inner, "muted"));
     } else if (previewLines === 1) {
       lines.push(paint(previewTitle, inner, "muted"));
     }
@@ -8096,19 +8055,6 @@ async function customizeResetAll(ctx, toolsRegistered) {
     moshi: { available: moshi.available, value: moshi.active },
     worktree: { available: true, value: customizeWorktreeValue() },
   };
-  // The four pi performance keys are part of "every option" too, and their
-  // default is OFF. All of it — which keys, what they are called, how they are
-  // written — comes from lib/customize-perf-rows.js, so this file never names
-  // a setting.
-  const perfModule = customizePerfModule();
-  let perfState = { ok: false, allOff: true };
-  if (perfModule && typeof perfModule.defaultsState === "function") {
-    try {
-      perfState = perfModule.defaultsState(process.env);
-    } catch {
-      perfState = { ok: false, allOff: false };
-    }
-  }
   // S6/T4: judge the sidebar against the default that APPLIES here. Without
   // the plugin OFF is that default (nothing to reset, nothing to apply); with
   // it, OFF is something to reset. An ON sidebar needs no probe: it already
@@ -8123,13 +8069,13 @@ async function customizeResetAll(ctx, toolsRegistered) {
     if (!current[option.id].available) return false;
     if (option.id === "sidebar" && sidebarPluginMissing) return true;
     return current[option.id].value === option.valueId;
-  }) && perfState.allOff === true;
+  });
   if (atDefaults) {
     if (typeof notify === "function") {
       notify(
         sidebarPluginMissing
-          ? `Nothing to reset: the sidebar is already OFF by default, and moshi, worktree and performance switches already match their defaults. ${sidebarConditionalDefault}`
-          : "Nothing to reset: sidebar, moshi, worktree and performance switches already match their defaults.",
+          ? `Nothing to reset: the sidebar is already OFF by default, and moshi and worktree already match their defaults. ${sidebarConditionalDefault}`
+          : "Nothing to reset: sidebar, moshi and worktree already match their defaults.",
         "info",
       );
     }
@@ -8199,26 +8145,6 @@ async function customizeResetAll(ctx, toolsRegistered) {
       : (seen.length > 0 ? seen[seen.length - 1] : `could not reset ${option.label}; nothing was changed.`);
     fail(option.label, reason);
   }
-  // Only when something was on: a reset that had nothing to do with the
-  // performance switches keeps its summary unchanged instead of padding it.
-  if (perfModule && typeof perfModule.resetToDefaults === "function" && perfState.allOff !== true) {
-    let perfWrite = null;
-    try {
-      perfWrite = perfModule.resetToDefaults(process.env);
-    } catch (err) {
-      perfWrite = { ok: false, entries: [], error: (err && err.message) || String(err) };
-    }
-    if (perfWrite && Array.isArray(perfWrite.entries)) {
-      for (const entry of perfWrite.entries) {
-        results.push({ label: entry.label, applied: entry.applied === true });
-      }
-    }
-    if (!perfWrite || perfWrite.ok !== true) {
-      if (!firstError) firstError = (perfWrite && perfWrite.error) || "could not reset the performance switches; nothing was changed.";
-    } else if (perfWrite.changed === true) {
-      needsReload = true;
-    }
-  }
   const changedCount = results.filter((entry) => entry.applied).length;
   let text;
   if (!firstError) {
@@ -8238,36 +8164,10 @@ async function customizeResetAll(ctx, toolsRegistered) {
 // verdict; notifies exactly once (providers run against a capturing ctx
 // so an inline notify never double-posts) and reloads only when the
 // change reported needsReload.
-// One performance row toggle. The verdict, the sentence and the reload
-// decision all come from lib/customize-perf-rows.js; a module that cannot load
-// reports the row as unchanged instead of pretending it landed.
-async function customizeApplyPerfRow(rowId, ctx) {
-  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
-  const module = customizePerfModule();
-  let result = null;
-  if (module && typeof module.applyRow === "function") {
-    try {
-      result = module.applyRow(String(rowId ?? ""), process.env);
-    } catch (err) {
-      result = { ok: false, changed: false, needsReload: false, label: String(rowId ?? ""), error: (err && err.message) || String(err) };
-    }
-  }
-  const text = module && typeof module.applyRowMessage === "function"
-    ? module.applyRowMessage(result)
-    : `${String(rowId ?? "the performance row")} not changed. the performance rows are unavailable in this session.`;
-  const needsReload = Boolean(result && result.ok === true && result.needsReload === true);
-  if (typeof notify === "function") {
-    notify(`${text}${needsReload ? " Reloading now to apply the change." : ""}`, result && result.ok === true ? "info" : "error");
-  }
-  if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
-  return { changed: Boolean(result && result.changed === true), needsReload };
-}
-
 async function applyCustomizeChoice(categoryId, valueId, ctx, toolsRegistered) {
   // The reset spans every option, so it never goes through the
   // per-category provider lookup below.
   if (categoryId === "reset") return customizeResetAll(ctx, toolsRegistered);
-  if (categoryId === "perf") return customizeApplyPerfRow(valueId, ctx);
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const category = CUSTOMIZE_CATEGORIES.find((entry) => entry.id === categoryId);
   const title = category ? category.title : String(categoryId);
@@ -9267,10 +9167,10 @@ export default function (pi) {
   } catch {
     toolsRegistered = false;
   }
-  // S30: the customize panel's performance previews are plain-language
-  // behavior/benefit/tradeoff copy from lib/customize-perf-rows.js; the
-  // measured evidence lives in the docs, never in the UI (so the host's own
-  // raw setting descriptions are intentionally not read into the panel).
+  // S30: the customize panel's previews are plain-language copy from each
+  // category's own rows; the measured evidence lives in the docs, never in the
+  // UI (so the host's own raw setting descriptions are intentionally not read
+  // into the panel).
   registerWarpMessageRenderer(pi);
   registerCustomizeCommand(pi, toolsRegistered);
   registerOddCommand(pi);
@@ -9405,11 +9305,10 @@ export default function (pi) {
         return null;
       }
     });
-    // S16/S16a: the trace's session snapshot. Written once per session — and
-    // again by the customize row when tracing is switched on — so every run in
-    // the log is preceded by the four switches and the installed-Pi evidence
-    // that describe it. Tracing OFF is the default and costs one flag stat
-    // here: no package scan, no write, no timing instrumentation.
+    // S16/S16a: the trace's session snapshot, written once per session while
+    // GENTLE_PERF_TRACE switches tracing on, so every run in the log is
+    // preceded by the identity that describes it. Tracing OFF (the default)
+    // costs one environment check here: no write, no timing instrumentation.
     pi.on("session_start", () => {
       try {
         const trace = perfTraceLib();
