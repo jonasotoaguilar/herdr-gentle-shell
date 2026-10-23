@@ -213,7 +213,7 @@ describe('createOddView read-only association (S10b)', () => {
     assert.ok(!body.includes('unsaved'), 'no unsaved indicator exists');
     assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
     assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
-    assert.match(body, /ctrl\+j\/k scroll/, 'the reading keys stay in the legend');
+    assert.match(body, /ctrl\+j\/k( scroll)?/, 'the reading keys stay in the legend');
     assert.match(body, /esc close/, 'the close key stays in the legend');
   });
 
@@ -327,7 +327,7 @@ describe('createOddView key consistency (K3)', () => {
     assert.match(body, / › al/, 'the filter is visible while typing');
     view.handleInput('enter');
     const kept = strip(view.render(80).join('\n'));
-    assert.match(kept, /› al \(T to edit\)/, 'leaving the box keeps the filter');
+    assert.match(kept, /› al( |$)/m, 'leaving the box keeps the filter');
     assert.match(kept, /alpha/);
     const keptRows = kept.split('\n').filter((line) => /[▸ ] [✓·✎] /.test(line));
     assert.ok(keptRows.every((line) => !line.includes('beta') && !line.includes('gamma')), 'the filter still applies after leaving the box');
@@ -342,7 +342,7 @@ describe('createOddView key consistency (K3)', () => {
     view.handleInput('m');
     view.handleInput('enter');
     const body = strip(view.render(80).join('\n'));
-    assert.match(body, /› gam \(T to edit\)/, 'the / filter is kept like the T filter');
+    assert.match(body, /› gam( |$)/m, 'the / filter is kept like the T filter');
     assert.match(body, /gamma/);
     assert.ok(!body.split('\n').filter((line) => /│ [▸ ] /.test(line)).some((line) => line.includes('alpha')), 'alpha is filtered out');
   });
@@ -397,8 +397,8 @@ describe('createOddView key consistency (K3)', () => {
     const { view } = makeKeyView();
     await tick();
     const body = strip(view.render(80).join('\n'));
-    assert.match(body, /› Search \(T\)/, 'the search row names the filter key once');
-    assert.ok(!/T filter/.test(body), 'the footer does not repeat the filter hint');
+    assert.match(body, /› Search/, 'the search row is the search widget');
+    assert.match(body, /T/, 'the footer names the filter key (S4)');
     assert.match(body, /o open/, 'the footer names the external-open key');
     assert.ok(!body.includes('? help'), 'the footer no longer hints the removed help key');
   });
@@ -612,7 +612,7 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     assert.ok(!strip(lines[0]).includes('1/2'), 'the count is not buried in the title');
     view.handleInput('enter');
     lines = strip(view.render(80).join('\n')).split('\n');
-    assert.match(strip(lines[1]), /› al \(T to edit\)/, 'leaving the box keeps the query visible');
+    assert.match(strip(lines[1]), /› al( |$)/m, 'leaving the box keeps the query visible');
     view.handleInput('/');
     lines = strip(view.render(80).join('\n')).split('\n');
     assert.match(strip(lines[1]), /› al█/, '/ edits the same row');
@@ -645,7 +645,7 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
       let body = strip(view.render(width).join('\n'));
       assert.equal(view.state.scroll, 0, `${width}x${rows}: the start is the top`);
       assert.match(body, /line 1\b/, `${width}x${rows}: the first source line is visible at the start`);
-      assert.match(body.split('\n')[1], /› Search \(T\)/, `${width}x${rows}: the query row is visible`);
+      assert.match(body.split('\n')[1], /› Search/, `${width}x${rows}: the query row is visible`);
       view.handleInput('\x1b[6~');
       body = strip(view.render(width).join('\n'));
       assert.ok(view.state.scroll > 0, `${width}x${rows}: PageDown reaches a middle window`);
@@ -730,8 +730,8 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     assert.ok(!body.includes('space'), 'no space hint');
     assert.ok(!body.includes('ctrl+s'), 'no save hint');
     assert.ok(!body.includes('assigned'), 'no assigned count');
-    assert.match(body, /ctrl\+j\/k scroll/, 'the scroll hint stays');
-    assert.match(body, /› Search \(T\)/, 'the filter hint stays, once, on the search row');
+    assert.match(body, /ctrl\+j\/k( scroll)?/, 'the scroll hint stays');
+    assert.match(body, /› Search/, 'the search row stays, without naming its key');
     assert.match(body, /o open/, 'the open hint stays');
     assert.match(body, /esc close/, 'the close hint stays');
     gatedOff.view.handleInput(' ');
@@ -745,7 +745,7 @@ describe('createOddView warp usability (S13,S14,S23-S27,S29)', () => {
     gatedOff.view.handleInput('a');
     gatedOff.view.handleInput('l');
     gatedOff.view.handleInput('enter');
-    assert.match(strip(gatedOff.view.render(80).join('\n')).split('\n')[1], /› al \(T to edit\)/, 'search still works');
+    assert.match(strip(gatedOff.view.render(80).join('\n')).split('\n')[1], /› al( |$)/m, 'search still works');
     gatedOff.view.handleInput('o');
     await tick();
     assert.equal(opened.length, 1, 'the external open still works');
@@ -802,14 +802,14 @@ describe('S13: the odd frame repeats nothing', () => {
     assert.match(lines[0], /✎ Odd · 2 documents/, 'the title carries the one total');
   });
 
-  test('the search key is named by the search row alone, never by the footer', async () => {
+  test('the search key is named by the footer alone (S4 supersedes the earlier split)', async () => {
     const view = quietView();
     await tick();
-    const lines = strip(view.render(80).join('\n')).split('\n');
+    const lines = strip(view.render(120).join('\n')).split('\n');
     const footer = footerOf(lines);
-    assert.match(lines[1], /› Search \(T\)/, 'the search row names its own key');
-    assert.ok(!tokensOf(footer).some((token) => /^T\b/.test(token)), `the footer does not repeat T: ${footer}`);
-    assert.ok(!footer.includes('search'), 'the footer does not repeat the search hint');
+    assert.match(lines[1], /› Search/, 'the search row carries the query only');
+    assert.ok(!lines[1].includes('(T)'), 'no parenthetical key above the footer');
+    assert.ok(tokensOf(footer).some((token) => /^T/.test(token)), `the footer names T: ${footer}`);
   });
 
   test('while searching the footer names the search keys once and the input carries only the query', async () => {
@@ -849,7 +849,162 @@ describe('S13: the odd frame repeats nothing', () => {
     view.handleInput('ctrl+j');
     const lines = strip(view.render(80).join('\n')).split('\n');
     assert.equal(lines.length, 20, 'the frame still fills every row');
-    assert.match(lines[1], /› Search \(T\) +\d+-\d+\/\d+/, 'the position rides the search row');
+    assert.match(lines[1], /› Search +\d+-\d+\/\d+/, 'the position rides the search row');
     assert.equal(lines.length - 3, 20 - 3, 'the panes keep the rows the status row used to take');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worktree-ui-feedback T2/T5: S1 (real host input), S3/D3 (wrapped names and
+// viewport-driven rows), S4 (every hint on the footer, Delete clears), S5
+// ("para odd igual, si son muchas igual se pagina").
+// ---------------------------------------------------------------------------
+describe('createOddView feedback round (S1,S3,S4,S5,D3)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function build(opts = {}) {
+    const paints = [];
+    const view = createOddView({
+      docs: opts.docs || [doc('alpha'), doc('beta')],
+      loadDoc: opts.loadDoc || (() => ({ ok: true, text: longDoc(200) })),
+      helpers: opts.helpers === undefined ? (realTui || helpers) : opts.helpers,
+      theme: plainTheme,
+      rowsAvailable: () => (opts.rows === undefined ? 20 : opts.rows),
+      requestRender: () => { paints.push(true); },
+      done: () => {},
+      ...opts.rest,
+    });
+    return { view, paints };
+  }
+
+  const footerOf = (lines) => strip(lines[lines.length - 2]);
+  const searchRowOf = (lines) => strip(lines[1]);
+  const leftRows = (lines) => lines
+    .slice(2, -2)
+    .map((line) => strip(line).split('│')[1] || '');
+
+  test('S1: ctrl+j scrolls the preview when the host reads the byte as ctrl+j and enter alike', { skip: realTui ? false : 'requires @earendil-works/pi-tui' }, () => {
+    // The installed 1.4 matcher reports the same 0x0a as BOTH `ctrl+j` and
+    // `enter` while the Kitty protocol is inactive, which is the terminal the
+    // user reported. The reading keys must still win over the alias here.
+    assert.equal(realTui.matchesKey('\n', 'ctrl+j'), true, 'the host byte is ctrl+j');
+    assert.equal(realTui.matchesKey('\n', 'enter'), true, 'and the host also calls it enter');
+    const { view } = build();
+    view.render(80);
+    view.handleInput('\n');
+    assert.ok(view.state.scroll > 0, 'ctrl+j scrolls the preview through the real matcher');
+    view.handleInput('\x1b[107;5u'); // Kitty ctrl+k press
+    assert.equal(view.state.scroll, 0, 'the Kitty encoding scrolls back');
+    view.handleInput('\x0b');
+    assert.equal(view.state.scroll, 0, 'the legacy control byte clamps at the top');
+    view.handleInput('\x1b[106;5:2u'); // Kitty ctrl+j repeat
+    assert.ok(view.state.scroll > 0, 'a Kitty key repeat also scrolls');
+    assert.equal(view.state.index, 0, 'no scroll key moved the list selection');
+  });
+
+  test('S5: a long document list paginates by the body budget, and ←/→ page it', async () => {
+    const docs = Array.from({ length: 14 }, (_, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
+    const { view } = build({ docs, rows: 12 });
+    await tick();
+    let lines = view.render(80);
+    // rows 12 -> top rule + search row + footer + bottom rule = 8 body rows
+    const firstPage = leftRows(lines).filter((row) => row.trim() !== '');
+    assert.equal(firstPage.length, 8, 'every body row carries a document, no fixed page size');
+    assert.match(searchRowOf(lines), /1\/2/, 'the page position rides the search row');
+    assert.match(firstPage[0], /document-01/);
+
+    view.handleInput('right');
+    lines = view.render(80);
+    const secondPage = leftRows(lines).filter((row) => row.trim() !== '');
+    assert.equal(secondPage.length, 6, 'the last page carries the remaining documents');
+    assert.match(secondPage[0], /document-09/, 'the second page starts where the first ended');
+    assert.match(searchRowOf(lines), /2\/2/, 'the page position follows');
+    assert.equal(view.state.index, 8, 'the selection moves to the first document of the new page');
+
+    view.handleInput('left');
+    assert.equal(view.state.index, 0, '← returns to the first document of the previous page');
+    view.handleInput('right');
+    view.handleInput('right');
+    assert.equal(view.state.index, 8, '→ never pages past the last page');
+    view.handleInput('left');
+    view.handleInput('left');
+    assert.equal(view.state.index, 0, '← never pages before the first page');
+  });
+
+  test('S5: ↓ walks every document across page boundaries, skipping none', async () => {
+    const docs = Array.from({ length: 14 }, (_, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
+    const { view } = build({ docs, rows: 12 });
+    await tick();
+    const seen = [];
+    const pages = [];
+    for (let step = 0; step < docs.length; step += 1) {
+      const rendered = view.render(80);
+      const rows = leftRows(rendered);
+      const focused = rows.find((row) => row.includes('▸')) || '';
+      seen.push((focused.match(/document-\d+/) || [''])[0]);
+      pages.push((searchRowOf(rendered).match(/(\d+)\/2/) || [])[1]);
+      view.handleInput('down');
+    }
+    assert.deepEqual(seen, docs.map((entry) => entry.name.replace(/\.md$/, '')), 'every document is reachable in order');
+    assert.deepEqual([...new Set(pages)], ['1', '2'], 'the page followed the selection across the boundary');
+  });
+
+  test('S3: a long document name wraps over the rows it needs instead of truncating', async () => {
+    const name = 'a-document-name-that-is-far-wider-than-the-list-pane';
+    const { view } = build({ docs: [doc(name), doc('beta')], rows: 20, loadDoc: () => ({ ok: true, text: 'body\n' }) });
+    await tick();
+    const rows = leftRows(view.render(80)).map((row) => row.trim());
+    const rendered = rows.join(' ');
+    assert.ok(!rendered.includes('…'), `no ellipsis truncation: ${rendered}`);
+    assert.ok(rendered.includes('wider'), 'the middle of the name is visible');
+    assert.ok(rendered.includes('pane'), 'the end of the name is visible');
+    assert.match(searchRowOf(view.render(80)), /› Search\b/, 'the search row still reads as the search widget');
+  });
+
+  test('S4: T is named by the footer only, never above it', async () => {
+    const { view } = build();
+    await tick();
+    const lines = view.render(120);
+    assert.equal(searchRowOf(lines).includes('(T)'), false, 'the search row names no key');
+    assert.ok(!searchRowOf(lines).includes('T to edit'), 'leaving the box never re-adds the parenthetical key');
+    assert.match(footerOf(lines), /T search/, 'the footer names the search key');
+    view.handleInput('T');
+    view.handleInput('a');
+    const typing = view.render(80);
+    assert.match(searchRowOf(typing), /› a█/, 'the input row carries the query only');
+    assert.match(footerOf(typing), /del clear/, 'the footer advertises Delete while the box is open');
+    assert.match(footerOf(typing), /bksp/, 'and Backspace for one character');
+  });
+
+  test('S4: Delete clears the whole query, Backspace deletes one character', async () => {
+    const { view } = build({ docs: [doc('alpha'), doc('beta'), doc('gamma')] });
+    await tick();
+    view.handleInput('T');
+    for (const char of 'gam') view.handleInput(char);
+    assert.equal(view.state.query, 'gam');
+    view.handleInput('\x7f');
+    assert.equal(view.state.query, 'ga', 'Backspace removes exactly one character');
+    for (const char of 'mma') view.handleInput(char);
+    assert.equal(leftRows(view.render(80)).filter((row) => row.includes('gamma')).length, 1, 'the query filters');
+    view.handleInput('\x1b[3~'); // Delete
+    assert.equal(view.state.query, '', 'Delete clears the entire query');
+    assert.equal(view.state.searching, true, 'and leaves the box open for a new query');
+    assert.equal(leftRows(view.render(80)).filter((row) => /document|alpha|beta|gamma/.test(row)).length, 3, 'every document lists again');
+    for (const char of 'beta') view.handleInput(char);
+    view.handleInput('delete'); // the host name for the same key
+    assert.equal(view.state.query, '', 'the host key name clears it too');
+  });
+
+  test('D3: Tab stays out of the list; only ←/→ page and ↑↓/j/k select', async () => {
+    const docs = Array.from({ length: 10 }, (_, at) => doc(`document-${at + 1}`));
+    const { view } = build({ docs, rows: 12 });
+    await tick();
+    view.handleInput('tab');
+    assert.equal(view.state.index, 0, 'Tab changes no selection in a single-dataset reader');
+    assert.equal(view.state.scroll, 0);
+    view.handleInput('down');
+    assert.equal(view.state.index, 1, 'bare ↓ still moves the selection');
+    view.handleInput('j');
+    assert.equal(view.state.index, 2, 'bare j still moves the selection');
   });
 });
