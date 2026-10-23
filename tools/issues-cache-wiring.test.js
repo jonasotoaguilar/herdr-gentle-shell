@@ -1,17 +1,21 @@
 'use strict';
-// worktree-ui-redesign S10/S7c/S7d wiring tests: lib/issues-cache.js as the
-// extension actually uses it — one complete OPEN snapshot at session start, a
-// margin-only refresh when `/herdr-gentle:issues` opens, and per-worktree
+// worktree-ui-redesign S10/S5/S7c/S7d wiring tests: lib/issues-cache.js as the
+// extension actually uses it — one complete OPEN snapshot at session start for
+// assignment proof, fresh server pages for the viewer, and per-worktree
 // assignment verification that drops an issue only on PROOF and never purges
 // what it cannot prove.
 //
 // Observable contract under test (the argv that reaches the injected `gh`
-// runner, the registry bytes on disk, and the text the mounted detail renders):
+// runner, the registry bytes on disk, and the text the mounted surfaces
+// render):
 // - session start lists the open set with ONE bounded fetch and never works
 //   from a truncated or sampled page;
-// - each `/herdr-gentle:issues` open asks only for the newest 20 UPDATED
-//   issues, closed ones included, and requests nothing like the full set;
-// - a closure reported by that margin is merged, so the worktree that still
+// - each `/herdr-gentle:issues` mount reads ONE fresh search page per bucket,
+//   bounded by the reader's row budget, and never re-primes the snapshot;
+// - the assignment margin is a SEPARATE bounded `--state all` read that starts
+//   only after the overlay mounted, is settled before the command returns, and
+//   never becomes a second source for the list on screen;
+// - a closure the shared refresh reports is merged, so the worktree that still
 //   carried the issue loses it — persisted in the registry — and the detail's
 //   Issues tab no longer lists it;
 // - an issue that gh answers 404 for is dropped on proof, while an
@@ -165,7 +169,7 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
     buckets: { mine: null, assigned: null, involved: null },
     mode: 'ok',
     snapshot: 'ok',
-    listOverdelivers: false,
+    searchOverdelivers: false,
     calls: [],
     set(number, state, updatedAt = '2024-01-05T00:00:00Z') {
       model.issues.set(number, { state, updatedAt });
@@ -201,7 +205,12 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
       return { status: 1, stdout: '', stderr: 'HTTP 401: Bad credentials (https://api.github.com/graphql)' };
     }
     if (argv[0] === 'api' && argv[1] === 'user') return json({ login: 'octo' });
-    if (argv[0] === 'api' && argv[1] === 'graphql') return json(graphqlOpenPage(model, argv));
+    if (argv[0] === 'api' && argv[1] === 'graphql') {
+      // Two GraphQL shapes reach gh: the assignment snapshot connection and
+      // the viewer's `search` page. They are told apart by their variables.
+      if (graphqlVariable(argv, 'search') !== null) return json(graphqlSearchPage(model, argv));
+      return json(graphqlOpenPage(model, argv));
+    }
     if (argv[0] === 'repo' && argv[1] === 'view') return json({ nameWithOwner: model.nameWithOwner });
     if (argv[0] === 'issue' && argv[1] === 'list') {
       const at = (flag) => argv[argv.indexOf(flag) + 1];
@@ -217,7 +226,6 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
         .filter(([number]) => members === null || members.has(number))
         .map(([number, record]) => fixture(number, record)));
       const served = Number.isFinite(limit) ? rows.slice(0, limit) : rows;
-      if (model.listOverdelivers === true) return json([...served, ...served]);
       return json(served);
     }
     if (argv[0] === 'issue' && argv[1] === 'view') {
@@ -242,16 +250,71 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
   return model;
 }
 
+// A `-F name=value` GraphQL variable, the only way the client sends them.
+function graphqlVariable(argv, name) {
+  for (let index = 0; index < argv.length - 1; index += 1) {
+    if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
+  }
+  return null;
+}
+
+function searchNode(number, record) {
+  return {
+    number,
+    title: `issue title ${number}`,
+    state: record.state.toUpperCase(),
+    stateReason: '',
+    author: { login: 'octo' },
+    labels: { nodes: [] },
+    createdAt: '2024-01-01T00:00:00Z',
+    updatedAt: record.updatedAt,
+    url: `https://example.test/issues/${number}`,
+    comments: { totalCount: 0 },
+    reactionGroups: [],
+  };
+}
+
+// The exact page shape `getIssuePage` reads: a `search` connection with
+// issueCount, pageInfo and edges carrying their own cursor. The search string
+// selects the bucket exactly as GitHub would.
+function graphqlSearchPage(model, argv) {
+  const search = String(graphqlVariable(argv, 'search') || '');
+  const first = Number(graphqlVariable(argv, 'first'));
+  const cursor = graphqlVariable(argv, 'cursor');
+  const bucket = /-author:@me/.test(search) ? 'involved'
+    : (/assignee:@me/.test(search) ? 'assigned' : 'mine');
+  const members = model.buckets[bucket];
+  const rows = [...model.issues.entries()]
+    .filter(([, record]) => record.state === 'open')
+    .filter(([number]) => members === null || members.has(number))
+    .sort((left, right) => {
+      const byTime = Date.parse(right[1].updatedAt) - Date.parse(left[1].updatedAt);
+      return byTime !== 0 ? byTime : right[0] - left[0];
+    });
+  const offset = cursor === null ? 0 : Number(String(cursor).replace('search-', '')) || 0;
+  const page = rows.slice(offset, offset + (Number.isFinite(first) ? first : rows.length));
+  const hasNextPage = offset + page.length < rows.length;
+  let edges = page.map(([number, record]) => ({ cursor: `row-${number}`, node: searchNode(number, record) }));
+  if (model.searchOverdelivers === true && edges.length > 0) {
+    // A server page that answers with more rows than were asked for.
+    edges = [...edges, ...edges.map((edge, index) => ({ cursor: `extra-${index}`, node: edge.node }))];
+  }
+  return {
+    data: {
+      search: {
+        issueCount: rows.length,
+        pageInfo: { hasNextPage, endCursor: hasNextPage ? `search-${offset + page.length}` : null },
+        edges,
+      },
+    },
+  };
+}
+
 // The exact connection shape `listAllOpenIssues` pages through:
 // `repository.issues(states: OPEN, first:, after:)` with totalCount and
 // pageInfo. `model.snapshot` simulates the ways a page can lie.
 function graphqlOpenPage(model, argv) {
-  const variable = (name) => {
-    for (let index = 0; index < argv.length - 1; index += 1) {
-      if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
-    }
-    return null;
-  };
+  const variable = (name) => graphqlVariable(argv, name);
   if (model.snapshot === 'errors') return { errors: [{ message: 'API rate limit exceeded' }] };
   const first = Number(variable('first'));
   const cursor = variable('cursor');
@@ -275,19 +338,7 @@ function graphqlOpenPage(model, argv) {
         issues: {
           totalCount: rows.length,
           pageInfo: { hasNextPage, endCursor },
-          nodes: nodes.map(({ number, record }) => ({
-            number,
-            title: `issue title ${number}`,
-            state: record.state.toUpperCase(),
-            stateReason: '',
-            author: { login: 'octo' },
-            labels: { nodes: [] },
-            createdAt: '2024-01-01T00:00:00Z',
-            updatedAt: record.updatedAt,
-            url: `https://example.test/issues/${number}`,
-            comments: { totalCount: 0 },
-            reactionGroups: [],
-          })),
+          nodes: nodes.map(({ number, record }) => searchNode(number, record)),
         },
       },
     },
@@ -298,8 +349,23 @@ function opensOf(calls, state) {
   return calls.filter((argv) => argv[0] === 'issue' && argv[1] === 'list' && argv[argv.indexOf('--state') + 1] === state);
 }
 
-function graphqlPages(calls) {
-  return calls.filter((argv) => argv[0] === 'api' && argv[1] === 'graphql');
+// The assignment snapshot is the only connection paginated by `states: OPEN`.
+function snapshotPages(calls) {
+  return calls.filter((argv) => argv[0] === 'api' && argv[1] === 'graphql'
+    && argv.some((entry) => entry.includes('issues(states: OPEN')));
+}
+
+function searchPages(calls) {
+  return calls.filter((argv) => argv[0] === 'api' && argv[1] === 'graphql'
+    && graphqlVariable(argv, 'search') !== null);
+}
+
+function searchLimits(calls) {
+  return searchPages(calls).map((argv) => Number(graphqlVariable(argv, 'first')));
+}
+
+function searchQueries(calls) {
+  return searchPages(calls).map((argv) => String(graphqlVariable(argv, 'search')));
 }
 
 // The viewer mounts first and paints after its cached pages settle, so its
@@ -351,15 +417,13 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
       const boot = makeCtx(root);
       await Promise.all(sessions(handlers, boot.ctx));
 
-      const pages = graphqlPages(model.calls);
+      const pages = snapshotPages(model.calls);
       assert.equal(pages.length, 3, `250 rows are three 100-row cursor pages: ${pages.length}`);
-      // The only `issue list` reads at startup are the viewer's three buckets,
-      // each bounded by the snapshot count + 1 — never a whole-set download.
-      const seeded = opensOf(model.calls, 'open');
-      assert.equal(seeded.length, 3, 'one bucket read each');
-      for (const argv of seeded) {
-        assert.equal(Number(argv[argv.indexOf('--limit') + 1]), 251, 'bounded by the snapshot count + 1');
-      }
+      // Startup pays for the assignment snapshot alone: the viewer's buckets
+      // arrive one fresh search page at a time (S5/D1), so no bucket listing
+      // and no `gh issue list` read happens here.
+      assert.equal(opensOf(model.calls, 'open').length, 0, 'no bucket listing at startup');
+      assert.equal(searchPages(model.calls).length, 0, 'no viewer page before the viewer mounts');
       for (const argv of pages) {
         assert.ok(argv.includes('first=100'), 'the page size is the server maximum');
         assert.ok(!argv.includes('--search'), 'server pagination, never the search API');
@@ -386,18 +450,18 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
       const { handlers } = await loadExtension();
 
       await Promise.all([...sessions(handlers, makeCtx(root).ctx), ...sessions(handlers, makeCtx(root).ctx)]);
-      assert.equal(graphqlPages(model.calls).length, 3, 'concurrent starts share the prime in flight');
+      assert.equal(snapshotPages(model.calls).length, 3, 'concurrent starts share the prime in flight');
 
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
-      assert.equal(graphqlPages(model.calls).length, 3, 'a repeated start reuses the primed cache');
+      assert.equal(snapshotPages(model.calls).length, 3, 'a repeated start reuses the primed cache');
     } finally {
       restoreEnv();
     }
   });
 });
 
-describe('S10: the margin-only refresh on /issues open', { concurrency: false }, () => {
-  test('it asks for the newest 20 UPDATED issues, closed included, and nothing else', async () => {
+describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: false }, () => {
+  test('it reads one row-budget page per bucket and never re-primes', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('refresh');
@@ -410,19 +474,78 @@ describe('S10: the margin-only refresh on /issues open', { concurrency: false },
       const before = model.calls.length;
       const opened = makeCtx(root);
       await commands.get('herdr-gentle:issues').handler('', opened.ctx);
+      const frame = await viewerFrame(opened);
 
       const after = model.calls.slice(before);
-      const margins = opensOf(after, 'all');
-      assert.equal(margins.length, 1, `exactly one margin refresh per open: ${JSON.stringify(after)}`);
-      assert.equal(Number(margins[0][margins[0].indexOf('--limit') + 1]), 20, 'the newest 20 updated issues');
-      assert.equal(margins[0][margins[0].indexOf('--search') + 1], 'sort:updated-desc', 'ordered by last update');
-      // The viewer's own pages keep their S2 searches; the cache never adds a
-      // second full open listing.
-      const viewerPages = opensOf(after, 'open');
-      assert.equal(viewerPages.length, 3, 'the three viewer pages, unchanged');
-      for (const argv of viewerPages) {
-        assert.match(argv[argv.indexOf('--search') + 1], /@me/, 'each viewer page keeps its own query');
+      // The viewer mounts on the first bucket and reads ONE page, bounded by
+      // the reader's own row budget: the 24-row host leaves 17 list rows, so
+      // the request is 17 — never a fixed count and never the whole set.
+      assert.equal(searchPages(after).length, 1, `one fresh page for the bucket on screen: ${JSON.stringify(after)}`);
+      assert.deepEqual(searchLimits(after), [17], 'bounded by the row budget');
+      assert.deepEqual(searchQueries(after), [
+        'repo:octo/repo is:issue is:open author:@me sort:updated-desc',
+      ], 'the page carries its bucket\'s own S2 search, never the snapshot connection');
+      for (const argv of searchPages(after)) {
+        assert.ok(!argv.some((entry) => entry.startsWith('cursor=')), 'the first page starts the connection');
+        assert.ok(!argv.some((entry) => entry.startsWith('owner=')), 'the search seam replaces the snapshot connection');
       }
+      assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
+      // S5/S10: the assignment margin is a SEPARATE evidence read behind the
+      // fresh page, never a second source for the rows on screen.
+      const margins = opensOf(after, 'all');
+      assert.equal(margins.length, 1, `one separate assignment margin read: ${JSON.stringify(after)}`);
+      assert.match(frame, /My issues \(120\+\)/, 'the tab names the server total, more to come');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the assignment margin is a separate bounded read that starts after the mount', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('margin-separate');
+      const model = fakeGitHub();
+      for (let number = 1; number <= 120; number += 1) model.set(number, 'open');
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+
+      const before = model.calls.length;
+      const opened = makeCtx(root);
+      let callsAtMount = null;
+      // Capture the reads that exist at the exact mount boundary: the overlay
+      // must be on screen before the assignment evidence read starts.
+      opened.ctx.ui.custom = async (factory) => {
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        const component = factory(hostTui, plainTheme, {}, () => {});
+        callsAtMount = model.calls.slice(before).map((argv) => argv.slice());
+        opened.mounted.component = component;
+        opened.mounted.text = clean(component.render(110).join('\n'));
+        return null;
+      };
+      await commands.get('herdr-gentle:issues').handler('', opened.ctx);
+
+      assert.deepEqual(
+        (callsAtMount || []).filter((argv) => argv[0] === 'issue' && argv[1] === 'list'),
+        [],
+        'no assignment margin listing before the overlay mounted',
+      );
+      const after = model.calls.slice(before);
+      const margins = opensOf(after, 'all');
+      assert.equal(margins.length, 1, `exactly one margin read: ${JSON.stringify(after)}`);
+      assert.deepEqual(margins[0].slice(0, 4), ['issue', 'list', '--state', 'all'],
+        'the margin lists every state, not the viewer\'s open bucket');
+      assert.equal(margins[0][margins[0].indexOf('--limit') + 1], '20',
+        'the margin is the shared cache\'s bounded newest-20 window');
+      // The rows the reader sees still come from the fresh server page only.
+      assert.deepEqual(searchQueries(after), ['repo:octo/repo is:issue is:open author:@me sort:updated-desc'],
+        'the margin never replaces or adds to the viewer\'s page source');
+      assert.equal(searchPages(after).length, 1, 'exactly one fresh viewer page');
+      assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
+      // The first frame is the truthful loading state: mounting never waits for
+      // a network read, and the margin in particular starts after it.
+      assert.match(opened.mounted.text, /loading issues…/, 'the mount frame is still loading, not a cache');
+      assert.match(await viewerFrame(opened), /My issues \(120\+\)/, 'the frame renders the server total');
     } finally {
       restoreEnv();
     }
@@ -551,7 +674,7 @@ describe('S10: every open issue, no snapshot cap', { concurrency: false }, () =>
       const { commands, handlers } = await loadExtension();
 
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
-      assert.equal(graphqlPages(model.calls).length, 7, '620 rows are seven 100-row cursor pages');
+      assert.equal(snapshotPages(model.calls).length, 7, '620 rows are seven 100-row cursor pages');
 
       const opened = makeCtx(target);
       await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
@@ -603,7 +726,7 @@ describe('S10: every open issue, no snapshot cap', { concurrency: false }, () =>
   }
 });
 
-describe('S10: the viewer pages come from the session cache', { concurrency: false }, () => {
+describe('S5: the viewer reads each page fresh from its bucket', { concurrency: false }, () => {
   // The viewer's three buckets, seeded from fixtures: `mine` holds #1..#3,
   // `assigned` #7..#9, `involved` #11, so a bucket that answered for another
   // query would be visible in the counts.
@@ -618,11 +741,7 @@ describe('S10: the viewer pages come from the session cache', { concurrency: fal
     return model;
   }
 
-  function listLimits(calls, state) {
-    return opensOf(calls, state).map((argv) => Number(argv[argv.indexOf('--limit') + 1]));
-  }
-
-  test('the prime seeds all three buckets and an open only asks the 20-row margins', async () => {
+  test('each open reads one bounded page and never re-primes', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('viewer');
@@ -632,38 +751,36 @@ describe('S10: the viewer pages come from the session cache', { concurrency: fal
       const { commands, handlers } = await loadExtension();
 
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
-      const seeded = opensOf(model.calls, 'open');
-      assert.equal(seeded.length, 3, 'one full read per bucket at startup');
-      assert.deepEqual(listLimits(model.calls, 'open'), [46, 46, 46], 'bounded by the snapshot count + 1');
+      assert.equal(snapshotPages(model.calls).length, 1, '45 open issues are one snapshot page');
+      assert.equal(searchPages(model.calls).length, 0, 'startup reads no bucket page');
 
       const before = model.calls.length;
       const opened = makeCtx(root);
       await commands.get('herdr-gentle:issues').handler('', opened.ctx);
+      const firstFrame = await viewerFrame(opened);
       const after = model.calls.slice(before);
 
-      assert.equal(graphqlPages(after).length, 0, 'the snapshot is never re-primed');
-      assert.deepEqual(listLimits(after, 'open'), [20, 20, 20], 'each bucket merges only its newest 20 rows');
-      assert.equal(opensOf(after, 'all').length, 1, 'the shared margin, once');
-      assert.deepEqual(listLimits(after, 'all'), [20]);
-      for (const argv of [...opensOf(after, 'open'), ...opensOf(after, 'all')]) {
-        assert.ok(Number(argv[argv.indexOf('--limit') + 1]) <= 20, `no full re-download after startup: ${argv.join(' ')}`);
-      }
-      assert.match(await viewerFrame(opened), /My issues \(45\)/, 'the cached page holds every row, not the 20-row margin');
+      assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
+      assert.equal(searchPages(after).length, 1, 'the bucket on screen is read fresh');
+      assert.deepEqual(searchLimits(after), [17], 'the request is the row budget, never a fixed count');
+      assert.match(firstFrame, /My issues \(45\+\)/, 'the tab names the server total');
 
-      // A second open asks the same margins again and still never re-primes.
+      // A second open reads the same first page again: fresh rows every time,
+      // still no snapshot.
       const beforeSecond = model.calls.length;
       const second = makeCtx(root);
       await commands.get('herdr-gentle:issues').handler('', second.ctx);
+      const secondFrame = await viewerFrame(second);
       const again = model.calls.slice(beforeSecond);
-      assert.equal(graphqlPages(again).length, 0, 'never a second snapshot');
-      assert.deepEqual(listLimits(again, 'open'), [20, 20, 20]);
-      assert.match(await viewerFrame(second), /My issues \(45\)/, 'rows older than the margin stay cached');
+      assert.equal(snapshotPages(again).length, 0, 'never a second snapshot');
+      assert.equal(searchPages(again).length, 1, 'a refresh is a fresh page, not a cache hit');
+      assert.match(secondFrame, /My issues \(45\+\)/);
     } finally {
       restoreEnv();
     }
   });
 
-  test('a closed or no-longer-matching issue leaves the cached bucket, and nothing else does', async () => {
+  test('a closed or no-longer-matching issue leaves its bucket, and nothing else does', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('membership');
@@ -674,26 +791,30 @@ describe('S10: the viewer pages come from the session cache', { concurrency: fal
 
       const first = makeCtx(root);
       await commands.get('herdr-gentle:issues').handler('', first.ctx);
-      assert.match(await viewerFrame(first), /Assigned \(3\)/, 'the seeded bucket lists its three issues');
+      assert.match(await viewerFrame(first), /My issues \(3\)/, 'the first bucket lists its three issues');
+      // Each bucket is read when it is shown: tab moves to Assigned.
+      first.mounted.component.handleInput('tab');
+      assert.match(await viewerFrame(first), /Assigned \(3\)/, 'the bucket lists its three issues');
 
-      // #8 closes and #9 stops matching the query; both are touched after the
-      // prime, so both are in the margin the next open merges.
+      // #8 closes and #9 stops matching the query.
       model.set(8, 'closed', '2024-04-01T00:00:00Z');
       model.set(9, 'open', '2024-04-02T00:00:00Z');
       model.buckets.assigned.delete(9);
 
       const second = makeCtx(root);
       await commands.get('herdr-gentle:issues').handler('', second.ctx);
+      assert.match(await viewerFrame(second), /My issues \(3\)/, 'the untouched bucket keeps every row');
+      second.mounted.component.handleInput('tab');
       const body = await viewerFrame(second);
       assert.match(body, /Assigned \(1\)/, 'only #7 still matches the query');
-      assert.match(body, /My issues \(3\)/, 'the untouched bucket keeps every row');
-      assert.match(body, /Involved \(1\)/, 'and so does the smallest one');
+      second.mounted.component.handleInput('tab');
+      assert.match(await viewerFrame(second), /Involved \(1\)/, 'and so does the smallest one');
     } finally {
       restoreEnv();
     }
   });
 
-  test('one repository\'s viewer cache never answers for another', async () => {
+  test('one repository\'s pages never answer for another', async () => {
     setEnv(stdEnv());
     try {
       const rootA = makeRepo('viewer-a');
@@ -717,7 +838,7 @@ describe('S10: the viewer pages come from the session cache', { concurrency: fal
       await commands.get('herdr-gentle:issues').handler('', openedB.ctx);
       const bodyB = await viewerFrame(openedB);
       assert.match(bodyB, /My issues \(3\)/, 'B answers from B');
-      assert.match(bodyB, /#5/, 'B lists its own issue');
+      assert.match(bodyB, /issue title 5/, 'B lists its own issue');
 
       const openedA = makeCtx(rootA);
       await commands.get('herdr-gentle:issues').handler('', openedA.ctx);
@@ -727,23 +848,23 @@ describe('S10: the viewer pages come from the session cache', { concurrency: fal
     }
   });
 
-  test('a bucket read that fills the snapshot bound is a failed proof, never a page', async () => {
+  test('a server page that overdelivers is a failed read, never a rendered page', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('overfull');
       const model = fakeGitHub();
       for (let number = 1; number <= 45; number += 1) model.set(number, 'open');
-      // gh returns more rows than the open snapshot can possibly hold: the
-      // bound no longer proves completeness, so no page may be primed.
-      model.listOverdelivers = true;
+      // gh answers with more edges than were requested: the page cannot be
+      // trusted, so none of it is primed or painted.
+      model.searchOverdelivers = true;
       ghIssues.setGhRunner(model.runner);
       const { commands, handlers } = await loadExtension();
 
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
       const opened = makeCtx(root);
       await commands.get('herdr-gentle:issues').handler('', opened.ctx);
-      assert.match(await viewerFrame(opened), /failed to load issues: .*cannot prove the My issues page is complete/,
-        'the unprovable read is reported, never rendered as a page');
+      assert.match(await viewerFrame(opened), /failed to load issues: .*exceeded the requested issue page size/,
+        'the overdelivered page is reported, never rendered as a page');
     } finally {
       restoreEnv();
     }

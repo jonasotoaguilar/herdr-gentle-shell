@@ -8994,18 +8994,29 @@ async function executeIssues(rawArgs, ctx) {
     if (typeof notify === "function") notify(`issues: cannot load the gh client: ${(err && err.message) || err}`, "error");
     return;
   }
-  // S10: each open merges only the newest margin into the shared snapshot —
-  // and that same margin decides which cached viewer rows may have changed
-  // membership. A failed or impossible refresh changes nothing in the cache
-  // and invalidates nothing.
-  const refreshed = await refreshIssuesCache(repoRoot);
-  const recent = refreshed.ok === true && Array.isArray(refreshed.recent) ? refreshed.recent : null;
-  // S19: mount the viewer FIRST, with no eager page or label fetch. The view
-  // asks for its (open) pages through `loadPages({state})` and its labels
-  // through `loadLabels()` on first use, so the first frame paints a loading
-  // state instead of waiting on `gh`.
-  const loadPages = ({ state } = {}) => issuesFetchPages(gh, checkoutRoot, state, { recent });
+  // S5/D1: one page per request, straight through the real client. The bucket
+  // id selects the EXACT source query (the same three searches the cached
+  // path used, so a bucket is never widened or re-filtered here), and the
+  // cursor/limit come from the reader's own row budget. An unknown bucket is
+  // an explicit failure and never reaches a subprocess.
+  const loadIssuePage = (request = {}) => {
+    const spec = ISSUES_PAGE_QUERIES.find((bucket) => bucket.id === request.bucketId);
+    if (!spec) return { ok: false, error: `unknown issues bucket "${String(request.bucketId)}"` };
+    const asked = Number(request.limit);
+    // The client accepts 1..1000 per request; the row budget is the upper
+    // bound, never a fixed page size.
+    const limit = Number.isFinite(asked) ? Math.min(1000, Math.max(1, Math.floor(asked))) : 1;
+    const cursor = request.cursor == null || request.cursor === "" ? null : String(request.cursor);
+    return issuesWrapFailure(
+      gh.getIssuePage({ query: spec.query, after: cursor, first: limit }, { cwd: checkoutRoot }),
+      "cannot read issues",
+    );
+  };
   const loadLabels = () => gh.listLabels({ cwd: checkoutRoot });
+  // S8: the assignee editor's candidate list is the repository's assignable
+  // users, read lazily on the editor's first open (never at mount) and scoped
+  // to this checkout, exactly like the label list above it.
+  const loadAssignees = () => gh.listAssignableUsers({ cwd: checkoutRoot });
   const assigned = issuesStoredAssignment(repoRoot, checkoutRoot);
   const checkoutName = path.basename(checkoutRoot);
   const assignmentEnabled = worktreeAssignmentEnabled();
@@ -9017,7 +9028,11 @@ async function executeIssues(rawArgs, ctx) {
   }
   if (!helpers || !ctx || !ctx.ui || typeof ctx.ui.custom !== "function") {
     // No interactive host: fetch once so the one-line notice states the real
-    // total, then say the viewer needs an interactive session.
+    // total, then say the viewer needs an interactive session. Only this
+    // fallback reads cached viewer rows; the interactive reader keeps its
+    // assignment-evidence refresh separate from its fresh page data.
+    const refreshed = await refreshIssuesCache(repoRoot);
+    const recent = refreshed.ok === true && Array.isArray(refreshed.recent) ? refreshed.recent : null;
     const loaded = await issuesFetchPages(gh, checkoutRoot, "open", { recent });
     const pages = Array.isArray(loaded.pages) ? loaded.pages : [];
     if (typeof notify === "function") {
@@ -9044,6 +9059,10 @@ async function executeIssues(rawArgs, ctx) {
       return await gh.editLabels(number, { add, remove }, { cwd: checkoutRoot });
     })(), "cannot edit labels"),
     postComment: (number, text) => issuesWrapFailure(gh.commentIssue(number, text, { cwd: checkoutRoot }), "cannot comment"),
+    // S8/S16: assignee toggles save only the add/remove delta through one
+    // fixed-argv `gh issue edit`; the repository role check inside the client
+    // is the final authority, so a refused save is reported, never assumed.
+    editAssignees: (number, { add, remove }) => issuesWrapFailure(gh.editAssignees(number, { add, remove }, { cwd: checkoutRoot }), "cannot edit assignees"),
     setState: (number, state) => issuesWrapFailure(gh.setIssueState(number, state, { cwd: checkoutRoot }), "cannot change the issue state"),
     openBrowser: (number) => issuesOpenInBrowser(checkoutRoot, number),
     reload: async ({ state } = {}) => {
@@ -9058,15 +9077,28 @@ async function executeIssues(rawArgs, ctx) {
       }
     },
   };
+  // S5/S10: the viewer reads its own fresh pages, so the assignment margin is a
+  // SEPARATE evidence read. It starts only after the overlay has mounted and
+  // never feeds the accumulated cache into the viewer; `finally` settles it even
+  // when the reader closes the overlay immediately, so the evidence the next
+  // assignment surface needs is never lost to an early return.
+  let evidenceRead = null;
   try {
-    await ctx.ui.custom(
+    const overlay = ctx.ui.custom(
       (hostTui, theme, _keybindings, done) => perfTraceView("issues", libRequire("issues-view.js").createIssuesView({
-        loadPages,
+        // S5: bucket metadata only (ids and labels); the rows arrive page by
+        // page through `loadIssuePage`, so no accumulated list is handed over.
+        pages: ISSUES_PAGE_QUERIES.map((spec) => ({ id: spec.id, label: spec.label, issues: null })),
+        loadIssuePage,
         loadLabels,
+        loadAssignees,
         assigned,
         checkoutName,
         assignmentEnabled,
-        loadIssue: (number) => gh.getIssue(number, { cwd: checkoutRoot }),
+        // S16: `includeMetadata` is what carries the authoritative repository
+        // role, current assignees and linked PR count into the view. Without
+        // it the view sees no confirmed capability and offers no editors.
+        loadIssue: (number) => gh.getIssue(number, { cwd: checkoutRoot, includeMetadata: true }),
         saveAssignment: (numbers) => {
           if (!worktreeAssignmentEnabled()) return worktreeAssignmentRefused();
           return issuesSaveAssignment(repoRoot, checkoutRoot, numbers, ctx);
@@ -9088,9 +9120,18 @@ async function executeIssues(rawArgs, ctx) {
       // reading long issues with their comments.
       { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 } },
     );
+    // Mount boundary: the factory above has already been called, so this read
+    // can never delay the first paint. A rejected read is an unanswerable
+    // margin, never a purge — `refreshIssuesCache` reports instead of throwing.
+    evidenceRead = Promise.resolve()
+      .then(() => refreshIssuesCache(repoRoot))
+      .catch((err) => ({ ok: false, primed: true, error: (err && err.message) || "cannot refresh issues" }));
+    await overlay;
   } catch {
     // A host that rejects the overlay degrades to one muted line.
     if (typeof notify === "function") notify("issues: the viewer could not open in this session", "info");
+  } finally {
+    if (evidenceRead !== null) await evidenceRead;
   }
 }
 
@@ -9119,18 +9160,14 @@ async function checkIssuesGate(_pi, ctx) {
       // assignment test answer without re-listing the whole repository. A
       // failed prime leaves no cache and is reported by the first surface that
       // needed it, never as a false "no open issues".
+      // The authoritative open snapshot is primed here because assignment
+      // verification reads it. The viewer's bucket cache is NOT seeded: it
+      // reads fresh pages per open, so priming it would only pay for rows no
+      // surface reads any more.
       try {
-        const primed = await primeIssuesCache(gh, cwd);
-        // S10/S16: the viewer's three buckets are seeded from the SAME startup
-        // read, bounded by the snapshot's own count. A failure here leaves
-        // them unprimed — the viewer retries once per open and reports the
-        // unprovable read — instead of pretending a page is complete.
-        if (primed.ok === true) {
-          const key = issuesCacheKey(cwd);
-          if (key !== null) await primeIssuesViewBuckets(gh, cwd, key, primed.count);
-        }
+        await primeIssuesCache(gh, cwd);
       } catch {
-        // Best effort: the viewer and the detail prime on demand instead.
+        // Best effort: the detail primes on demand instead.
       }
       return { ok: true };
     }
@@ -9174,7 +9211,7 @@ function registerIssuesCommand(pi) {
   // survives. Registration belongs to each load, never to module lifetime.
   if (typeof pi?.registerCommand !== "function") return;
   pi.registerCommand("herdr-gentle:issues", {
-    description: "Read and triage this repository's GitHub issues: three pages, detail pane, labels, comments, close/reopen",
+    description: "Browse fresh GitHub issue pages and details; edit labels/assignees, comment or close when permitted",
     handler: async (args, ctx) => {
       const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
       const gate = await probeIssuesGate(ctx);

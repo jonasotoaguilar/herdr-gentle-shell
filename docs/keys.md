@@ -26,9 +26,10 @@ returns to the bottom panel. Printable text is meaningful, so `q` is not close.
 
 ## Create
 
-`c` opens the type/name flow. Choose the change type, enter its name, then
-confirm. There are no Issues/ODD panes, associations or dataset tabs here.
-`enter` advances/confirms, `ctrl+s` submits, and `esc` cancels.
+`c` opens the compact bottom type/name flow, with branch/path preview above.
+`tab`, `shift+tab` or `←`/`→` move between fields; `↑`/`↓` choose the type.
+There are no Issues/ODD panes or associations. `enter` advances/confirms,
+`ctrl+s` submits, and `esc` cancels without creating a branch or checkout.
 
 ## Worktree detail
 
@@ -37,6 +38,8 @@ confirm. There are no Issues/ODD panes, associations or dataset tabs here.
 | Action | Keys |
 | --- | --- |
 | Switch Issues/ODD tab | `tab`, `shift+tab` |
+| Page active list (never switch tabs) | `←`/`→` |
+| Refresh focused preview | `r` |
 | Move selection | `↑`/`↓`, `j`/`k` |
 | Toggle an open issue | `space` |
 | Select one ODD document | `enter` or `space` |
@@ -61,15 +64,23 @@ only; there is no `f` state toggle or reopen path.
 | Reload | `r` | `r` |
 | Open externally | `o` (editor) | `o` (browser) |
 | Switch bucket | — | `tab`, `shift+tab` |
-| Copy number/URL | — | `y`, `Y` |
-| Edit labels | — | `L` |
+| Page active list | `←`/`→` | `←`/`→` |
+| Edit labels (when permitted) | — | `l`, `L` |
+| Edit assignees (when permitted) | — | `a` |
 | Comment | — | `c` |
 | Close issue | — | `x`, `X`, then confirmation |
 | Leave view | `esc` | `esc` |
 
-Issue sub-editors keep their local actions: `space` toggles a label, `ctrl+s`
-applies labels or posts a comment, and Escape leaves the editor. These are not
-worktree-assignment operations. A nonempty comment draft asks before discarding.
+Labels and assignees are preselected multi-select toggles: `space` adds/removes,
+`ctrl+s` applies and Escape leaves the editor. Missing or unconfirmed permissions
+hide both the shortcut and editor entry; creating labels needs its separate
+capability. Comments refetch detail after a successful post. A nonempty draft asks
+before discarding. These actions do not assign a worktree, and Copy is removed.
+
+In an active search, Delete clears the whole query and Backspace removes one
+character; only that search footer advertises clearing. Lists page by viewport
+rows and wrapped titles, not a fixed item count. Issues page changes and `r` read
+fresh data; `r` also refreshes the focused detail.
 
 ## Preview scrolling
 

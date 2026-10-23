@@ -186,6 +186,19 @@ function openComponent(factory, host) {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
 
+// Captures the options the extension mounts the real view with, while leaving
+// everything the extension calls (`lib/gh-issues.js`) real and injectable.
+function captureIssuesView() {
+  const lib = require('../lib/issues-view.js');
+  const original = lib.createIssuesView;
+  const holder = { options: null };
+  lib.createIssuesView = (options) => {
+    holder.options = options;
+    return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+  };
+  return { holder, restore: () => { lib.createIssuesView = original; } };
+}
+
 // The cursor-paged GraphQL snapshot the session cache primes through, built
 // from the rows the list seam answers with.
 function graphqlSnapshotOf(argv, rows) {
@@ -225,16 +238,107 @@ function graphqlSnapshotOf(argv, rows) {
   });
 }
 
+// The cursor-paged SEARCH snapshot the fresh viewer reads through
+// `getIssuePage` (S5/D1): every edge carries its own opaque cursor, so a
+// caller resumes after the last row it actually showed.
+function graphqlSearchPage(argv, rows) {
+  const field = (name) => {
+    for (let index = 0; index < argv.length - 1; index += 1) {
+      if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
+    }
+    return null;
+  };
+  const first = Number(field('first'));
+  const after = field('cursor');
+  const start = after === null ? 0 : Number(String(after).replace('row-', '')) + 1;
+  const page = rows.slice(start, start + (Number.isFinite(first) ? first : rows.length));
+  const hasNextPage = start + page.length < rows.length;
+  const node = (row) => ({
+    number: row.number,
+    title: row.title,
+    state: String(row.state || 'OPEN').toUpperCase(),
+    stateReason: '',
+    url: row.url,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    author: { login: (row.author && row.author.login) || 'someone' },
+    labels: { nodes: [] },
+    comments: { totalCount: 0 },
+    reactionGroups: [],
+  });
+  return JSON.stringify({
+    data: {
+      search: {
+        issueCount: rows.length,
+        pageInfo: { hasNextPage, endCursor: hasNextPage ? `row-${start + page.length - 1}` : null },
+        edges: page.map((row, at) => ({ cursor: `row-${start + at}`, node: node(row) })),
+      },
+    },
+  });
+}
+
+// The exact source query each fresh GraphQL search page asked for, with the
+// client's own `repo:… is:issue is:open` prefix removed so the bucket text is
+// asserted verbatim.
+function searchQueries(calls) {
+  return calls
+    .filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql')
+    .map((call) => {
+      for (let index = 0; index < call.argv.length - 1; index += 1) {
+        if (call.argv[index] === '-F' && call.argv[index + 1].startsWith('search=')) {
+          return call.argv[index + 1].slice('search='.length);
+        }
+      }
+      return null;
+    })
+    .filter((value) => value !== null)
+    .map((value) => value.replace(/^repo:\S+ is:issue is:open /, ''));
+}
+
 // Pattern-matching `gh` runner over the captured real-`gh` fixtures:
 // answers by argv shape and records every call, so the action tests can
 // pin the exact fixed argv each write reaches `gh` with.
-function makeIssuesRunner({ failComment = false } = {}) {
+//
+// The repository role is part of the answer, never assumed by the viewer: a
+// triage-level or unknown role removes the label/assignee editors (S16).
+// `WRITE` is the default because the label test creates a label, which needs
+// `canCreateLabels` and therefore write access.
+function makeIssuesRunner({ failComment = false, role = 'WRITE' } = {}) {
   const calls = [];
   const ok = (stdout) => ({ status: 0, stdout, stderr: '', error: null });
   const rows = JSON.parse(fixture('gh-issue-list.json'));
-  const runner = async (bin, argv) => {
-    calls.push({ bin, argv: argv.slice() });
-    if (argv[0] === 'api' && argv[1] === 'graphql') return ok(graphqlSnapshotOf(argv, rows));
+  const graphqlQuery = (argv) => {
+    const index = argv.indexOf('-f');
+    const value = index >= 0 && typeof argv[index + 1] === 'string' ? argv[index + 1] : '';
+    return value.startsWith('query=') ? value.slice('query='.length) : '';
+  };
+  const runner = async (bin, argv, opts) => {
+    calls.push({ bin, argv: argv.slice(), cwd: opts ? opts.cwd : undefined });
+    if (argv[0] === 'api' && argv[1] === 'graphql') {
+      const query = graphqlQuery(argv);
+      if (query.includes('assignableUsers')) {
+        return ok(JSON.stringify({ data: { repository: { assignableUsers: {
+          nodes: [{ login: 'jonasotoaguilar', name: 'Jonathan Soto' }, { login: 'octocat', name: 'Octo Cat' }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } }));
+      }
+      if (query.includes('projectItems')) {
+        return ok(JSON.stringify({ data: { repository: { issue: {
+          projectItems: { nodes: [], pageInfo: { hasNextPage: false } },
+        } } } }));
+      }
+      if (query.includes('viewerPermission')) {
+        return ok(JSON.stringify({ data: { repository: {
+          viewerPermission: role,
+          issue: {
+            assignees: { nodes: [{ login: 'jonasotoaguilar' }], pageInfo: { hasNextPage: false } },
+            closedByPullRequestsReferences: { totalCount: 2 },
+          },
+        } } }));
+      }
+      if (query.includes('type: ISSUE')) return ok(graphqlSearchPage(argv, rows));
+      return ok(graphqlSnapshotOf(argv, rows));
+    }
     if (argv[0] === 'api') return ok(fixture('gh-api-user.json'));
     if (argv[0] === 'repo') return ok(fixture('gh-repo-view.json'));
     if (argv[0] === 'issue' && argv[1] === 'list') return ok(fixture('gh-issue-list.json'));
@@ -384,19 +488,18 @@ describe('/herdr-gentle:issues overlay', () => {
       overlayOptions: { anchor: 'center', width: '100%', maxHeight: '100%', margin: 0 },
     });
     assert.deepEqual(notes, [], 'opening writes no notification');
-    const searches = calls
+    // S5/S10: the fresh viewer never consults the accumulated session buckets,
+    // so `gh issue list --search` is not called at all while it opens; the
+    // rows come from cursor pages through the real client's search seam.
+    const listSearches = calls
       .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
       .map((call) => call.argv[call.argv.indexOf('--search') + 1]);
-    // S10/S16: the source asks gh for last-update ordering, so each page's
-    // query carries the sort; Involved excludes the viewer's own issues so
-    // the two buckets are disjoint at the source, before any client filter.
-    const BUCKET_SEARCHES = [
-      'author:@me sort:updated-desc',
-      'assignee:@me sort:updated-desc',
-      'involves:@me -author:@me sort:updated-desc',
-    ];
-    assert.deepEqual(searches, [...BUCKET_SEARCHES, ...BUCKET_SEARCHES],
-      'each bucket is read once at prime and then merged by its own 20-row margin');
+    assert.deepEqual(listSearches, [], 'the viewer reads fresh pages, never the cached buckets');
+    // S5/D1: the source asks gh for last-update ordering with the EXACT bucket
+    // query; Involved excludes the viewer's own issues so the two buckets are
+    // disjoint at the source, before any client filter.
+    assert.deepEqual(searchQueries(calls), ['author:@me sort:updated-desc'],
+      'the mount reads the active bucket fresh with its own exact query');
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues/, 'first page tab');
     assert.match(body, /Assigned/, 'second page tab');
@@ -471,7 +574,10 @@ describe('/herdr-gentle:issues read-only association (S10b)', () => {
     assert.ok(!body.includes('ctrl+s save'), 'no save hint');
     assert.ok(!body.includes('unsaved'), 'no unsaved claim');
     assert.ok(!/\d+ assigned/.test(body), 'no assigned count');
-    assert.match(body, /x\/X close/, 'the footer legend stays');
+    // The legend is ONE row (S2): at this width, with both edit capabilities
+    // confirmed by the detail the fresh mount now reads immediately, it
+    // compacts to its short tokens, so `close` rides the final `esc close`.
+    assert.match(body, /x\/X/, 'the footer legend stays');
     assert.ok(!body.includes('f open/closed'), 'S10a: the removed state toggle never reaches the legend');
     assert.deepEqual(notes, [], 'reading writes nothing and notifies nothing');
   });
@@ -655,9 +761,19 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
   function makeBoundedRunner(n) {
     const calls = [];
     const ok = (stdout) => ({ status: 0, stdout, stderr: '', error: null });
+    const graphqlQueryOf = (argv) => {
+      const index = argv.indexOf('-f');
+      const value = index >= 0 && typeof argv[index + 1] === 'string' ? argv[index + 1] : '';
+      return value.startsWith('query=') ? value.slice('query='.length) : '';
+    };
     const runner = async (bin, argv) => {
       calls.push({ bin, argv: argv.slice() });
-      if (argv[0] === 'api' && argv[1] === 'graphql') return ok(graphqlSnapshotOf(argv, manyListIssues(n)));
+      if (argv[0] === 'api' && argv[1] === 'graphql') {
+        // S5: the viewer's page is the cursor SEARCH seam; the snapshot query
+        // still answers the startup prime the assignment data needs.
+        if (graphqlQueryOf(argv).includes('type: ISSUE')) return ok(graphqlSearchPage(argv, manyListIssues(n)));
+        return ok(graphqlSnapshotOf(argv, manyListIssues(n)));
+      }
       if (argv[0] === 'api') return ok(fixture('gh-api-user.json'));
       if (argv[0] === 'repo') return ok(fixture('gh-repo-view.json'));
       if (argv[0] === 'issue' && argv[1] === 'list') {
@@ -674,26 +790,30 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
     return { runner, calls };
   }
 
-  test('pages handed to the view carry the real total past one fetch page', async () => {
+  test('the active bucket names the real total, not the rows one page fetched', async () => {
     const root = makeRepo({ tag: 'issues-totals' });
     const { runner } = makeBoundedRunner(45);
     const { component } = await openIssues(root, { runner });
-    const body = clean(component.render(110).join('\n'));
-    assert.match(body, /My issues \(45\)/, 'the tab names the real total, not the first fetch page');
-    assert.match(body, /Assigned \(45\)/);
-    assert.match(body, /Involved \(45\)/);
-    assert.ok(!body.includes('+ issues'), 'an under-bound fetch never carries the + marker');
+    let body = clean(component.render(110).join('\n'));
+    assert.match(body, /My issues \(45/, 'the tab names the server total, not the first page length');
+    // S5: a bucket's total arrives with its own fresh page, so the other tabs
+    // name theirs once they are read instead of carrying a primed list.
+    component.handleInput('tab');
+    await tick();
+    body = clean(component.render(110).join('\n'));
+    assert.match(body, /Assigned \(45/, 'a bucket read fresh still reports the real total');
+    assert.ok(!body.includes('+ issues'), 'the total is never repeated below the list');
   });
 
-  test('a bucket that holds every open issue is complete, never marked truncated', async () => {
+  test('a cursor page keeps the server total honest across the whole bucket', async () => {
     const root = makeRepo({ tag: 'issues-trunc' });
     const { runner } = makeBoundedRunner(500);
     const { component } = await openIssues(root, { runner });
     const body = clean(component.render(110).join('\n'));
-    // The bucket's read is bounded by the snapshot count + 1, so 500 rows out
-    // of 500 open issues proves the page complete: no bound marker.
-    assert.match(body, /My issues \(500\)/, 'the tab names the proven-complete total');
-    assert.ok(!/My issues \(500\+\)/.test(body), 'S16: a proven-complete page carries no bound marker');
+    // The page carries `issueCount` for the whole bucket, so the tab names 500
+    // even though the request itself asked only for a row budget. `+` here
+    // means "more pages exist", which is exactly what `hasNextPage` reports.
+    assert.match(body, /My issues \(500\+?\)/, 'the tab names the server total for the bucket');
     assert.ok(!/\d+\+ issues/.test(body), 'S13: the bound is never repeated below the list');
   });
 });
@@ -703,7 +823,7 @@ describe('/herdr-gentle:issues honest totals end to end', () => {
 // view lists open issues only, so no other state is ever requested.
 // ---------------------------------------------------------------------------
 describe('/herdr-gentle:issues first paint and open-only reads', () => {
-  test('the overlay mounts before any list or label fetch and requests open pages', async () => {
+  test('the overlay mounts before any list or label fetch and reads its first page fresh', async () => {
     const root = makeRepo({ tag: 'issues-lazy' });
     const { runner, calls } = makeIssuesRunner();
     const { commands, mod, sessionStarts } = await loadExtension();
@@ -728,35 +848,32 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
     assert.ok(callsAtMount !== null, 'the overlay mounted');
     assert.equal(callsAtMount.filter((line) => line.includes('issue list')).length, 0, 'no list fetch before mount');
     assert.equal(callsAtMount.filter((line) => line.includes('label list')).length, 0, 'no label fetch before mount');
+    // S5: the rows come from one fresh cursor page through the client's search
+    // seam — the accumulated list API is not part of this path at all.
     const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
-    assert.equal(lists.length, 6, 'three buckets primed and three margin-refreshed after mount');
-    for (const call of lists) {
-      const at = call.argv.indexOf('--state');
-      assert.equal(call.argv[at + 1], 'open', `open state requested: ${call.argv.join(' ')}`);
-    }
+    assert.deepEqual(lists, [], 'the fresh viewer never reads the session list cache');
+    assert.deepEqual(searchQueries(calls), ['author:@me sort:updated-desc'], 'one fresh page for the bucket on screen');
   });
 
-  test('the removed state key is inert and a reload asks for open again', async () => {
+  test('the removed state key is inert and a reload re-reads the current page', async () => {
     const root = makeRepo({ tag: 'issues-closed' });
     const { runner, calls } = makeIssuesRunner();
     const { component } = await openIssues(root, { runner });
-    const states = () => calls
-      .filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list')
-      .map((call) => call.argv[call.argv.indexOf('--state') + 1]);
-    const primed = states();
-    assert.deepEqual(primed, ['open', 'open', 'open', 'open', 'open', 'open'],
-      'the three buckets are primed and then margin-refreshed, all as open');
+    await tick();
+    const reads = () => searchQueries(calls);
+    const primed = reads();
+    assert.deepEqual(primed, ['author:@me sort:updated-desc'], 'the mount read the active bucket once');
     const before = clean(component.render(110).join('\n'));
     component.handleInput('f');
     await tick();
-    assert.deepEqual(states(), primed, 'f fetches nothing: no other state is asked for');
+    assert.deepEqual(reads(), primed, 'f fetches nothing: no other state is asked for');
     assert.equal(clean(component.render(110).join('\n')), before, 'f repaints nothing');
     component.handleInput('r');
     await tick();
-    const reloaded = states().slice(primed.length);
-    assert.equal(reloaded.filter((state) => state === 'open').length, 3,
-      'a reload asks for the three open buckets again');
-    assert.equal(states().includes('closed'), false, 'the closed state is never requested');
+    assert.deepEqual(reads().slice(primed.length), ['author:@me sort:updated-desc'],
+      'a reload re-reads the current page fresh');
+    assert.equal(calls.some((call) => call.argv.includes('--state')), false,
+      'the list API is never asked for any state');
   });
 });
 
@@ -785,17 +902,6 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
       for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
       for (const [key, value] of Object.entries(saved)) process.env[key] = value;
     }
-  }
-
-  function captureIssuesView() {
-    const lib = require('../lib/issues-view.js');
-    const original = lib.createIssuesView;
-    const holder = { options: null };
-    lib.createIssuesView = (options) => {
-      holder.options = options;
-      return { render: () => [], handleInput: () => {}, invalidate: () => {} };
-    };
-    return { holder, restore: () => { lib.createIssuesView = original; } };
   }
 
   test('mode off: the command exists, assignmentEnabled is false and the save callback refuses with zero writes', async () => {
@@ -878,70 +984,120 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// S8/S16 mounted wiring: the extension must hand the real view real seams
+// bound to THIS checkout. The view module is captured instead of mounted, so
+// what is asserted is the mounted contract itself: assignable users and the
+// issue detail reach the real exported `gh-issues.js` helpers with the
+// checkout's cwd (the detail asking for authoritative metadata), and an
+// assignee save reaches `editAssignees` with fixed argv while a refused save
+// writes nothing.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues mounted wiring (S8,S16)', () => {
+  test('assignees, detail metadata and assignee edits reach the real client for this checkout', async () => {
+    const root = makeRepo({ tag: 'issues-wiring' });
+    const { runner, calls } = makeIssuesRunner();
+    const capture = captureIssuesView();
+    const seen = { users: [], issue: [], edit: [] };
+    const real = {
+      users: ghIssues.listAssignableUsers,
+      issue: ghIssues.getIssue,
+      edit: ghIssues.editAssignees,
+    };
+    ghIssues.listAssignableUsers = (opts) => { seen.users.push(opts); return real.users(opts); };
+    ghIssues.getIssue = (number, opts) => { seen.issue.push({ number, opts }); return real.issue(number, opts); };
+    ghIssues.editAssignees = (number, changes, opts) => {
+      seen.edit.push({ number, changes, opts });
+      return real.edit(number, changes, opts);
+    };
+    try {
+      await openIssues(root, { runner });
+      const options = capture.holder.options;
+      assert.ok(options, 'the view received its options');
+      assert.equal(typeof options.loadAssignees, 'function', 'the view can load assignable users');
+      assert.equal(typeof options.actions.editAssignees, 'function', 'the assignee editor has a save action');
+
+      const users = await options.loadAssignees();
+      assert.equal(users.ok, true, 'assignable users load');
+      assert.deepEqual(users.users.map((user) => user.login), ['jonasotoaguilar', 'octocat']);
+      assert.equal(seen.users.length, 1, 'the real listAssignableUsers answered');
+      assert.equal(seen.users[0].cwd, root, 'assignable users are scoped to this checkout');
+      assert.ok(calls.some((call) => call.argv[0] === 'api' && call.cwd === root),
+        'the assignable-user read ran in the checkout');
+
+      const detail = await options.loadIssue(76);
+      assert.equal(detail.ok, true);
+      assert.equal(seen.issue[0].number, 76);
+      assert.equal(seen.issue[0].opts.cwd, root, 'the detail is read in this checkout');
+      assert.equal(seen.issue[0].opts.includeMetadata, true, 'the view asks for authoritative metadata');
+      assert.deepEqual(detail.issue.permissions, { canEditLabels: true, canEditAssignees: true, canCreateLabels: true },
+        'the repository role reaches the view as confirmed capabilities');
+      assert.deepEqual(detail.issue.assignees, ['jonasotoaguilar'], 'current assignees reach the preview');
+
+      const saved = await options.actions.editAssignees(76, { add: ['octocat'], remove: [] });
+      assert.equal(saved.ok, true, 'a permitted save reports success');
+      assert.equal(seen.edit[0].opts.cwd, root);
+      const write = calls.find((call) => call.argv[0] === 'issue' && call.argv[1] === 'edit'
+        && call.argv.includes('--add-assignee'));
+      assert.deepEqual(write.argv, ['issue', 'edit', '76', '--add-assignee', 'octocat'], 'fixed argv, no shell');
+      assert.equal(write.cwd, root, 'the write runs in this checkout');
+
+      const readOnly = makeIssuesRunner({ role: 'READ' });
+      ghIssues.setGhRunner(readOnly.runner);
+      const refused = await options.actions.editAssignees(76, { add: ['octocat'], remove: [] });
+      assert.equal(refused.ok, false, 'a read-only role is refused');
+      assert.match(refused.error, /permission/i);
+      assert.equal(readOnly.calls.filter((call) => call.argv[1] === 'edit').length, 0,
+        'a refused save never writes');
+    } finally {
+      ghIssues.listAssignableUsers = real.users;
+      ghIssues.getIssue = real.issue;
+      ghIssues.editAssignees = real.edit;
+      capture.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // S19/S16: the verifier's page-read probes — the three bucket fetches must
 // overlap in wall-clock time, and no read may ask `gh` for `--state all`
 // while Involved excludes the authored bucket at the source.
 // ---------------------------------------------------------------------------
 describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => {
-  test('the three page fetches run in parallel, never serialized', async () => {
-    const DELAY_MS = 120;
+  test('the mount reads only the bucket it shows, and every bucket reads its own exact query', async () => {
     const root = makeRepo({ tag: 'issues-parallel' });
-    const base = makeIssuesRunner();
-    let firstListAt = null;
-    let listsDone = 0;
-    let resolveAll;
-    const allListsDone = new Promise((resolve) => { resolveAll = resolve; });
-    const runner = async (bin, argv) => {
-      if (argv[0] === 'issue' && argv[1] === 'list') {
-        if (firstListAt === null) firstListAt = Date.now();
-        await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
-        listsDone += 1;
-        if (listsDone === 3) resolveAll(Date.now());
-      }
-      return base.runner(bin, argv);
-    };
-
-    const { commands, mod, sessionStarts } = await loadExtension();
-    ghIssues.setGhRunner(runner);
-    const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
-    await fireSessionStart(sessionStarts, gateCtx(scratch, []));
-    const def = commands.get('herdr-gentle:issues');
-    assert.ok(def, 'the command is registered');
-    mod.setIssuesTuiLoader(async () => stubTui);
-    let factory = null;
-    const { ctx } = makeCtx({ cwd: root, customImpl: async (captured) => { factory = captured; return null; } });
-    await def.handler('', ctx);
-    openComponent(factory, makeHostTui(24));
-
-    const finishedAt = await allListsDone;
-    assert.equal(listsDone, 3, 'all three buckets were fetched');
-    const elapsed = finishedAt - firstListAt;
-    assert.ok(
-      elapsed < 260,
-      `three ${DELAY_MS}ms pages finished in ${elapsed}ms; serialized they would need ~${DELAY_MS * 3}ms`,
-    );
+    const { runner, calls } = makeIssuesRunner();
+    const { component } = await openIssues(root, { runner });
+    await tick();
+    assert.deepEqual(searchQueries(calls), ['author:@me sort:updated-desc'],
+      'one fresh page for the bucket on screen, no eager prefetch of the others');
+    component.handleInput('tab');
+    await tick();
+    assert.deepEqual(searchQueries(calls), [
+      'author:@me sort:updated-desc',
+      'assignee:@me sort:updated-desc',
+    ], 'selecting a bucket reads its own page fresh');
+    component.handleInput('tab');
+    await tick();
+    assert.deepEqual(searchQueries(calls), [
+      'author:@me sort:updated-desc',
+      'assignee:@me sort:updated-desc',
+      'involves:@me -author:@me sort:updated-desc',
+    ], 'Involved excludes authored issues at the source');
   });
 
-  test('no page fetch ever asks for --state all, and Involved excludes the authored bucket', async () => {
+  test('no page read ever uses the list API or widens to all states', async () => {
     const root = makeRepo({ tag: 'issues-state-honest' });
     const { runner, calls } = makeIssuesRunner();
     await openIssues(root, { runner });
     const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
-    // Each bucket is read once at prime and then merged by its 20-row margin.
-    assert.equal(lists.length, 6, 'three buckets primed, then merged by their margins');
-    for (const call of lists) {
-      const at = call.argv.indexOf('--state');
-      assert.ok(at >= 0, `every list call names its state: ${call.argv.join(' ')}`);
-      assert.notEqual(call.argv[at + 1], 'all', `--state all is never emitted: ${call.argv.join(' ')}`);
-      assert.ok(['open', 'closed'].includes(call.argv[at + 1]), `the state is a real filter: ${call.argv.join(' ')}`);
+    // S5: with cursor pages there is no session list to prime or merge, so the
+    // list API is not part of this path at all.
+    assert.deepEqual(lists, [], 'fresh pages never consult the accumulated list cache');
+    const graphql = calls.filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql');
+    assert.ok(graphql.length > 0, 'the viewer read its page through the client');
+    for (const call of graphql) {
+      assert.ok(!call.argv.includes('state=all'), `no read widens to all states: ${call.argv.join(' ')}`);
     }
-    const involved = lists
-      .map((call) => call.argv[call.argv.indexOf('--search') + 1])
-      .filter((query) => query.startsWith('involves:'));
-    assert.deepEqual(involved, [
-      'involves:@me -author:@me sort:updated-desc',
-      'involves:@me -author:@me sort:updated-desc',
-    ], 'Involved excludes authored issues at the source, in its prime and its margin');
   });
 });
 
@@ -961,5 +1117,126 @@ describe('S2 feedback: command registration survives a reused module', () => {
     reloaded.clear();
     mod.default(api);
     assert.ok(reloaded.has('herdr-gentle:issues'), 'a rebuilt registry on the same API must also regain the command');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5/D1 mounted seam: the overlay mounts BEFORE any page read, and the loader
+// is the real GitHub client called with the exact bucket query, the caller's
+// cursor, the viewport row budget and THIS checkout's cwd. Nothing is served
+// from a session list, so a repeated request is a repeated read.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues mounted page seam (S5,D1)', () => {
+  // Mounts the real view through the command, recording the order of the
+  // overlay opening, the view creation and every page read, and keeping the
+  // mounted options so a caller can drive the seam directly.
+  async function mountCapturing(root, rows = 24) {
+    const base = makeIssuesRunner();
+    const lib = require('../lib/issues-view.js');
+    const realCreate = lib.createIssuesView;
+    const realPage = ghIssues.getIssuePage;
+    const order = [];
+    const pages = [];
+    const holder = { options: null };
+    ghIssues.getIssuePage = (params, opts) => {
+      order.push('page');
+      pages.push({ params, opts });
+      return realPage(params, opts);
+    };
+    lib.createIssuesView = (options) => {
+      holder.options = options;
+      order.push('view');
+      return realCreate(options);
+    };
+    const restore = () => {
+      lib.createIssuesView = realCreate;
+      ghIssues.getIssuePage = realPage;
+    };
+    let mounted = null;
+    try {
+      const { commands, mod, sessionStarts } = await loadExtension();
+      ghIssues.setGhRunner(base.runner);
+      const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+      await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+      mod.setIssuesTuiLoader(async () => stubTui);
+      const { ctx } = makeCtx({ cwd: root });
+      ctx.ui.custom = async (factory) => {
+        order.push('custom');
+        mounted = openComponent(factory, makeHostTui(rows));
+        return null;
+      };
+      await commands.get('herdr-gentle:issues').handler('', ctx);
+      await tick();
+    } catch (err) {
+      restore();
+      throw err;
+    }
+    return { order, pages, holder, base, mounted, restore };
+  }
+
+  test('the overlay mounts before any page read, with bucket metadata only', async () => {
+    const root = makeRepo({ tag: 'issues-order' });
+    const run = await mountCapturing(root);
+    try {
+      assert.equal(run.order[0], 'custom', 'the overlay opens before anything is read');
+      assert.deepEqual(run.order.slice(0, 3), ['custom', 'view', 'page'],
+        'the view mounts first, and its own mount is what asks for the first page');
+      assert.ok(run.mounted, 'the real view mounted');
+      const options = run.holder.options;
+      assert.deepEqual(options.pages.map((page) => [page.id, page.label, page.issues]), [
+        ['mine', 'My issues', null],
+        ['assigned', 'Assigned', null],
+        ['involved', 'Involved', null],
+      ], 'bucket metadata only: no accumulated rows are handed to the view');
+      assert.equal(options.loadPages, undefined, 'the cached loader is not passed beside the fresh seam');
+      assert.equal(typeof options.loadIssuePage, 'function', 'the fresh page seam is mounted');
+      const first = run.pages[0];
+      assert.deepEqual(first.params, { query: 'author:@me sort:updated-desc', after: null, first: first.params.first },
+        'the mount reads the exact `mine` source query from the first cursor');
+      assert.ok(Number.isInteger(first.params.first) && first.params.first >= 1, 'the limit is a row budget');
+      assert.equal(first.opts.cwd, root, 'the page read runs in this checkout');
+    } finally {
+      run.restore();
+    }
+  });
+
+  test('the loader passes the exact bucket query, cursor, dynamic limit and cwd, and every request is fresh', async () => {
+    const root = makeRepo({ tag: 'issues-seam' });
+    const narrow = await mountCapturing(root, 24);
+    let narrowLimit = null;
+    try {
+      narrowLimit = narrow.pages[0].params.first;
+      const asked = await narrow.holder.options.loadIssuePage({ bucketId: 'assigned', cursor: 'row-3', limit: 7 });
+      assert.equal(asked.ok, true, 'the real client answered the page');
+      const call = narrow.pages[narrow.pages.length - 1];
+      assert.deepEqual(call.params, { query: 'assignee:@me sort:updated-desc', after: 'row-3', first: 7 },
+        'the bucket query, the caller cursor and the caller limit pass straight through');
+      assert.deepEqual(call.opts, { cwd: root }, 'the page read is scoped to this checkout');
+
+      const before = narrow.pages.length;
+      await narrow.holder.options.loadIssuePage({ bucketId: 'involved', cursor: null, limit: 5 });
+      await narrow.holder.options.loadIssuePage({ bucketId: 'involved', cursor: null, limit: 5 });
+      assert.deepEqual(narrow.pages.slice(before).map((entry) => entry.params), [
+        { query: 'involves:@me -author:@me sort:updated-desc', after: null, first: 5 },
+        { query: 'involves:@me -author:@me sort:updated-desc', after: null, first: 5 },
+      ], 'identical requests read again instead of answering from a cache');
+
+      const subprocesses = narrow.base.calls.length;
+      assert.deepEqual(narrow.holder.options.loadIssuePage({ bucketId: 'bogus', cursor: null, limit: 5 }),
+        { ok: false, error: 'unknown issues bucket "bogus"' }, 'an unknown bucket fails explicitly');
+      assert.equal(narrow.base.calls.length, subprocesses, 'an unknown bucket never runs gh');
+      assert.equal(narrow.pages.length, before + 2, 'an unknown bucket never asks for a page');
+    } finally {
+      narrow.restore();
+    }
+
+    const wide = await mountCapturing(root, 60);
+    try {
+      const wideLimit = wide.pages[0].params.first;
+      assert.ok(wideLimit > narrowLimit,
+        `the limit follows the viewport row budget: ${narrowLimit} at 24 rows, ${wideLimit} at 60`);
+    } finally {
+      wide.restore();
+    }
   });
 });

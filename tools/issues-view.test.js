@@ -19,6 +19,7 @@ const assert = require('node:assert/strict');
 
 const { createIssuesView } = require('../lib/issues-view.js');
 const ghIssues = require('../lib/gh-issues.js');
+const layout = require('../lib/view-layout.js');
 
 // Optional real host helpers, guarded exactly like tools/odd-view.test.js:
 // CI installs no dependencies, so the byte-level key assertions run only
@@ -51,6 +52,11 @@ const helpers = {
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text) };
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+// S16: every permission the editor gates on, confirmed true. Fixtures that
+// mean to open an editor carry this explicitly; a fixture without it is a
+// repository where editing is not permitted.
+const EDITABLE = { canEditLabels: true, canEditAssignees: true, canCreateLabels: true };
+
 function issue(number, overrides = {}) {
   return {
     number,
@@ -82,7 +88,9 @@ function makeView(opts = {}) {
     issues: opts.issues,
     loadIssue: opts.loadIssue,
     loadPages: opts.loadPages,
+    loadIssuePage: opts.loadIssuePage,
     loadLabels: opts.loadLabels,
+    loadAssignees: opts.loadAssignees,
     assigned: opts.assigned,
     saveAssignment: opts.saveAssignment,
     actions,
@@ -124,6 +132,17 @@ function bodyOf(view, width) {
   return strip(lines.join('\n'));
 }
 
+// Only the LEFT pane of every body row, so a list assertion can never be
+// satisfied by the preview on the right: S3 puts titles left and the number
+// right, and the two are trimmed to different widths.
+function leftColumn(view, width, rows = 24) {
+  const panes = layout.paneWidths(layout.innerWidth(width));
+  return view.render(width)
+    .slice(4, Math.max(4, rows - 2))
+    .map((line) => [...strip(line)].slice(2, 2 + panes.left).join(''))
+    .join('\n');
+}
+
 describe('issues view tabs and list', () => {
   test('renders the framed card with the three tabs and their counts', async () => {
     const { view } = makeView({
@@ -142,7 +161,7 @@ describe('issues view tabs and list', () => {
     assert.match(body, /esc close/, 'the footer names the close key');
   });
 
-  test('tab and arrows switch pages; shift+tab goes back', async () => {
+  test('tab switches buckets; the arrows page the active list (D3)', async () => {
     const { view } = makeView({
       pages: pagesOf([[issue(1)], [issue(2)], [issue(3)]]),
       issues: [issue(1)],
@@ -154,11 +173,11 @@ describe('issues view tabs and list', () => {
     assert.equal(view.state.page, 1);
     assert.match(bodyOf(view, 100), /issue title 2/);
     view.handleInput('right');
-    assert.equal(view.state.page, 2);
+    assert.equal(view.state.page, 1, 'right pages the list, never the buckets');
     view.handleInput('shift+tab');
-    assert.equal(view.state.page, 1);
-    view.handleInput('left');
     assert.equal(view.state.page, 0);
+    view.handleInput('left');
+    assert.equal(view.state.page, 0, 'left pages back, never the buckets');
   });
 
   test('up/down and j/k move the selection; home/end jump', async () => {
@@ -207,18 +226,19 @@ describe('issues view tabs and list', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    view.state.pageSize = 4;
+    // S5: capacity follows the real body budget (12 rows - 6 frame rows - the
+    // list's own page marker), so ten single-row titles need two pages.
     const first = bodyOf(view, 100);
-    assert.match(first, /page 1\/3/, 'the list footer shows the page position');
+    assert.match(first, /page 1\/2/, 'the list footer shows the derived page position');
     assert.ok(!/\b10 issues\b/.test(first), 'the count is not repeated under the list');
     view.handleInput(']');
+    assert.equal(view.state.listPage, 2, 'the next page holds what did not fit');
     view.handleInput(']');
     view.handleInput(']');
-    assert.equal(view.state.listPage, 3, 'never past the last page');
-    assert.match(bodyOf(view, 100), /page 3\/3/);
+    assert.equal(view.state.listPage, 2, 'never past the last page');
+    assert.match(bodyOf(view, 100), /page 2\/2/);
     view.handleInput('[');
-    assert.equal(view.state.listPage, 2);
-    view.handleInput('[');
+    assert.equal(view.state.listPage, 1);
     view.handleInput('[');
     assert.equal(view.state.listPage, 1, 'never before the first page');
   });
@@ -252,7 +272,35 @@ describe('issues view search', () => {
     await tick();
     const body = bodyOf(view, 100);
     assert.ok(!body.includes('T// search'), 'the broken hint is gone');
-    assert.match(body, /› Search \(T\)/, 'the idle row names the Search widget and its key');
+    assert.match(body, /› Search/, 'the idle row names the Search widget');
+    assert.ok(!body.includes('(T)'), 'no (T) hint sits above the footer');
+    assert.match(bodyOf(view, 160), /T search/, 'the footer names the search key');
+  });
+
+  test('Delete clears the whole active query, Backspace one character, and only typing advertises clearing', async () => {
+    const rows = [issue(1, { title: 'alpha crash' }), issue(2, { title: 'beta typo' })];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'alpha cr') view.handleInput(ch);
+    const footerOf = () => strip(view.render(80).at(-2));
+    assert.match(bodyOf(view, 80), /› alpha cr█/);
+    assert.match(footerOf(), /del clear/, 'the footer advertises clearing while the input is active');
+    assert.ok(!bodyOf(view, 80).includes('beta typo'), 'the query filters the other row out');
+    view.handleInput('backspace');
+    assert.equal(view.state.query, 'alpha c', 'Backspace deletes one character');
+    view.handleInput('delete');
+    assert.equal(view.state.query, '', 'Delete clears the WHOLE query');
+    const body = bodyOf(view, 80);
+    assert.match(body, /› █/, 'the input row shows the emptied query');
+    assert.match(footerOf(), /del clear/, 'the clearing hint stays while the input is still active');
+    assert.match(body, /beta typo/, 'clearing the query lists every row again');
+    view.handleInput('enter');
+    assert.ok(!footerOf().includes('del clear'), 'the clearing hint leaves with the input');
   });
 
   test('T opens the box, typing filters live, Enter leaves keeping the filter', async () => {
@@ -449,11 +497,13 @@ describe('issues view read-only association (S10b)', () => {
       assert.ok(!body.includes('ctrl+s save'), `width ${width}: no save hint`);
       assert.ok(!body.includes('unsaved'), `width ${width}: no unsaved claim`);
       assert.ok(!/\d+ assigned/.test(body), `width ${width}: no assigned count`);
-      const row = body.split('\n').find((line) => line.includes('#1 issue title 1'));
-      assert.match(row, /#1 issue title 1/, 'the issue row still renders');
-      assert.ok(!/[✓✎]/.test(row), 'no assignment mark on the row');
-      const second = body.split('\n').find((line) => line.includes('#2 issue title 2'));
-      assert.ok(!/[✓✎]/.test(second), 'no assignment mark on the other row either');
+      // S3: the left row is the title alone — the number lives in the preview.
+      const left = leftColumn(view, width);
+      assert.match(left, /issue title 1/, 'the issue row still renders');
+      assert.ok(!left.includes('#1'), 'no issue number in the left list');
+      assert.ok(!/[✓✎]/.test(left), 'no assignment mark on the row');
+      assert.match(left, /issue title 2/, 'the other row still renders');
+      assert.ok(!/[✓✎]/.test(left), 'no assignment mark on the other row either');
     }
     assert.match(bodyOf(view, 160), /x\/X close/, 'the footer legend stays');
   });
@@ -507,7 +557,7 @@ describe('issues view read-only association (S10b)', () => {
     view.handleInput('T');
     for (let i = 0; i < 7; i += 1) view.handleInput('backspace');
     view.handleInput('enter');
-    assert.match(bodyOf(view, 80), /#1 issue title 1/, 'the query clears again');
+    assert.match(leftColumn(view, 80), /issue title 1/, 'the query clears again');
     const beforeF = bodyOf(view, 80);
     view.handleInput('f');
     assert.equal(bodyOf(view, 80), beforeF, 'the removed state key repaints nothing');
@@ -530,7 +580,11 @@ describe('issues view editors and confirmations', () => {
       actions: {
         editLabels: (number, add, remove, created) => { calls.push([number, add, remove, created]); return { ok: true }; },
       },
-      loadIssue: (n) => ({ ok: true, issue: issue(n, { labels: [{ name: 'bug' }] }), comments: [] }),
+      loadIssue: (n) => ({
+        ok: true,
+        issue: issue(n, { labels: [{ name: 'bug' }], permissions: { canEditLabels: true, canCreateLabels: true } }),
+        comments: [],
+      }),
     });
     await tick();
     view.handleInput('L');
@@ -555,7 +609,11 @@ describe('issues view editors and confirmations', () => {
       issues: rows,
       labels: [{ name: 'bug' }, { name: 'docs' }],
       actions: { editLabels: () => ({ ok: false, error: 'nope' }) },
-      loadIssue: (n) => ({ ok: true, issue: issue(n, { labels: [{ name: 'bug' }] }), comments: [] }),
+      loadIssue: (n) => ({
+        ok: true,
+        issue: issue(n, { labels: [{ name: 'bug' }], permissions: { canEditLabels: true, canCreateLabels: true } }),
+        comments: [],
+      }),
     });
     await tick();
     view.handleInput('L');
@@ -567,13 +625,24 @@ describe('issues view editors and confirmations', () => {
     assert.match(bodyOf(view, 100), /nope/);
   });
 
-  test('c opens the comment input; Enter is a newline, ctrl+s posts, esc asks before discarding', async () => {
+  test('c opens the comment input; Enter is a newline, ctrl+s posts and refreshes the detail, esc asks before discarding', async () => {
     const calls = [];
+    const loads = [];
+    let comments = [];
     const { view } = makeView({
       pages: pagesOf([[issue(1)], [], []]),
       issues: [issue(1)],
-      actions: { postComment: (number, text) => { calls.push([number, text]); return { ok: true }; } },
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      actions: {
+        postComment: (number, text) => {
+          calls.push([number, text]);
+          comments = [{ author: 'octo', createdAt: new Date().toISOString(), body: text }];
+          return { ok: true };
+        },
+      },
+      loadIssue: (n, detailOptions) => {
+        loads.push([n, detailOptions]);
+        return { ok: true, issue: issue(n), comments: comments.slice() };
+      },
     });
     await tick();
     view.handleInput('c');
@@ -587,6 +656,11 @@ describe('issues view editors and confirmations', () => {
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0], [1, 'hi\nthere']);
     assert.equal(view.state.mode, 'list');
+    const refreshes = loads.filter(([, detailOptions]) => detailOptions && detailOptions.refresh === true);
+    assert.deepEqual(refreshes.map(([number]) => number), [1], 'the posted issue detail is refetched, never served from cache');
+    const posted = bodyOf(view, 100);
+    assert.match(posted, /hi/);
+    assert.match(posted, /there/, 'the new comment is visible without reopening the issue');
 
     view.handleInput('c');
     for (const ch of 'draft') view.handleInput(ch);
@@ -596,6 +670,28 @@ describe('issues view editors and confirmations', () => {
     view.handleInput('y');
     assert.equal(view.state.mode, 'list', 'y discards the draft');
     assert.equal(calls.length, 1, 'discard posts nothing');
+  });
+
+  test('a failed refresh after a posted comment is visible and never claims updated data', async () => {
+    let posted = false;
+    const { view } = makeView({
+      pages: pagesOf([[issue(1)], [], []]),
+      issues: [issue(1)],
+      actions: { postComment: () => { posted = true; return { ok: true }; } },
+      loadIssue: (n, detailOptions) => {
+        if (posted && detailOptions && detailOptions.refresh === true) return { ok: false, error: 'gh timed out' };
+        return { ok: true, issue: issue(n), comments: [] };
+      },
+    });
+    await tick();
+    view.handleInput('c');
+    for (const ch of 'still posted') view.handleInput(ch);
+    view.handleInput('ctrl+s');
+    await tick();
+    const body = bodyOf(view, 100);
+    assert.match(body, /unreadable: gh timed out/, 'the failed refresh is visible');
+    assert.match(body, /comment posted/, 'the posted result is reported truthfully');
+    assert.ok(!body.includes('(end of issue)'), 'cached content is never presented as refreshed');
   });
 
   test('a failed comment post keeps the draft and shows the error', async () => {
@@ -631,9 +727,9 @@ describe('issues view editors and confirmations', () => {
     await tick();
     assert.deepEqual(calls, [[1, 'closed']], 'x closes through the injected action');
     const afterClose = bodyOf(view, 100);
-    assert.ok(!afterClose.includes('#1 issue title 1'), 'the closed issue leaves the open list at once');
+    assert.ok(!leftColumn(view, 100).includes('issue title 1'), 'the closed issue leaves the open list at once');
     assert.match(afterClose, /My issues \(1\)/, 'the tab count drops with it');
-    assert.match(afterClose, /#2 issue title 2/, 'the remaining open issue stays listed');
+    assert.match(leftColumn(view, 100), /issue title 2/, 'the remaining open issue stays listed');
 
     view.handleInput('X');
     assert.equal(view.state.mode, 'confirm', 'X asks the same close confirmation');
@@ -789,7 +885,9 @@ describe('issues view states and key discipline', () => {
     await tick();
     const snapshot = JSON.stringify(view.state);
     const rendered = view.render(80).join('\n');
-    for (const key of ['e', 'p', 'z', 'a', 'd', 'w', 'v', 'u', 'g', 'i', 'm', 'h', 'b', 's', 'n', 'ctrl+u', 'ctrl+d', 'alt+x']) {
+    // `a` is no longer foreign: S16 binds it to the assignee editor (and it
+    // stays inert for this permission-less fixture, which S16 covers).
+    for (const key of ['e', 'p', 'z', 'd', 'w', 'v', 'u', 'g', 'i', 'm', 'h', 'b', 's', 'n', 'ctrl+u', 'ctrl+d', 'alt+x']) {
       view.handleInput(key);
     }
     assert.equal(JSON.stringify(view.state), snapshot, 'foreign keys change nothing');
@@ -879,8 +977,41 @@ describe('issues view detail assignees (adopted reference idea 1)', () => {
   });
 });
 
-describe('issues view clipboard copy y/Y (adopted reference idea 3)', () => {
-  test('y copies the issue number through the injected writer', async () => {
+describe('issues view preview metadata (S9)', () => {
+  test('shows every assignee, projects and a nonzero linked PR count, and omits empty metadata', async () => {
+    const full = issue(5, {
+      assignees: [{ login: 'ann' }, { login: 'bob' }],
+      projects: [{ title: 'Roadmap', url: 'https://example.test/p/1' }],
+      linkedPullRequestCount: 2,
+    });
+    const rich = makeView({
+      pages: pagesOf([[full], [], []]),
+      issues: [full],
+      loadIssue: () => ({ ok: true, issue: full, comments: [] }),
+    });
+    await tick();
+    const body = bodyOf(rich.view, 120);
+    assert.match(body, /assignees: ann, bob/, 'every assigned person is shown');
+    assert.match(body, /projects: Roadmap/, 'the associated project is shown');
+    assert.match(body, /linked PRs: 2/, 'the nonzero PR count is shown');
+
+    const bare = issue(6, { metadataError: 'Project metadata is unavailable or incomplete (read:project)' });
+    const empty = makeView({
+      pages: pagesOf([[bare], [], []]),
+      issues: [bare],
+      loadIssue: () => ({ ok: true, issue: bare, comments: [] }),
+    });
+    await tick();
+    const thin = bodyOf(empty.view, 120);
+    assert.ok(!/projects?:/i.test(thin), 'an issue without projects names none');
+    assert.ok(!/linked PR/i.test(thin), 'a zero PR count is omitted, never rendered as "0 PR"');
+    assert.ok(!/read:project|scope/i.test(thin), 'no scope text leaks into the compact preview');
+    assert.match(thin, /metadata unavailable/, 'unavailable metadata is one concise status');
+  });
+});
+
+describe('issues view Copy removal (S7)', () => {
+  test('y and Y are inert: no clipboard write and no copy notice', async () => {
     const calls = [];
     const rows = [issue(76, { title: 'copy me' })];
     const { view } = makeView({
@@ -890,14 +1021,18 @@ describe('issues view clipboard copy y/Y (adopted reference idea 3)', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n, { title: 'copy me' }), comments: [] }),
     });
     await tick();
+    const before = bodyOf(view, 160);
     view.handleInput('y');
+    view.handleInput('Y');
     await tick();
-    assert.deepEqual(calls, ['76']);
-    assert.match(bodyOf(view, 100), /Copied 76 to clipboard/);
+    assert.deepEqual(calls, [], 'y and Y never touch the clipboard');
+    const after = bodyOf(view, 160);
+    assert.equal(after, before, 'both keys repaint nothing');
+    assert.ok(!after.includes('Copied'), 'no copy claim is rendered');
+    assert.ok(!after.includes('clipboard'), 'no clipboard failure path is rendered either');
   });
 
-  test('Y copies the already-loaded URL without another loadIssue call', async () => {
-    let loads = 0;
+  test('Y copies neither the issue URL nor anything else', async () => {
     const url = 'https://example.test/i/76';
     const rows = [issue(76, { url })];
     const copies = [];
@@ -905,21 +1040,16 @@ describe('issues view clipboard copy y/Y (adopted reference idea 3)', () => {
       pages: pagesOf([rows, [], []]),
       issues: rows,
       actions: { copyText: (text) => { copies.push(text); return { ok: true, via: 'test' }; } },
-      loadIssue: (n) => {
-        loads += 1;
-        return { ok: true, issue: issue(n, { url }), comments: [] };
-      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { url }), comments: [] }),
     });
     await tick();
-    const settled = loads;
     view.handleInput('Y');
     await tick();
-    assert.deepEqual(copies, [url]);
-    assert.equal(loads, settled, 'the URL comes from the loaded issue, never a new fetch');
-    assert.match(bodyOf(view, 100), /Copied https:\/\/example\.test\/i\/76 to clipboard/);
+    assert.deepEqual(copies, [], 'the URL is not copied');
+    assert.ok(!bodyOf(view, 100).includes('Copied'), 'nothing claims a copy');
   });
 
-  test('an honest miss never pretends it copied', async () => {
+  test('a clipboard failure seam is never consulted, so no miss is claimed either', async () => {
     const { view } = makeView({
       pages: pagesOf([[issue(76)], [], []]),
       issues: [issue(76)],
@@ -930,19 +1060,18 @@ describe('issues view clipboard copy y/Y (adopted reference idea 3)', () => {
     view.handleInput('y');
     await tick();
     const body = bodyOf(view, 100);
-    assert.match(body, /clipboard unavailable/);
-    assert.match(body, /nothing copied/);
-    assert.ok(!body.includes('Copied'), 'a miss never claims success');
+    assert.ok(!body.includes('clipboard unavailable'), 'the copy seam is never consulted');
+    assert.ok(!body.includes('Copied'), 'no success or miss notice exists');
   });
 
-  test('the footer names the two copy keys', async () => {
+  test('the footer never names a copy key', async () => {
     const { view } = makeView({
       pages: pagesOf([[issue(1)], [], []]),
       issues: [issue(1)],
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    assert.match(bodyOf(view, 120), /y\/Y copy/);
+    assert.ok(!bodyOf(view, 160).includes('y/Y'), 'no copy hint anywhere');
   });
 });
 
@@ -1276,7 +1405,7 @@ describe('issues view lazy labels (S19)', () => {
         labelCalls += 1;
         return { ok: true, labels: [{ name: 'bug' }, { name: 'docs' }] };
       },
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions: EDITABLE }), comments: [] }),
     });
     await tick();
     assert.equal(labelCalls, 0, 'opening the view never fetches labels');
@@ -1299,7 +1428,7 @@ describe('issues view lazy labels (S19)', () => {
         labelCalls += 1;
         return { ok: false, error: 'gh label list failed: rate limited' };
       },
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions: EDITABLE }), comments: [] }),
     });
     await tick();
     view.handleInput('L');
@@ -1318,7 +1447,7 @@ describe('issues view lazy labels (S19)', () => {
     const { view } = makeView({
       loadPages: () => pagesResult([[issue(1)], [], []]),
       loadLabels: () => gate.promise,
-      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions: EDITABLE }), comments: [] }),
     });
     await tick();
     view.handleInput('L');
@@ -1449,7 +1578,7 @@ describe('issues view dedicated search row (S26)', () => {
       const lines = chrome(view, width);
       assert.match(lines[0], /◈ Issues/, 'row 1 is the concise title');
       assert.ok(!/search/i.test(lines[0]), 'the title buries nothing about search');
-      assert.match(lines[1], /› Search \(T\)/, 'row 2 is the dedicated Search widget');
+      assert.match(lines[1], /› Search(?! \(T\))/, 'row 2 is the dedicated Search widget');
       assert.match(lines[2], /My issues \(1\)/, 'row 3 carries the tabs and their counts');
       assert.match(lines[2], /Assigned \(0\)/, 'every tab count stays');
       assert.ok(!/f[:(]/.test(lines[3]), 'row 4 carries notices only, no state toggle');
@@ -1478,7 +1607,7 @@ describe('issues view dedicated search row (S26)', () => {
     }
     view.handleInput('enter');
     const settled = chrome(view, 80);
-    assert.match(settled[1], /› beta \(T to edit\)/, 'a kept filter shows its query in the widget');
+    assert.match(settled[1], /› beta(?! \(T)/, 'a kept filter shows its query in the widget');
     assert.ok(!settled.join('\n').includes('alpha crash'), 'the kept filter still filters the list');
   });
 
@@ -1487,37 +1616,34 @@ describe('issues view dedicated search row (S26)', () => {
     const { view } = makeView({
       pages: pagesOf([rows, [], []]),
       issues: rows,
-      actions: { copyText: () => ({ ok: false, error: 'no clipboard tool available' }) },
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    view.handleInput('y');
-    await tick();
+    view.handleInput('L');
     let lines = chrome(view, 80);
-    assert.match(lines[3], /clipboard unavailable/, 'the error lands on the notice row');
+    assert.match(lines[3], /labels cannot be edited/, 'the refusal lands on the notice row');
     view.handleInput('T');
     view.handleInput('1');
     lines = chrome(view, 80);
     assert.match(lines[1], /› 1█/, 'the query row stays the input');
-    assert.match(lines[3], /clipboard unavailable/, 'the error never disappears while typing');
+    assert.match(lines[3], /labels cannot be edited/, 'the error never disappears while typing');
   });
 
   test('a long notice truncates inside the frame instead of overflowing it', async () => {
+    const longError = 'the issue page could not be read: gh timed out after 30s while querying the remote repository for this bucket';
     const { view } = makeView({
       pages: pagesOf([[issue(76)], [], []]),
       issues: [issue(76)],
-      actions: { copyText: () => ({ ok: false, error: 'no clipboard tool available at all' }) },
+      loadError: longError,
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
-    await tick();
-    view.handleInput('y');
     await tick();
     for (const width of [80, 160]) {
       for (const line of view.render(width)) {
         assert.equal(helpers.visibleWidth(line), width, `every row keeps the exact cell width at ${width}`);
       }
     }
-    assert.match(chrome(view, 80)[3], /clipboard unavailable/, 'the notice still shows on the notice row');
+    assert.match(chrome(view, 80)[3], /the issue page could not be read/, 'the notice still shows on the notice row');
   });
 
   test('the loading frame keeps the search widget directly under the title', async () => {
@@ -1528,12 +1654,12 @@ describe('issues view dedicated search row (S26)', () => {
     });
     const loading = chrome(view, 160);
     assert.match(loading[0], /◈ Issues/, 'row 1 is the title');
-    assert.match(loading[1], /› Search \(T\)/, 'row 2 is the search widget while loading');
+    assert.match(loading[1], /› Search/, 'row 2 is the search widget while loading');
     assert.match(loading.join('\n'), /loading issues/, 'the loading state stays');
     assert.match(loading[loading.length - 2], /esc close/, 'the footer legend stays');
     gate.resolve(pagesResult([[issue(1)], [], []]));
     await tick();
-    assert.match(chrome(view, 160)[1], /› Search \(T\)/, 'the widget stays under the title after loading');
+    assert.match(chrome(view, 160)[1], /› Search/, 'the widget stays under the title after loading');
   });
 });
 
@@ -1642,13 +1768,14 @@ describe('S13: the issues frame repeats nothing', () => {
     assert.match(lines[2], /▸ My issues \(2\)/, 'the tab row marks the active bucket and its count');
   });
 
-  test('the search key is named by the search row alone, never by the footer', async () => {
+  test('the search key is named by the footer alone, never above it', async () => {
     const view = await opened();
     const lines = view.render(80).map(strip);
     const footer = footerOf(lines);
-    assert.match(lines[1], /› Search \(T\)/, 'the search row names its own key');
-    assert.equal(((lines.join('\n')).match(/\(T\)/g) || []).length, 1, 'the search key is named once');
-    assert.ok(!tokensOf(footer).some((token) => /^T\b/.test(token)), `the footer does not repeat T: ${footer}`);
+    assert.match(lines[1], /› Search/, 'the search row names the widget');
+    assert.ok(!lines[1].includes('(T)'), 'no key hint rides the search row');
+    assert.equal((lines.join('\n')).match(/\(T\)/g), null, 'no parenthesised T hint survives');
+    assert.ok(tokensOf(footer).some((token) => /^T( search)?$/.test(token)), `the footer owns the search key: ${footer}`);
   });
 
   test('while searching the footer names the search keys once and the input carries only the query', async () => {
@@ -1693,5 +1820,415 @@ describe('S13: the issues frame repeats nothing', () => {
     for (const row of lines.slice(0, 4)) {
       assert.ok(!row.includes('issue title 1'), `chrome repeats no focused title: ${row}`);
     }
+  });
+});
+
+// S16/D2: label and assignee editing is a repository capability, never the
+// fact that the user is authenticated. Issue detail carries
+// `permissions:{canEditLabels,canEditAssignees,canCreateLabels}`; absent or
+// unknown reads as false, so the footer hint disappears AND the key cannot
+// enter the editor — the same gate for both, and no loader or write runs.
+describe('S16: repository permissions gate the label and assignee editors', () => {
+  const users = () => ({ ok: true, users: [{ login: 'ann', name: 'Ann' }, { login: 'bob', name: '' }, { login: 'carol', name: 'Carol' }] });
+
+  test('the footer names each editor only for a permission confirmed true', async () => {
+    const cases = [
+      [EDITABLE, true],
+      [{}, false],
+      [undefined, false],
+      [{ canEditLabels: 'yes', canEditAssignees: 1 }, false],
+    ];
+    for (const [permissions, shown] of cases) {
+      const rows = [issue(1)];
+      const { view } = makeView({
+        pages: pagesOf([rows, [], []]),
+        issues: rows,
+        loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions }), comments: [] }),
+      });
+      await tick();
+      const body = bodyOf(view, 124);
+      assert.equal(body.includes('L labels'), shown, `labels hint for ${JSON.stringify(permissions)}`);
+      assert.equal(body.includes('a assign'), shown, `assignees hint for ${JSON.stringify(permissions)}`);
+    }
+  });
+
+  test('l and a neither enter an editor nor load or write without permission', async () => {
+    for (const permissions of [undefined, {}, { canEditLabels: false, canEditAssignees: false }]) {
+      const calls = [];
+      const rows = [issue(1)];
+      const { view } = makeView({
+        pages: pagesOf([rows, [], []]),
+        issues: rows,
+        labels: [{ name: 'bug' }],
+        loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions }), comments: [] }),
+        loadAssignees: () => { calls.push('loadAssignees'); return users(); },
+        actions: {
+          editLabels: () => { calls.push('editLabels'); return { ok: true }; },
+          editAssignees: () => { calls.push('editAssignees'); return { ok: true }; },
+        },
+      });
+      await tick();
+      view.handleInput('l');
+      view.handleInput('a');
+      await tick();
+      assert.equal(view.state.mode, 'list', `no editor opens for ${JSON.stringify(permissions)}`);
+      assert.deepEqual(calls, [], 'no loader and no write ran');
+      assert.match(bodyOf(view, 124), /permission/, 'the refusal names the missing permission');
+    }
+  });
+
+  test('a opens the assignee editor preselected and saves add/remove deltas', async () => {
+    const calls = [];
+    const loads = [];
+    const rows = [issue(1)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n, opts) => {
+        loads.push(opts);
+        const assignees = loads.length === 1 ? [{ login: 'bob' }] : [{ login: 'ann' }];
+        return { ok: true, issue: issue(n, { permissions: EDITABLE, assignees }), comments: [] };
+      },
+      loadAssignees: () => users(),
+      actions: { editAssignees: (number, changes) => { calls.push([number, changes]); return { ok: true }; } },
+    });
+    await tick();
+    view.handleInput('a');
+    assert.equal(view.state.mode, 'assignees');
+    await tick();
+    const editor = bodyOf(view, 100);
+    assert.match(editor, /\[x\] bob/, 'the current assignee starts selected');
+    assert.match(editor, /\[ \] ann/, 'an unassigned user starts unselected');
+    view.handleInput('space');
+    view.handleInput('down');
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.deepEqual(calls, [[1, { add: ['ann'], remove: ['bob'] }]], 'one delta call: add ann, remove bob');
+    assert.equal(view.state.mode, 'list', 'success leaves the editor');
+    assert.deepEqual(loads[1], { refresh: true }, 'the saved detail is refetched, never served from the cache');
+    const body = bodyOf(view, 100);
+    assert.match(body, /assignees: ann/, 'the preview shows the refetched assignees');
+    assert.ok(!body.includes('assignees: bob'), 'the pre-save detail is gone');
+  });
+
+  test('the create-label row and key need canCreateLabels, not just triage', async () => {
+    const created = [];
+    const rows = [issue(1, { labels: [{ name: 'bug' }] })];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      labels: [{ name: 'bug' }],
+      loadIssue: (n) => ({
+        ok: true,
+        issue: issue(n, { labels: [{ name: 'bug' }], permissions: { canEditLabels: true, canCreateLabels: false } }),
+        comments: [],
+      }),
+      actions: { editLabels: (n, add, remove, made) => { created.push([add, remove, made]); return { ok: true }; } },
+    });
+    await tick();
+    view.handleInput('l');
+    assert.equal(view.state.mode, 'labels', 'triage permission alone still opens the editor');
+    const editor = bodyOf(view, 100);
+    assert.ok(!editor.includes('create new'), 'no create row without canCreateLabels');
+    view.handleInput('n');
+    assert.equal(view.state.labelCreating, false, 'n starts no creation');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.deepEqual(created, [[[], [], []]], 'no label creation was sent');
+  });
+
+  test('a rejected assignee save keeps the editor, the toggles and a visible error', async () => {
+    const loads = [];
+    const rows = [issue(1)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n, opts) => {
+        loads.push(opts);
+        return { ok: true, issue: issue(n, { permissions: EDITABLE, assignees: [{ login: 'bob' }] }), comments: [] };
+      },
+      loadAssignees: () => users(),
+      actions: { editAssignees: () => ({ ok: false, error: 'permission denied by GitHub' }) },
+    });
+    await tick();
+    view.handleInput('a');
+    await tick();
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    await tick();
+    assert.equal(view.state.mode, 'assignees', 'the editor stays open');
+    const body = bodyOf(view, 100);
+    assert.match(body, /permission denied by GitHub/, 'the server rejection is visible');
+    assert.match(body, /\[x\] ann/, 'the local toggle survives the rejection');
+    assert.match(body, /\[x\] bob/, 'the stored assignee is unchanged');
+    assert.equal(loads.length, 1, 'a failed save refetches nothing');
+  });
+
+  test('moving focus to an issue without permissions withdraws both hints and both keys', async () => {
+    const calls = [];
+    const rows = [issue(1), issue(2)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n, n === 1 ? { permissions: EDITABLE } : {}), comments: [] }),
+      loadAssignees: () => { calls.push('loadAssignees'); return users(); },
+    });
+    await tick();
+    assert.match(bodyOf(view, 124), /L labels/, 'the permitted issue shows the hint');
+    view.handleInput('j');
+    await tick();
+    const body = bodyOf(view, 124);
+    assert.ok(!body.includes('L labels'), 'the labels hint is gone');
+    assert.ok(!body.includes('a assign'), 'the assignees hint is gone');
+    view.handleInput('a');
+    await tick();
+    assert.equal(view.state.mode, 'list', 'the key cannot enter the editor');
+    assert.deepEqual(calls, [], 'no assignee loader ran');
+  });
+});
+
+// S3/S5/D1/D3: the widened wrapping left list and the server-page seam.
+describe('issues left list width, wrapping and fresh pages (S3/S5/D1/D3)', () => {
+  // One issue carrying its server cursor, as D1 delivers it.
+  function cursorIssue(cursor, row) {
+    return { ...row, cursor };
+  }
+
+  function page(issues, extra = {}) {
+    return { ok: true, issues, total: issues.length, hasNextPage: false, ...extra };
+  }
+
+  test('the left pane takes the shared half width at 40, 80, 120 and 200 columns', async () => {
+    for (const width of [40, 80, 120, 200]) {
+      const { view } = makeView({
+        rows: 24,
+        loadIssuePage: () => page([cursorIssue('c1', issue(1, { title: 'short title' }))]),
+        loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      });
+      await tick();
+      const expected = layout.paneWidths(layout.innerWidth(width)).left;
+      const bodyRow = strip(view.render(width)[5]);
+      const chars = [...bodyRow];
+      assert.equal(chars.indexOf('│', 2), 3 + expected, `${width}: the left pane is ${expected} cells`);
+      if (width >= 100) assert.ok(expected > 36, `${width}: no old 34/36-column cap survives`);
+    }
+  });
+
+  test('the left list shows the full wrapped title and never the issue number', async () => {
+    const title = 'wrapped title that keeps every single word of the issue visible';
+    const { view } = makeView({
+      rows: 30,
+      loadIssuePage: () => page([cursorIssue('c1', issue(7, { title }))]),
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { title }), comments: [] }),
+    });
+    await tick();
+    const left = leftColumn(view, 80, 30);
+    assert.ok(!left.includes('#7'), 'the issue number is not in the left list');
+    assert.equal(left.replace(/\s+/g, ' ').includes(title), true, 'the whole title is readable');
+    const rows = left.split('\n').filter((row) => row.trim() !== '');
+    assert.ok(rows.length > 1, 'a title too long for one row wraps onto the next');
+    assert.ok(rows.slice(0, rows.length - 1).length >= 2, 'the wrap uses as many rows as it needs');
+  });
+
+  test('the request limit comes from the viewport body height, never from a fixed 20', async () => {
+    for (const [rows, expected] of [[12, 5], [14, 7], [30, 23], [40, 33]]) {
+      const calls = [];
+      const { view } = makeView({
+        rows,
+        loadIssuePage: (request) => {
+          calls.push(request);
+          return page([cursorIssue('c1', issue(1))]);
+        },
+      });
+      await tick();
+      assert.equal(calls.length, 1, `${rows}: one mount read`);
+      assert.equal(calls[0].limit, expected, `${rows}: limit is the body-row upper bound`);
+      assert.equal(calls[0].cursor, null, `${rows}: the first page starts at the head`);
+      assert.equal(calls[0].bucketId, 'mine', `${rows}: the request names its bucket`);
+      assert.ok(view);
+    }
+  });
+
+  test('the next page starts after the LAST SHOWN cursor, never after unused fetched rows', async () => {
+    const calls = [];
+    const served = [
+      cursorIssue('ca', issue(1, { title: 'alpha beta gamma delta epsilon zeta' })),
+      cursorIssue('cb', issue(2, { title: 'one two three four five six seven' })),
+    ];
+    const { view } = makeView({
+      rows: 12,
+      loadIssuePage: (request) => {
+        calls.push(request);
+        return page(served, { hasNextPage: true });
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    const left = leftColumn(view, 40, 12);
+    assert.match(left, /alpha/, 'the first row fits');
+    assert.ok(!left.includes('one two'), 'the row that does not fit is not shown');
+    view.handleInput(']');
+    assert.equal(calls.length, 2, 'the arrow asked for the next page');
+    assert.equal(calls[1].cursor, 'ca', 'the next page starts after the LAST SHOWN row');
+    assert.equal(calls[1].limit, 5, 'the limit follows the body budget again');
+  });
+
+  test('previous and r fetch fresh pages, and tab switches the bucket', async () => {
+    const calls = [];
+    const { view } = makeView({
+      rows: 12,
+      loadIssuePage: (request) => {
+        calls.push(request);
+        const issues = request.cursor === null
+          ? [cursorIssue('ca', issue(1)), cursorIssue('cb', issue(2))]
+          : [cursorIssue('cc', issue(3))];
+        return page(issues, { hasNextPage: request.cursor === null });
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    // The host paints before it accepts a key, and only a painted list knows
+    // which row was the LAST SHOWN one.
+    leftColumn(view, 60, 12);
+    view.handleInput(']');
+    view.handleInput('[');
+    assert.equal(calls.length, 3, 'previous is a real request, never a cached list');
+    assert.equal(calls[2].cursor, null, 'page one starts at the head again');
+    view.handleInput('r');
+    assert.equal(calls.length, 4, 'r re-reads the current page');
+    assert.equal(calls[3].cursor, null, 'r re-reads the page the reader is on');
+    assert.equal(calls[3].bucketId, 'mine');
+    view.handleInput('tab');
+    assert.equal(calls.length, 5, 'the new bucket is read on selection');
+    assert.equal(calls[4].bucketId, 'assigned', 'tab moves to the next bucket');
+  });
+
+  test('r refreshes the focused preview even when the page answers with the same issues', async () => {
+    const served = [cursorIssue('ca', issue(1)), cursorIssue('cb', issue(2))];
+    let comments = [];
+    let loads = 0;
+    const { view } = makeView({
+      rows: 20,
+      loadIssuePage: () => page(served, { hasNextPage: false }),
+      loadIssue: (n) => {
+        loads += 1;
+        return { ok: true, issue: issue(n), comments: comments.slice() };
+      },
+    });
+    await tick();
+    leftColumn(view, 60, 20);
+    view.handleInput('j');
+    assert.equal(view.state.index, 1, 'the second issue is focused');
+    comments = [{ author: 'ann', createdAt: new Date().toISOString(), body: 'fresh comment' }];
+    const before = loads;
+    view.handleInput('r');
+    await tick();
+    assert.ok(loads > before, 'the focused detail is refetched');
+    const body = bodyOf(view, 60);
+    assert.match(body, /#2 /, 'the reader stays on the same issue');
+    assert.match(body, /fresh comment/, 'the refreshed preview shows the new comment');
+  });
+
+  test('a resize resets the page boundaries and a stale answer never paints', async () => {
+    const pending = [];
+    const { view } = makeView({
+      rows: 30,
+      loadIssuePage: (request) => {
+        const entry = deferred();
+        pending.push({ request, entry });
+        return entry.promise;
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    pending[0].entry.resolve(page([cursorIssue('c1', issue(1)), cursorIssue('c2', issue(2))], { hasNextPage: true }));
+    await tick();
+    bodyOf(view, 120);
+    view.handleInput(']');
+    assert.equal(pending[1].request.cursor, 'c2', 'the second page starts after the last shown row');
+    pending[1].entry.resolve(page([cursorIssue('c3', issue(3))], { hasNextPage: true }));
+    await tick();
+    bodyOf(view, 120);
+    assert.equal(view.state.listPage, 2);
+    // S5/D1: boundaries derived from another viewport cannot survive a resize.
+    bodyOf(view, 60);
+    assert.equal(pending.length, 3, 'the resize reads the first page again');
+    assert.equal(pending[2].request.cursor, null, 'the reset page starts at the head');
+    assert.equal(view.state.listPage, 1, 'the page position is back at one');
+    view.handleInput('r');
+    assert.equal(pending.length, 4, 'r asks again');
+    pending[3].entry.resolve(page([cursorIssue('c4', issue(9, { title: 'newest answer' }))]));
+    await tick();
+    pending[2].entry.resolve(page([cursorIssue('c0', issue(8, { title: 'stale answer' }))], { hasNextPage: true }));
+    await tick();
+    const left = leftColumn(view, 60, 30);
+    assert.match(left, /newest answer/, 'the newest request paints');
+    assert.ok(!left.includes('stale answer'), 'an earlier answer never overwrites it');
+  });
+
+  test('a resize invalidates an inactive bucket too, so its stale page never paints', async () => {
+    const pending = [];
+    const { view } = makeView({
+      rows: 30,
+      loadIssuePage: (request) => {
+        const entry = deferred();
+        pending.push({ request, entry });
+        return entry.promise;
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    // The first bucket is read, then the reader moves to the second one and
+    // leaves a second-page request in flight there.
+    pending[0].entry.resolve(page([cursorIssue('a1', issue(1))], { hasNextPage: true }));
+    await tick();
+    bodyOf(view, 120);
+    view.handleInput('tab');
+    pending[1].entry.resolve(page([cursorIssue('b1', issue(2))], { hasNextPage: true }));
+    await tick();
+    bodyOf(view, 120);
+    view.handleInput(']');
+    assert.equal(pending[2].request.cursor, 'b1', 'the inactive bucket has a second page in flight');
+    // Moving on and resizing must invalidate that answer too: the reset
+    // boundaries describe the new viewport, so a page requested for the old
+    // one cannot paint into them just because the bucket is not on screen.
+    view.handleInput('tab');
+    pending[3].entry.resolve(page([cursorIssue('c1', issue(3))]));
+    await tick();
+    bodyOf(view, 120);
+    bodyOf(view, 60);
+    pending[2].entry.resolve(page([
+      cursorIssue('b2', issue(9, { title: 'stale second page' })),
+    ], { hasNextPage: true }));
+    await tick();
+    view.handleInput('tab');
+    view.handleInput('tab');
+    const left = leftColumn(view, 60, 30);
+    assert.match(left, /issue title 2/, 'the bucket reads the page the reset recorded');
+    assert.ok(!left.includes('stale second page'), 'the earlier bucket answer never paints after a resize');
+    const returned = pending[pending.length - 1].request;
+    assert.equal(returned.bucketId, 'assigned', 'the bucket is read again on return');
+    assert.equal(returned.cursor, null, 'and it starts at the head of the reset page');
+  });
+
+  test('a failed page load is shown truthfully while the view stays mounted', async () => {
+    const { view } = makeView({
+      loadIssuePage: () => ({ ok: false, error: 'gh issue list failed: HTTP 403: rate limited' }),
+    });
+    await tick();
+    const body = bodyOf(view, 80);
+    assert.match(body, /failed to load issues: gh issue list failed: HTTP 403: rate limited/);
+    assert.ok(!body.includes('issue title'), 'no rows are invented');
+    assert.match(bodyOf(view, 160), /esc close/, 'the footer still names the close key');
+  });
+
+  test('static pages stay supported with no loader at all', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[issue(1, { title: 'static row' })], [], []]),
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { title: 'static row' }), comments: [] }),
+    });
+    await tick();
+    assert.match(leftColumn(view, 100), /static row/, 'the eager pages still render');
+    assert.match(bodyOf(view, 100), /page 1\/1/);
+    assert.ok(!leftColumn(view, 100).includes('#1'), 'the eager path drops the number too');
   });
 });
