@@ -1,13 +1,16 @@
 'use strict';
-// T2/T5 (worktree-ui-feedback S3, S5, D1, D3) tests: lib/view-layout.js —
-// the ONE width and pagination rule the three full-screen readers share.
+// T2/T5 (worktree-ui-feedback S3, S5, D1, D3) and round-3 T3 (S5, S8, S17)
+// tests: lib/view-layout.js — the ONE width, wrapping and pagination rule the
+// full-screen readers share.
 //
-// Contract under test, as observable output only: the left pane takes about
-// half of the inner width with no fixed column cap (S3); a list label wraps
-// over as many rows as its text needs instead of being truncated (S3); and
-// the page boundaries are derived from the wrapped row heights against the
-// real body-row budget, so capacity follows the terminal and never a fixed
-// item count (S5, D3). Nothing here touches the filesystem or the network.
+// Contract under test, as observable output only: the preview pane takes the
+// larger 60% share and the list the smaller 40% one, with no fixed column cap
+// (S5); a list label wraps over as many rows as its text needs instead of
+// being truncated, and it prefers a hyphen boundary over a mid-word cut
+// (S17); and the page boundaries are derived from the wrapped row heights
+// against the real body-row budget, so capacity follows the terminal and
+// never a fixed item count (S8, D3). Nothing here touches the filesystem or
+// the network.
 
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,15 +21,16 @@ const helpers = {
   visibleWidth: (text) => [...String(text).replace(/\x1b\[[0-9;]*m/g, '')].length,
 };
 
-describe('paneWidths (S3)', () => {
-  test('the left pane takes about half the inner width and grows with the terminal', () => {
-    const widths = [80, 120, 200].map((width) => layout.paneWidths(layout.innerWidth(width)));
-    for (let at = 0; at < widths.length; at += 1) {
-      const { left, right } = widths[at];
-      const inner = [80, 120, 200][at] - 4;
-      assert.ok(Math.abs(left - inner / 2) <= 2, `${inner}: left ${left} is about half of ${inner}`);
-      assert.ok(right >= 24, `${inner}: the preview keeps a readable minimum, got ${right}`);
-      assert.equal(left + right + 3, inner, `${inner}: the two panes and the divider fill the inner width`);
+describe('paneWidths (S5)', () => {
+  test('the preview takes the larger 60% share and the list the 40% one at every normal size', () => {
+    for (const width of [80, 120, 200]) {
+      const inner = layout.innerWidth(width);
+      const { left, right, divider } = layout.paneWidths(inner);
+      assert.ok(right > left, `${width}: the preview is wider than the list (${left}/${right})`);
+      assert.ok(Math.abs(left / (left + right) - 0.4) < 0.02, `${width}: the list takes 40% (${left}/${right})`);
+      assert.ok(Math.abs(right / (left + right) - 0.6) < 0.02, `${width}: the preview takes 60% (${left}/${right})`);
+      assert.ok(right >= 24, `${width}: the preview keeps a readable minimum, got ${right}`);
+      assert.equal(left + right + divider, inner, `${width}: the two panes and the divider fill the inner width`);
     }
   });
 
@@ -55,7 +59,7 @@ describe('paneWidths (S3)', () => {
   });
 });
 
-describe('wrapLabel (S3)', () => {
+describe('wrapLabel (S3, S17)', () => {
   test('a short label stays on one row and keeps the focus marker', () => {
     assert.deepEqual(layout.wrapLabel(helpers, 'tiny title', 20, { first: '▸ ' }), ['▸ tiny title']);
   });
@@ -77,6 +81,35 @@ describe('wrapLabel (S3)', () => {
 
   test('an empty label still renders one row so the item stays selectable', () => {
     assert.deepEqual(layout.wrapLabel(helpers, '', 10, { first: '▸ ' }), ['▸ ']);
+  });
+
+  test('a hyphenated label breaks after its own hyphens, never inside a segment', () => {
+    assert.deepEqual(
+      layout.wrapLabel(helpers, 'alpha-beta-gamma-delta', 14, { first: '', rest: '' }),
+      ['alpha-beta-', 'gamma-delta'],
+      'each row ends on a hyphen boundary instead of splitting a segment',
+    );
+  });
+
+  test('every character of a hyphenated label survives the wrap', () => {
+    const label = 'a-document-name-that-is-far-wider-than-the-list-pane';
+    const rows = layout.wrapLabel(helpers, label, 30, { first: '▸ ', rest: '  ' });
+    assert.ok(rows.length > 1, `the label wraps: ${JSON.stringify(rows)}`);
+    for (const row of rows) assert.ok(helpers.visibleWidth(row) <= 30, `row too wide: ${row}`);
+    assert.equal(rows.map((row) => row.slice(2)).join(''), label, 'no character is lost or duplicated');
+  });
+
+  test('only a segment wider than the pane is hard-cut, and the rest continues', () => {
+    const label = 'short-supercalifragilisticexpialidocious-tail';
+    const rows = layout.wrapLabel(helpers, label, 12, { first: '', rest: '' });
+    assert.equal(rows[0], 'short-', 'the segment that fits keeps its own row');
+    for (const row of rows) assert.ok(helpers.visibleWidth(row) <= 12, `row too wide: ${row}`);
+    assert.equal(rows.join(''), label, 'the long segment is cut, never dropped');
+  });
+
+  test('a hyphen and a space are both break opportunities in one label', () => {
+    const rows = layout.wrapLabel(helpers, 'alpha-beta gamma-delta', 13, { first: '', rest: '' });
+    assert.deepEqual(rows, ['alpha-beta', 'gamma-delta'], 'the space break drops the space, the hyphen stays');
   });
 });
 
