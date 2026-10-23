@@ -2,13 +2,18 @@
 // T4 (worktree-ui-feedback S4,S12,S15): the worktree CREATION and EDITING
 // panel.
 //
-// Creating is the TWO-FIELD bottom flow a human reported as still being a
-// pop-up (S12): a preview of the REAL derived branch and path ABOVE, then the
-// change type as an inline list, then the change name. `tab`/`shift+tab`/
-// `←`/`→` move between those two fields and `↑`/`↓` pick the type; `enter` on
-// the name creates. Only type and name exist: no Issues/Odd selector, no
-// association, no step counter. The component derives its own compact
-// content height (the host mounts it at the bottom later), so a wrapped
+// Creating is the TABBED bottom flow a human reported as still being a
+// pop-up (S12), with the fields stacked together instead of tabbed (S7): a
+// preview of the REAL derived branch and path ABOVE, then `Type` and `Name` as
+// the two tabs of one strip, only the active field's content under them (the
+// type tab holds the inline list, the name tab the text field). The preview
+// stays BLANK (`-`) until both fields derive a real branch and path: an
+// untouched form is not an error, so nothing in the preview is painted red or
+// names a failure, while a refused submit still says exactly why.
+// `tab`/`shift+tab`/`←`/`→` move between the two tabs and `↑`/`↓` pick the
+// type; `enter` on the name creates. Only type and name exist: no Issues/Odd
+// selector, no association, no step counter. The component derives its own
+// compact content height (the host mounts it at the bottom), so a wrapped
 // surface never leaves slack rows. The Issues/Odd association panes, their
 // selection state and their previews are NOT part of this surface; they
 // survive only in the panel's editing mode, which the editing tests below
@@ -164,18 +169,19 @@ function typeText(view, text) {
 }
 
 describe('the rendered panel', { concurrency: false }, () => {
-  test('shows the preview above the type list and the name, and nothing else', () => {
+  test('shows the preview above the Type|Name tabs, with only the active field under them', () => {
     const { view } = openPanel({ initialName: 'new-change' });
     const lines = renderedLines(view, 100);
     const text = allText(lines);
     const at = (needle) => lines.findIndex((line) => stripAnsi(line).includes(needle));
+    assert.match(text, /Type · Name/, 'the two fields are TABS, not two stacked rows (S7)');
     assert.match(text, /Type: Feature \(feat\)/, 'the conventional type with its human label');
-    assert.match(text, /Name: new-change/, 'the typed name');
+    assert.ok(!text.includes('Name:'), 'only the ACTIVE tab renders its field under the strip');
     findLine(lines, 'preview branch: feat/new-change');
     findLine(lines, `preview path: ${path.join(path.dirname(REPO), `${path.basename(REPO)}-worktrees`, 'feat-new-change')}`);
-    assert.ok(at('preview branch:') < at('Type:'), 'the preview sits ABOVE the type field');
-    assert.ok(at('preview path:') < at('Type:'), 'both preview rows sit above the fields');
-    assert.ok(at('Type:') < at('Name:'), 'type above name');
+    assert.ok(at('preview branch:') < at('Type · Name'), 'the preview sits ABOVE the tabs');
+    assert.ok(at('preview path:') < at('Type · Name'), 'both preview rows sit above the tabs');
+    assert.ok(at('Type · Name') < at('Type: Feature'), 'the active field sits UNDER its tab strip');
     for (const type of panel.CHANGE_TYPES) {
       assert.ok(text.includes(`${type.label} (${type.id})`), `the type list is inline: ${type.id}`);
     }
@@ -187,6 +193,14 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.match(text, /Ctrl\+S create/, 'the keys footer names ctrl+s');
     assert.match(text, /Esc cancel/, 'the keys footer names esc');
     assert.ok(!text.includes('? help'), 'the footer never advertises a help key');
+    // The Name tab is the name field alone: the type row and its list belong
+    // to the other tab and are not rendered under this one.
+    view.handleInput('\t');
+    const nameTab = allText(renderedLines(view, 100));
+    assert.match(nameTab, /Type · Name/, 'the tab strip stays visible');
+    assert.match(nameTab, /Name: new-change/, 'the Name tab renders the name field');
+    assert.ok(!nameTab.includes('Type: Feature'), 'the Type field belongs to the Type tab');
+    assert.ok(!nameTab.includes('Bug fix (fix)'), 'the inline type list is not shown under the Name tab');
   });
 
   test('every line is exactly the requested width and the surface ends at its own content', () => {
@@ -235,29 +249,43 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.match(findLine(lines, 'Name:'), /Name: new-change▊/);
   });
 
-  test('an invalid name is shown as invalid instead of a derived branch', () => {
-    const { view } = openPanel();
+  test('an incomplete form leaves the preview blank and neutral, never red (S7)', () => {
+    const { view, finished } = openPanel();
     const lines = renderedLines(view, 100);
-    const branch = findLine(lines, 'preview branch:');
-    assert.ok(branch.includes('✗'), 'the invalid state is marked');
-    assert.match(branch, /name is empty/);
-    assert.ok(!branch.includes('feat/worktree'), 'no fake branch is derived from an empty name');
-    const target = findLine(lines, 'preview path:');
-    assert.match(target, /✗ not derived/);
-    // A name with nothing slug-worthy is refused, not silently turned into `worktree`.
+    assert.equal(findLine(lines, 'preview branch:').trim(), 'preview branch: -', 'an empty name previews nothing yet');
+    assert.equal(findLine(lines, 'preview path:').trim(), 'preview path: -');
+    const text = allText(lines);
+    for (const noise of ['✗', 'name is empty', 'not derived', 'invalid', 'cannot create']) {
+      assert.ok(!text.includes(noise), `the untouched preview carries no ${JSON.stringify(noise)}\n${text}`);
+    }
+    assert.ok(!text.includes('feat/worktree'), 'no fake branch is derived from an empty name');
+    // A name with nothing slug-worthy is refused on SUBMIT, not painted into
+    // the preview while the user is still typing.
     focusName(view);
     typeText(view, '!!!');
-    assert.match(findLine(renderedLines(view, 100), 'preview branch:'), /name has no letters or digits/);
+    const typed = renderedLines(view, 100);
+    assert.equal(findLine(typed, 'preview branch:').trim(), 'preview branch: -', 'an underivable name stays blank');
+    assert.equal(findLine(typed, 'preview path:').trim(), 'preview path: -');
+    view.handleInput('\x13');
+    assert.deepEqual(finished, [], 'an invalid name still never creates');
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
-  test('a git refusal of the derived branch is surfaced verbatim', () => {
+  test('a git refusal is refused honestly on submit and never painted into the preview', () => {
     const git = {
       slugifyBranch: () => '-bad',
       validateBranch: (branch) => ({ ok: false, reason: `invalid branch name: ${branch}` }),
       canonicalWorktreePath: () => '/nowhere',
     };
-    const { view } = openPanel({ git, initialName: 'x' });
-    assert.match(findLine(renderedLines(view, 100), 'preview branch:'), /invalid branch name: feat\/-bad/);
+    const { view, finished } = openPanel({ git, initialName: 'x' });
+    assert.equal(
+      findLine(renderedLines(view, 100), 'preview branch:').trim(),
+      'preview branch: -',
+      'an underivable branch stays blank instead of going red',
+    );
+    view.handleInput('\x13');
+    assert.deepEqual(finished, [], 'the refusal creates nothing');
+    assert.match(allText(renderedLines(view, 100)), /cannot create: invalid branch name: feat\/-bad/);
   });
 
   test('the name field renders a real placeholder and a cursor, and never treats the placeholder as the value', () => {
@@ -368,11 +396,13 @@ describe('S12: two fields, nothing else', { concurrency: false }, () => {
     let text = allText(renderedLines(view, 100));
     assert.ok(!text.includes('cannot create'), 'nothing has been refused yet');
     view.handleInput('\x1b[B'); // pick the second type
+    text = allText(renderedLines(view, 100));
+    assert.match(text, /Type: Bug fix \(fix\)/, 'the Type tab shows the picked type');
+    assert.deepEqual(finished, [], 'picking the type creates nothing yet');
     view.handleInput('\t'); // reach the name
     assert.equal(view.state.focus, 'name', 'tab hands the flow to the name');
     text = allText(renderedLines(view, 100));
-    assert.match(text, /Type: Bug fix \(fix\)/);
-    assert.deepEqual(finished, [], 'picking the type creates nothing yet');
+    assert.match(text, /Name: ▊/, 'the Name tab renders the name field');
     typeText(view, 'panel-change');
     assert.deepEqual(finished, [], 'typing the name creates nothing yet');
     view.handleInput('enter'); // confirm
@@ -482,7 +512,7 @@ describe('completion', { concurrency: false }, () => {
 describe('the create panel never reads the issue or odd libraries (S6)', { concurrency: false }, () => {
   test('no gh call and no odd document is listed or read with the real libraries in place', async () => {
     const seen = [];
-    ghIssues.setGhRunner((bin, argv) => {
+    ghIssues.setGhRunner((_bin, argv) => {
       seen.push(argv);
       return { status: 1, stderr: 'the create panel must not call gh', stdout: '' };
     });
@@ -790,6 +820,97 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.equal(finished.length, 1);
     assert.ok(!('mode' in finished[0]), 'a creation carries no mode marker');
     assert.deepEqual(Object.keys(finished[0]).sort(), ['name', 'ok', 'type']);
+  });
+});
+
+// S7: the creation surface is TABBED like the worktree editor — a `Type ·
+// Name` strip with only the active field's content under it — and its preview
+// stays blank until both fields derive a real branch and path. An untouched
+// form is not an error: nothing in the preview is painted red or names a
+// failure, while a refused submit still says exactly why.
+describe('S7: Type|Name tabs and a neutral preview', { concurrency: false }, () => {
+  // A theme that records every role it is asked to paint, so "is it red?" is
+  // a fact about the painted output instead of a guess about copy.
+  function recordingPanel(overrides = {}) {
+    const roles = [];
+    const theme = {
+      fg: (role, text) => { roles.push(role); return text; },
+      bold: (text) => text,
+    };
+    return { roles, ...openPanel({ theme, ...overrides }) };
+  }
+
+  test('nothing in the preview is red or error copy until an actual submit is refused', () => {
+    const { view, roles } = recordingPanel();
+    renderedLines(view, 100);
+    assert.ok(!roles.includes('error'), `an untouched form paints no error role\n${roles.join(',')}`);
+    const text = allText(renderedLines(view, 100));
+    assert.ok(!text.includes('✗'), 'no error glyph in the preview');
+    assert.equal(findLine(renderedLines(view, 100), 'preview branch:').trim(), 'preview branch: -');
+    assert.equal(findLine(renderedLines(view, 100), 'preview path:').trim(), 'preview path: -');
+    // Half-filled is still neutral: a picked type with no name is not an error.
+    view.handleInput('\x1b[B');
+    renderedLines(view, 100);
+    assert.ok(!roles.includes('error'), 'a picked type alone is not an error');
+    // The refusal appears only after the user actually asks to create.
+    view.handleInput('\x13');
+    const refused = renderedLines(view, 100);
+    assert.ok(roles.includes('error'), 'a refused submit is painted as an error');
+    assert.match(allText(refused), /cannot create: name is empty/);
+  });
+
+  test('the tabs hold one field each and keep both values while switching', () => {
+    const { view } = openPanel();
+    view.handleInput('\x1b[B'); // type: Bug fix
+    view.handleInput('\t'); // -> Name tab
+    typeText(view, 'tab-change');
+    let text = allText(renderedLines(view, 100));
+    assert.match(text, /Name: tab-change▊/);
+    assert.ok(!text.includes('Bug fix (fix)'), 'the type list belongs to the Type tab');
+    view.handleInput('\x1b[Z'); // shift+tab back to Type
+    text = allText(renderedLines(view, 100));
+    assert.match(text, /Type: Bug fix \(fix\)/, 'the picked type survived the round trip');
+    assert.ok(!text.includes('Name:'), 'the name field is not rendered under the Type tab');
+    view.handleInput('\x1b[C'); // -> back to the name
+    assert.equal(view.state.name, 'tab-change', 'the typed name survived too');
+    assert.match(allText(renderedLines(view, 100)), /Name: tab-change/);
+    view.handleInput('\x1b[D'); // -> Type
+    text = allText(renderedLines(view, 100));
+    for (const type of panel.CHANGE_TYPES) {
+      assert.ok(text.includes(`${type.label} (${type.id})`), `the type list is whole: ${type.id}`);
+    }
+    assert.match(findLine(renderedLines(view, 100), 'preview branch:').trim(), /^preview branch: fix\/tab-change$/);
+  });
+
+  test('a valid type and name preview the exact branch and path', () => {
+    const { view } = openPanel({ initialType: 'fix', initialName: 'new-change' });
+    const lines = renderedLines(view, 100);
+    findLine(lines, 'preview branch: fix/new-change');
+    const expected = path.join(path.dirname(REPO), `${path.basename(REPO)}-worktrees`, 'fix-new-change');
+    findLine(lines, `preview path: ${expected}`);
+    assert.ok(!allText(lines).includes('preview branch: -'), 'a derived branch replaces the blank preview');
+  });
+
+  test('cancel writes nothing and a confirmed creation fires exactly once', () => {
+    const cancelled = openPanel();
+    focusName(cancelled.view);
+    typeText(cancelled.view, 'discarded');
+    cancelled.view.handleInput('escape');
+    cancelled.view.handleInput('escape');
+    assert.deepEqual(cancelled.finished, [null], 'cancel emits null exactly once and nothing else');
+    assert.ok(!cancelled.finished.some((value) => value && value.ok === true), 'cancel never creates');
+
+    const confirmed = openPanel();
+    focusName(confirmed.view);
+    typeText(confirmed.view, 'new-change');
+    confirmed.view.handleInput('enter');
+    confirmed.view.handleInput('enter');
+    confirmed.view.handleInput('\x13');
+    assert.deepEqual(
+      confirmed.finished,
+      [{ ok: true, type: 'feat', name: 'new-change' }],
+      'one creation, never a duplicate',
+    );
   });
 });
 

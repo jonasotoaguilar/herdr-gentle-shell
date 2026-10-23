@@ -1,20 +1,23 @@
-# Two-field bottom creation
+# Tabbed bottom creation
 
 Warp's `c` action opens a compact bottom interaction, not a centered popup.
-Only **type** and **name** are collected; human creation has no Issues/ODD
-selectors. Agent tools retain their independent optional associations.
+The **Type · Name** tab strip shows only the active field below it. Human
+creation has no Issues/ODD selectors; agent tools retain their independent
+optional associations.
 
 | Action | Keys |
 | --- | --- |
 | Choose type from the inline list | `↑` / `↓` |
-| Switch type/name fields | `tab`, `shift+tab`, `←` / `→` |
+| Switch Type/Name tabs | `tab`, `shift+tab`, `←` / `→` |
 | Advance / confirm | `enter` |
 | Create from either field | `ctrl+s` |
 | Cancel without mutation | `esc` |
 
 A printable character on the type list starts the name. Branch and path previews
-appear **above** the fields and use the existing Git validators and canonical
-worktree-path helper. Invalid names show the refusal, never a guessed path.
+appear **above** the tabs and use the existing Git validators and canonical
+worktree-path helper. Until a valid candidate can be derived, both previews
+remain neutral (`-`), not red errors. A refused submission shows the reason
+below the active field, never a guessed path.
 The result remains `{ok:true,type,name}`; no association state is added.
 
 The view derives content height from its fixed rows and visible type-list rows.
