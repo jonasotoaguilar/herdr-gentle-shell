@@ -15,13 +15,20 @@ never the principal — sorted by name. Each row shows the document NAME
 only: the `.md` extension stripped, no path. The title stays short, just
 the viewer and the document count (`✎ Odd · 4 documents`).
 
-Below the title a dedicated search row carries the live filter query (and
-`(T to edit)` once the box is left with a kept query), with the selected
-document's scroll position at its right edge (`› Search (T)    1-14/200`).
-That is the whole chrome above the panes: the title's count is the only
-total rendered, no row repeats the focused document name the list already
-marks, and the `T` hint lives on the search row alone, never in the footer
-as well. The header never repeats the checkout/branch identity.
+Below the title the fixed search row carries the live query and list-page
+indicator (`› Search · page 1/4`), including one-page and empty lists. The
+selected document's reading position sits at the right edge when space allows;
+it yields before the list-page indicator on narrow terminals. The `T` hint
+belongs only in the footer. The header never repeats checkout/branch identity
+or the focused name already marked in the list.
+
+All fullscreen readers use the shared 40% list / 60% preview allocation, subject
+to minimum widths on small terminals. Names wrap at spaces and hyphens, keeping
+all characters; a segment is split only if it cannot fit the entire text width.
+Page capacity is not a fixed document count: the viewer reserves four chrome
+rows (frame top, Search, footer, frame bottom), then packs whole names according
+to their wrapped row cost into the remaining height. A taller name therefore
+reduces the number of entries on that page.
 
 Rows carry no association mark and the status row carries no assigned or
 unsaved fact: the viewer never claims which document belongs to the
@@ -43,8 +50,8 @@ document.
 | Key | Effect |
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | Move the selection |
-| `ctrl+j` / PageDown | Scroll the document down one page |
-| `ctrl+k` / PageUp | Scroll the document up one page |
+| `ctrl+shift+j/k` when negotiated; `Shift+J/K` fallback; PageDown/PageUp always | Scroll the document down/up one page |
+| `ctrl+d` / `ctrl+u` | Scroll down/up half a page |
 | mouse wheel | Scroll the document up/down, never the selection |
 | `home` / `end` | Jump to the top / bottom of the document |
 | `T` (or `/`) | Filter the list by document name; the query stays on the search row, and while the box holds the keyboard the footer names that interaction's keys (`type to filter · bksp edit · enter/esc keep`) |
@@ -52,9 +59,14 @@ document.
 | `o` | Open the focused document in `$VISUAL`/`$EDITOR` |
 | `esc` (`ctrl+c`, `q`) | Close; writes nothing |
 
+These are plugin bindings, not Pi native defaults. The footer names
+Ctrl+Shift+J/K only when the host confirms the extended keyboard protocol;
+otherwise it names Shift+J/K. It never guesses from the OS. Bare LF/CR and
+legacy Ctrl+J/K are not preview-scroll aliases.
+
 The document pane scrolls independently of the list. Each hint is named
-once: the search row names `T`, and only the footer of the interaction in
-progress names the keys that belong to it.
+once: the footer names `T`, and while searching that same footer switches to
+the actions available in the search input.
 
 ## The association is not here
 
