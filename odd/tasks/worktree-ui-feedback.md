@@ -49,7 +49,7 @@ D4. Reuse this thread worktree. Independent view, GitHub-client, and warp/create
 
 ## Tasks
 
-T1 | S1-S2 | route: actual CLI proof blocked on human fixture-trust choice; no UI step passed in first attempt | status: blocked | commit: 81f488e,a00414e
+T1 | S1-S2 | route: corrected retry stopped at isolated fixture trust,0steps/0sends; needs explicit per-run approval | status: blocked | commit: 81f488e,a00414e
 T2 | S3-S5,S7,S10 | route: layout/readers and integration verified; independent race probes plus1975/1975 suite | status: done | commit: 76bbf88,1051b6c,9fca719,8faaa58
 T3 | S5-S6,S8-S9,S16 | route: parent inline; client57/57, independent client/view146/146, public rejection probes | status: done | commit: b0410c0
 T4 | S4,S12,S15 | route: component, public flow and mutation/cancel checks green; physical CLI kept inT1/T7 | status: done | commit: 4ce6829,76f180e
@@ -99,3 +99,7 @@ L28. Source commits: a00414e detail+matching integration;76f180e type/name+botto
 L29. After source normalization, native ASSESS on9fca719 with base8faaa58 committedOnly:true is available: nativeRisk medium, agentEscalation item4/high, reviewDue:false, reason under_budget, RDDon. Separate verifier required and passed. No START, native approval or receipt is claimed; earlier untracked assessment failures do not become approvals.
 L30. Active LSP probe:5 files checked,0diagnostics but0confirmed clean,4inconclusive; extension9425lines exceeds5000limit. Not clean coverage. No retry/escalation of missing static proof.
 L31. One real CLI/PTy attempt produced no spec proof: fixture trust prompt, then harness extension path incorrectly resolved under.ui/extensions. Raw+frames retained under.ui/worktree-feedback-smoke/run1/artifacts/. The script continued key replay after the prompt; those keys are never human consent. No viewer loaded and no UIstep passed. Do not automatically repeat. Exact human trust target: /home/jona/mnt/sv-home/dev/projects/herdr-gentle-shell-worktrees/feat-worktree-ui-redesign/.ui/worktree-feedback-smoke/run1/repo. Original choices in order: Trust; Trust parent folder (run1); Trust (this session only); Do not trust; Do not trust (this session only). Trust permits .pi settings/resources, missing-package installation and project extension execution. Recommend session-only for this exact fixture; a fresh corrected attempt needs explicit human choice.
+
+L32. User retry authorization, verbatim: "prueba denuevo, ya habilite". Authorizes one fresh corrected attempt against the same isolated fixture, not invented trust tokens, consent autoanswers or core/live configuration changes. Stop if a consent gate remains.
+
+L33. Corrected authorized retry: run_smoke_attempt2.sh exit20; preflight correct absolute extension path; consent detected before any input,0steps/0sends, childreaped,fixtureGitunchanged. Artifacts under.ui/worktree-feedback-smoke/run1/artifacts-attempt2/. IsolatedHOME/PI_CODING_AGENT_DIR has no trust.json; human real-profile trust cannot transfer. No UI proof, no retry, no grant inferred. Request explicit authorization for one --approve process at exactly run1/repo (session-only), not persistent trust/config edits.
