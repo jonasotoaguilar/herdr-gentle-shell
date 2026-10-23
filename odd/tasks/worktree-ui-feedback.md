@@ -49,7 +49,7 @@ D4. Reuse this thread worktree. Independent view, GitHub-client, and warp/create
 
 ## Tasks
 
-T1 | S1-S2 | route: corrected retry stopped at isolated fixture trust,0steps/0sends; needs explicit per-run approval | status: blocked | commit: 81f488e,a00414e
+T1 | S1-S2 | route: attempt3 consumed approval, extension loaded but0UIsteps; repair offline fixtures and preflight without another CLI launch | status: in_progress | commit: 81f488e,a00414e
 T2 | S3-S5,S7,S10 | route: layout/readers and integration verified; independent race probes plus1975/1975 suite | status: done | commit: 76bbf88,1051b6c,9fca719,8faaa58
 T3 | S5-S6,S8-S9,S16 | route: parent inline; client57/57, independent client/view146/146, public rejection probes | status: done | commit: b0410c0
 T4 | S4,S12,S15 | route: component, public flow and mutation/cancel checks green; physical CLI kept inT1/T7 | status: done | commit: 4ce6829,76f180e
@@ -103,3 +103,7 @@ L31. One real CLI/PTy attempt produced no spec proof: fixture trust prompt, then
 L32. User retry authorization, verbatim: "prueba denuevo, ya habilite". Authorizes one fresh corrected attempt against the same isolated fixture, not invented trust tokens, consent autoanswers or core/live configuration changes. Stop if a consent gate remains.
 
 L33. Corrected authorized retry: run_smoke_attempt2.sh exit20; preflight correct absolute extension path; consent detected before any input,0steps/0sends, childreaped,fixtureGitunchanged. Artifacts under.ui/worktree-feedback-smoke/run1/artifacts-attempt2/. IsolatedHOME/PI_CODING_AGENT_DIR has no trust.json; human real-profile trust cannot transfer. No UI proof, no retry, no grant inferred. Request explicit authorization for one --approve process at exactly run1/repo (session-only), not persistent trust/config edits.
+
+L34. Human selected exact UI option "Autorizar --approve sólo en este intento del fixture" (authorize_one_fixture_process). Grants one new process using --approve only at the exact run1/repo fixture with isolatedHOME/PI_CODING_AGENT_DIR. No persistent trust, no real-profile changes, no other directories or further retries authorized. Preserve attempts1/2; attempt3 artifacts separate.
+
+L35. Attempt3 used the one authorized --approve process: trust resolved, correct extension loaded, then strict harness stop on No models available; exit21,0steps/0sends, childreaped, fixtureGit unchanged. Fake gh also returned {} for api user, so Issues invocation could not pass its gate. These are isolated fixture defects, not production UI proof. Grant consumed; no further --approve process authorized. Prepare a fixture-local dummy model with loopback-only endpoint and correct fake-gh identity, validate via offline public SDK/helper probes, NO CLI launch/network/real credentials. Another actual run requires fresh human per-run approval.
