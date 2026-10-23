@@ -7,6 +7,11 @@
 //   nothing and creates no log;
 // - an enabled trace appends one parseable JSON line per event and never lets
 //   a field outside the per-kind allowlist reach the file;
+// - every record carries the one run id of this process, which a caller cannot
+//   override (S18), and the session snapshot also identifies the run: pid,
+//   uptime and the host tui mode read from settings.json;
+// - the frame observer adds process resource samples: a baseline on the first
+//   traced frame, then at most one per interval, with real or absent numbers;
 // - writeTraceMode is atomic and refuses to replace a malformed flag;
 // - the log rotates to exactly one previous file and stays inside its cap;
 // - an over-long line is truncated with a marker instead of being dropped;
@@ -189,7 +194,7 @@ describe('perf trace events', { concurrency: false }, () => {
 
     const [session, render, daemon, unknownView, garbageFields] = lines;
 
-    assert.deepEqual(Object.keys(session), ['at', 'kind', 'piVersion', 'perf', 'support']);
+    assert.deepEqual(Object.keys(session), ['at', 'kind', 'piVersion', 'perf', 'support', 'run']);
     assert.equal(session.piVersion, '1.3.0');
     assert.deepEqual(session.perf, {
       heightIndex: true,
@@ -204,19 +209,19 @@ describe('perf trace events', { concurrency: false }, () => {
       incrementalSearchCorpus: 'declared',
     });
 
-    assert.deepEqual(Object.keys(render), ['at', 'kind', 'view', 'ms', 'width', 'height', 'rows']);
+    assert.deepEqual(Object.keys(render), ['at', 'kind', 'view', 'ms', 'width', 'height', 'rows', 'run']);
     assert.deepEqual(
       { view: render.view, ms: render.ms, width: render.width, height: render.height, rows: render.rows },
       { view: 'odd', ms: 12, width: 120, height: 40, rows: 30 },
     );
 
-    assert.deepEqual(Object.keys(daemon), ['at', 'kind', 'ms', 'panes', 'tokens']);
+    assert.deepEqual(Object.keys(daemon), ['at', 'kind', 'ms', 'panes', 'tokens', 'run']);
     assert.deepEqual({ ms: daemon.ms, panes: daemon.panes, tokens: daemon.tokens }, { ms: 5, panes: 3, tokens: 99 });
 
     assert.equal('view' in unknownView, false, 'a view outside warp/odd/issues/create is dropped');
     assert.equal(unknownView.ms, 7, 'the rest of the event still lands');
 
-    assert.deepEqual(Object.keys(garbageFields), ['at', 'kind'], 'non-object fields degrade to the envelope');
+    assert.deepEqual(Object.keys(garbageFields), ['at', 'kind', 'run'], 'non-object fields degrade to the envelope');
 
     const raw = fs.readFileSync(file, 'utf8');
     for (const leaked of ['secret', '/home/jona/private-repo', '/tmp/secret.md', 'renamedSetting']) {
@@ -543,9 +548,9 @@ describe('perf trace frame observer', { concurrency: false }, () => {
     observer.frame({ ms: 4, width: 80, rows: 12 });
 
     const lines = logLines(dir);
-    assert.deepEqual(lines.map((line) => line.kind), ['render', 'observer']);
+    assert.deepEqual(lines.map((line) => line.kind), ['render', 'observer', 'resource'], 'the first frame also writes the resource baseline');
     const [render, sample] = lines;
-    assert.deepEqual(Object.keys(render), ['at', 'kind', 'view', 'ms', 'width', 'height', 'rows'], 'the render line keeps its documented shape');
+    assert.deepEqual(Object.keys(render), ['at', 'kind', 'view', 'ms', 'width', 'height', 'rows', 'run'], 'the render line keeps its documented shape');
     assert.deepEqual(
       { view: render.view, ms: render.ms, width: render.width, height: render.height, rows: render.rows },
       { view: 'odd', ms: 4, width: 80, height: 24, rows: 12 },
@@ -561,10 +566,10 @@ describe('perf trace frame observer', { concurrency: false }, () => {
 
   test('the append cost a sample carries is the previous sample\'s, never the current write', () => {
     // The injected clock makes the trailing semantics exact: the second sample
-    // must report the FIRST sample's two writes (5 + 3 ms) and never the 100 +
-    // 200 ms the second sample itself spent.
+    // must report the FIRST frame's three writes (render 5 + observer 3 +
+    // resource 200 ms) and never the 100 + 200 ms the second frame itself spent.
     const { dir, env } = framesEnv();
-    const stamps = [0, 5, 5, 8, 8, 108, 108, 308];
+    const stamps = [0, 5, 5, 8, 8, 8, 208, 208, 308, 308, 508, 508];
     let tick = 0;
     const nowMs = () => stamps[Math.min(tick++, stamps.length - 1)];
     const observer = trace.createFrameObserver({ view: 'odd', env, host: quietHost, nowMs });
@@ -573,8 +578,8 @@ describe('perf trace frame observer', { concurrency: false }, () => {
 
     const [first, second] = samples(dir);
     assert.equal(first.measuredAppends, 0);
-    assert.equal(second.measuredAppends, 2, 'both writes of the previous sample were measured');
-    assert.equal(second.prevAppendMs, 8, 'the previous sample cost 5 + 3 ms; the current 100 + 200 is not reported');
+    assert.equal(second.measuredAppends, 3, 'all three writes of the previous frame were measured');
+    assert.equal(second.prevAppendMs, 208, 'the previous frame cost 5 + 3 + 200 ms; the current 100 + 200 is not reported');
   });
 
   test('the host full-redraw counter is a snapshot with its state, never a duration', () => {
@@ -834,7 +839,7 @@ describe('perf trace session snapshot', { concurrency: false }, () => {
     assert.equal(result.written, true, result.reason);
 
     const [line] = readLines(result.path);
-    assert.deepEqual(Object.keys(line), ['at', 'kind', 'piVersion', 'perf', 'support']);
+    assert.deepEqual(Object.keys(line), ['at', 'kind', 'piVersion', 'perf', 'support', 'pid', 'uptimeMs', 'run']);
     assert.equal(line.kind, 'session');
     assert.equal(line.piVersion, '1.3.0');
     assert.deepEqual(line.perf, {
@@ -888,5 +893,281 @@ describe('perf trace session snapshot', { concurrency: false }, () => {
     assert.equal(line.kind, 'session');
     assert.equal('support' in line, false, 'no invented evidence');
     assert.equal('piVersion' in line, false);
+  });
+});
+
+// S18: a trace is only useful for conclusions if two sessions can be told
+// apart. Every record therefore carries the one run id of this process, and the
+// session snapshot also identifies the run itself: the pid, the process uptime
+// and which TUI the host was running. The tui mode is READ from settings.json
+// and never written: the trace has no business editing host configuration.
+describe('perf trace run identity', { concurrency: false }, () => {
+  const settings = require('../lib/pi-perf-settings.js');
+
+  function identityEnv(settingsText) {
+    const root = scratch('perf-trace-identity-');
+    const stateDir = path.join(root, 'state');
+    const agentDir = path.join(root, 'agent');
+    fs.mkdirSync(agentDir, { recursive: true });
+    if (settingsText !== null) fs.writeFileSync(path.join(agentDir, 'settings.json'), settingsText);
+    return {
+      root,
+      stateDir,
+      agentDir,
+      file: path.join(agentDir, 'settings.json'),
+      env: { GENTLE_STATUS_STATE_DIR: stateDir, PI_CODING_AGENT_DIR: agentDir },
+    };
+  }
+
+  test('every record carries the run id, and a caller cannot override it', () => {
+    const { stateDir, env } = identityEnv('{"tuiMode":"regular"}\n');
+    assert.equal(trace.writeTraceMode(true, env).ok, true);
+    assert.equal(trace.traceSession(env, { scan: () => ({ keys: {} }) }).written, true);
+    trace.traceEvent('render', { view: 'odd', ms: 1, width: 80, height: 24, rows: 1, run: 'caller-chosen' }, env);
+    trace.traceEvent('observer', { view: 'odd', frame: 1, run: 'caller-chosen' }, env);
+    trace.traceEvent('resource', { frames: 1, rssMB: 10, run: 'caller-chosen' }, env);
+    trace.traceEvent('daemon', { ms: 1, panes: 1, tokens: 1 }, env);
+
+    const lines = readLines(path.join(stateDir, trace.LOG_NAME));
+    assert.deepEqual(lines.map((line) => line.kind), ['session', 'render', 'observer', 'resource', 'daemon']);
+    assert.equal(typeof trace.RUN_ID, 'string');
+    assert.ok(trace.RUN_ID.length > 0, 'the module exposes the run id it stamps');
+    for (const line of lines) {
+      assert.equal(line.run, trace.RUN_ID, `${line.kind} carries this process's run id`);
+      assert.equal(Object.keys(line).at(-1), 'run', 'the run id is added last and cannot be overridden');
+    }
+  });
+
+  test('the session snapshot identifies the run: pid, uptime and the host tui mode', () => {
+    const { file, env } = identityEnv('{"tuiMode":"regular","heightIndex":true}\n');
+    assert.equal(trace.writeTraceMode(true, env).ok, true);
+    assert.equal(trace.traceSession(env, { scan: () => ({ keys: {} }) }).written, true);
+
+    const [line] = readLines(trace.tracePath(env));
+    assert.equal(line.pid, process.pid);
+    assert.equal(typeof line.uptimeMs, 'number');
+    assert.ok(line.uptimeMs >= 0 && line.uptimeMs <= 1e10, 'a bounded uptime');
+    assert.equal(line.tuiMode, 'regular', 'the host mode comes from settings.json');
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":"regular","heightIndex":true}\n', 'settings.json is read, never written');
+  });
+
+  test('an unusable tui mode is left out instead of guessed', () => {
+    const cases = [null, '{"tuiMode":"split"}\n', '{"tuiMode":true}\n', 'not json at all\n', '{"heightIndex":true}\n'];
+    for (const settingsText of cases) {
+      const { env } = identityEnv(settingsText);
+      assert.equal(trace.writeTraceMode(true, env).ok, true);
+      assert.equal(trace.traceSession(env, { scan: () => ({ keys: {} }) }).written, true);
+      const [line] = readLines(trace.tracePath(env));
+      assert.equal('tuiMode' in line, false, `${settingsText} yields no tui mode`);
+      assert.equal(line.pid, process.pid, 'the rest of the identity still lands');
+      assert.equal(typeof line.uptimeMs, 'number');
+      assert.equal(line.run, trace.RUN_ID);
+    }
+  });
+
+  test('readHostValues reports the host tui mode and creates nothing', () => {
+    const { file, env } = identityEnv(null);
+    assert.deepEqual(settings.readHostValues(env), { ok: true, path: file, values: {} });
+    assert.equal(fs.existsSync(file), false, 'reading a missing settings file never creates it');
+    assert.deepEqual(fs.readdirSync(path.dirname(file)), []);
+
+    fs.writeFileSync(file, '{"tuiMode":"fullscreen","heightIndex":true}\n');
+    assert.deepEqual(settings.readHostValues(env), { ok: true, path: file, values: { tuiMode: 'fullscreen' } });
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":"fullscreen","heightIndex":true}\n');
+
+    fs.writeFileSync(file, '{"tuiMode":"split"}\n');
+    assert.deepEqual(settings.readHostValues(env), { ok: true, path: file, values: {} }, 'an unknown mode is not a value');
+
+    fs.writeFileSync(file, '{"tuiMode":\n');
+    const broken = settings.readHostValues(env);
+    assert.equal(broken.ok, false, 'a file that cannot be parsed is reported as unreadable');
+    assert.equal(broken.path, file);
+    assert.deepEqual(broken.values, {});
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"tuiMode":\n', 'the broken file is untouched');
+  });
+});
+
+// S18: collecting render timings alone cannot answer "what did enabling the
+// switches cost this Pi process". The observer therefore samples the process
+// itself: memory and CPU, bounded and rounded, once immediately so even a short
+// run has a baseline, then at most once per interval. A sampler that fails
+// writes no numbers rather than a zero someone would average later.
+describe('perf trace resource samples', { concurrency: false }, () => {
+  const quietHost = { terminal: { rows: 24 } };
+
+  function framesEnv() {
+    const { dir, env } = scratchEnv();
+    assert.equal(trace.writeTraceMode(true, env).ok, true);
+    return { dir, env };
+  }
+
+  function logLines(dir) {
+    const file = path.join(dir, trace.LOG_NAME);
+    return fs.existsSync(file) ? readLines(file) : [];
+  }
+
+  function resources(dir) {
+    return logLines(dir).filter((line) => line.kind === 'resource');
+  }
+
+  test('the first traced frame writes a baseline, then samples follow the interval', () => {
+    const { dir, env } = framesEnv();
+    let now = 1000;
+    let cpuReads = 0;
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      terminalRows: () => 24,
+      nowMs: () => now,
+      resourceIntervalMs: 1000,
+      sampleMemory: () => ({ rss: 209715200, heapUsed: 41943040, heapTotal: 52428800, external: 1048576 }),
+      sampleCpu: () => {
+        cpuReads += 1;
+        return cpuReads === 1 ? { user: 1200000, system: 200000 } : { user: 1300000, system: 200000 };
+      },
+    });
+
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    const baseline = resources(dir);
+    assert.equal(baseline.length, 1, 'the baseline is written with the first frame, not later');
+    assert.equal(baseline[0].run, trace.RUN_ID);
+    assert.equal(baseline[0].frames, 1, 'frames since the previous sample, so the frame that wrote it');
+    assert.equal(baseline[0].rssMB, 200);
+    assert.equal(baseline[0].heapUsedMB, 40);
+    assert.equal(baseline[0].heapTotalMB, 50);
+    assert.equal(baseline[0].externalMB, 1);
+    assert.equal(baseline[0].cpuUserMs, 1200, 'CPU milliseconds this process had used');
+    assert.equal(baseline[0].cpuSystemMs, 200);
+    assert.equal('windowMs' in baseline[0], false, 'the baseline covers no window');
+    assert.equal('cpuPercent' in baseline[0], false, 'and therefore has no percentage');
+    for (const key of Object.keys(baseline[0])) {
+      assert.ok(['at', 'kind', 'frames', 'rssMB', 'heapUsedMB', 'heapTotalMB', 'externalMB', 'cpuUserMs', 'cpuSystemMs', 'windowMs', 'cpuPercent', 'run'].includes(key), `${key} is allowlisted`);
+    }
+
+    now += 500;
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    assert.equal(resources(dir).length, 1, 'a frame inside the interval writes no sample');
+
+    now += 1000;
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    const [, sample] = resources(dir);
+    assert.equal(sample.frames, 2, 'two frames since the baseline');
+    assert.equal(sample.windowMs, 1500, 'the wall time the sample covers');
+    assert.equal(sample.cpuPercent, 6.7, '100 * (100 ms of CPU / 1500 ms)');
+    assert.equal(sample.cpuUserMs, 1300, 'the cumulative CPU reading of this sample');
+    assert.equal(sample.rssMB, 200);
+  });
+
+  test('a sampler that fails writes no numbers instead of invented ones', () => {
+    const { dir, env } = framesEnv();
+    const throwing = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      nowMs: () => 1000,
+      sampleMemory: () => { throw new Error('memoryUsage exploded'); },
+      sampleCpu: () => 'not a cpu reading',
+    });
+    assert.doesNotThrow(() => throwing.frame({ ms: 1, width: 80, rows: 1 }));
+
+    const [onlyFrames] = resources(dir);
+    assert.equal(onlyFrames.frames, 1, 'the frame count is still real');
+    for (const key of ['rssMB', 'heapUsedMB', 'heapTotalMB', 'externalMB', 'cpuUserMs', 'cpuSystemMs', 'windowMs', 'cpuPercent']) {
+      assert.equal(key in onlyFrames, false, `${key} is absent when its sampler failed`);
+    }
+
+    const nonsense = trace.createFrameObserver({
+      view: 'issues',
+      env,
+      host: quietHost,
+      nowMs: () => 5000,
+      sampleMemory: () => ({ rss: -1, heapUsed: Number.NaN, heapTotal: 1e18, external: 'lots' }),
+      sampleCpu: () => ({ user: -5, system: 1e18 }),
+    });
+    nonsense.frame({ ms: 1, width: 80, rows: 1 });
+    const [outOfRange] = resources(dir).slice(1);
+    for (const key of ['rssMB', 'heapUsedMB', 'heapTotalMB', 'externalMB', 'cpuUserMs', 'cpuSystemMs']) {
+      assert.equal(key in outOfRange, false, `${key} is dropped when it is not a real reading`);
+    }
+  });
+
+  test('a disabled trace samples nothing at all', () => {
+    const { dir, env } = scratchEnv();
+    let calls = 0;
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      nowMs: () => 1000,
+      sampleMemory: () => { calls += 1; return { rss: 1000 }; },
+      sampleCpu: () => { calls += 1; return { user: 1, system: 1 }; },
+    });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+
+    assert.equal(calls, 0, 'nothing is sampled for a frame the log will not describe');
+    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false);
+    assert.equal(fs.existsSync(dir), false);
+  });
+
+  test('a write that fails in the same frame ends the resource sampling too', () => {
+    // The panel (another process) switching tracing off between the render line
+    // and the observer line is a real race; the frame must then stop sampling
+    // instead of writing a resource line for a frame it could not describe.
+    const { dir, env } = framesEnv();
+    const flag = path.join(dir, trace.FLAG_NAME);
+    let clockReads = 0;
+    let calls = 0;
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      nowMs: () => {
+        clockReads += 1;
+        if (clockReads === 3) fs.writeFileSync(flag, '{"version":1,"enabled":false}\n');
+        return 1000 + clockReads;
+      },
+      sampleMemory: () => { calls += 1; return { rss: 1000 }; },
+      sampleCpu: () => { calls += 1; return { user: 1, system: 1 }; },
+    });
+
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    assert.deepEqual(logLines(dir).map((line) => line.kind), ['render'], 'only the line that already succeeded is written');
+    assert.equal(calls, 0, 'no sampler runs after a failed append');
+  });
+
+  test('an unbalanced resource event is reduced to its allowlisted fields', () => {
+    const { dir, env } = framesEnv();
+    const result = trace.traceEvent('resource', {
+      frames: 4.5,
+      rssMB: 1e6,
+      heapUsedMB: 12,
+      heapTotalMB: -1,
+      externalMB: 3,
+      cpuUserMs: 1e12,
+      cpuSystemMs: 7,
+      windowMs: 900,
+      cpuPercent: 1e7,
+      prompt: 'secret user text',
+      cwd: '/home/jona/private-repo',
+    }, env);
+    assert.equal(result.written, true);
+
+    const [line] = readLines(path.join(dir, trace.LOG_NAME));
+    assert.equal(line.heapUsedMB, 12);
+    assert.equal(line.externalMB, 3);
+    assert.equal(line.cpuSystemMs, 7);
+    assert.equal(line.windowMs, 900);
+    assert.equal('frames' in line, false, 'a fractional frame count is not a count');
+    assert.equal('rssMB' in line, false, 'an over-cap RSS is dropped');
+    assert.equal('heapTotalMB' in line, false, 'a negative memory reading is dropped');
+    assert.equal('cpuUserMs' in line, false, 'an over-cap CPU reading is dropped');
+    assert.equal('cpuPercent' in line, false, 'an over-cap percentage is dropped');
+    for (const key of Object.keys(line)) {
+      assert.ok(['at', 'kind', 'frames', 'rssMB', 'heapUsedMB', 'heapTotalMB', 'externalMB', 'cpuUserMs', 'cpuSystemMs', 'windowMs', 'cpuPercent', 'run'].includes(key), `${key} is allowlisted`);
+    }
+    const raw = fs.readFileSync(path.join(dir, trace.LOG_NAME), 'utf8');
+    for (const leaked of ['secret', '/home/jona/private-repo']) assert.equal(raw.includes(leaked), false);
   });
 });

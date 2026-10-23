@@ -242,7 +242,7 @@ describe('perf trace session hook', { concurrency: false }, () => {
     assert.deepEqual(Object.keys(line).slice(0, 2), ['at', 'kind']);
     assert.equal(line.kind, 'session');
     for (const key of Object.keys(line)) {
-      assert.ok(['at', 'kind', 'piVersion', 'perf', 'support'].includes(key), `${key} is allowlisted`);
+      assert.ok(['at', 'kind', 'run', 'pid', 'uptimeMs', 'tuiMode', 'piVersion', 'perf', 'support'].includes(key), `${key} is allowlisted`);
     }
     assert.deepEqual(line.perf, {
       heightIndex: false,
@@ -285,7 +285,7 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
       assert.equal(line.height, 24, 'the terminal height');
       assert.equal(line.rows, lines.length, 'the rendered row count');
       for (const key of Object.keys(line)) {
-        assert.ok(['at', 'kind', 'view', 'ms', 'width', 'height', 'rows'].includes(key), `${key} is allowlisted`);
+        assert.ok(['at', 'kind', 'run', 'view', 'ms', 'width', 'height', 'rows'].includes(key), `${key} is allowlisted`);
       }
     }
 

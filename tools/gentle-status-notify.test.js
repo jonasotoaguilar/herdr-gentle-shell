@@ -348,7 +348,7 @@ describe('performance trace frames', () => {
     assert.equal(typeof line.tokens, 'number');
     assert.ok(line.tokens > 0, 'the frame published the owned family');
     for (const key of Object.keys(line)) {
-      assert.ok(['at', 'kind', 'ms', 'panes', 'tokens'].includes(key), `${key} is allowlisted`);
+      assert.ok(['at', 'kind', 'run', 'ms', 'panes', 'tokens'].includes(key), `${key} is allowlisted`);
     }
     // Counts only: no pane id, session path or token value may reach the log.
     const raw = fs.readFileSync(traceFile(), 'utf8');

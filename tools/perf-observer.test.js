@@ -7,7 +7,8 @@
 // Contract under test (observable behavior only — the JSONL bytes on disk:
 // which lines exist, their allowlisted fields, and whether a disabled trace
 // writes anything at all):
-// - one traced frame writes one `render` line and one `observer` line;
+// - one traced frame writes one `render` line and one `observer` line, and the
+//   first traced frame also writes the `resource` baseline (S18);
 // - the component duration stays on the render line, the observer line carries
 //   the trailing append cost of the writes that already finished;
 // - the host counter is a snapshot plus its support state, and the host
@@ -199,7 +200,11 @@ describe('perfTraceView observer samples', { concurrency: false }, () => {
     opened[0].render(80);
 
     const lines = readLog(env);
-    assert.deepEqual(lines.map((line) => line.kind), ['render', 'observer', 'render', 'observer']);
+    assert.deepEqual(
+      lines.map((line) => line.kind),
+      ['render', 'observer', 'resource', 'render', 'observer'],
+      'each frame writes its render and observer lines; the first also writes the resource baseline',
+    );
 
     const renders = lines.filter((line) => line.kind === 'render');
     for (const line of renders) {
@@ -210,7 +215,7 @@ describe('perfTraceView observer samples', { concurrency: false }, () => {
       assert.equal(line.height, 24, 'the terminal height');
       assert.equal(line.rows, 1);
       for (const key of Object.keys(line)) {
-        assert.ok(['at', 'kind', 'view', 'ms', 'width', 'height', 'rows'].includes(key), `${key} is allowlisted`);
+        assert.ok(['at', 'kind', 'view', 'ms', 'width', 'height', 'rows', 'run'].includes(key), `${key} is allowlisted`);
       }
     }
 
@@ -222,7 +227,7 @@ describe('perfTraceView observer samples', { concurrency: false }, () => {
     assert.equal('prevAppendMs' in first, false, 'nothing was measured before the first sample');
 
     assert.equal(second.frame, 2);
-    assert.equal(second.measuredAppends, 2, 'the two writes of the previous frame were measured');
+    assert.equal(second.measuredAppends, 3, 'the render, observer and resource writes of the previous frame were measured');
     assert.equal(typeof second.prevAppendMs, 'number');
     assert.ok(second.prevAppendMs >= 0, 'a trailing cost, never a negative number');
     assert.equal(second.hostFullRedraws, 7);
