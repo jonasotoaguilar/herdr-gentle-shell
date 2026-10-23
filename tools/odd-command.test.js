@@ -320,7 +320,9 @@ describe('/herdr-gentle:odd read-only association (S10b)', () => {
     assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
     assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
     assert.match(body, /ctrl\+j\/k scroll/, 'the reading legend stays');
-    assert.match(body, /› Search \(T\)/, 'the search row names the filter key once');
+    assert.match(body, /› Search /, 'the search row names the filter alone, with no key above (S4)');
+    assert.ok(!/› Search \(T\)/.test(body), 'the search row never carries the (T) key hint (S4)');
+    assert.match(body, /T search/, 'the filter key lives in the footer instead (S4)');
     assert.ok(!/T filter/.test(body), 'the footer never repeats the search hint (S13)');
     assert.match(body, /o open/, 'the open legend stays');
     assert.match(body, /esc close/, 'the close legend stays');
