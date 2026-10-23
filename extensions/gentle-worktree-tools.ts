@@ -74,19 +74,33 @@ function perfTraceView(view, component, hostTui) {
       return undefined;
     }
   };
+  // The per-frame observer owns the trailing append cost and the last host and
+  // event-loop readings, so a frame reports what already finished measuring
+  // instead of a fabricated duration for the write that carries it. It also
+  // reads only the PUBLIC root host surface (the full-redraw counter) and says
+  // so, because a package render timing is not a full-host render timing.
+  let observer = null;
+  try {
+    observer = typeof lib.createFrameObserver === "function"
+      ? lib.createFrameObserver({ view, host: hostTui, terminalRows })
+      : null;
+  } catch {
+    observer = null;
+  }
+  // An observer that cannot be built leaves the view untouched: tracing may
+  // never change what a frame renders.
+  if (!observer) return component;
   const render = component.render;
   component.render = function tracedRender(width, ...rest) {
     const started = process.hrtime.bigint();
     const lines = render.call(this, width, ...rest);
     const ms = Number(process.hrtime.bigint() - started) / 1e6;
     try {
-      lib.traceEvent("render", {
-        view,
+      observer.frame({
         ms,
         width: Number.isFinite(width) ? width : undefined,
-        height: terminalRows(),
         rows: Array.isArray(lines) ? lines.length : undefined,
-      }, process.env);
+      });
     } catch {
       // Tracing never changes what a frame renders or how it fails.
     }

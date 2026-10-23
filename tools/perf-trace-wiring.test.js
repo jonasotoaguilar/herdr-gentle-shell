@@ -62,6 +62,29 @@ function traceLib() {
   return require('../lib/perf-trace.js');
 }
 
+// S14: a trace test never depends on this machine's gh credentials or on the
+// network. The gate's two identity calls and the page read the issues viewer
+// makes answer from this stub; it answers ONLY those shapes, so any other gh
+// invocation is a visible failure instead of a live call. The caller restores
+// the real runner.
+function stubGhRunner() {
+  const issues = require('../lib/gh-issues.js');
+  issues.setGhRunner((_bin, argv) => {
+    if (argv[0] === 'api' && argv[1] === 'user') {
+      return { status: 0, stderr: '', stdout: JSON.stringify({ login: 'octo' }) };
+    }
+    if (argv[0] === 'repo' && argv[1] === 'view') {
+      return { status: 0, stderr: '', stdout: JSON.stringify({ nameWithOwner: 'octo/repo' }) };
+    }
+    if (argv[0] === 'api' && argv[1] === 'graphql') {
+      const data = { search: { issueCount: 0, edges: [], pageInfo: { hasNextPage: false, endCursor: null } } };
+      return { status: 0, stderr: '', stdout: JSON.stringify({ data }) };
+    }
+    return { status: 1, stdout: '', stderr: `gh stub: unexpected ${argv.join(' ')}` };
+  });
+  return () => issues.setGhRunner(null);
+}
+
 function git(cwd, args) {
   return execFileSync('git', args, {
     cwd,
@@ -292,9 +315,16 @@ describe('perf trace render instrumentation', { concurrency: false }, () => {
     const { commands } = await loadExtension();
     traceLib().writeTraceMode(true, env);
 
+    // The invocation gate and the page read go through the stub, so this test
+    // mounts the real view without a credential or a live GitHub read.
+    const restoreGh = stubGhRunner();
     const { ctx, opened } = mountingCtx({ cwd: repo, afterMount: (component) => component.render(100) });
-    await command(commands, 'herdr-gentle:issues').handler('', ctx);
-    assert.equal(opened.length, 1, 'the issues view mounted without a gh call');
+    try {
+      await command(commands, 'herdr-gentle:issues').handler('', ctx);
+    } finally {
+      restoreGh();
+    }
+    assert.equal(opened.length, 1, 'the issues view mounted');
     opened[0].render(100);
 
     const views = readLog(env).filter((line) => line.kind === 'render').map((line) => line.view);

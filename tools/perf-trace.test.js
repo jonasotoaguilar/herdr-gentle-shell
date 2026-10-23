@@ -513,6 +513,234 @@ describe('perf trace state dir resolution', { concurrency: false }, () => {
   });
 });
 
+// S14/D4: one traced frame writes the component's own render duration and a
+// SEPARATE observer sample. The append cost a sample carries is the cost of
+// writes that already finished (the previous sample's), so no line contains a
+// fabricated duration for the write that produces it. The host contributes a
+// public counter with its support state, and the event loop a bounded
+// process-level interval — never a relabelled component or host duration.
+describe('perf trace frame observer', { concurrency: false }, () => {
+  const quietHost = { terminal: { rows: 24 } };
+
+  function framesEnv() {
+    const { dir, env } = scratchEnv();
+    assert.equal(trace.writeTraceMode(true, env).ok, true);
+    return { dir, env };
+  }
+
+  function logLines(dir) {
+    const file = path.join(dir, trace.LOG_NAME);
+    return fs.existsSync(file) ? readLines(file) : [];
+  }
+
+  function samples(dir) {
+    return logLines(dir).filter((line) => line.kind === 'observer');
+  }
+
+  test('a frame writes the component duration and a separate observer sample', () => {
+    const { dir, env } = framesEnv();
+    const observer = trace.createFrameObserver({ view: 'odd', env, host: quietHost, terminalRows: () => 24 });
+    observer.frame({ ms: 4, width: 80, rows: 12 });
+
+    const lines = logLines(dir);
+    assert.deepEqual(lines.map((line) => line.kind), ['render', 'observer']);
+    const [render, sample] = lines;
+    assert.deepEqual(Object.keys(render), ['at', 'kind', 'view', 'ms', 'width', 'height', 'rows'], 'the render line keeps its documented shape');
+    assert.deepEqual(
+      { view: render.view, ms: render.ms, width: render.width, height: render.height, rows: render.rows },
+      { view: 'odd', ms: 4, width: 80, height: 24, rows: 12 },
+      'the render line carries the component duration only',
+    );
+    assert.equal(sample.view, 'odd');
+    assert.equal(sample.frame, 1);
+    assert.equal(sample.measuredAppends, 0, 'no write had been measured before the first sample');
+    assert.equal('prevAppendMs' in sample, false, 'a sample never invents a cost it did not measure');
+    assert.equal(sample.hostFullRedrawsState, 'absent', 'a host without the counter says so');
+    assert.equal(sample.hostRenderMsState, 'absent', 'the public host exposes no render-duration observer');
+  });
+
+  test('the append cost a sample carries is the previous sample\'s, never the current write', () => {
+    // The injected clock makes the trailing semantics exact: the second sample
+    // must report the FIRST sample's two writes (5 + 3 ms) and never the 100 +
+    // 200 ms the second sample itself spent.
+    const { dir, env } = framesEnv();
+    const stamps = [0, 5, 5, 8, 8, 108, 108, 308];
+    let tick = 0;
+    const nowMs = () => stamps[Math.min(tick++, stamps.length - 1)];
+    const observer = trace.createFrameObserver({ view: 'odd', env, host: quietHost, nowMs });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+
+    const [first, second] = samples(dir);
+    assert.equal(first.measuredAppends, 0);
+    assert.equal(second.measuredAppends, 2, 'both writes of the previous sample were measured');
+    assert.equal(second.prevAppendMs, 8, 'the previous sample cost 5 + 3 ms; the current 100 + 200 is not reported');
+  });
+
+  test('the host full-redraw counter is a snapshot with its state, never a duration', () => {
+    const { dir, env } = framesEnv();
+    let redraws = 12;
+    const host = { terminal: { rows: 24 }, get fullRedraws() { return redraws; } };
+    const observer = trace.createFrameObserver({ view: 'odd', env, host, terminalRows: () => 24 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    redraws = 15;
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+
+    const [first, second] = samples(dir);
+    assert.equal(first.hostFullRedrawsState, 'declared');
+    assert.equal(first.hostFullRedraws, 12);
+    assert.equal('hostFullRedrawsDelta' in first, false, 'no delta without a previous snapshot');
+    assert.equal(second.hostFullRedraws, 15);
+    assert.equal(second.hostFullRedrawsDelta, 3);
+    assert.equal(second.hostRenderMsState, 'absent', 'a counter is not a duration');
+    for (const key of Object.keys(second)) {
+      assert.equal(/^host.*Ms$/.test(key), false, `${key} is not an invented host duration`);
+    }
+  });
+
+  test('a missing, throwing or uninterpretable host counter is reported, never guessed', () => {
+    const { dir, env } = framesEnv();
+    const hosts = [
+      { terminal: { rows: 24 }, get fullRedraws() { throw new Error('boom'); } },
+      { terminal: { rows: 24 }, fullRedraws: 'many' },
+      { terminal: { rows: 24 } },
+      undefined,
+    ];
+    for (const host of hosts) {
+      const observer = trace.createFrameObserver({ view: 'odd', env, host, terminalRows: () => 24 });
+      observer.frame({ ms: 1, width: 80, rows: 1 });
+    }
+
+    const [throwing, texty, absent, missing] = samples(dir);
+    assert.equal(throwing.hostFullRedrawsState, 'unknown', 'a throwing getter is unreadable, not absent');
+    assert.equal(throwing.hostRenderMsState, 'unknown', 'the host could not be inspected');
+    assert.equal('hostFullRedraws' in throwing, false);
+    assert.equal(texty.hostFullRedrawsState, 'unknown', 'a non-numeric counter is not a count');
+    assert.equal('hostFullRedraws' in texty, false);
+    assert.equal(absent.hostFullRedrawsState, 'absent');
+    assert.equal(missing.hostFullRedrawsState, 'unknown', 'a host that was never inspected is unknown');
+  });
+
+  test('the event-loop metric is a bounded process-level interval, never a component duration', () => {
+    const { dir, env } = framesEnv();
+    const readings = [
+      { active: 10, idle: 90 },
+      { active: 30, idle: 190 },
+      { active: 5, idle: 3 },
+    ];
+    let read = 0;
+    const sampleLoop = () => readings[Math.min(read++, readings.length - 1)];
+    const observer = trace.createFrameObserver({ view: 'odd', env, host: quietHost, sampleLoop });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+
+    const [first, second, backwards] = samples(dir);
+    assert.equal('processLoopUtilization' in first, false, 'the first reading is only a baseline');
+    assert.equal('processLoopState' in first, false);
+    assert.equal(second.processLoopState, 'declared');
+    assert.equal(second.processLoopActiveMs, 20);
+    assert.equal(second.processLoopIdleMs, 100);
+    assert.equal(second.processLoopWindowMs, 120);
+    assert.equal(second.processLoopUtilization, 0.1667, 'a bounded 0..1 ratio of the interval');
+    for (const key of Object.keys(second)) {
+      if (/^(active|idle|utilization|window)/i.test(key)) {
+        assert.match(key, /^processLoop/, `${key} names its scope`);
+      }
+    }
+    assert.equal('processLoopUtilization' in backwards, false, 'a reading that goes backwards is dropped');
+    assert.equal('processLoopWindowMs' in backwards, false);
+    assert.equal(backwards.processLoopState, 'unknown');
+  });
+
+  test('zero-window bootstrap samples remain unknown and later advancing samples work', () => {
+    // Node may return zero samples before the event loop has bootstrapped.
+    // No elapsed window proves neither zero load nor missing API support.
+    const { dir, env } = framesEnv();
+    let reads = 0;
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      sampleLoop: () => (++reads <= 2 ? { active: 0, idle: 0 } : { active: 8, idle: 2 }),
+    });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+
+    const second = samples(dir)[1];
+    assert.equal(second.processLoopState, 'unknown', 'a zero window is not proof of unsupported ELU');
+    for (const key of ['processLoopUtilization', 'processLoopActiveMs', 'processLoopIdleMs', 'processLoopWindowMs']) {
+      assert.equal(key in second, false, `${key} is not invented from 0/0`);
+    }
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    const third = samples(dir)[2];
+    assert.equal(third.processLoopState, 'declared');
+    assert.equal(third.processLoopUtilization, 0.8);
+  });
+
+  test('an unusable loop sampler or state environment never breaks the frame', () => {
+    const { dir, env } = framesEnv();
+    const observer = trace.createFrameObserver({
+      view: 'odd',
+      env,
+      host: quietHost,
+      sampleLoop: () => { throw new Error('no perf_hooks'); },
+    });
+    assert.doesNotThrow(() => observer.frame({ ms: 2, width: 80, rows: 3 }));
+    const [, sample] = logLines(dir);
+    assert.equal('processLoopUtilization' in sample, false, 'an unsampleable loop records nothing');
+    assert.equal(sample.frame, 1, 'the rest of the sample still lands');
+
+    const nowhere = trace.createFrameObserver({ view: 'odd', env: null, host: quietHost });
+    assert.doesNotThrow(() => nowhere.frame({ ms: 2, width: 80, rows: 3 }));
+  });
+
+  test('nothing is written, and nothing is logged, while tracing is off', () => {
+    const { dir, env } = scratchEnv();
+    const observer = trace.createFrameObserver({ view: 'odd', env, host: quietHost });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    observer.frame({ ms: 1, width: 80, rows: 1 });
+    assert.equal(fs.existsSync(path.join(dir, trace.LOG_NAME)), false, 'the disabled trace writes no log');
+    assert.equal(fs.existsSync(dir), false, 'and creates no state directory');
+  });
+
+  test('an observer event reduces unlisted and out-of-range fields to nothing', () => {
+    const { dir, env } = framesEnv();
+    const result = trace.traceEvent('observer', {
+      view: 'settings',
+      frame: -1,
+      measuredAppends: 7,
+      prevAppendMs: -5,
+      hostFullRedrawsState: 'maybe',
+      hostRenderMsState: 'declared',
+      hostFullRedraws: 1e12,
+      hostFullRedrawsDelta: -3,
+      processLoopUtilization: 4,
+      processLoopWindowMs: 1e12,
+      processLoopState: 'maybe',
+      prompt: 'secret user text',
+      cwd: '/home/jona/private-repo',
+    }, env);
+    assert.equal(result.written, true);
+
+    const [line] = readLines(path.join(dir, trace.LOG_NAME));
+    assert.equal(line.measuredAppends, 7, 'an in-range count lands');
+    assert.equal(line.hostRenderMsState, 'declared', 'a support state is one of the three values');
+    assert.equal('frame' in line, false, 'a negative sample index is dropped');
+    assert.equal('prevAppendMs' in line, false, 'a negative cost is dropped');
+    assert.equal('hostFullRedraws' in line, false, 'an over-cap counter is dropped');
+    assert.equal('hostFullRedrawsDelta' in line, false);
+    assert.equal('hostFullRedrawsState' in line, false, 'an unlisted state is not evidence');
+    assert.equal('processLoopUtilization' in line, false, 'a ratio above 1 is dropped');
+    assert.equal('processLoopWindowMs' in line, false);
+    assert.equal('processLoopState' in line, false, 'an unlisted loop state is not evidence');
+    assert.equal('view' in line, false, 'settings is not a traced view');
+
+    const raw = fs.readFileSync(path.join(dir, trace.LOG_NAME), 'utf8');
+    for (const leaked of ['secret', '/home/jona/private-repo']) assert.equal(raw.includes(leaked), false);
+  });
+});
+
 // S16: the flag is written by the panel (Pi) and read by the daemon (another
 // process). A verdict cached without re-checking the file would freeze the
 // first read and leave tracing inert until a restart, so every entry point
