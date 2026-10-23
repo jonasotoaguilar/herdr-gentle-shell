@@ -49,7 +49,7 @@ D4. Reuse this thread worktree. Independent view, GitHub-client, and warp/create
 
 ## Tasks
 
-T1 | S1-S2 | route: attempt4 real ODD/detail scroll PASS; Issues scroll and reload proof incomplete, one-run grant consumed | status: blocked | commit: 81f488e,a00414e
+T1 | S1-S2 | route: human chose manual validation; partial CLI proof retained, missing controls await human observations | status: blocked | commit: 81f488e,a00414e
 T2 | S3-S5,S7,S10 | route: layout/readers and integration verified; independent race probes plus1975/1975 suite | status: done | commit: 76bbf88,1051b6c,9fca719,8faaa58
 T3 | S5-S6,S8-S9,S16 | route: parent inline; client57/57, independent client/view146/146, public rejection probes | status: done | commit: b0410c0
 T4 | S4,S12,S15 | route: component, public flow and mutation/cancel checks green; physical CLI kept inT1/T7 | status: done | commit: 4ce6829,76f180e
@@ -58,7 +58,9 @@ T6 | S2,S5-S6,S8,S10,S12-S13 | route: mounted fresh pages and separate assignmen
 T7 | S13 | route:1975/1975 and independent checks stand; actual CLI proof PARTIAL, no delivery-complete claim | status: pending | commit: 81f488e..9fca719
 T8 | S14 | route: metrics implemented and verified; full-host timing/flag efficacy unavailable, needs scope/acceptance decision | status: blocked | commit: f46218f
 
-T9 | S1-S2,S11-S13 | route: fix canonical fixture mode, command-registration preflight, post-send waits and model-turn stop before any future CLI | status: pending | commit: ignored harness only; no new launch authorized
+T9 | S1-S2,S11-S13 | route: automatic harness repair/retry made obsolete by explicit manual-only choice | status: dropped | commit: no production changes
+
+T10 | S1-S2,S11-S14 | route: manual guide read back and structurally checked; 7 unchecked controls, no UI or test launch | status: done | commit: 186df4d
 
 ## Log
 
@@ -116,3 +118,7 @@ L37. Human explicitly selected "Autorizar un intento con el fixture corregido" (
 
 L38. Attempt4 consumed authorize_corrected_fixture_once; CLI exit0,39 scripted steps,38sends,64.93sec,childreaped,Gitunchanged. Parent read actual VT frames: ODD scroll58-77/287, preselectedalice/bobeditor, and warp/reload chaterrors. Script steps-completed is NOT overall UIpass. Confirmed: ODD Ctrl+j/k,ODDDelete,Issues initialpage/editorscancel,detailTab/no-arrow-tab-switch andCtrl+j no selection. Unverified: Issues scroll, reload/discoverability-after-reload,3-row assignedheader, multi-page arrows, Warp/create, permission-absent actualTTY.
 L39. Harness modefile was versionless{enabled:true}, correctly rejected by productionreadMode requiringversion1. Warp not registered; unknownslash entered a dummy local modelturn (connectionerror/retry), no externalprovider or realmodelresponse. Later/reload included leftoverc and didnotexecute. Record this as harnessfailure, notproductbug, notzero-model-attempt claim. Future preparation must usepublic modewriter/reader and verifycommandregistration, post-send mountedframes and stopbadinput/modelturn. No automaticretry or grantreuse. Priorartifacts retained under.ui/worktree-feedback-smoke/run1/artifacts-attempt4/.
+
+L40. Human explicitly selected "Pasar a prueba manual, sin más intentos automáticos" (manual_validation_only). No more automaticCLI attempts, no reuseofapproval, no pending harnessrepairneeded. Preservepartialevidence and preparemanualguide usingregularprofile/currentfeaturecheckout; leave missingactualUIcontrols unchecked. T8 full-host measurement decision remains unresolved. Manualguidecompletion isnotUIacceptance.
+
+L41. Manualguide docs/worktree-ui-manual-check.md committed186df4d. Parent readall, clarified earlier partialobservations and added explicit Issues/ODD list-pagingcheck. Structuralvalidation PASS:5 commandliterals matchregistrations,2paths/key-maplinkexist,shellblockbalanced,7uncheckedcontrols,no trailingwhitespace. No Pi/test/network execution; RED/GREEN notapplicable toprose. Nativeassessment committedguide(base3352b41) passive/non_executable_only,reviewDue:false,structuralReadbackOnly:true,noverifier/testsrequired. This finishesT10 only, notT1/T7/T8; no actualUIresult upgraded.
