@@ -8844,7 +8844,6 @@ const ISSUES_FETCH_PAGE_SIZE = 30;
 // once per session (module lifetime == session). The flag flips only
 // when an alert is actually handed to notify, so a startup without UI
 // never consumes the session's single alert.
-let issuesCommandRegistered = false;
 let issuesGateNotified = false;
 // S3: `null` = not probed yet, `true` = gh is usable this session, `false` =
 // the last probe failed. The command is registered eagerly at load so it is
@@ -9094,14 +9093,13 @@ function issuesGateMessage(error) {
   return `issues: ${text} — /herdr-gentle:issues cannot open until then`;
 }
 
-async function checkIssuesGate(pi, ctx) {
+async function checkIssuesGate(_pi, ctx) {
   try {
     const gh = libRequire("gh-issues.js");
     const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
     const res = await gh.ghStatus({ cwd });
     issuesGateOpen = !!(res && res.ok === true);
     if (res && res.ok === true) {
-      registerIssuesCommand(pi);
       // S10: the session's open-issue snapshot. Priming here (once, at
       // startup, from the same authenticated check) is what lets every later
       // assignment test answer without re-listing the whole repository. A
@@ -9158,9 +9156,9 @@ async function probeIssuesGate(ctx) {
 }
 
 function registerIssuesCommand(pi) {
-  if (issuesCommandRegistered) return;
+  // The runtime rebuilds its command registry on reload even when this module
+  // survives. Registration belongs to each load, never to module lifetime.
   if (typeof pi?.registerCommand !== "function") return;
-  issuesCommandRegistered = true;
   pi.registerCommand("herdr-gentle:issues", {
     description: "Read and triage this repository's GitHub issues: three pages, detail pane, labels, comments, close/reopen",
     handler: async (args, ctx) => {

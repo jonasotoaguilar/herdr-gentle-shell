@@ -944,3 +944,22 @@ describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => 
     ], 'Involved excludes authored issues at the source, in its prime and its margin');
   });
 });
+
+
+describe('S2 feedback: command registration survives a reused module', () => {
+  test('each runtime load registers issues even when its module state survives', async () => {
+    const { commands, mod } = await loadExtension();
+    assert.ok(commands.has('herdr-gentle:issues'));
+    const reloaded = new Map();
+    const api = {
+      registerTool: () => {},
+      registerCommand: (name, definition) => reloaded.set(name, definition),
+      on: () => () => {},
+    };
+    mod.default(api);
+    assert.ok(reloaded.has('herdr-gentle:issues'), 'reload must not inherit an already-registered flag from the old runtime');
+    reloaded.clear();
+    mod.default(api);
+    assert.ok(reloaded.has('herdr-gentle:issues'), 'a rebuilt registry on the same API must also regain the command');
+  });
+});
