@@ -49,14 +49,16 @@ D4. Reuse this thread worktree. Independent view, GitHub-client, and warp/create
 
 ## Tasks
 
-T1 | S1-S2 | route: attempt3 consumed approval, extension loaded but0UIsteps; repair offline fixtures and preflight without another CLI launch | status: in_progress | commit: 81f488e,a00414e
+T1 | S1-S2 | route: attempt4 real ODD/detail scroll PASS; Issues scroll and reload proof incomplete, one-run grant consumed | status: blocked | commit: 81f488e,a00414e
 T2 | S3-S5,S7,S10 | route: layout/readers and integration verified; independent race probes plus1975/1975 suite | status: done | commit: 76bbf88,1051b6c,9fca719,8faaa58
 T3 | S5-S6,S8-S9,S16 | route: parent inline; client57/57, independent client/view146/146, public rejection probes | status: done | commit: b0410c0
 T4 | S4,S12,S15 | route: component, public flow and mutation/cancel checks green; physical CLI kept inT1/T7 | status: done | commit: 4ce6829,76f180e
 T5 | S1,S4,S6,S8-S11,S16 | route: view, callbacks, permissions and refresh verified independently; whole suite green | status: done | commit: a00414e,9fca719
 T6 | S2,S5-S6,S8,S10,S12-S13 | route: mounted fresh pages and separate assignment evidence; retained closure GREEN+independent5/5 | status: done | commit: 9fca719,76f180e,81f488e
-T7 | S13 | route: code committed and1975/1975; native assessment reviewDue:false; final delivery waitsT1/T8 decisions | status: pending | commit: 81f488e..9fca719
+T7 | S13 | route:1975/1975 and independent checks stand; actual CLI proof PARTIAL, no delivery-complete claim | status: pending | commit: 81f488e..9fca719
 T8 | S14 | route: metrics implemented and verified; full-host timing/flag efficacy unavailable, needs scope/acceptance decision | status: blocked | commit: f46218f
+
+T9 | S1-S2,S11-S13 | route: fix canonical fixture mode, command-registration preflight, post-send waits and model-turn stop before any future CLI | status: pending | commit: ignored harness only; no new launch authorized
 
 ## Log
 
@@ -107,3 +109,10 @@ L33. Corrected authorized retry: run_smoke_attempt2.sh exit20; preflight correct
 L34. Human selected exact UI option "Autorizar --approve sólo en este intento del fixture" (authorize_one_fixture_process). Grants one new process using --approve only at the exact run1/repo fixture with isolatedHOME/PI_CODING_AGENT_DIR. No persistent trust, no real-profile changes, no other directories or further retries authorized. Preserve attempts1/2; attempt3 artifacts separate.
 
 L35. Attempt3 used the one authorized --approve process: trust resolved, correct extension loaded, then strict harness stop on No models available; exit21,0steps/0sends, childreaped, fixtureGit unchanged. Fake gh also returned {} for api user, so Issues invocation could not pass its gate. These are isolated fixture defects, not production UI proof. Grant consumed; no further --approve process authorized. Prepare a fixture-local dummy model with loopback-only endpoint and correct fake-gh identity, validate via offline public SDK/helper probes, NO CLI launch/network/real credentials. Another actual run requires fresh human per-run approval.
+
+L36. Parent reviewed preflight-prepared/preflight.json and pi-agent/models.json: env1/1, fakeGH16/16, dummyModel10/10; overallpass:true,failures:[]. Only available provider/model fixture-offline/fixture-dummy, endpoint http://127.0.0.1:9/v1, fakekey, cleanenv. Preparation completed without CLI/PTy/LLM requests. This proves fixture readiness ONLY, not UI behavior. User requested plan reconciliation; T1 remains blocked until fresh per-process --approve permission, T8 unsupported measurement decision unchanged, T7 delivery pending. No prior process grant reused.
+
+L37. Human explicitly selected "Autorizar un intento con el fixture corregido" (authorize_corrected_fixture_once): ONE process up to90sec, --approve only for exact run1/repo, dummyloopbackmodel+isolatedconfig, no externalcalls/persistenttrust/production changes. Attempt4 authorized; priorgrants remain consumed. Stop at any new blocker, no retries.
+
+L38. Attempt4 consumed authorize_corrected_fixture_once; CLI exit0,39 scripted steps,38sends,64.93sec,childreaped,Gitunchanged. Parent read actual VT frames: ODD scroll58-77/287, preselectedalice/bobeditor, and warp/reload chaterrors. Script steps-completed is NOT overall UIpass. Confirmed: ODD Ctrl+j/k,ODDDelete,Issues initialpage/editorscancel,detailTab/no-arrow-tab-switch andCtrl+j no selection. Unverified: Issues scroll, reload/discoverability-after-reload,3-row assignedheader, multi-page arrows, Warp/create, permission-absent actualTTY.
+L39. Harness modefile was versionless{enabled:true}, correctly rejected by productionreadMode requiringversion1. Warp not registered; unknownslash entered a dummy local modelturn (connectionerror/retry), no externalprovider or realmodelresponse. Later/reload included leftoverc and didnotexecute. Record this as harnessfailure, notproductbug, notzero-model-attempt claim. Future preparation must usepublic modewriter/reader and verifycommandregistration, post-send mountedframes and stopbadinput/modelturn. No automaticretry or grantreuse. Priorartifacts retained under.ui/worktree-feedback-smoke/run1/artifacts-attempt4/.
