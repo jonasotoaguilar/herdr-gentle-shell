@@ -28,7 +28,7 @@
 // annotations), so the test copies it to a temporary .mjs path with the
 // package import lines stubbed and import()s it with a fake `pi` object.
 
-const { test, describe, after } = require('node:test');
+const { test, describe, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -1546,6 +1546,12 @@ const TO_PERF_ROW_2 = [...TO_PERF, 'right', 'down'];
 const TO_PERF_ROW_3 = [...TO_PERF, 'right', 'down', 'down'];
 
 describe('customize performance rows', { concurrency: false }, () => {
+  // S17: these rows exist only on a build that DECLARES their settings, so the
+  // row contract is exercised against a host that declares all four. The
+  // absent/partial cases live in their own describe below.
+  beforeEach(() => perfLib().setSupportScanner(declareAllScan));
+  afterEach(() => perfLib().setSupportScanner(null));
+
   test('the three switches read OFF with no settings file, and opening the panel writes nothing', async () => {
     const env = scratchStateEnv();
     const { component } = await runPanel({ env, inputs: TO_PERF });
@@ -1753,6 +1759,13 @@ function fakeScan({ declared = [], unknown = [] } = {}) {
   return { ok: true, piVersion: '1.3.0', root: '/test/pi', keys };
 }
 
+// S17: a switch exists only when the installed build declares its setting. The
+// four settings ship on an unmerged Pi branch, so most users' host declares
+// none of them and the section must say so instead of offering dead toggles.
+function declareAllScan() {
+  return fakeScan({ declared: [...perfLib().PERF_KEYS] });
+}
+
 async function withScan(scanner, fn) {
   const lib = perfLib();
   lib.setSupportScanner(scanner);
@@ -1769,7 +1782,110 @@ async function withScan(scanner, fn) {
 const TO_TRACE = [...TO_PERF, 'right', 'down', 'down', 'down'];
 const TO_RESET = ['down', 'down', 'down', 'down'];
 
+// ---------------------------------------------------------------------------
+// S17: no dead option. A performance row is offered only when the installed
+// build declares every setting it writes; the four settings ship only on a Pi
+// branch, so a released host declares none and the section says so.
+//
+// Contract under test (observable behavior only — what the panel renders, the
+// settings.json bytes, and the notified text):
+// - a build that declares none of the four shows no ON/OFF row and one honest
+//   sentence naming the version;
+// - Enter on that sentence changes nothing and writes no settings file;
+// - a build that declares a subset shows exactly the rows it declares;
+// - the fused row needs BOTH of its keys, never half a switch;
+// - applyRow refuses an undeclared row by id, so a caller cannot write a key
+//   the host ignores;
+// - the reset never resurrects an undeclared key.
+// ---------------------------------------------------------------------------
+
+describe('customize performance rows are gated on host support (S17)', { concurrency: false }, () => {
+  test('a build that declares none shows no switches, and says why', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan(), async () => {
+      const { component } = await runPanel({ env, inputs: TO_PERF });
+      const text = flatCard(component);
+      assert.ok(!/Height index \+ eviction · (ON|OFF|PARTIAL)/.test(text), 'no dead optimization row is offered');
+      assert.ok(!/Recent tool output expansion · (ON|OFF)/.test(text), 'no dead optimization row is offered');
+      assert.ok(!/Incremental search corpus · (ON|OFF)/.test(text), 'no dead optimization row is offered');
+      assert.ok(text.includes('No supported display performance settings · none declared'), 'the section states the fact');
+      assert.ok(text.includes('Pi 1.3.0 declares none of the four display performance settings'), 'the build is named');
+      assert.ok(
+        perfLib().panelModel(env).rows[0].detail.includes('there is nothing to toggle here'),
+        'the consequence is stated (the card clips the sentence, the detail keeps it whole)',
+      );
+      assert.ok(text.includes('Performance trace · OFF'), 'the trace is ours and stays available');
+      assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'opening the panel still writes nothing');
+    });
+  });
+
+  test('Enter on the "nothing to toggle" row is refused and writes no settings', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan(), async () => {
+      const { notes, seq } = await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
+      assert.equal(notes.length, 1, 'the refusal is reported, not swallowed');
+      assert.match(notes[0][0], /^No supported display performance settings not changed\. /);
+      assert.match(notes[0][0], /declares none of the four display performance settings, so there is nothing to toggle/);
+      assert.ok(!seq.includes('reload'), 'a refusal never reloads');
+      assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'a refusal writes no settings file');
+    });
+  });
+
+  test('a build that declares a subset shows exactly the rows it declares', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan({ declared: ['expandRecentToolOutput', 'incrementalSearchCorpus'] }), async () => {
+      const text = flatCard((await runPanel({ env, inputs: TO_PERF })).component);
+      assert.ok(text.includes('Recent tool output expansion · OFF'), 'the declared row is offered');
+      assert.ok(text.includes('Incremental search corpus · OFF'), 'the declared row is offered');
+      assert.ok(!/Height index \+ eviction · (ON|OFF|PARTIAL)/.test(text), 'the undeclared fused row is absent');
+      assert.ok(!text.includes('none declared'), 'a declared build is never told it has nothing');
+    });
+  });
+
+  test('the fused row needs both keys: one declared key is not enough', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan({ declared: ['evictOffscreenLines'] }), async () => {
+      const text = flatCard((await runPanel({ env, inputs: TO_PERF })).component);
+      assert.ok(!text.includes('Height index + eviction'), 'half a switch is never offered');
+      assert.ok(text.includes('none declared'), 'with nothing fully declared the section says so');
+    });
+  });
+
+  test('applyRow refuses an undeclared row by id and writes nothing', async () => {
+    const env = scratchStateEnv();
+    await withScan(() => fakeScan(), async () => {
+      const result = perfLib().applyRow('recent-output-expansion', env);
+      assert.equal(result.ok, false, 'the write is refused');
+      assert.equal(result.changed, false);
+      assert.match(result.error, /Pi 1\.3\.0 does not declare expandRecentToolOutput/);
+      assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'no settings file is created');
+      assert.equal(
+        perfLib().applyRowMessage(result),
+        'Recent tool output expansion not changed. Recent tool output expansion is not offered: Pi 1.3.0 does not declare expandRecentToolOutput, so the switch would change a setting nothing reads.',
+      );
+    });
+  });
+
+  test('the reset never resurrects an undeclared key', async () => {
+    const env = scratchStateEnv();
+    writePerfSettings(env, { heightIndex: true, expandRecentToolOutput: true });
+    const before = fs.readFileSync(perfSettingsFile(env), 'utf8');
+    await withScan(() => fakeScan(), async () => {
+      const result = perfLib().resetToDefaults(env);
+      assert.equal(result.ok, true, 'a reset with nothing declared is not a failure');
+      assert.equal(result.changed, false, 'nothing was written');
+      assert.deepEqual(result.entries, [], 'no undeclared key is named');
+    });
+    assert.equal(fs.readFileSync(perfSettingsFile(env), 'utf8'), before, 'the file is byte-identical');
+  });
+});
+
 describe('customize performance trace option', { concurrency: false }, () => {
+  // The optimization rows still sit above the trace row on a host that
+  // declares them, so the navigation constants keep their meaning here.
+  beforeEach(() => perfLib().setSupportScanner(declareAllScan));
+  afterEach(() => perfLib().setSupportScanner(null));
+
   test('the trace option is OFF by default, and opening the panel writes nothing', async () => {
     const env = scratchStateEnv();
     const { component } = await runPanel({ env, inputs: TO_TRACE });
@@ -1839,7 +1955,7 @@ describe('customize performance trace option', { concurrency: false }, () => {
     const garbage = '{"version":1,"enabled":';
     fs.writeFileSync(flag, garbage);
 
-    const { notes, seq, component } = await runPanel({
+    const { notes, seq } = await runPanel({
       env,
       inputs: TO_TRACE,
       inspect: (opened) => {
@@ -1861,7 +1977,7 @@ describe('customize performance trace option', { concurrency: false }, () => {
     const env = scratchStateEnv();
     writePerfSettings(env, { heightIndex: true, evictOffscreenLines: false });
     traceLib().writeTraceMode(true, env);
-    await withScan(() => fakeScan(), async () => {
+    await withScan(declareAllScan, async () => {
       const { component } = await runPanel({ env, inputs: TO_TRACE });
       const text = flatCard(component);
       assert.ok(text.includes('Performance trace · ON'), 'the trace row reads its own flag');
@@ -1872,7 +1988,7 @@ describe('customize performance trace option', { concurrency: false }, () => {
     });
   });
 
-  test('the installed-Pi evidence is evidence only, and only while tracing', async () => {
+  test('the installed-Pi evidence is shown only while tracing, and the gate scan always runs', async () => {
     const env = scratchStateEnv();
     let scans = 0;
     await withScan(() => {
@@ -1880,13 +1996,12 @@ describe('customize performance trace option', { concurrency: false }, () => {
       return fakeScan({ declared: ['heightIndex'], unknown: ['evictOffscreenLines'] });
     }, async () => {
       const off = await runPanel({ env, inputs: TO_TRACE });
-      assert.equal(scans, 0, 'a disabled trace never scans the installed package');
-      assert.ok(!flatCard(off.component).includes('support evidence'), 'no evidence is claimed without a scan');
+      assert.ok(scans >= 1, 'S17: the scan decides which rows exist, so it runs even with the trace off');
+      assert.ok(!flatCard(off.component).includes('support evidence'), 'no evidence is claimed without the trace');
 
       traceLib().writeTraceMode(true, env);
       const on = await runPanel({ env, inputs: TO_TRACE });
       const text = flatCard(on.component);
-      assert.equal(scans, 1, 'an enabled trace scans once per panel render');
       assert.ok(text.includes('Evidence (Pi 1.3.0): 1 declared, 2 absent, 1 unknown'));
       assert.ok(
         perfLib().panelModel(env).rows.at(-1).detail.includes('evidence only, never proof of speedup'),
@@ -1915,7 +2030,7 @@ describe('customize performance trace option', { concurrency: false }, () => {
 
   test('a switch change under an enabled trace starts a new identified run', async () => {
     const env = scratchStateEnv();
-    await withScan(() => fakeScan(), async () => {
+    await withScan(declareAllScan, async () => {
       traceLib().writeTraceMode(true, env);
 
       // Run 1: the row is OFF, then switched ON — the run that starts now is

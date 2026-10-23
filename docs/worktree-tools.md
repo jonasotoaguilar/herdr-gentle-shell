@@ -674,10 +674,18 @@ this gate — a missing prerequisite may block turning a feature ON, never OFF.
 
 ### Performance (`/herdr-gentle:customize` — `Performance` rows)
 
-Three rows, each shipped OFF, each turning on one pi render optimisation for
-long fullscreen sessions. pi itself keeps four individual settings; row 1
-writes two of them because eviction has no effect without the index it lives
-inside. A user who changes nothing keeps today's behaviour exactly.
+A row exists only when the installed Pi build DECLARES the setting it writes.
+The four optimisations below live on an unmerged Pi branch
+(`perf/fullscreen-long-sessions`); a released Pi declares none of them, so the
+section shows one honest line — `No supported display performance settings ·
+none declared` — and no switches. The panel never offers an option the host
+ignores: writing a key nothing reads was the defect this gate removes.
+
+On a build that declares them, the rows are each shipped OFF, each turning on
+one pi render optimisation for long fullscreen sessions. pi itself keeps four
+individual settings; row 1 writes two of them because eviction has no effect
+without the index it lives inside. A build that declares only some of the four
+shows only the rows it fully declares — the fused row needs BOTH its keys.
 
 - **Height index + eviction** writes `heightIndex` and `evictOffscreenLines`.
   A mixed state reached through pi's own `/settings` (one key on, the other
@@ -697,8 +705,10 @@ text. The settings behavior is unchanged.
 
 Benchmark evidence remains in `odd/tasks/pi-fullscreen-perf.md` and the
 pi-side `packages/tui/test/perf/RESULTS.md` referenced there. Those measurements
-use synthetic transcripts; they are not a promise for the current session.
-The switches require a Pi build implementing the corresponding settings.
+use synthetic transcripts; they are not a promise for the current session. Our
+own results recommend only `expandRecentToolOutput` and
+`incrementalSearchCorpus`: with the first one on, the height index is
+net-negative and regresses Ctrl+F, and eviction is only reachable through it.
 
 Writes go through `lib/pi-perf-settings.js`: the four keys are merged into
 `<agent-dir>/settings.json` without disturbing any other key, atomically and
@@ -712,12 +722,14 @@ for a reload so it applies without a restart; a failed one never reloads.
 The panel's `Reset` row returns the user-visible options to the
 defaults their own read sites define — `sidebar` Gentle **when the Herdr plugin
 is installed and usable and OFF when it is not** (see below), `moshi` off,
-`worktree` enabled, and the four performance keys `heightIndex`,
-`evictOffscreenLines`, `expandRecentToolOutput` and
-`incrementalSearchCorpus` OFF — by writing each default THROUGH the same
-writer the corresponding row uses, never by deleting a flag file. The
+`worktree` enabled, and the performance keys the installed build declares
+(`heightIndex`, `evictOffscreenLines`, `expandRecentToolOutput`,
+`incrementalSearchCorpus`) OFF — by writing each default THROUGH the same
+writer the corresponding row uses, never by deleting a flag file. A key the
+build does not declare is never written, so a reset cannot resurrect a setting
+the host ignores. The
 performance keys go through `lib/pi-perf-settings.js`, in one atomic merge
-that leaves every other setting alone, and the summary names each of the four
+that leaves every other setting alone, and the summary names each of them
 by its own label; a reset that had nothing to do with them keeps its summary
 unchanged. The moshi reset
 therefore also clears its Pi `settings.json` exclusion, and the sidebar reset
