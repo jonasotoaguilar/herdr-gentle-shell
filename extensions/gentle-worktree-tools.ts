@@ -6175,8 +6175,8 @@ function warpDeletableAt(others, index, principal, read, repoRoot) {
 // display-only and cannot take keys — but only its geometry changes: anchored
 // at the bottom, full width, no margin and no minimum width, so it reads as a
 // bottom panel. Its height is the view's own content (S4), never a fixed
-// frame, and `rowsAvailable` is the ceiling it may use. The create/edit panel
-// keeps its centred popup untouched (T5/T6 own that surface).
+// frame, and `rowsAvailable` is the ceiling it may use. Creation uses the same
+// bottom geometry with its own compact content height; editing is fullscreen.
 const WARP_OVERLAY_MAX_ROWS = 24;
 const WARP_SELECTOR_OVERLAY = Object.freeze({
   overlay: true,
@@ -6184,7 +6184,7 @@ const WARP_SELECTOR_OVERLAY = Object.freeze({
 });
 const WARP_PANEL_OVERLAY = Object.freeze({
   overlay: true,
-  overlayOptions: Object.freeze({ anchor: "center", width: "70%", minWidth: 60, maxHeight: WARP_OVERLAY_MAX_ROWS }),
+  overlayOptions: Object.freeze({ anchor: "bottom-center", width: "100%", margin: 0, maxHeight: WARP_OVERLAY_MAX_ROWS }),
 });
 // S7/S11: the worktree detail and the odd/issues viewers own the whole screen
 // (100% width and height, no margin) — the same shape for all three, so a

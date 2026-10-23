@@ -700,3 +700,29 @@ describe('S8b: migration warnings cross command boundaries', { concurrency: fals
     });
   }
 });
+
+
+describe('S12 feedback: create is a bottom interaction', { concurrency: false }, () => {
+  test('the public warp flow mounts compact create at the bottom; cancel changes nothing', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('bottom-create');
+      addRegisteredWorktree(root, 'feat/existing-bottom');
+      stubGh([]);
+      const branches = git(root, ['for-each-ref', '--format=%(refname)']);
+      const checkouts = git(root, ['worktree', 'list', '--porcelain']);
+      const { commands } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [['c'], ['\x1b']] });
+      await commands.get('herdr-gentle:warp').handler('', built.ctx);
+      assert.equal(built.mounts.length, 2, 'selector and create both mounted');
+      const create = built.mounts[1];
+      assert.deepEqual(create.options, { overlay: true, overlayOptions: { anchor: 'bottom-center', width: '100%', margin: 0, maxHeight: 24 } });
+      assert.ok(create.component.render(100).length < 24, 'create keeps content height rather than filling the screen');
+      assert.equal(git(root, ['for-each-ref', '--format=%(refname)']), branches, 'cancel creates no branch');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), checkouts, 'cancel creates no checkout');
+      assert.deepEqual(built.notes, [], 'cancel stays silent');
+    } finally {
+      restoreEnv();
+    }
+  });
+});

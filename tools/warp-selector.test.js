@@ -514,7 +514,9 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
                 view.handleInput('c'); // S6: the create hotkey
                 return;
               }
-              view.handleInput('\x1b[B'); // type -> name
+              view.handleInput('\x1b[B'); // the inline type list moves to Bug fix
+              view.handleInput('\x1b[A'); // and back to Feature, the expected type
+              view.handleInput('\t'); // Tab hands the flow to the name field
               for (const char of 'panel-change') view.handleInput(char);
               view.handleInput('\x13'); // ctrl+s creates
             } catch (err) {
@@ -1438,7 +1440,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('inside the creating panel both steps, tab and help each add no mutation', async () => {
+  test('inside the creating panel the inline type list, both fields and tab each add no mutation', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-create-keys');
@@ -1448,10 +1450,12 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       try {
         const driver = multiDriver([['c'], (view) => {
           const step = stepRecorder(view, watcher);
-          step('open the change-type picker', (v) => v.handleInput('\r'));
-          assert.equal(view.state.typePanelOpen, true, 'the type picker opened');
-          step('move inside the type picker', (v) => v.handleInput('\x1b[B'));
-          step('pick the change type', (v) => v.handleInput('\r'));
+          step('move inside the inline type list', (v) => v.handleInput('\x1b[B'));
+          assert.equal(view.state.focus, 'type', 'the type list keeps the keyboard');
+          assert.equal(view.state.typeIndex, 1, 'down selects the next change type');
+          step('move back to the first type', (v) => v.handleInput('\x1b[A'));
+          assert.equal(view.state.typeIndex, 0, 'up selects the previous change type');
+          step('tab to the name field', (v) => v.handleInput('\t'));
           assert.equal(view.state.focus, 'name', 'step 1 hands over to step 2');
           step('type the change name', (v) => {
             for (const char of 'panel-change') v.handleInput(char);
@@ -1459,10 +1463,13 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           assert.equal(view.state.name, 'panel-change', 'the name field kept the typed value');
           step('return to the type field', (v) => v.handleInput('\x1b[A'));
           assert.equal(view.state.focus, 'type');
-          step('press tab', (v) => v.handleInput('\t'));
-          assert.equal(view.state.focus, 'type', 'S6: tab reaches no pane');
-          step('ask for help', (v) => v.handleInput('?'));
-          assert.equal(view.state.focus, 'type', '? opens nothing');
+          step('left reaches the name field', (v) => v.handleInput('\x1b[D'));
+          assert.equal(view.state.focus, 'name', 'left walks the two fields');
+          step('right returns to the type field', (v) => v.handleInput('\x1b[C'));
+          assert.equal(view.state.focus, 'type', 'right walks the two fields');
+          step('press an unbound key', (v) => v.handleInput('?'));
+          assert.equal(view.state.focus, 'name', '? starts the name instead of opening help');
+          assert.equal(view.state.name, 'panel-change?', 'the printable key lands in the name field');
           step('cancel the panel', (v) => v.handleInput('\x1b'));
           assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
           assert.ok(step.steps.length >= 8, 'every scripted interaction was measured');
@@ -1594,8 +1601,12 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       try {
         let confirmedAt = 0;
         const driver = multiDriver([['c'], (view) => {
-          view.handleInput('\x1b[B');
+          view.handleInput('\x1b[B'); // the inline type list moves to Bug fix
+          view.handleInput('\x1b[A'); // and back to Feature, the expected type
+          view.handleInput('\t'); // Tab hands the flow to the name field
           for (const char of 'nothing-yet') view.handleInput(char);
+          assert.equal(view.state.typeIndex, 0, 'the inline type list sits on Feature');
+          assert.equal(view.state.name, 'nothing-yet', 'the name field kept every character');
           assert.deepEqual(watcher.kinds(), [], 'navigating and typing before the confirm wrote nothing');
           confirmedAt = watcher.events.length;
           view.handleInput('\x13'); // the explicit confirm

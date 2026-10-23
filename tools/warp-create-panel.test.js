@@ -1,13 +1,18 @@
 'use strict';
-// T5 (worktree-ui-redesign S6): the worktree CREATION panel.
+// T4 (worktree-ui-feedback S4,S12,S15): the worktree CREATION and EDITING
+// panel.
 //
-// Creating asks for exactly TWO things, in this order: the change type
-// (with its sub-panel — there is no native dropdown in this host) and the
-// change name with its live branch/path preview. `enter` on the name is the
-// creation. The Issues/Odd association panes, their selection state and
-// their previews are NOT part of this surface; they survive only in the
-// panel's editing mode, which the editing tests below still drive. Every
-// test renders headlessly at a fixed size and asserts that every line is
+// Creating is the TWO-FIELD bottom flow a human reported as still being a
+// pop-up (S12): a preview of the REAL derived branch and path ABOVE, then the
+// change type as an inline list, then the change name. `tab`/`shift+tab`/
+// `←`/`→` move between those two fields and `↑`/`↓` pick the type; `enter` on
+// the name creates. Only type and name exist: no Issues/Odd selector, no
+// association, no step counter. The component derives its own compact
+// content height (the host mounts it at the bottom later), so a wrapped
+// surface never leaves slack rows. The Issues/Odd association panes, their
+// selection state and their previews are NOT part of this surface; they
+// survive only in the panel's editing mode, which the editing tests below
+// still drive. Every test renders headlessly and asserts that every line is
 // EXACTLY the requested width, and drives the component with synthetic
 // keys. The create tests use the real seams (`lib/gh-issues.js` through
 // `setGhRunner`) to prove the panel reads NO issue or odd source.
@@ -72,6 +77,18 @@ function boxLines(view, width, height) {
   return lines;
 }
 
+// S12: the create surface derives its own height, so the assertion is the
+// width of every line plus "no filler below the closing rule" instead of a
+// fixed frame size.
+function renderedLines(view, width) {
+  const lines = view.render(width);
+  assert.ok(lines.length > 0, 'the panel renders something');
+  for (const line of lines) {
+    assert.equal([...stripAnsi(line)].length, width, `line is not ${width} wide: ${JSON.stringify(line)}`);
+  }
+  return lines;
+}
+
 function findLine(lines, needle) {
   const line = lines.find((entry) => stripAnsi(entry).includes(needle));
   assert.ok(line !== undefined, `no line contains ${JSON.stringify(needle)}\n${lines.map(stripAnsi).join('\n')}`);
@@ -128,8 +145,10 @@ function openPanel(overrides = {}) {
 }
 
 // Focus shortcuts for the EDITING mode (the create panel has no panes).
+// Creating moves between its two fields with Tab/←/→ (S12), so this helper
+// uses the same key; the editing header keeps its own ↓ between fields.
 function focusName(view) {
-  view.handleInput('down'); // type -> name
+  view.handleInput('\t'); // type -> name
 }
 function focusIssues(view) {
   view.handleInput('\t');
@@ -145,38 +164,70 @@ function typeText(view, text) {
 }
 
 describe('the rendered panel', { concurrency: false }, () => {
-  test('shows the change type, the change name, the live branch and path preview, the two steps and the footers', () => {
+  test('shows the preview above the type list and the name, and nothing else', () => {
     const { view } = openPanel({ initialName: 'new-change' });
-    const lines = boxLines(view, 100, 24);
+    const lines = renderedLines(view, 100);
     const text = allText(lines);
+    const at = (needle) => lines.findIndex((line) => stripAnsi(line).includes(needle));
     assert.match(text, /Type: Feature \(feat\)/, 'the conventional type with its human label');
     assert.match(text, /Name: new-change/, 'the typed name');
     findLine(lines, 'preview branch: feat/new-change');
     findLine(lines, `preview path: ${path.join(path.dirname(REPO), `${path.basename(REPO)}-worktrees`, 'feat-new-change')}`);
-    assert.match(text, /Step 1 of 2 · change type/, 'the first step is named');
-    assert.match(text, /↑\/↓ fields/, 'the footer names the arrow map');
-    assert.match(text, /←\/→ type/, 'the footer names the type keys');
+    assert.ok(at('preview branch:') < at('Type:'), 'the preview sits ABOVE the type field');
+    assert.ok(at('preview path:') < at('Type:'), 'both preview rows sit above the fields');
+    assert.ok(at('Type:') < at('Name:'), 'type above name');
+    for (const type of panel.CHANGE_TYPES) {
+      assert.ok(text.includes(`${type.label} (${type.id})`), `the type list is inline: ${type.id}`);
+    }
+    assert.ok(!text.includes('Step 1 of 2'), 'no step counter: the surface is the two fields');
+    assert.ok(!text.includes('Step 2 of 2'), 'no step counter on the name either');
+    assert.ok(!text.includes('Choose the change type'), 'the type is a list in place, not a second pop-up surface');
+    assert.match(text, /↑\/↓ type/, 'the footer names the type-selection keys');
     assert.match(text, /Enter confirm/, 'the footer names the confirm key');
     assert.match(text, /Ctrl\+S create/, 'the keys footer names ctrl+s');
     assert.match(text, /Esc cancel/, 'the keys footer names esc');
     assert.ok(!text.includes('? help'), 'the footer never advertises a help key');
   });
 
-  test('every line is exactly the requested width at several terminal sizes', () => {
-    for (const [width, height] of [[60, 18], [80, 24], [100, 24], [120, 30]]) {
+  test('every line is exactly the requested width and the surface ends at its own content', () => {
+    for (const [width, height] of [[40, 24], [60, 24], [80, 24], [100, 24], [120, 40]]) {
       const { view } = openPanel({ rowsAvailable: () => height });
-      boxLines(view, width, height);
+      const lines = renderedLines(view, width);
+      assert.ok(lines.length <= height, `${width}x${height}: the surface never exceeds the host budget`);
+      assert.ok(lines.length < height, `${width}x${height}: it derives its own height instead of filling the host rows`);
+      assert.match(stripAnsi(lines[lines.length - 1]), /^─+$/, `${width}x${height}: the closing rule is the last row`);
     }
+    // A short host windows the inline type list to the rows left over and
+    // still ends on its closing rule: no filler rows above or below.
+    const short = openPanel({ rowsAvailable: () => 18 });
+    const lines = renderedLines(short.view, 80);
+    assert.equal(lines.length, 18, 'a short host is filled exactly, never overflowed');
+    assert.match(stripAnsi(lines[lines.length - 1]), /^─+$/);
+    assert.ok(!allText(lines).includes('Revert (revert)'), 'the type list windows around the selection');
+  });
+
+  test('a host too short for the two fields says so in one line instead of overflowing', () => {
+    const { view } = openPanel({ rowsAvailable: () => 6 });
+    const lines = renderedLines(view, 60);
+    assert.equal(lines.length, 1, 'one honest row, never more than the host offers');
+    assert.match(stripAnsi(lines[0]), /New worktree .* enlarge the terminal/);
+    assert.equal(view.render(0).length, 0, 'a hostile width renders nothing');
+    // A refusal adds a row, so the same guard covers the tightest host that
+    // fits the fixed form plus its message.
+    const refused = openPanel({ rowsAvailable: () => 8 });
+    refused.view.handleInput('\x13');
+    const tight = renderedLines(refused.view, 60);
+    assert.equal(tight.length, 1, 'the refusal never overflows a too-short host');
   });
 
   test('typing the name moves the branch and path preview live, character by character', () => {
     const { view } = openPanel();
     focusName(view);
     typeText(view, 'new');
-    let lines = boxLines(view, 100, 24);
+    let lines = renderedLines(view, 100);
     assert.match(findLine(lines, 'preview branch:').trim(), /feat\/new$/);
     typeText(view, '-change');
-    lines = boxLines(view, 100, 24);
+    lines = renderedLines(view, 100);
     findLine(lines, 'preview branch: feat/new-change');
     findLine(lines, 'preview path:');
     const preview = findLine(lines, 'preview path:');
@@ -186,7 +237,7 @@ describe('the rendered panel', { concurrency: false }, () => {
 
   test('an invalid name is shown as invalid instead of a derived branch', () => {
     const { view } = openPanel();
-    const lines = boxLines(view, 100, 24);
+    const lines = renderedLines(view, 100);
     const branch = findLine(lines, 'preview branch:');
     assert.ok(branch.includes('✗'), 'the invalid state is marked');
     assert.match(branch, /name is empty/);
@@ -196,7 +247,7 @@ describe('the rendered panel', { concurrency: false }, () => {
     // A name with nothing slug-worthy is refused, not silently turned into `worktree`.
     focusName(view);
     typeText(view, '!!!');
-    assert.match(findLine(boxLines(view, 100, 24), 'preview branch:'), /name has no letters or digits/);
+    assert.match(findLine(renderedLines(view, 100), 'preview branch:'), /name has no letters or digits/);
   });
 
   test('a git refusal of the derived branch is surfaced verbatim', () => {
@@ -206,53 +257,49 @@ describe('the rendered panel', { concurrency: false }, () => {
       canonicalWorktreePath: () => '/nowhere',
     };
     const { view } = openPanel({ git, initialName: 'x' });
-    assert.match(findLine(boxLines(view, 100, 24), 'preview branch:'), /invalid branch name: feat\/-bad/);
+    assert.match(findLine(renderedLines(view, 100), 'preview branch:'), /invalid branch name: feat\/-bad/);
   });
 
   test('the name field renders a real placeholder and a cursor, and never treats the placeholder as the value', () => {
     const { view, finished } = openPanel();
     focusName(view);
-    let text = allText(boxLines(view, 100, 24));
+    let text = allText(renderedLines(view, 100));
     assert.match(text, /Name: ▊name-change/, 'the placeholder is ghost text after the caret');
     view.handleInput('n');
-    text = allText(boxLines(view, 100, 24));
+    text = allText(renderedLines(view, 100));
     assert.match(text, /Name: n▊/, 'the typed value replaces the ghost text');
     assert.ok(!text.includes('name-change'), 'the placeholder disappears once there is a value');
     // The placeholder is not a name: creating from it is refused.
     view.handleInput('\x7f');
     view.handleInput('\x13');
     assert.deepEqual(finished, [], 'a ghost placeholder never creates anything');
-    assert.match(allText(boxLines(view, 100, 24)), /cannot create: name is empty/);
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name is empty/);
   });
 });
 
 describe('the type field', { concurrency: false }, () => {
-  test('enter opens the type sub-panel and a pick closes it and moves to the name', () => {
-    const { view } = openPanel();
-    view.handleInput('enter');
-    assert.equal(view.state.typePanelOpen, true, 'enter opens the sub-panel');
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Choose the change type/);
-    for (const type of panel.CHANGE_TYPES) {
-      assert.ok(text.includes(`${type.label} (${type.id})`), `the sub-panel lists ${type.id}`);
-    }
-    view.handleInput('down');
-    view.handleInput('enter');
-    assert.equal(view.state.typePanelOpen, false, 'picking closes the sub-panel');
-    assert.equal(view.state.focus, 'name', 'a pick moves focus to the name');
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Type: Bug fix \(fix\)/);
+  test('↑/↓ move the type selection in place and the preview follows live', () => {
+    const { view } = openPanel({ initialName: 'new-change' });
+    assert.equal(view.state.typeIndex, 0);
+    view.handleInput('\x1b[B'); // down
+    assert.equal(view.state.typeIndex, 1);
+    assert.equal(view.state.focus, 'type', 'picking a type never leaves the list');
+    assert.match(allText(renderedLines(view, 100)), /Type: Bug fix \(fix\)/);
+    assert.match(findLine(renderedLines(view, 100), 'preview branch:').trim(), /^preview branch: fix\/new-change$/);
+    assert.match(stripAnsi(renderedLines(view, 100).find((line) => stripAnsi(line).includes('Bug fix') && stripAnsi(line).includes('❯ '))), /Bug fix \(fix\)/, 'the selected row carries the marker');
+    view.handleInput('\x1b[A'); // up
+    assert.equal(view.state.typeIndex, 0);
+    view.handleInput('\x1b[A');
+    assert.equal(view.state.typeIndex, 0, 'the first type is a clamp');
+    for (let i = 0; i < panel.CHANGE_TYPES.length + 3; i += 1) view.handleInput('\x1b[B');
+    assert.equal(view.state.typeIndex, panel.CHANGE_TYPES.length - 1, 'the last type is a clamp');
   });
 
-  test('left/right cycle the type as a shortcut', () => {
-    const { view } = openPanel({ initialName: 'new-change' });
-    view.handleInput('right');
-    assert.match(findLine(boxLines(view, 100, 24), 'preview branch:').trim(), /^preview branch: fix\/new-change$/);
-    assert.match(allText(boxLines(view, 100, 24)), /Type: Bug fix \(fix\)/);
-    view.handleInput('left');
-    view.handleInput('left');
-    const last = panel.CHANGE_TYPES[panel.CHANGE_TYPES.length - 1];
-    assert.match(allText(boxLines(view, 100, 24)), new RegExp(`Type: ${last.label} \\(${last.id}\\)`));
+  test('a printable key on the type field starts the name instead of typing into a list', () => {
+    const { view } = openPanel();
+    view.handleInput('n');
+    assert.equal(view.state.focus, 'name', 'the typed character moves to the name field');
+    assert.equal(view.state.name, 'n', 'and is kept as its first character');
   });
 
   test('the type set and the branch format match the repository branch-pr convention', () => {
@@ -266,19 +313,19 @@ describe('the type field', { concurrency: false }, () => {
     const literal = line.slice(line.indexOf('= ') + 2).replace(/;\s*$/, '');
     const branchRe = new RegExp(literal.slice(1, literal.lastIndexOf('/')).replace(/\\\//g, '/'));
     const { view } = openPanel({ initialName: 'new-change' });
-    const branch = findLine(boxLines(view, 100, 24), 'preview branch:').trim().replace('preview branch: ', '');
+    const branch = findLine(renderedLines(view, 100), 'preview branch:').trim().replace('preview branch: ', '');
     assert.ok(branchRe.test(branch), `${branch} must match the skill's <type>/<slug> shape`);
   });
 });
 
-// S6: creating a worktree asks for exactly TWO things — the change type and
+// S12: creating a worktree asks for exactly TWO things — the change type and
 // the change name — and then creates it. The Issues/Odd association panes,
 // their selection state, their keys and their previews belong to no part of
 // this surface any more.
-describe('S6: creation asks for the type and the name, nothing else', { concurrency: false }, () => {
+describe('S12: two fields, nothing else', { concurrency: false }, () => {
   test('the panel has no Issues pane, no Odd pane, no pane tab and no preview column', () => {
     const { view } = openPanel({ initialName: 'new-change' });
-    const text = allText(boxLines(view, 120, 24));
+    const text = allText(renderedLines(view, 120));
     assert.ok(!text.includes('Issues'), `no Issues pane\n${text}`);
     assert.ok(!text.includes('Odd'), `no Odd pane\n${text}`);
     assert.ok(!text.includes('Preview'), `no preview column header\n${text}`);
@@ -293,41 +340,50 @@ describe('S6: creation asks for the type and the name, nothing else', { concurre
     for (const key of ['pane', 'filterOpen', 'queries', 'cursor', 'selectedIssues', 'selectedOdd', 'issues', 'odd']) {
       assert.equal(key in view.state, false, `the create panel keeps no ${key} state`);
     }
-    assert.deepEqual(Object.keys(view.state).sort(), ['focus', 'message', 'name', 'typeCursor', 'typeIndex', 'typePanelOpen']);
+    assert.deepEqual(Object.keys(view.state).sort(), ['focus', 'message', 'name', 'typeIndex']);
   });
 
-  test('tab and shift+tab are inert: they never switch panes nor move a field', () => {
+  test('tab, shift+tab, ← and → move between the type list and the name field', () => {
     const { view, finished } = openPanel({ initialName: 'new-change' });
-    const before = allText(boxLines(view, 100, 24));
+    assert.equal(view.state.focus, 'type');
     view.handleInput('\t');
-    assert.equal(view.state.focus, 'type', 'tab does not leave the type field');
-    assert.equal(allText(boxLines(view, 100, 24)), before, 'the frame is byte-identical after tab');
+    assert.equal(view.state.focus, 'name', 'tab reaches the name');
+    view.handleInput('\t');
+    assert.equal(view.state.focus, 'type', 'tab returns to the type');
+    view.handleInput('\x1b[C'); // right
+    assert.equal(view.state.focus, 'name', '→ reaches the name');
+    view.handleInput('\x1b[D'); // left
+    assert.equal(view.state.focus, 'type', '← returns to the type');
+    view.handleInput('\x1b[D');
+    assert.equal(view.state.focus, 'name', '← at the first field wraps to the name');
+    view.handleInput('\x1b[C');
+    assert.equal(view.state.focus, 'type', '→ at the last field wraps to the type');
     view.handleInput('\x1b[Z'); // shift+tab
-    assert.equal(view.state.focus, 'type', 'shift+tab moves no field either');
-    view.handleInput('\x1b[B'); // -> name
-    view.handleInput('\t');
-    assert.equal(view.state.focus, 'name', 'tab from the name field is inert too');
-    assert.deepEqual(finished, [], 'tab never completes or cancels a creation');
+    assert.equal(view.state.focus, 'name', 'shift+tab walks the fields back');
+    assert.deepEqual(finished, [], 'moving between fields never completes or cancels');
   });
 
-  test('the two steps run in order and create with the chosen type and name', () => {
+  test('the two-field flow creates with the chosen type and name', () => {
     const { view, finished } = openPanel();
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Step 1 of 2 · change type/);
+    let text = allText(renderedLines(view, 100));
     assert.ok(!text.includes('cannot create'), 'nothing has been refused yet');
-    view.handleInput('enter'); // step 1: open the change-type picker
-    assert.equal(view.state.typePanelOpen, true);
-    view.handleInput('down'); // Feature -> Bug fix
-    view.handleInput('enter'); // pick it and reach step 2
-    assert.equal(view.state.focus, 'name', 'the type pick hands over to the name');
-    text = allText(boxLines(view, 100, 24));
+    view.handleInput('\x1b[B'); // pick the second type
+    view.handleInput('\t'); // reach the name
+    assert.equal(view.state.focus, 'name', 'tab hands the flow to the name');
+    text = allText(renderedLines(view, 100));
     assert.match(text, /Type: Bug fix \(fix\)/);
-    assert.match(text, /Step 2 of 2 · change name/);
     assert.deepEqual(finished, [], 'picking the type creates nothing yet');
     typeText(view, 'panel-change');
     assert.deepEqual(finished, [], 'typing the name creates nothing yet');
-    view.handleInput('enter'); // step 2: create
+    view.handleInput('enter'); // confirm
     assert.deepEqual(finished, [{ ok: true, type: 'fix', name: 'panel-change' }]);
+  });
+
+  test('enter on the type field reaches the name without creating', () => {
+    const { view, finished } = openPanel();
+    view.handleInput('enter');
+    assert.equal(view.state.focus, 'name');
+    assert.deepEqual(finished, [], 'enter on the type only moves the flow on');
   });
 
   test('the created payload carries no issues and no odd fields, and ignores injected associations', () => {
@@ -361,7 +417,7 @@ describe('S6: creation asks for the type and the name, nothing else', { concurre
 describe('completion', { concurrency: false }, () => {
   test('enter on the name field creates with the two collected values', () => {
     const { view, finished } = openPanel();
-    view.handleInput('down'); // type -> name
+    focusName(view);
     typeText(view, 'new-change');
     view.handleInput('enter');
     assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change' }]);
@@ -381,47 +437,42 @@ describe('completion', { concurrency: false }, () => {
     const { view, finished } = openPanel();
     view.handleInput('\x13');
     assert.deepEqual(finished, [], 'an empty name never creates');
-    assert.match(allText(boxLines(view, 100, 24)), /cannot create: name is empty/);
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name is empty/);
     focusName(view);
     typeText(view, 'new-change');
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('cannot create'), 'fixing the name clears the refusal');
+    assert.ok(!allText(renderedLines(view, 100)).includes('cannot create'), 'fixing the name clears the refusal');
     view.handleInput('\x13');
     assert.equal(finished.length, 1);
   });
 
   test('enter on an invalid name refuses with the same message instead of creating', () => {
     const { view, finished } = openPanel({ initialName: '!!!' });
-    view.handleInput('down'); // type -> name
+    focusName(view);
     view.handleInput('enter');
     assert.deepEqual(finished, [], 'nothing is created');
-    assert.match(allText(boxLines(view, 100, 24)), /cannot create: name has no letters or digits/);
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
-  test('esc cancels the whole creation with null, exactly once', () => {
-    const { view, finished } = openPanel();
-    view.handleInput('escape');
-    view.handleInput('escape');
-    assert.deepEqual(finished, [null]);
-  });
+  test('cancel writes nothing and emits null exactly once, from either field', () => {
+    const fromType = openPanel();
+    fromType.view.handleInput('escape');
+    fromType.view.handleInput('escape');
+    assert.deepEqual(fromType.finished, [null]);
 
-  test('esc unwinds the type sub-panel before cancelling', () => {
-    const { view, finished } = openPanel();
-    view.handleInput('enter');
-    view.handleInput('escape');
-    assert.equal(view.state.typePanelOpen, false);
-    assert.deepEqual(finished, [], 'closing the sub-panel does not cancel the creation');
-    view.handleInput('escape');
-    assert.deepEqual(finished, [null]);
+    const fromName = openPanel({ initialName: 'typed-but-discarded' });
+    focusName(fromName.view);
+    typeText(fromName.view, '-more');
+    fromName.view.handleInput('escape');
+    assert.deepEqual(fromName.finished, [null], 'a typed name is discarded, never created');
   });
 
   test('there is no key-help overlay: the footer already carries every shortcut', () => {
     const { view } = openPanel();
-    const before = allText(boxLines(view, 100, 24));
     view.handleInput('?');
-    const after = allText(boxLines(view, 100, 24));
-    assert.equal(after, before, '? is not a binding: no overlay opens on the Type field');
+    const after = allText(renderedLines(view, 100));
     assert.ok(!after.includes('close this help'), 'no key list replaces the content');
     assert.ok(!after.includes('? help'), 'the footer never advertises a help key');
+    assert.equal('help' in view.state, false, 'the surface keeps no help overlay state');
     assert.match(after, /Enter confirm/);
     assert.match(after, /Ctrl\+S create/);
     assert.match(after, /Esc cancel/);
@@ -449,7 +500,7 @@ describe('the create panel never reads the issue or odd libraries (S6)', { concu
         renderMarkdown: undefined,
       });
       await flush();
-      const text = allText(boxLines(view, 100, 24));
+      const text = allText(renderedLines(view, 100));
       assert.ok(!text.includes('alpha'), 'no odd document row is listed');
       assert.ok(!text.includes('Fix the crash'), 'no issue row is listed');
       view.handleInput('\x13');
@@ -572,11 +623,13 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     findLine(boxLines(view, 100, 24), 'checkout branch: feat/old-change');
   });
 
-  test('the type sub-panel never opens in editing mode', () => {
+  test('the type picker never opens in editing mode', () => {
     const { view } = editPanel();
     view.handleInput('enter');
-    assert.equal(view.state.typePanelOpen, false);
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('Choose the change type'));
+    assert.equal('typePanelOpen' in view.state, false, 'the edit surface keeps no type-picker state');
+    const text = allText(boxLines(view, 100, 24));
+    assert.ok(!text.includes('Choose the change type'));
+    assert.ok(!text.includes('Bug fix (fix)'), 'no inline type list on the frozen surface');
   });
 
   test('the edit header carries the checkout summary and the preselected association counts', () => {
@@ -720,17 +773,19 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.match(after, /Esc cancel/);
   });
 
-  test('create mode keeps its editable fields and its sub-panel, and its payload carries no mode marker', () => {
+  test('create mode keeps both editable fields and its two-field navigation, and its payload carries no mode marker', () => {
     const { view, finished } = openPanel({ initialName: 'new-change' });
-    view.handleInput('down'); // type -> name
+    focusName(view);
     typeText(view, '-2');
     assert.equal(view.state.name, 'new-change-2', 'the create name is still editable');
-    view.handleInput('down'); // S6: nothing sits below the name while creating
+    view.handleInput('down'); // S12: nothing sits below the name while creating
     assert.equal(view.state.focus, 'name');
     view.handleInput('up'); // -> type
     assert.equal(view.state.focus, 'type');
-    view.handleInput('right');
-    assert.equal(view.state.typeIndex, 1, '←/→ still cycle the type while creating');
+    view.handleInput('down');
+    assert.equal(view.state.typeIndex, 1, '↑/↓ pick the type in place');
+    view.handleInput('\t');
+    assert.equal(view.state.focus, 'name', 'tab still moves to the name');
     view.handleInput('\x13');
     assert.equal(finished.length, 1);
     assert.ok(!('mode' in finished[0]), 'a creation carries no mode marker');
@@ -753,24 +808,13 @@ describe('S2: one-row key legends', { concurrency: false }, () => {
   test('the create legend owns exactly one row at every width', () => {
     for (const width of WIDTHS) {
       const { view } = openPanel();
-      const lines = boxLines(view, width, 24);
+      const lines = renderedLines(view, width);
       const legend = legendRows(lines, LEGEND);
       assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
       assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
-      assert.match(legend[0], /↑\/↓/, `width ${width}: the field keys survive`);
+      assert.match(legend[0], /confirm/, `width ${width}: the confirm key survives`);
       assert.match(legend[0], /Esc cancel/, `width ${width}: the cancel key survives`);
-    }
-  });
-
-  test('the type sub-panel legend owns exactly one row at every width', () => {
-    for (const width of WIDTHS) {
-      const { view } = openPanel();
-      view.handleInput('enter');
-      const lines = boxLines(view, width, 24);
-      const legend = legendRows(lines, /Esc close|Enter pick/);
-      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
-      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
-      assert.match(legend[0], /Esc close/, `width ${width}: the close key survives`);
+      assert.ok(!legend[0].includes('Step'), `width ${width}: no step counter rides the footer`);
     }
   });
 
