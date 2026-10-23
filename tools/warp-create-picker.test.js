@@ -404,6 +404,43 @@ describe('the reusable multi-select component', { concurrency: false }, () => {
     assert.equal(view.state.mode, 'search', 'editing stays in the field');
   });
 
+  // S4/S12: while the search field is active, Delete clears what was typed in
+  // one keystroke instead of erasing it character by character. Backspace
+  // keeps its one-character meaning, and neither key leaves the field.
+  test('Delete clears the whole active query while Backspace removes one character', () => {
+    const { view, finished } = open({ pageSize: 12 });
+    view.handleInput('t');
+    for (const char of 'row 1') view.handleInput(char);
+    assert.equal(view.state.query, 'row 1');
+    view.handleInput('\x1b[3~'); // the raw Delete sequence
+    assert.equal(view.state.query, '', 'one Delete clears everything typed');
+    assert.equal(view.state.mode, 'search', 'the search field stays active');
+    assert.equal(view.state.page, 0);
+    assert.ok(textOf(view).includes('row 6'), 'the full list is visible again');
+    assert.deepEqual(finished, [], 'clearing the query never completes the step');
+
+    for (const char of 'row 2') view.handleInput(char);
+    view.handleInput('backspace');
+    assert.equal(view.state.query, 'row ', 'Backspace still removes exactly one character');
+    view.handleInput('delete');
+    assert.equal(view.state.query, '', 'the installed matcher spelling clears it too');
+  });
+
+  test('the search footer advertises the clear key on its one row', () => {
+    for (const width of [40, 80, 120]) {
+      const { view } = open({ pageSize: 12 });
+      view.handleInput('t');
+      const lines = view.render(width).map((line) => String(line).replace(/\x1b\[[0-9;]*m/g, ''));
+      const legend = lines.filter((line) => /filter kept|back to list|tab|clear|esc cancel/i.test(line));
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.match(legend[0], /clear/i, `width ${width}: the active search names the clear key: ${legend[0]}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      view.handleInput('\x1b'); // leave the field for the list
+      const listLines = view.render(width).map((line) => String(line).replace(/\x1b\[[0-9;]*m/g, ''));
+      assert.equal(listLines.filter((line) => /clear/i.test(line)).length, 0, `width ${width}: no clear hint while no search is active`);
+    }
+  });
+
   test('escape cancels the whole step', () => {
     const { view, finished } = open();
     view.handleInput('down');

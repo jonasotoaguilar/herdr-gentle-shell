@@ -1,6 +1,7 @@
 'use strict';
-// T2/T3 (warp S2,S3,S4,S5,S6,S9,S12,S16) tests: lib/warp-selector-view.js —
-// the warp surface as ONE component with two views: the S4 bottom panel
+// T2/T3 + T4 (warp S2,S3,S4,S5,S6,S9,S12,S16; worktree-ui-feedback S4,S12,S15)
+// tests: lib/warp-selector-view.js — the warp surface as ONE component with
+// two views: the S4 bottom panel
 // (title, the current worktree's name, its data line, a separator, up to five
 // worktree rows, an optional `view all worktrees` row, the focused worktree's
 // data line, the one-row key legend) and the extended list (always-active
@@ -19,11 +20,15 @@
 // line carries branch, the issue and odd COUNTS, the change size as LINE
 // COUNTS (`changes +A −D`, S16), `↑N ↓M` and both ages, omits a measured zero
 // for the change size and for each of `↑`/`↓`, and says `unavailable` — never
-// `0` — for a fact it cannot read; the facts are read for the current and the
+// `0` — for a fact it cannot read, while an unreadable AGE is the brief `—`
+// and never the caller's prose reason (S15: the reason stays in the data);
+// the facts are read for the current and the
 // focused checkout, at most once each, and render() performs no I/O; `c`
 // opens the create flow instead of owning a list row (S6) while `e`, `v`,
 // `enter`, `r` and `esc` keep their meanings; `esc` steps back one level from
-// the list; no key outside the documented map changes state.
+// the list; while the search is active `delete` clears the whole query and
+// `backspace` edits one character, and the delete legend names the real
+// `ctrl+d` binding (S4/S12); no key outside the documented map changes state.
 //
 // The panel frame is pinned: 7 fixed rows (top rule, current name, current
 // data, separator, focused data, legend, bottom rule) plus up to five
@@ -71,7 +76,11 @@ const CHECKOUTS = [
 const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
 // The same facts rendered, so an assertion names the behaviour, not the
 // formatter's punctuation.
-const DEFAULT_LINE = 'branch feat/alpha · issues 1 · odd 1 · changes +2 −1 · ↑1 · created 28d ago · modified unavailable';
+const DEFAULT_LINE = 'branch feat/alpha · issues 1 · odd 1 · changes +2 −1 · ↑1 · created 28d ago · modified —';
+// S15: the two ages are the facts that carry a prose reason when they are
+// unreadable, so a compact preview line names them with a dash instead of
+// repeating that explanation. The reason itself stays in the data.
+const NO_AGES = 'created — · modified —';
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -277,7 +286,7 @@ describe('current worktree data line (S4a)', () => {
     const frame = panel(view, WIDE);
     assert.equal(
       frame.currentData,
-      'branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · created unavailable · modified unavailable',
+      `branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`,
     );
     assert.ok(!frame.currentData.includes(' 0'), 'a failed read never claims a number');
   });
@@ -297,7 +306,7 @@ describe('focused checkout facts (S4d, S9)', () => {
   test('every fact that cannot be read renders unavailable, never zero', async () => {
     const { view } = await opened({ facts: () => null });
     const frame = panel(view, WIDE);
-    assert.equal(frame.focusData, 'branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · created unavailable · modified unavailable');
+    assert.equal(frame.focusData, `branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`);
   });
 
   test('more associations never widen the line: only their counts render', async () => {
@@ -316,8 +325,8 @@ describe('focused checkout facts (S4d, S9)', () => {
       ['changes', 'changes unavailable'],
       ['ahead', '↑unavailable'],
       ['behind', '↓unavailable'],
-      ['createdAt', 'created unavailable'],
-      ['lastActivity', 'modified unavailable'],
+      ['createdAt', 'created —'],
+      ['lastActivity', 'modified —'],
     ];
     for (const [field, expected] of cases) {
       const facts = { ...BASE, [field]: field === 'createdAt' ? 'unavailable' : null };
@@ -399,7 +408,7 @@ describe('ordering and both ages (S12)', () => {
     { name: 'dirty-fresh', path: '/w/dirty-fresh', branch: 'feat/df', lastActivity: ago(3600_000) },
   ];
 
-  test('orders the rows by last activity descending, keeps the unreadable one last and shows its reason', async () => {
+  test('orders the rows by last activity descending, keeps the unreadable one last and never prints its reason', async () => {
     const { view } = await opened({ checkouts: ORDERED, current: { name: 'cur', path: '/w/cur' }, facts: () => null });
     const rows = panel(view, WIDE).worktrees;
     assert.match(rows[0], /^▸ commit-fresh/, 'the most recent commit leads and takes the focus');
@@ -411,8 +420,11 @@ describe('ordering and both ages (S12)', () => {
     await tick();
     const focused = panel(view, WIDE);
     assert.match(focused.worktrees[3], /^▸ open/);
-    assert.ok(focused.focusData.includes('modified not a git repository'), `the reason replaces a fake date: ${focused.focusData}`);
+    assert.ok(focused.focusData.endsWith('modified —'), `a brief value replaces a fake date: ${focused.focusData}`);
+    assert.ok(!focused.focusData.includes('not a git repository'), `the reason stays out of the row: ${focused.focusData}`);
     assert.ok(!/modified 20\d\d/.test(focused.focusData));
+    const stored = view.state.checkouts.find((entry) => entry.path === '/w/open');
+    assert.equal(stored.lastActivityReason, 'not a git repository', 'the provenance is kept in data');
   });
 
   test('the extended list keeps the same order', async () => {
@@ -436,7 +448,44 @@ describe('ordering and both ages (S12)', () => {
     assert.ok(line({ createdAt: ago(86400_000), lastActivity: ago(2 * 86400_000) }).endsWith('created 1d ago · modified 2d ago'));
     assert.ok(line({ createdAt: ago(30 * 86400_000), lastActivity: ago(60 * 86400_000) }).endsWith('created 1mo ago · modified 2mo ago'));
     assert.ok(line({ createdAt: ago(365 * 86400_000), lastActivity: ago(2 * 365 * 86400_000) }).endsWith('created 1y ago · modified 2y ago'));
-    assert.ok(line({ createdAt: null, lastActivity: null }).endsWith('created unavailable · modified unavailable'));
+    assert.ok(line({ createdAt: null, lastActivity: null }).endsWith(NO_AGES));
+  });
+});
+
+// S15: "las preview son breves, no puedes poner ese texto entenso para ese
+// caso de modified". The screenshot showed `modified no activity since the
+// checkout was created`; a compact row now carries the brief value only, and
+// the provenance the caller supplied stays available in the component's data.
+describe('S15: compact facts rows never print the raw reason', () => {
+  const LONG = 'no activity since the checkout was created';
+  const WITH_REASON = { ...DEFAULT_FACTS, lastActivity: null, lastActivityReason: LONG };
+
+  test('an unreadable age renders a dash instead of the long explanation', async () => {
+    const { view } = await opened({ facts: () => WITH_REASON });
+    const frame = panel(view, WIDE);
+    assert.ok(frame.focusData.endsWith('created 28d ago · modified —'), `the readable age survives and the other stays brief: ${frame.focusData}`);
+    assert.ok(!frame.focusData.includes(LONG), `no prose reason in the row: ${frame.focusData}`);
+    assert.ok(!frame.currentData.includes(LONG), `nor under the current worktree: ${frame.currentData}`);
+    assert.ok(!frame.lines.join('\n').includes('activity since'), 'the reason appears nowhere on screen');
+  });
+
+  test('a row-level reason is kept as data and never rendered', async () => {
+    const checkouts = [
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      { name: 'stale', path: '/w/stale', branch: 'feat/stale', lastActivity: null, lastActivityReason: LONG },
+    ];
+    const { view } = await opened({ checkouts, current: { name: 'cur', path: '/w/cur' }, facts: () => null });
+    const frame = panel(view, WIDE);
+    assert.match(frame.worktrees[0], /^▸ stale/, 'the unreadable row still sorts last and takes the focus');
+    assert.ok(frame.focusData.endsWith('modified —'), `the row's own reason is not printed: ${frame.focusData}`);
+    const stored = view.state.checkouts.find((entry) => entry.path === '/w/stale');
+    assert.equal(stored.lastActivityReason, LONG, 'the provenance survives in the component data');
+  });
+
+  test('the created age uses the same brief form, and a real timestamp is never replaced', async () => {
+    const line = (facts) => formatFactsLine(facts, { now: NOW });
+    assert.ok(line({ createdAt: { available: false, reason: 'birthtime unavailable on this filesystem' }, lastActivity: { available: false, reason: LONG } }).endsWith(NO_AGES));
+    assert.ok(line({ createdAt: '2026-02-01', lastActivity: ago(2 * 86400_000) }).endsWith('created 28d ago · modified 2d ago'), 'readable values never lose their age');
   });
 });
 
@@ -743,6 +792,73 @@ describe('S1: render performs no I/O and enrichment keeps the selection', () => 
   });
 });
 
+// S12/S4: Delete clears the WHOLE query only while the search field is
+// active, Backspace still removes one character, and neither of them ever
+// signals a worktree deletion — that stays ctrl+d on an eligible row.
+describe('S12: Delete clears the search, Backspace edits it', () => {
+  const filterRow = (view, width = WIDTH) => screen(view, width).rows[1];
+
+  test('Delete empties the whole query while the search is active', async () => {
+    const { view, results } = await opened();
+    view.handleInput('v');
+    for (const char of 'alpha') view.handleInput(char);
+    assert.equal(view.state.filter, 'alpha');
+    view.handleInput('\x1b[3~'); // the raw Delete sequence
+    assert.equal(view.state.filter, '', 'one Delete clears everything typed');
+    assert.equal(view.state.filterOpen, true, 'the search stays active');
+    assert.equal(view.state.listCursor, 0, 'the cursor starts over on the full list');
+    assert.equal(filterRow(view), 'filter: ▏', 'the empty query is back in the field');
+    assert.ok(!screen(view).rows.slice(2, 17).join('\n').includes('no matches'), 'every row is visible again');
+    assert.deepEqual(results, [], 'clearing a search never resolves a deletion');
+  });
+
+  test('the installed matcher spelling of Delete clears it too', async () => {
+    const { view } = await opened();
+    view.handleInput('v');
+    for (const char of 'beta') view.handleInput(char);
+    view.handleInput('delete');
+    assert.equal(view.state.filter, '');
+  });
+
+  test('Backspace still deletes exactly one character', async () => {
+    const { view } = await opened();
+    view.handleInput('v');
+    for (const char of 'alpha') view.handleInput(char);
+    view.handleInput('backspace');
+    assert.equal(view.state.filter, 'alph');
+    view.handleInput('\x7f');
+    assert.equal(view.state.filter, 'alp');
+  });
+
+  test('Delete with the search closed changes nothing and deletes no worktree', async () => {
+    const { view, results } = await opened({ canDelete: (path) => path === '/w/feat-alpha' });
+    view.handleInput('down');
+    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'an eligible row is focused');
+    const before = JSON.parse(JSON.stringify(view.state));
+    view.handleInput('\x1b[3~');
+    assert.deepEqual(results, [], 'Delete is not a deletion binding');
+    assert.deepEqual(view.state, before, 'and it changes no state');
+    assert.match(panel(view, WIDE).legend, /ctrl\+d delete/, 'the legend keeps naming the real delete key');
+  });
+
+  test('the footer advertises Delete clear on one row only while the search is active', async () => {
+    for (const width of [40, 80, 120]) {
+      const { view } = await opened();
+      view.handleInput('v');
+      view.handleInput('T');
+      const open = view.render(width).map(strip);
+      const openLegend = open[open.length - 2];
+      assert.match(openLegend, /clear/, `width ${width}: the active search names the clear key: ${openLegend}`);
+      assert.equal(open.filter((line) => /clear/.test(line)).length, 1, `width ${width}: hints stay on the one footer row`);
+      assert.ok(!openLegend.includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${openLegend}`);
+      view.handleInput('\x1b'); // close the search, keeping the query
+      const closed = view.render(width).map(strip);
+      assert.ok(!/clear/.test(closed[closed.length - 2]), `width ${width}: no clear hint when no search is active`);
+      assert.equal(closed.length, HEIGHT, `width ${width}: the legend takes no extra row`);
+    }
+  });
+});
+
 describe('keys that are not in the map', () => {
   test('no key outside the documented map changes the panel state', async () => {
     const { view, results } = await opened();
@@ -933,7 +1049,7 @@ describe('S24: Ctrl+D on a deletable panel row', () => {
     assert.deepEqual(view.state, before);
   });
 
-  test('the delete token rides the one-row legend where it fits and drops before esc', async () => {
+  test('the delete token names the ACTUAL ctrl+d binding where it fits and drops before esc', async () => {
     for (const width of [40, 60, 80, 120]) {
       const { view } = await opened({ canDelete: registered });
       view.handleInput('down');
@@ -942,23 +1058,24 @@ describe('S24: Ctrl+D on a deletable panel row', () => {
       assert.equal(helpers.visibleWidth(frame.lines[frame.lines.length - 2]), width, `width ${width}: the legend row is cell-exact`);
       assert.ok(!frame.legend.includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${frame.legend}`);
       assert.match(frame.legend, /esc close/, `width ${width}: the close key outlives the delete key: ${frame.legend}`);
-      assert.equal(/del/.test(frame.legend), width >= 60, `width ${width}: delete is named where it fits: ${frame.legend}`);
+      assert.ok(!/\bdel delete\b|(^|· )del( ·|$)/.test(frame.legend), `width ${width}: the legend never claims a bare del key: ${frame.legend}`);
+      assert.equal(/ctrl\+d/.test(frame.legend), width >= 60, `width ${width}: the real binding is named where it fits: ${frame.legend}`);
     }
     const wide = await opened({ canDelete: registered });
     wide.view.handleInput('down');
     assert.equal(
       panel(wide.view, 120).legend,
-      '↑↓ move · enter choose · c create · e edit · del delete · r reload · esc close',
-      'the full legend names the delete key between edit and reload',
+      '↑↓ move · enter choose · c create · e edit · ctrl+d delete · r reload · esc close',
+      'the full legend names the real ctrl+d binding between edit and reload',
     );
   });
 
   test('a row the rule refuses leaves the legend without the delete token', async () => {
     const { view, results } = await opened({ canDelete: registered });
     assert.match(panel(view).worktrees[0], /^▸ main /, 'the principal is focused first');
-    assert.ok(!panel(view).legend.includes('del'), `nothing to delete, so nothing is advertised: ${panel(view).legend}`);
+    assert.ok(!/ctrl\+d/.test(panel(view).legend), `nothing to delete, so nothing is advertised: ${panel(view).legend}`);
     view.handleInput('down');
-    assert.match(panel(view).legend, /del/, 'moving onto a deletable row names the key');
+    assert.match(panel(view, WIDE).legend, /ctrl\+d delete/, 'moving onto a deletable row names the real key');
     view.handleInput('\x04');
     assert.deepEqual(results, [{ delete: DELETABLE }]);
   });
