@@ -78,12 +78,12 @@ T9 | S1-S2,S11-S13 | route: automatic harness repair/retry made obsolete by expl
 
 T10 | S1-S2,S11-S14 | route: manual guide read back and structurally checked; 7 unchecked controls, no UI or test launch | status: done | commit: 186df4d
 T11 | S17,S19 | route: rows gated on host declaration; unsupported builds get one truthful sentence; customize-panel 80/80 | status: done | commit: 854388e
-T12 | S18 | route: run identity + process RAM/CPU samples + comparator/report with comparability guards | status: pending | commit: none yet
+T12 | S18,S24 | route: run identity + process RAM/CPU samples + analyzer/report implemented; activation now environment-only | status: done | commit: 3246463,d4424e8
 T13 | S17 | route: four inert keys removed from the live settings.json; backup settings.json.bak-20261023-162912; diff shows only those 4 lines | status: done | commit: no code
 T14 | S20 | route: superseded by T16, which deletes the whole performance surface instead of only the four settings | status: dropped | commit: no code
 T15 | S21 | route: dropped — collapsing other tools' output optimises Pi's transcript, not this plugin's own features; S21 is superseded by S22/S23 | status: dropped | commit: no code
-T16 | S22,S24 | route: section and host settings deleted (-3532/+594 over 21 files); trace activated by GENTLE_PERF_TRACE; flag file, panel row and writer gone; suite 1954/1954 0 fail 0 skip | status: done | commit: pending
-T17 | S23 | route: optimise this plugin's own surfaces (load, view render, daemon/polling, spawns) with evidence, no host knobs | status: pending | commit: none yet
+T16 | S22,S24 | route: section and host settings deleted (-3532/+594 over 21 files); trace activated by GENTLE_PERF_TRACE; flag file, panel row and writer gone; suite 1954/1954 0 fail 0 skip | status: done | commit: d4424e8
+T17 | S23 | route: import safety and async shared pending repository listing; parent suite1965/1965 and independent150/150+10probes; no host change or wall-clock speedup claim | status: done | commit: 76a5f67; listing unit recorded in L51
 
 ## Log
 
@@ -171,4 +171,8 @@ one review. Boundaries, in commit order:
 - Slice 2 — manual guide and delivery state: `186df4d`, `f1f69a2`.
 - Slice 3 — performance honesty: host gating `854388e`, trace run identity/RAM/CPU `3246463`, section
   removal and env-gated trace `d4424e8`. This slice is the CLOSED boundary: the next commit opens slice 4.
-- Slice 4 (next) — T17, optimising this package's own load, view render, daemon and spawns.
+- Slice 4 — T17, plugin-only import safety (`76a5f67`) and asynchronous pending-listing coalescing (commit `perf(worktree): share asynchronous listings across concurrent facts`, recorded in Git alongside this document). Closed; no additional host tuning.
+
+L50. Corrected evidence: the 6.1 ms parse probe rejected ESM syntax, so it is not extension load evidence. Independent source audit found N identical synchronous git worktree listings across N cold checkout facts; Promise.all invokes those prefixes synchronously. T17 will reuse the existing parser and async runner, coalesce only concurrent listings, and preserve refresh freshness and invalidation. No host/fork changes or long-lived stale cache. Risk: item 4 (in-flight ownership and invalidation); independent verification required.
+
+L51. T17 closed with a bounded plugin-only improvement: checkout facts now use listWorktreesAsync (existing parser/async runner), sharing a repository listing only while pending. Later batches fetch fresh; failure releases ownership; invalidate removes pending ownership and late completions cannot clear a newer owner or repopulate invalidated facts. Existing sync listing API stays unchanged. RED: 8 new tests failed on base; GREEN54/54 focused, parent full suite1965/1965,0fail,0skip. Independent verification150/150 tests plus10/10 public probes, including invalidate(null), provider isolation, repoRoot-less ownership and differential equality to76a5f67. No blockers; the undocumented monkeypatch seam advisory needs no compatibility shim (documented opts.listWorktrees remains supported). LSP: CommonJS conversion hints and existing nested-ternary advisories, no errors. ASSESS native medium, agent escalation item4/high, reviewDuefalse under_budget: separate verifier completed; no native START/approval claimed. Deterministic benefit is N pending identical listings ->1 and no synchronous listing in the checkout-facts default; no end-to-end timing, RAM or CPU percentage improvement is claimed. This closes the scoped listing work; remaining explicit sync APIs/callers and unrelated view/daemon behavior were not rewritten. Manual UI acceptance T1/T7 remains separate and unchanged. Risk: item4 (concurrency).

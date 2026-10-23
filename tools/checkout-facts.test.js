@@ -128,6 +128,29 @@ function makeFacts(root, extra = {}) {
   });
 }
 
+// Deterministic async control for the listing seam: the test decides WHEN a
+// listing settles, so coalescing and ownership are asserted by call counts
+// instead of wall-clock thresholds.
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+// Drain pending microtasks/timers until `predicate` holds, without assuming a
+// duration: only the number of yields is bounded, never a speed claim.
+async function until(predicate, label) {
+  for (let i = 0; i < 200; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`never observed: ${label}`);
+}
+
 function countingRunner() {
   const calls = [];
   return {
@@ -271,6 +294,46 @@ describe('worktree-git listWorktrees (unchanged behaviour)', { concurrency: fals
   test('a directory that is not a repository still throws', () => {
     const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-notrepo-list-')));
     assert.throws(() => gitLib.listWorktrees(notRepo), /git worktree list failed/);
+  });
+});
+
+// T17/S23: the async twin an interactive path uses so a repository listing
+// never blocks the host event loop. Same fixed argv, same parser, same
+// entries as the sync API — a faster path may not answer differently.
+describe('worktree-git listWorktreesAsync (T17)', { concurrency: false }, () => {
+  test('lists the principal, linked and detached checkouts exactly like the sync API', async () => {
+    const root = makeRepo('async-listing');
+    const linked = addWorktree(root, 'feat/async-listing');
+    const detached = fs.realpathSync(track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-wt-detached-'))));
+    git(root, ['worktree', 'add', '--detach', detached, 'HEAD']);
+    const listed = await gitLib.listWorktreesAsync(root);
+    assert.deepEqual(listed, gitLib.listWorktrees(root));
+    // Order is git's business, identity is the contract: compare per path.
+    const byPath = new Map(listed.map((entry) => [path.resolve(entry.path), entry]));
+    assert.equal(byPath.size, 3);
+    for (const [entryPath, branch, isDetached] of [
+      [root, 'main', false],
+      [linked, 'feat/async-listing', false],
+      [detached, null, true],
+    ]) {
+      const entry = byPath.get(entryPath);
+      assert.ok(entry, `missing listing entry for ${entryPath}`);
+      assert.equal(entry.branch, branch);
+      assert.equal(entry.detached, isDetached);
+      assert.equal(entry.bare, false);
+      assert.match(entry.head, /^[0-9a-f]{40}$/);
+    }
+  });
+
+  test('a directory that is not a repository rejects with the same message', async () => {
+    const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-notrepo-async-')));
+    await assert.rejects(() => gitLib.listWorktreesAsync(notRepo), /git worktree list failed/);
+  });
+
+  test('a blown-up runner resolves as an error, never as an empty listing', async () => {
+    const root = makeRepo('async-listing-error');
+    const runAsync = async () => ({ status: null, stdout: '', stderr: '', error: 'spawn unavailable' });
+    await assert.rejects(() => gitLib.listWorktreesAsync(root, { runAsync }), /git worktree list failed/);
   });
 });
 
@@ -764,5 +827,157 @@ describe('checkout-facts', { concurrency: false }, () => {
     writeRow(root, { ...fullRow(wt, 'feat/odd-none'), odd: null });
     const got = await makeFacts(root).facts(wt);
     assert.deepEqual(got.odd, { available: true, value: [], reason: null });
+  });
+});
+
+// T17/S23: the repository listing is ONE read while it is pending. Before
+// this, `Promise.all` over N checkouts ran N identical synchronous
+// `git worktree list` spawns, because each facts() call listed the repository
+// inline. The fix coalesces only the PENDING listing: nothing settles into a
+// long-lived cache, so a later read still asks git again.
+const gitEntry = (entryPath, branch) => ({
+  path: entryPath, branch, head: null, detached: false, bare: false,
+});
+
+// Isolate the LISTING: every other git read is stubbed, so a runner call can
+// only be the repository listing. That makes the count an exact statement
+// about coalescing instead of an incidental total.
+function listingOnlyFacts(root, extra = {}) {
+  return factsLib.createCheckoutFacts({
+    repoRoot: root,
+    ttlMs: 5000,
+    now: () => 1000,
+    summarize: async () => ({ ok: true, files: 0, added: 0, deleted: 0, binaryCount: 0, entries: [] }),
+    aheadBehind: async () => ({ ok: true, ahead: 0, behind: 0, base: 'main', baseSource: 'explicit' }),
+    lastCommit: async () => ({ ok: true, timestampMs: 1_700_000_000_000 }),
+    firstCommit: async () => ({ ok: true, timestampMs: 1_600_000_000_000 }),
+    ...extra,
+  });
+}
+
+describe('checkout-facts: one shared repository listing (T17, S23)', { concurrency: false }, () => {
+  test('three concurrent checkout facts list the repository once and keep their own branches', async () => {
+    const root = makeRepo('shared-listing');
+    const wtA = addWorktree(root, 'feat/shared-a');
+    const wtB = addWorktree(root, 'feat/shared-b');
+    const runner = countingRunner();
+    const facts = listingOnlyFacts(root, { runAsync: runner.runAsync });
+    const [principal, a, b] = await Promise.all([facts.facts(root), facts.facts(wtA), facts.facts(wtB)]);
+    assert.deepEqual(runner.calls, ['git worktree list --porcelain -z']);
+    assert.deepEqual(principal.branch, { available: true, value: 'main', reason: null, detached: false });
+    assert.equal(principal.createdAt.source, 'root-commit');
+    assert.deepEqual(a.branch, { available: true, value: 'feat/shared-a', reason: null, detached: false });
+    assert.deepEqual(b.branch, { available: true, value: 'feat/shared-b', reason: null, detached: false });
+  });
+
+  test('the default listing runs through the async runner, never the sync spawn', async () => {
+    const root = makeRepo('async-default-listing');
+    const runner = countingRunner();
+    const facts = listingOnlyFacts(root, { runAsync: runner.runAsync });
+    await facts.facts(root);
+    assert.deepEqual(runner.calls, ['git worktree list --porcelain -z']);
+  });
+
+  test('a later batch lists again instead of reusing a settled listing', async () => {
+    const root = makeRepo('renamed-branch');
+    const wt = addWorktree(root, 'feat/rename');
+    const runner = countingRunner();
+    let clock = 1000;
+    const facts = listingOnlyFacts(root, { runAsync: runner.runAsync, now: () => clock });
+    const first = await facts.facts(wt);
+    assert.equal(first.branch.value, 'feat/rename');
+    assert.deepEqual(runner.calls, ['git worktree list --porcelain -z']);
+    git(wt, ['branch', '-m', 'feat/renamed']);
+    clock += 5001; // past the per-checkout TTL, so this read is cold again
+    const second = await facts.facts(wt);
+    assert.equal(second.branch.value, 'feat/renamed');
+    assert.deepEqual(runner.calls, [
+      'git worktree list --porcelain -z',
+      'git worktree list --porcelain -z',
+    ]);
+  });
+
+  test('a failed listing is shared once, then retried by the next read', async () => {
+    const root = makeRepo('listing-retry');
+    const wtA = addWorktree(root, 'feat/retry-a');
+    const wtB = addWorktree(root, 'feat/retry-b');
+    const wtC = addWorktree(root, 'feat/retry-c');
+    let calls = 0;
+    const facts = listingOnlyFacts(root, {
+      listWorktrees: async (repo) => {
+        calls += 1;
+        if (calls === 1) throw new Error('listing exploded');
+        return gitLib.listWorktrees(repo);
+      },
+    });
+    const [a, b] = await Promise.all([facts.facts(wtA), facts.facts(wtB)]);
+    assert.equal(calls, 1, 'a pending rejection is shared, not retried per checkout');
+    for (const got of [a, b]) {
+      assert.equal(got.branch.available, false);
+      assert.equal(got.branch.value, null);
+      assert.match(got.branch.reason, /listing exploded/);
+    }
+    const retried = await facts.facts(wtC);
+    assert.equal(calls, 2, 'the rejected listing must not stay owned');
+    assert.deepEqual(retried.branch, { available: true, value: 'feat/retry-c', reason: null, detached: false });
+  });
+
+  // PRESERVE: the seam stays injectable as sync OR async, and the async
+  // default answers exactly what the previous synchronous path answered.
+  test('a synchronous listing override answers the same as the async default', async () => {
+    const root = makeRepo('sync-override');
+    const wt = addWorktree(root, 'feat/sync-override');
+    let calls = 0;
+    const injected = listingOnlyFacts(root, {
+      listWorktrees: (repo) => {
+        calls += 1;
+        return gitLib.listWorktrees(repo);
+      },
+    });
+    const [fromSync, fromDefault] = await Promise.all([injected.facts(wt), listingOnlyFacts(root).facts(wt)]);
+    assert.equal(calls, 1);
+    assert.deepEqual(fromSync, fromDefault);
+    assert.deepEqual(fromSync.branch, { available: true, value: 'feat/sync-override', reason: null, detached: false });
+  });
+
+  test('invalidating a pending listing cannot interfere with newer work', async () => {
+    const root = makeRepo('invalidate-pending');
+    const wtA = addWorktree(root, 'feat/invalidate-a');
+    const wtB = addWorktree(root, 'feat/invalidate-b');
+    const pending = [];
+    const facts = listingOnlyFacts(root, {
+      listWorktrees: () => {
+        const next = deferred();
+        pending.push(next);
+        return next.promise;
+      },
+    });
+    const firstRead = facts.facts(wtA);
+    await until(() => pending.length === 1, 'the first listing to be requested');
+    // A concurrent checkout of the SAME repository rides the pending listing.
+    const concurrentRead = facts.facts(wtB);
+    // Yields only, no timing claim: any listing the concurrent read starts is
+    // requested long before this loop ends.
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pending.length, 1, 'a concurrent checkout must share the pending listing');
+    // An invalidate() drops the PENDING listing too: a listing that began
+    // before the change it invalidated may not be served to a later read.
+    facts.invalidate(wtA);
+    const secondRead = facts.facts(wtA);
+    await until(() => pending.length === 2, 'the post-invalidate listing');
+    pending[1].resolve([gitEntry(root, 'main'), gitEntry(wtA, 'feat/fresh'), gitEntry(wtB, 'feat/invalidate-b')]);
+    const fresh = await secondRead;
+    assert.equal(fresh.branch.value, 'feat/fresh');
+    // The superseded reads still settle with their own (older) answer...
+    pending[0].resolve([gitEntry(root, 'main'), gitEntry(wtA, 'feat/stale'), gitEntry(wtB, 'feat/invalidate-b')]);
+    const stale = await firstRead;
+    assert.equal(stale.branch.value, 'feat/stale');
+    assert.equal((await concurrentRead).branch.value, 'feat/invalidate-b');
+    // ...without clearing the newer ownership or repopulating the cache.
+    assert.equal(facts.peek(wtA).branch.value, 'feat/fresh');
+    const again = await facts.facts(wtA);
+    assert.equal(again.branch.value, 'feat/fresh');
+    assert.equal(again.cached, true);
+    assert.equal(pending.length, 2, 'a cached read must not list again');
   });
 });
