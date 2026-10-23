@@ -161,3 +161,14 @@ L47. Optimisation scope narrowed to the plugin's own code, verbatim: "Solo optim
 L48. User kept the trace but moved its switch out of the UI, verbatim: "o deja el trace pero que no se active por customize sino una variable de entorno". Final shape: GENTLE_PERF_TRACE enables it at load; no flag file, no panel row, no customize category; the Performance section disappears with the four host settings; the analyzer, the report CLI and docs/performance-trace.md stay.
 
 L49. T16 delivered and parent-verified. Deleted: lib/customize-perf-rows.js, lib/pi-perf-settings.js (settings.json writer + four-key reader), lib/pi-perf-support.js (installed-Pi scan) and their two test files; the customize panel now has sidebar/moshi/worktree/reset only. Activation of the trace is a single environment read, `GENTLE_PERF_TRACE` exactly `1` or `true`, wrapped so a hostile env returns false: no flag file, no stat cache, no writer, and the disabled path touches no file. Kept: run identity on every record, session snapshot (piVersion/run/pid/uptimeMs/tuiMode via read-only lib/host-settings.js), render/observer/resource/daemon kinds, rotation and allowlists, lib/perf-analyze.js with the piVersion/tuiMode/MIN_FRAMES guards, bin/gentle-perf-report.js (now teaching the env variable), perfTraceView on its five call sites, and docs/performance-trace.md rewritten around export -> run -> report. The parent removed the last residue the worker could not touch: 'gentle-perf-trace.json' is gone from STATE_KNOWN_FILES in lib/worktree-mode.js. Verification: grep for the four setting names, the deleted modules and the old trace-mode symbols returns only the test that pins their absence; the one remaining 'Performance' hit in the extension is WARP_CHANGE_TYPES (a Conventional-Commit type), not the removed section. Full isolated suite: 1954 tests, 1954 pass, 0 fail, 0 skip, exit 0.
+
+## Delivery slices (recorded, not published)
+
+The branch carries the whole thread since `origin/main`, so it is delivered as behaviour slices, never
+one review. Boundaries, in commit order:
+
+- Slice 1 — UI feedback round: layout, readers, editors, warp/create, ODD integration. Ends at `9fca719`.
+- Slice 2 — manual guide and delivery state: `186df4d`, `f1f69a2`.
+- Slice 3 — performance honesty: host gating `854388e`, trace run identity/RAM/CPU `3246463`, section
+  removal and env-gated trace `d4424e8`. This slice is the CLOSED boundary: the next commit opens slice 4.
+- Slice 4 (next) — T17, optimising this package's own load, view render, daemon and spawns.
