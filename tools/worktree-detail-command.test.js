@@ -815,3 +815,509 @@ describe('S12 feedback: create is a bottom interaction', { concurrency: false },
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// ui-consistency-round3 T9/S18 (L6): the detail must MOUNT before its slow
+// reads. The command used to serially await assignment verification, the whole
+// open-issue prime and the checkout facts, so a cold repository showed nothing
+// until every gh/git call had finished. This suite pins the progressive
+// contract on the exported `openWorktreeDetail` seam: the overlay exists first,
+// the stored assignment/ODD paint immediately, no count or fact is invented,
+// and the SAME mounted view is enriched as each independent read lands.
+// ---------------------------------------------------------------------------
+describe('T9 S18: the detail mounts before its slow reads', { concurrency: false }, () => {
+  const gitLib = require('../lib/worktree-git.js');
+
+  function deferred() {
+    let resolve = () => {};
+    let reject = () => {};
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  const METADATA_JSON = `${JSON.stringify({
+    data: {
+      repository: {
+        viewerPermission: 'WRITE',
+        issue: {
+          assignees: { nodes: [{ login: 'ana' }], pageInfo: { hasNextPage: false } },
+          closedByPullRequestsReferences: { totalCount: 0 },
+        },
+      },
+    },
+  })}\n`;
+
+  const PROJECTS_JSON = `${JSON.stringify({
+    data: { repository: { issue: { projectItems: { nodes: [], pageInfo: { hasNextPage: false } } } } },
+  })}\n`;
+
+  function graphqlOpenPayload(numbers) {
+    const rows = numbers.map((number) => ({
+      number,
+      title: `issue title ${number}`,
+      state: 'OPEN',
+      stateReason: '',
+      url: `https://example.test/issues/${number}`,
+      createdAt: '2024-01-01T00:00:00Z',
+      updatedAt: `2024-01-0${(number % 9) + 1}T00:00:00Z`,
+      author: { login: 'octo' },
+      labels: { nodes: [] },
+      comments: { totalCount: 0 },
+      reactionGroups: [],
+    }));
+    return {
+      status: 0,
+      stderr: '',
+      stdout: `${JSON.stringify({
+        data: {
+          repository: {
+            issues: { totalCount: rows.length, pageInfo: { hasNextPage: false, endCursor: null }, nodes: rows },
+          },
+        },
+      })}\n`,
+    };
+  }
+
+  function issueViewJson(number, { state = 'open', comments = [] } = {}) {
+    return {
+      status: 0,
+      stderr: '',
+      stdout: `${JSON.stringify({
+        number,
+        title: `issue title ${number}`,
+        state,
+        stateReason: '',
+        author: { login: 'octo' },
+        labels: [],
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-02T00:00:00Z',
+        url: `https://example.test/issues/${number}`,
+        body: `body of issue ${number}`,
+        comments,
+      })}\n`,
+    };
+  }
+
+  // A gh client whose two slow reads (the open snapshot and one issue read) are
+  // gates the test owns, so nothing depends on wall-clock timing.
+  function gatedGh({ openIssues, verify }) {
+    const calls = [];
+    ghIssues.setGhRunner(async (bin, argv) => {
+      calls.push(argv.slice());
+      const head = `${argv[0] || ''} ${argv[1] || ''}`;
+      if (head === 'api user') return { status: 0, stdout: '{"login":"octo"}\n', stderr: '' };
+      if (head === 'repo view') return { status: 0, stdout: '{"nameWithOwner":"octo/repo"}\n', stderr: '' };
+      if (head === 'api graphql') {
+        const query = argv.filter((item) => item.startsWith('query=')).join('');
+        if (query.includes('assignees')) return { status: 0, stdout: METADATA_JSON, stderr: '' };
+        if (query.includes('projectItems')) return { status: 0, stdout: PROJECTS_JSON, stderr: '' };
+        return openIssues();
+      }
+      if (head === 'issue view') return verify(Number(argv[2]));
+      return { status: 0, stdout: '{}', stderr: '' };
+    });
+    return calls;
+  }
+
+  const FULL_FACTS = {
+    branch: { available: true, value: 'feat/slow', detached: false },
+    changes: { available: true, value: { files: 3, added: 5, deleted: 1 } },
+    aheadBehind: { available: true, value: { ahead: 2, behind: 1 } },
+    createdAt: { available: true, value: new Date(Date.now() - 86400_000).toISOString() },
+    lastActivity: { available: true, value: new Date(Date.now() - 3600_000).toISOString() },
+  };
+
+  function factsDouble({ peeked = null } = {}) {
+    const order = [];
+    const peekCalls = [];
+    const factCalls = [];
+    const gate = deferred();
+    const provider = {
+      ttlMs: 1000,
+      peek: (checkoutPath) => {
+        order.push('peek');
+        peekCalls.push(checkoutPath);
+        return peeked;
+      },
+      invalidate: () => {},
+      facts: (checkoutPath) => {
+        order.push('facts');
+        factCalls.push(checkoutPath);
+        return gate.promise;
+      },
+    };
+    return { provider, order, peekCalls, factCalls, gate };
+  }
+
+  async function waitForMount(built) {
+    for (let step = 0; step < 40 && built.mounts.length === 0; step += 1) await flush();
+    return built.mounts[0] ? built.mounts[0].component : null;
+  }
+
+  // Closes whatever this run mounted, waiting (bounded) for a mount that only
+  // becomes possible once the gates are released. In the pre-change RED run the
+  // mount happens late, and this keeps the 10s host timeout out of the report.
+  async function closeMounted(built) {
+    const component = built.mounts[0] ? built.mounts[0].component : await waitForMount(built);
+    if (!component) return;
+    component.handleInput('\x1b');
+    await flush();
+    component.handleInput('\x1b');
+  }
+
+  const renderDetail = (component) => clean(component.render(120).join('\n'));
+
+  test('the overlay exists first, the stored assignment paints, then the same view is enriched', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('progressive-mount');
+      const target = addRegisteredWorktree(root, 'feat/slow', { issues: [7], odd: 'odd/tasks/one.md' });
+      writeDoc(target, 'one');
+      writeDoc(target, 'two');
+      const primeGate = deferred();
+      const verifyGate = deferred();
+      const verifiedIssue = issueViewJson(7, {
+        comments: [{ author: { login: 'ana' }, createdAt: '2024-01-03T00:00:00Z', body: 'first comment' }],
+      });
+      const calls = gatedGh({
+        openIssues: () => primeGate.promise,
+        verify: () => verifyGate.promise,
+      });
+      const facts = factsDouble();
+      const { mod } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-slow', path: target, branch: 'feat/slow' },
+        notify: built.ctx.ui.notify,
+        checkoutFacts: facts.provider,
+      });
+      running.catch(() => {});
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the detail mounts before the slow reads resolve');
+        let rendered = renderDetail(component);
+        assert.match(rendered, /◈ feat-slow/, 'the worktree is named');
+        assert.ok(rendered.includes(target), 'its path');
+        assert.match(rendered, /odd: one/, 'the stored ODD association is named immediately');
+        assert.match(rendered, /issues: #7/, 'the stored assignment is displayed immediately');
+        assert.match(rendered, /Issues \(…\)/, 'a pending list never claims a zero count');
+        assert.doesNotMatch(rendered, /Issues \(0\)|ODD \(0\)/);
+        assert.doesNotMatch(rendered, /changes \d|created \d/, 'no fact is invented before the facts land');
+        assert.equal(facts.peekCalls.length, 1, 'peek is the only synchronous facts read');
+        assert.equal(facts.factCalls.length, 1, 'the full read starts after the mount');
+        assert.deepEqual(facts.order.slice(0, 2), ['peek', 'facts']);
+
+        // 1) the stored assignment verification settles; 2) the list lands.
+        verifyGate.resolve(verifiedIssue);
+        await flush();
+        assert.match(renderDetail(component), /issues: #7/, 'the verified assignment keeps the stored id');
+        primeGate.resolve(graphqlOpenPayload([7, 12]));
+        await flush();
+        await flush();
+        rendered = renderDetail(component);
+        assert.match(rendered, /Issues \(2\)/, 'the known list reaches the SAME view');
+        assert.match(rendered, /#7 issue title 7/);
+        assert.match(rendered, /#12 issue title 12/);
+        // The focused issue's detail read is the shared, metadata-bearing one;
+        // it lands after the mount like every other read.
+        await waitForDetail(component, () => /assignees: ana/.test(renderDetail(component)), 'the issue preview metadata');
+        rendered = renderDetail(component);
+        assert.ok(calls.some((argv) => argv[0] === 'issue' && argv[1] === 'view' && argv.includes('--json')), 'the preview reads the issue');
+        assert.match(rendered, /assignees: ana/, 'S16: the metadata read still reaches the preview');
+        assert.match(rendered, /first comment/, 'S16: the comments envelope still reaches the preview');
+
+        facts.gate.resolve(FULL_FACTS);
+        await flush();
+        await flush();
+        rendered = renderDetail(component);
+        assert.match(rendered, /3 changes/, 'the facts land in the same view');
+        assert.match(rendered, /created 1d/);
+        assert.match(rendered, /modified 1hr/);
+        assert.deepEqual(built.notes, [], 'a successful enrichment is silent');
+      } finally {
+        verifyGate.resolve(issueViewJson(7));
+        primeGate.resolve(graphqlOpenPayload([]));
+        facts.gate.resolve(FULL_FACTS);
+        await closeMounted(built);
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+
+  test('a save while the initialization is pending writes nothing and says why', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('pending-save');
+      const target = addRegisteredWorktree(root, 'feat/pending-save', { issues: [7] });
+      writeDoc(target, 'one');
+      const primeGate = deferred();
+      const verifyGate = deferred();
+      gatedGh({ openIssues: () => primeGate.promise, verify: () => verifyGate.promise });
+      const { mod } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const registryFile = registryLib.registryPath(root);
+      const before = fs.readFileSync(registryFile);
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-pending-save', path: target, branch: 'feat/pending-save' },
+        notify: built.ctx.ui.notify,
+      });
+      running.catch(() => {});
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the detail mounts while the data is still loading');
+        component.handleInput('ctrl+s');
+        await flush();
+        await flush();
+        assert.deepEqual(fs.readFileSync(registryFile), before, 'no write happens from an unverified set');
+        const rendered = renderDetail(component);
+        assert.match(rendered, /save waits for/, 'the refusal is explained');
+        assert.deepEqual(built.notes, [], 'and nothing is claimed');
+      } finally {
+        verifyGate.resolve(issueViewJson(7));
+        primeGate.resolve(graphqlOpenPayload([7]));
+        await closeMounted(built);
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+
+  test('closing before the reads land writes nothing, notifies nothing and asks nothing more', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('close-before-reads');
+      const target = addRegisteredWorktree(root, 'feat/close-early', { issues: [7] });
+      writeDoc(target, 'one');
+      const primeGate = deferred();
+      const verifyGate = deferred();
+      const calls = gatedGh({ openIssues: () => primeGate.promise, verify: () => verifyGate.promise });
+      const { mod } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const registryFile = registryLib.registryPath(root);
+      const before = fs.readFileSync(registryFile);
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-close-early', path: target, branch: 'feat/close-early' },
+        notify: built.ctx.ui.notify,
+      });
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the detail mounts before the slow reads resolve');
+        component.handleInput('\x1b');
+        await running;
+        const callsAtClose = calls.length;
+        // The verification now proves #7 closed. After `done` it must not drop
+        // the assignment, notify, or start another query.
+        verifyGate.resolve(issueViewJson(7, { state: 'closed' }));
+        primeGate.resolve(graphqlOpenPayload([12]));
+        await flush();
+        await flush();
+        assert.deepEqual(fs.readFileSync(registryFile), before, 'no registry write after close');
+        assert.deepEqual(built.notes, [], 'no notification after close');
+        assert.equal(calls.length, callsAtClose, 'no further gh query after close');
+      } finally {
+        verifyGate.resolve(issueViewJson(7));
+        primeGate.resolve(graphqlOpenPayload([]));
+        await flush();
+        if (built.mounts[0] && built.mounts[0].component.state.tab) built.mounts[0].component.handleInput('\x1b');
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+
+  test('a failed issue list is named as a failure, never as an empty list, and blocks the save', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('failed-list');
+      const target = addRegisteredWorktree(root, 'feat/failed-list', { issues: [7] });
+      writeDoc(target, 'one');
+      const verifyGate = deferred();
+      gatedGh({
+        openIssues: () => ({ status: 1, stdout: '', stderr: 'HTTP 502' }),
+        verify: () => verifyGate.promise,
+      });
+      const { mod } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const registryFile = registryLib.registryPath(root);
+      const before = fs.readFileSync(registryFile);
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-failed-list', path: target, branch: 'feat/failed-list' },
+        notify: built.ctx.ui.notify,
+      });
+      running.catch(() => {});
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the detail mounts before the list fails');
+        verifyGate.resolve(issueViewJson(7));
+        await flush();
+        await flush();
+        const rendered = renderDetail(component);
+        assert.match(rendered, /issue list unreadable/, 'the failure is named in the list pane');
+        assert.doesNotMatch(rendered, /no open issues/, 'a failure is not an empty list');
+        assert.match(rendered, /Issues \(\?\)/, 'the count is marked unknown, never 0');
+        assert.equal(built.notes.length, 1, `one notice names the failure: ${JSON.stringify(built.notes)}`);
+        assert.match(String(built.notes[0][0]), /cannot list open issues/);
+        component.handleInput('ctrl+s');
+        await flush();
+        assert.deepEqual(fs.readFileSync(registryFile), before, 'an unverified set is never written');
+      } finally {
+        verifyGate.resolve(issueViewJson(7));
+        await closeMounted(built);
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+
+  test('the delayed verification never clobbers an unsaved selection on a warm cache mount', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('dirty-baseline');
+      const target = addRegisteredWorktree(root, 'feat/dirty-baseline', { issues: [7] });
+      writeDoc(target, 'one');
+      // Warm the shared snapshot with #12 only: #7 stays unknown to the cache,
+      // so its verification has to ask gh and can be held open.
+      stubGh([12]);
+      const { mod } = await loadExtension();
+      // Keep the warm-up mount open until its snapshot is really primed, so the
+      // second mount genuinely starts on a warm cache.
+      const warm = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const warmRun = mod.openWorktreeDetail(warm.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-dirty-baseline', path: target, branch: 'feat/dirty-baseline' },
+        notify: warm.ctx.ui.notify,
+      });
+      warmRun.catch(() => {});
+      const warmComponent = await waitForMount(warm);
+      await waitForDetail(warmComponent, () => warmComponent.state.dataState.issues === 'ready', 'the warm snapshot');
+      warmComponent.handleInput('\x1b');
+      await warmRun;
+
+      const verifyGate = deferred();
+      gatedGh({ openIssues: () => graphqlOpenPayload([12]), verify: () => verifyGate.promise });
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-dirty-baseline', path: target, branch: 'feat/dirty-baseline' },
+        notify: built.ctx.ui.notify,
+      });
+      running.catch(() => {});
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the warm detail mounts before the verification resolves');
+        assert.match(renderDetail(component), /Issues \(1\)/, 'a primed snapshot paints at mount');
+        assert.match(renderDetail(component), /issues: #7/, 'the stored assignment is displayed');
+        component.handleInput('space');
+        assert.deepEqual(component.state.issues.slice().sort((a, b) => a - b), [7, 12], 'the reader adds #12');
+        assert.equal(component.state.dirty, true);
+
+        verifyGate.resolve(issueViewJson(7));
+        await flush();
+        await flush();
+        assert.deepEqual(component.state.issues.slice().sort((a, b) => a - b), [7, 12],
+          'the delayed baseline never overwrites the unsaved selection');
+        assert.equal(component.state.dirty, true, 'and it stays unsaved');
+      } finally {
+        verifyGate.resolve(issueViewJson(7));
+        await closeMounted(built);
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+
+  test('a proven-closed assignment is dropped without losing a concurrently assigned id', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('concurrent-assign');
+      const target = addRegisteredWorktree(root, 'feat/concurrent', { issues: [7] });
+      writeDoc(target, 'one');
+      const primeGate = deferred();
+      const verifyGate = deferred();
+      gatedGh({ openIssues: () => primeGate.promise, verify: () => verifyGate.promise });
+      const { mod } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-concurrent', path: target, branch: 'feat/concurrent' },
+        notify: built.ctx.ui.notify,
+      });
+      running.catch(() => {});
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the detail mounts before the verification resolves');
+        // A concurrent writer adds #12 while the initial snapshot only knew #7.
+        assert.equal(registryLib.updateWorktree(root, target, { issues: [7, 12] }).ok, true);
+
+        verifyGate.resolve(issueViewJson(7, { state: 'closed' }));
+        primeGate.resolve(graphqlOpenPayload([12]));
+        await flush();
+        await flush();
+        await flush();
+        const row = registryLib.findByPath(root, target);
+        assert.deepEqual(row.issues, [12], 'only the proven-closed id is dropped; the concurrent one survives');
+        assert.match(renderDetail(component), /issues: #12/, 'and the view shows the merged assignment');
+      } finally {
+        verifyGate.resolve(issueViewJson(7));
+        primeGate.resolve(graphqlOpenPayload([]));
+        await closeMounted(built);
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+
+  test('a warm cache paints the full header from peek without waiting for the full read', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('warm-peek');
+      const target = addRegisteredWorktree(root, 'feat/warm-peek', { issues: [], odd: null });
+      writeDoc(target, 'one');
+      stubGh([]);
+      const facts = factsDouble({ peeked: FULL_FACTS });
+      const { mod } = await loadExtension();
+      const built = scriptedCtx({ cwd: root, steps: [() => {}] });
+      const running = mod.openWorktreeDetail(built.ctx, {
+        repoRoot: gitLib.repoIdentity(root).root,
+        target: { name: 'feat-warm-peek', path: target, branch: 'feat/warm-peek' },
+        notify: built.ctx.ui.notify,
+        checkoutFacts: facts.provider,
+      });
+      running.catch(() => {});
+      try {
+        const component = await waitForMount(built);
+        assert.ok(component, 'the warm detail mounts immediately');
+        const rendered = renderDetail(component);
+        assert.match(rendered, /branch feat\/slow/, 'the cached branch paints at mount');
+        assert.match(rendered, /3 changes/, 'the cached change size paints at mount');
+        assert.match(rendered, /created 1d/, 'the cached ages paint at mount');
+        assert.equal(facts.peekCalls.length, 1, 'exactly one synchronous peek');
+        assert.equal(facts.factCalls.length, 1, 'and one background read, not a blocking one');
+      } finally {
+        facts.gate.resolve(FULL_FACTS);
+        await closeMounted(built);
+        await running.catch(() => {});
+      }
+    } finally {
+      ghIssues.setGhRunner(null);
+      restoreEnv();
+    }
+  });
+});

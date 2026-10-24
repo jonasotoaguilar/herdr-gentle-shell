@@ -6937,24 +6937,21 @@ async function openWorktreeDetail(ctx, { repoRoot, target, notify, checkoutFacts
   const storedIssues = row && Array.isArray(row.issues) ? row.issues.slice() : [];
   // S8: the entity holds ONE document (or none).
   const storedOdd = row && typeof row.odd === "string" && row.odd.length > 0 ? row.odd : null;
-  // S7d: entering the detail re-checks this worktree's assignment. Only a
-  // proven closure or a gh 404 removes a number; anything unverifiable keeps
-  // it and is reported.
-  const verified = await verifyWorktreeAssignments({ repoRoot, cwd: target.path, numbers: storedIssues, gh });
-  let assigned = verified.keep;
-  let persistFailed = false;
-  if (verified.drop.length > 0) {
-    const persisted = persistVerifiedAssignment(repoRoot, target.path, verified.keep);
-    if (persisted.ok !== true) {
-      // Never claim a removal that was not stored: show what is stored and
-      // report why it could not be cleaned.
-      persistFailed = true;
-      assigned = storedIssues;
-      notify?.(`${target.name}: cannot drop closed issue assignment(s) ${issueNumberList(verified.drop)}: ${persisted.error}`, "error");
+  // S18/L6: everything from here to the mount is LOCAL and cheap — one
+  // registry row, one directory listing, one synchronous cache read — so the
+  // overlay opens on the first frame. The slow reads (assignment verification,
+  // the whole open-issue snapshot, checkout facts) start AFTER the component
+  // has been handed back, concurrently, and enrich it through `apply`.
+  const readStoredIssues = () => {
+    try {
+      const fresh = registry.findByPath(repoRoot, target.path);
+      return fresh && Array.isArray(fresh.issues) ? fresh.issues.slice() : storedIssues.slice();
+    } catch {
+      return storedIssues.slice();
     }
-  }
-  const note = persistFailed ? null : assignmentVerificationNote(target.name, verified);
-  if (note !== null) notify?.(note, "info");
+  };
+  const sortedUnique = (numbers) => Array.from(new Set(Array.isArray(numbers) ? numbers : []))
+    .sort((left, right) => left - right);
   // The odd documents this checkout offers, as the identity the detail saves.
   let documents = [];
   try {
@@ -6963,33 +6960,21 @@ async function openWorktreeDetail(ctx, { repoRoot, target, notify, checkoutFacts
   } catch {
     documents = [];
   }
-  // S7c: the choices are every OPEN issue. A primed snapshot answers at once;
-  // without one the detail primes the shared cache itself rather than
-  // pretending the repository has no open issues.
-  let issues = [];
-  let openError = null;
-  const cache = issuesCacheFor(repoRoot);
-  if (cache && cache.stats().primed === true) {
-    issues = cache.all();
-  } else {
-    const primed = await primeIssuesCache(gh, target.path);
-    if (primed.ok === true) {
-      issues = issuesCacheFor(repoRoot).all();
-    } else {
-      openError = primed.error;
-    }
-  }
-  if (openError !== null) {
-    notify?.(`${target.name}: cannot list open issues (${openError}); only the verified assignment is shown`, "info");
-  }
-  // S12: the header data comes from lib/checkout-facts.js, the one reader of
-  // branch, change size, ahead/behind, creation and last activity.
-  let facts = null;
+  // S18: a warm snapshot may paint at once, while a cold one stays PENDING —
+  // the view is told `null`, so it never claims the repository has no issues
+  // and never prints an invented `0`.
+  const mountCache = issuesCacheFor(repoRoot);
+  const primedIssues = mountCache && mountCache.stats().primed === true ? mountCache.all() : null;
+  // S18: only the synchronous facts cache is read before mount (no git spawn,
+  // no invented zero); the full read runs after the overlay exists.
+  let factsProvider = null;
+  let peekedFacts = null;
   try {
-    const provider = injectedFacts || libRequire("checkout-facts.js").createCheckoutFacts({ repoRoot });
-    facts = await provider.facts(target.path);
+    factsProvider = injectedFacts || libRequire("checkout-facts.js").createCheckoutFacts({ repoRoot });
+    if (factsProvider && typeof factsProvider.peek === "function") peekedFacts = factsProvider.peek(target.path);
   } catch {
-    facts = null;
+    factsProvider = null;
+    peekedFacts = null;
   }
   let helpers = null;
   try {
@@ -6997,16 +6982,41 @@ async function openWorktreeDetail(ctx, { repoRoot, target, notify, checkoutFacts
   } catch {
     helpers = null;
   }
+  // Lifecycle of THIS overlay. Every late outcome checks `alive` before it may
+  // paint, notify, start another read or write the registry: a read already
+  // running may finish into the shared caches, but nothing lands after close.
+  let alive = false;
+  // Initialization reads a save must wait for (assignment verification, and
+  // the open snapshot only when it was cold at mount), plus the "cannot verify
+  // at all" verdict that keeps an unverified set unwritable until the detail is
+  // reopened (a retry).
+  let pendingInit = primedIssues === null ? 2 : 1;
+  let initFailed = false;
+  // The verified baseline the save's hidden merge preserves; null until the
+  // verification lands (then the STORED row is the baseline).
+  let verifiedAssigned = null;
+  const settledRead = () => {
+    pendingInit = Math.max(0, pendingInit - 1);
+  };
+  const stillAlive = () => alive === true;
   const save = async (payload) => {
     // S29: the association write is refused while the worktree tools are
     // disabled, exactly like the odd and issues savers.
     if (!worktreeAssignmentEnabled()) return worktreeAssignmentRefused();
+    // S18: a save before initialization settles would persist an association
+    // set nobody verified. The view refuses it too; this is the second net that
+    // keeps the registry untouched.
+    if (pendingInit > 0) return { ok: false, error: "the worktree data is still loading" };
+    if (initFailed) return { ok: false, error: "the worktree assignment could not be verified" };
     const body = payload && typeof payload === "object" ? payload : {};
     const selected = Array.isArray(body.issues) ? body.issues : [];
     // An assigned number the surface could not list (an unverifiable read) is
     // kept as stored: a save may never remove what the reader was never shown.
-    const listable = new Set(issues.map((row) => (row && row.number)).filter(Number.isInteger));
-    const hidden = assigned.filter((number) => !listable.has(number));
+    const cache = issuesCacheFor(repoRoot);
+    const listableRows = cache && cache.stats().primed === true ? cache.all() : (primedIssues || []);
+    const listable = new Set(listableRows.map((entry) => (entry && entry.number)).filter(Number.isInteger));
+    const baseline = Array.isArray(verifiedAssigned) ? verifiedAssigned : storedIssues;
+    const hidden = baseline.filter((number) => !listable.has(number));
     const merged = Array.from(new Set([...selected, ...hidden])).sort((left, right) => left - right);
     const odd = oddNameForCheckout(target.path, body.odd);
     const saved = saveCheckoutFields(repoRoot, target.path, { issues: merged, odd }, ctx);
@@ -7021,32 +7031,145 @@ async function openWorktreeDetail(ctx, { repoRoot, target, notify, checkoutFacts
     if (injectedFacts && typeof injectedFacts.invalidate === "function") injectedFacts.invalidate(target.path);
     return { ok: true, dropped: saved.dropped };
   };
+  // S7d/S18: re-check the stored assignment and drop ONLY what is proven
+  // closed or deleted. The registry is read again at apply time, so an id a
+  // concurrent save added after the mount snapshot survives untouched, and an
+  // unverifiable id is never discarded.
+  const verifyAndSettleAssignment = async (view) => {
+    let report = null;
+    try {
+      report = await verifyWorktreeAssignments({ repoRoot, cwd: target.path, numbers: storedIssues, gh });
+    } catch (err) {
+      report = null;
+      if (stillAlive()) notify?.(`${target.name}: cannot verify the issue assignment (${(err && err.message) || err})`, "error");
+    }
+    try {
+      if (report === null) {
+        initFailed = true;
+        if (stillAlive()) {
+          view.apply({ assignedState: "error", assignedError: "the assignment could not be verified" });
+          notify?.(`${target.name}: saving is disabled until the detail is reopened, because the issue assignment could not be verified`, "info");
+        }
+        return;
+      }
+      // No write, notification or apply past this point once the overlay is
+      // gone — even though the read itself was allowed to finish.
+      if (!stillAlive()) return;
+      const current = readStoredIssues();
+      const snapshot = new Set(storedIssues);
+      const concurrent = current.filter((number) => !snapshot.has(number));
+      const merged = sortedUnique([...report.keep, ...concurrent]);
+      let shown = merged;
+      let note = assignmentVerificationNote(target.name, report);
+      if (report.drop.length > 0) {
+        const persisted = persistVerifiedAssignment(repoRoot, target.path, merged);
+        if (persisted.ok !== true) {
+          // Never claim a removal that was not stored, and never discard what
+          // could not be verified: the stored row is what stays on screen.
+          shown = sortedUnique(current);
+          note = null;
+          if (stillAlive()) notify?.(`${target.name}: cannot drop closed issue assignment(s) ${issueNumberList(report.drop)}: ${persisted.error}`, "error");
+        }
+      }
+      if (!stillAlive()) return;
+      verifiedAssigned = shown;
+      view.apply({ assignedIssues: shown, assignedState: "ready" });
+      if (note !== null) notify?.(note, "info");
+    } finally {
+      settledRead();
+    }
+  };
+  // S7c: the choices are every OPEN issue. A cold snapshot is primed here, after
+  // the mount, and the WHOLE open set is handed over — never a first page, so
+  // the picker's in-memory search never loses issues it did not load.
+  const primeAndSettleIssues = async (view) => {
+    let primed = null;
+    try {
+      primed = await primeIssuesCache(gh, target.path);
+    } catch (err) {
+      primed = { ok: false, error: (err && err.message) || "cannot load the open issues" };
+    }
+    try {
+      if (!stillAlive()) return;
+      if (primed && primed.ok === true) {
+        const cache = issuesCacheFor(repoRoot);
+        view.apply({ issues: cache ? cache.all() : [], issuesState: "ready" });
+        return;
+      }
+      const error = (primed && primed.error) || "cannot load the open issues";
+      view.apply({ issuesError: error });
+      notify?.(`${target.name}: cannot list open issues (${error}); only the verified assignment is shown`, "info");
+    } finally {
+      settledRead();
+    }
+  };
+  // S12: the header data comes from lib/checkout-facts.js, the one reader of
+  // branch, change size, ahead/behind, creation and last activity.
+  const enrichFacts = async (view) => {
+    if (!factsProvider) return;
+    let facts = null;
+    try {
+      facts = await factsProvider.facts(target.path);
+    } catch {
+      facts = null;
+    }
+    if (!facts || !stillAlive()) return;
+    view.apply({ worktree: detailWorktreeFacts(target, facts) });
+  };
   try {
     await ctx.ui.custom(
-      (hostTui, theme, _keybindings, done) => perfTraceView("detail", detailLib.createWorktreeDetailView({
-        worktree: detailWorktreeFacts(target, facts),
-        issues,
-        assignedIssues: assigned,
-        documents,
-        odd: storedOdd,
-        loadIssue: (number) => gh.getIssue(number, { cwd: target.path }),
-        loadDocument: (docPath) => docsLib.readOddDoc({ path: docPath }),
-        save,
-        helpers,
-        theme,
-        rowsAvailable: () => oddTerminalRows(hostTui),
-        requestRender: () => {
-          try {
-            if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
-          } catch {
-            // A repaint failure never breaks navigation.
-          }
-        },
-        done,
-      }), hostTui),
+      (hostTui, theme, _keybindings, done) => {
+        alive = true;
+        const view = detailLib.createWorktreeDetailView({
+          worktree: detailWorktreeFacts(target, peekedFacts),
+          // `null` is the honest "not known yet": the view names the pending
+          // read instead of painting an empty repository.
+          issues: primedIssues,
+          // The STORED assignment paints immediately, and `assignedState` keeps
+          // the save refused until the verification proves it.
+          assignedIssues: storedIssues,
+          assignedState: "loading",
+          documents,
+          odd: storedOdd,
+          // S16: the shared preview needs the repository-authoritative role,
+          // current assignees, projects and linked PR count — without
+          // `includeMetadata` the pane would show a thinner issue than Issues
+          // does. Comments come from the same uncached read.
+          loadIssue: (number) => gh.getIssue(number, { cwd: target.path, includeMetadata: true }),
+          loadDocument: (docPath) => docsLib.readOddDoc({ path: docPath }),
+          save,
+          helpers,
+          theme,
+          rowsAvailable: () => oddTerminalRows(hostTui),
+          requestRender: () => {
+            try {
+              if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+            } catch {
+              // A repaint failure never breaks navigation.
+            }
+          },
+          done: (value) => {
+            // The overlay is gone: no late answer may paint, notify, read or write.
+            alive = false;
+            done(value);
+          },
+        });
+        // S18/L6: the slow reads start AFTER the factory returns the view — one
+        // microtask, then concurrently. Every outcome (success, failure, throw)
+        // is already handled inside each task, so nothing rejects unhandled.
+        if (view && typeof view.apply === "function") {
+          queueMicrotask(() => {
+            const tasks = [verifyAndSettleAssignment(view), enrichFacts(view)];
+            if (primedIssues === null) tasks.push(primeAndSettleIssues(view));
+            void Promise.allSettled(tasks).catch(() => {});
+          });
+        }
+        return perfTraceView("detail", view, hostTui);
+      },
       FULLSCREEN_OVERLAY,
     );
   } catch {
+    alive = false;
     notify?.("detail: the worktree detail could not open in this session", "info");
   }
 }

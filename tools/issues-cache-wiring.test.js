@@ -388,10 +388,26 @@ function makeCtx(cwd) {
       notify: (message, level) => notes.push([message, level]),
       confirm: async () => true,
       custom: async (factory) => {
-        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        let settled;
+        const ready = new Promise((resolve) => { settled = resolve; });
+        const hostTui = {
+          terminal: { rows: 24 },
+          requestRender: () => {
+            const data = mounted.component?.state?.dataState;
+            if (data && data.assigned !== 'loading' && data.issues !== 'loading') settled();
+          },
+        };
         const component = factory(hostTui, plainTheme, {}, () => {});
         mounted.component = component;
         mounted.text = clean(component.render(110).join('\n'));
+        // Detail mounts stored data first. These legacy cache assertions need
+        // the public settled state, including named failures, not that frame.
+        // The Issues pager has no dataState and keeps its loading-frame tests.
+        if (component.state?.dataState) {
+          hostTui.requestRender();
+          await ready;
+          mounted.text = clean(component.render(110).join('\n'));
+        }
         return null;
       },
     },
