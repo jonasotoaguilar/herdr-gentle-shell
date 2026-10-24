@@ -84,10 +84,13 @@ fresh data; `r` also refreshes the focused detail.
 
 ## Preview scrolling
 
-Odd, issues and worktree detail accept `ctrl+j`/`ctrl+k` and `pgDn`/`pgUp` for
-page movement, plus `ctrl+d`/`ctrl+u` and uppercase `J`/`K` for half pages.
-Lowercase `j`/`k` always select list rows. The alternate pairs are useful when
-a terminal or multiplexer intercepts the original shortcuts.
+Odd, Issues and worktree detail share preview paging: `ctrl+shift+j/k`
+when the terminal reports it, printable `Shift+J/K` as the fallback, and
+`PgDn`/`PgUp` always. `ctrl+d`/`ctrl+u` remain half-page actions; lowercase
+`j`/`k` select list rows. The footer names the extended pair only when the
+host confirms that protocol, never based on the OS. These are plugin
+bindings, not Pi native defaults. Bare LF/CR and legacy Ctrl+J/K do not
+scroll the preview; Enter keeps its editor/selection meaning.
 
 ## Customize
 

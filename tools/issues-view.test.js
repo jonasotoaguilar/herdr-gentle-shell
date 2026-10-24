@@ -11,6 +11,12 @@
 // open-only listing with no state toggle (S10a); empty/error/
 // gh-unavailable states; no key outside S8 mutates state.
 //
+// S9/S10/S11/S13/S14/S15 additions: the fourth `All` bucket, a visited tab that
+// reuses its rows and page, the fixed page indicator on the search row, the
+// server search seam (query in every page request, no local re-filter, cursors
+// bound to their query, stale answers dropped), and the write lock with the
+// comment caret.
+//
 // S17: the generic `?` key-help overlay is gone; the footer legend is the
 // only key reference.
 
@@ -79,6 +85,16 @@ function pagesOf(lists) {
   return lists.map((rows, at) => ({ id: `p${at}`, label: names[at], issues: rows, total: rows.length }));
 }
 
+// One server page answer and one issue row carrying its cursor, as the
+// `loadIssuePage` seam delivers them.
+function pageResult(issues, extra = {}) {
+  return { ok: true, issues, total: issues.length, hasNextPage: false, ...extra };
+}
+
+function cursorRow(cursor, row) {
+  return { ...row, cursor };
+}
+
 function makeView(opts = {}) {
   const paints = [];
   let settled = 'pending';
@@ -96,7 +112,7 @@ function makeView(opts = {}) {
     actions,
     labels: opts.labels,
     helpers: opts.helpers || helpers,
-    theme: plainTheme,
+    theme: opts.theme || plainTheme,
     rowsAvailable: () => opts.rows || 24,
     requestRender: () => { paints.push(true); },
     done: (result) => { settled = result; },
@@ -104,8 +120,33 @@ function makeView(opts = {}) {
     ghAvailable: opts.ghAvailable,
     loadError: opts.loadError,
     assignmentEnabled: opts.assignmentEnabled,
+    // S9: the remote-search debounce clock is injected, so a burst of typing is
+    // observed without wall-clock waits.
+    scheduleQuery: opts.scheduleQuery,
+    cancelSchedule: opts.cancelSchedule,
   });
   return { view, done: () => settled, paints };
+}
+
+// A scheduler the test owns: nothing fires until `fire()` is called, so the
+// debounce window (and any stale callback inside it) is fully deterministic.
+function manualScheduler() {
+  const entries = [];
+  return {
+    entries,
+    schedule: (fn, delayMs) => {
+      const entry = { fn, delayMs, cancelled: false };
+      entries.push(entry);
+      return entry;
+    },
+    cancel: (entry) => { if (entry) entry.cancelled = true; },
+    live: () => entries.filter((entry) => !entry.cancelled),
+    fire() {
+      const live = entries.filter((entry) => !entry.cancelled);
+      for (const entry of live) entry.fn();
+      return live.length;
+    },
+  };
 }
 
 // A promise whose settlement the test owns, so no expectation depends on
@@ -202,7 +243,7 @@ describe('issues view tabs and list', () => {
     assert.equal(view.state.index, 0);
   });
 
-  test('the tab carries the issue count and the list footer only the page position', async () => {
+  test('the tab carries the issue count and the fixed indicator only the page position', async () => {
     const rows = [issue(1, { title: 'alpha bug' })];
     const { view } = makeView({
       pages: pagesOf([rows, [], []]),
@@ -213,7 +254,8 @@ describe('issues view tabs and list', () => {
     await tick();
     const body = bodyOf(view, 100);
     assert.match(body, /My issues \(1\)/, 'the open tab names its count');
-    assert.match(body, /page 1\/1/, 'the list footer names the page position');
+    assert.match(strip(view.render(100)[1]), /page 1\/1/, 'the fixed indicator sits on the search row');
+    assert.ok(!leftColumn(view, 100, 12).includes('page'), 'the list spends no row on the indicator');
     assert.ok(!/\b1 issues?\b/.test(body.replace('My issues', '')), 'no second total is repeated below the list');
   });
 
@@ -226,10 +268,11 @@ describe('issues view tabs and list', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
     });
     await tick();
-    // S5: capacity follows the real body budget (12 rows - 6 frame rows - the
-    // list's own page marker), so ten single-row titles need two pages.
+    // S5/S14: capacity follows the real body budget (12 rows - 6 frame rows;
+    // the page indicator left the list for the search row), so ten single-row
+    // titles need two pages.
     const first = bodyOf(view, 100);
-    assert.match(first, /page 1\/2/, 'the list footer shows the derived page position');
+    assert.match(first, /page 1\/2/, 'the fixed indicator shows the derived page position');
     assert.ok(!/\b10 issues\b/.test(first), 'the count is not repeated under the list');
     view.handleInput(']');
     assert.equal(view.state.listPage, 2, 'the next page holds what did not fit');
@@ -378,7 +421,7 @@ describe('issues view right pane', () => {
     assert.match(body, /carol/);
   });
 
-  test('ctrl+j/pgDn scroll to the last line of a long issue; home resets to the top', async () => {
+  test('ctrl+shift+j/pgDn scroll to the last line of a long issue; home resets to the top', async () => {
     const longBody = Array.from({ length: 100 }, (_, i) => `body line ${i + 1}`).join('\n');
     const { view } = makeView({
       pages: pagesOf([[issue(1, { body: longBody })], [], []]),
@@ -387,8 +430,8 @@ describe('issues view right pane', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n, { body: longBody }), comments: [] }),
     });
     await tick();
-    view.handleInput('ctrl+j');
-    assert.ok(view.state.scroll > 0, 'ctrl+j scrolls the issue pane');
+    view.handleInput('ctrl+shift+j');
+    assert.ok(view.state.scroll > 0, 'ctrl+shift+j scrolls the issue pane');
     for (let i = 0; i < 20 && !bodyOf(view, 100).includes('body line 100'); i += 1) view.handleInput('pagedown');
     const bottom = bodyOf(view, 100);
     assert.match(bottom, /body line 100/, 'the last line is reachable via the pane scroll keys');
@@ -407,10 +450,9 @@ describe('issues view right pane', () => {
   });
 });
 
-// S15: ctrl+j/ctrl+k are not delivered by every Linux terminal, so the issue
-// preview also answers the Vim-universal half-page pair and the shifted
-// letters — while their unshifted forms keep moving the list selection. These
-// drive the real installed matcher with the raw bytes a terminal emits.
+// S1: extended paging and printable Shift+J/K share a full-page action;
+// ctrl+d/u retain their half-page action and j/k select. These also exercise
+// the installed matcher with the bytes a terminal emits.
 describe('issues view preview scroll variants (S15)', () => {
   const skipReal = realTui ? false : 'requires @earendil-works/pi-tui';
   const longBody = Array.from({ length: 100 }, (_, i) => `body line ${i + 1}`).join('\n');
@@ -456,10 +498,10 @@ describe('issues view preview scroll variants (S15)', () => {
     assert.equal(view.state.index, 1, 'j still moves the list selection');
     view.handleInput('k');
     assert.equal(view.state.index, 0, 'k still moves the list selection');
-    view.handleInput('\n');                 // ctrl+j keeps scrolling
-    assert.ok(view.state.scroll > 0, 'ctrl+j still scrolls the pane');
-    view.handleInput('\x0b');               // ctrl+k keeps scrolling
-    assert.equal(view.state.scroll, 0, 'ctrl+k still scrolls the pane');
+    view.handleInput('\n');                 // legacy Enter is not a scroll alias
+    assert.equal(view.state.scroll, 0, 'LF never scrolls the pane');
+    view.handleInput('\x0b');
+    assert.equal(view.state.scroll, 0, 'legacy ctrl+k never scrolls the pane');
     view.handleInput('\x1b[6~');
     assert.equal(view.state.scroll, paged, 'PageDown still scrolls a full page');
     view.handleInput('\x1b[5~');
@@ -825,7 +867,7 @@ describe('issues view states and key discipline', () => {
       loadIssue: (n) => ({ ok: true, issue: issue(n, { body: longBody }), comments: [] }),
     });
     await tick();
-    view.handleInput('ctrl+j');
+    view.handleInput('ctrl+shift+j');
     assert.ok(view.state.scroll > 0, 'precondition: the pane is scrolled');
     view.handleInput('end');
     assert.equal(view.state.index, 2, 'end selects the last issue');
@@ -845,7 +887,7 @@ describe('issues view states and key discipline', () => {
     });
     await tick();
     view.handleInput('end');
-    view.handleInput('ctrl+j');
+    view.handleInput('ctrl+shift+j');
     assert.ok(view.state.scroll > 0, 'precondition: the pane is scrolled');
     view.handleInput('home');
     assert.equal(view.state.index, 0, 'home selects the first issue');
@@ -887,7 +929,8 @@ describe('issues view states and key discipline', () => {
     const rendered = view.render(80).join('\n');
     // `a` is no longer foreign: S16 binds it to the assignee editor (and it
     // stays inert for this permission-less fixture, which S16 covers).
-    for (const key of ['e', 'p', 'z', 'd', 'w', 'v', 'u', 'g', 'i', 'm', 'h', 'b', 's', 'n', 'ctrl+u', 'ctrl+d', 'alt+x']) {
+    // ctrl+u/d are real half-page bindings, checked in the scroll tests.
+    for (const key of ['e', 'p', 'z', 'd', 'w', 'v', 'u', 'g', 'i', 'm', 'h', 'b', 's', 'n', 'alt+x']) {
       view.handleInput(key);
     }
     assert.equal(JSON.stringify(view.state), snapshot, 'foreign keys change nothing');
@@ -1466,7 +1509,7 @@ describe('issues view lazy labels (S19)', () => {
 describe('issues view over the real gh client (argv, status, stderr)', () => {
   test('reads ask for the requested state, and a gh failure surfaces honestly', async () => {
     const calls = [];
-    ghIssues.setGhRunner((bin, argv) => {
+    ghIssues.setGhRunner((_bin, argv) => {
       calls.push(argv.slice());
       if (argv[0] === 'issue' && argv[1] === 'list') {
         return { status: 1, stdout: '', stderr: 'HTTP 401: Bad credentials', error: null };
@@ -1810,8 +1853,8 @@ describe('S13: the issues frame repeats nothing', () => {
     const view = await opened();
     const body = bodyOf(view, 80);
     assert.match(body, /My issues \(2\)/, 'the tab carries the total');
-    assert.ok(!/\b2 issues\b/.test(body), 'the list footer does not repeat it');
-    assert.match(body, /page 1\/1/, 'the list footer names the page position instead');
+    assert.ok(!/\b2 issues\b/.test(body), 'no row under the list repeats it');
+    assert.match(strip(view.render(80)[1]), /page 1\/1/, 'the fixed indicator names the page position instead');
   });
 
   test('no chrome row repeats the focused issue title the list and preview already show', async () => {
@@ -1846,7 +1889,7 @@ describe('S16: repository permissions gate the label and assignee editors', () =
         loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions }), comments: [] }),
       });
       await tick();
-      const body = bodyOf(view, 124);
+      const body = bodyOf(view, 220);
       assert.equal(body.includes('L labels'), shown, `labels hint for ${JSON.stringify(permissions)}`);
       assert.equal(body.includes('a assign'), shown, `assignees hint for ${JSON.stringify(permissions)}`);
     }
@@ -1924,7 +1967,7 @@ describe('S16: repository permissions gate the label and assignee editors', () =
         issue: issue(n, { labels: [{ name: 'bug' }], permissions: { canEditLabels: true, canCreateLabels: false } }),
         comments: [],
       }),
-      actions: { editLabels: (n, add, remove, made) => { created.push([add, remove, made]); return { ok: true }; } },
+      actions: { editLabels: (_n, add, remove, made) => { created.push([add, remove, made]); return { ok: true }; } },
     });
     await tick();
     view.handleInput('l');
@@ -1975,10 +2018,10 @@ describe('S16: repository permissions gate the label and assignee editors', () =
       loadAssignees: () => { calls.push('loadAssignees'); return users(); },
     });
     await tick();
-    assert.match(bodyOf(view, 124), /L labels/, 'the permitted issue shows the hint');
+    assert.match(bodyOf(view, 220), /L labels/, 'the permitted issue shows the hint');
     view.handleInput('j');
     await tick();
-    const body = bodyOf(view, 124);
+    const body = bodyOf(view, 220);
     assert.ok(!body.includes('L labels'), 'the labels hint is gone');
     assert.ok(!body.includes('a assign'), 'the assignees hint is gone');
     view.handleInput('a');
@@ -2032,7 +2075,7 @@ describe('issues left list width, wrapping and fresh pages (S3/S5/D1/D3)', () =>
   });
 
   test('the request limit comes from the viewport body height, never from a fixed 20', async () => {
-    for (const [rows, expected] of [[12, 5], [14, 7], [30, 23], [40, 33]]) {
+    for (const [rows, expected] of [[12, 6], [14, 8], [30, 24], [40, 34]]) {
       const calls = [];
       const { view } = makeView({
         rows,
@@ -2052,9 +2095,11 @@ describe('issues left list width, wrapping and fresh pages (S3/S5/D1/D3)', () =>
 
   test('the next page starts after the LAST SHOWN cursor, never after unused fetched rows', async () => {
     const calls = [];
+    // Both titles wrap past the body budget on their own, so only the first
+    // row can be shown and the second page must start after it.
     const served = [
-      cursorIssue('ca', issue(1, { title: 'alpha beta gamma delta epsilon zeta' })),
-      cursorIssue('cb', issue(2, { title: 'one two three four five six seven' })),
+      cursorIssue('ca', issue(1, { title: 'alpha beta gamma delta epsilon zeta eta theta' })),
+      cursorIssue('cb', issue(2, { title: 'one two three four five six seven eight nine ten' })),
     ];
     const { view } = makeView({
       rows: 12,
@@ -2071,7 +2116,7 @@ describe('issues left list width, wrapping and fresh pages (S3/S5/D1/D3)', () =>
     view.handleInput(']');
     assert.equal(calls.length, 2, 'the arrow asked for the next page');
     assert.equal(calls[1].cursor, 'ca', 'the next page starts after the LAST SHOWN row');
-    assert.equal(calls[1].limit, 5, 'the limit follows the body budget again');
+    assert.equal(calls[1].limit, 6, 'the limit follows the body budget again');
   });
 
   test('previous and r fetch fresh pages, and tab switches the bucket', async () => {
@@ -2200,6 +2245,9 @@ describe('issues left list width, wrapping and fresh pages (S3/S5/D1/D3)', () =>
       cursorIssue('b2', issue(9, { title: 'stale second page' })),
     ], { hasNextPage: true }));
     await tick();
+    // S15 added the fourth All bucket, so returning to Assigned from Involved
+    // takes three tabs (All, Mine, Assigned) instead of two.
+    view.handleInput('tab');
     view.handleInput('tab');
     view.handleInput('tab');
     const left = leftColumn(view, 60, 30);
@@ -2230,5 +2278,903 @@ describe('issues left list width, wrapping and fresh pages (S3/S5/D1/D3)', () =>
     assert.match(leftColumn(view, 100), /static row/, 'the eager pages still render');
     assert.match(bodyOf(view, 100), /page 1\/1/);
     assert.ok(!leftColumn(view, 100).includes('#1'), 'the eager path drops the number too');
+  });
+});
+
+// S9/S13/S15: the fourth All bucket, a tab switch that reuses what it already
+// loaded, and search over the COMPLETE bucket through the server page seam.
+// Every request is a public input: the loader receives
+// {bucketId, cursor, limit, query}.
+describe('issues view All tab, tab cache and server search (S9/S13/S15)', () => {
+  test('the fourth tab All lists every open issue of the repository with no dedup', async () => {
+    const requests = [];
+    const { view } = makeView({
+      rows: 24,
+      loadIssuePage: (request) => {
+        requests.push(request);
+        if (request.bucketId === 'all') {
+          return pageResult([cursorRow('a1', issue(76, { title: 'belt and braces' })), cursorRow('a2', issue(77))], { total: 2 });
+        }
+        return pageResult([cursorRow('m1', issue(76, { title: 'belt and braces' }))], { total: 1 });
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    const tabs = strip(view.render(100)[2]);
+    assert.match(tabs, /▸ My issues \(1\)/, 'the default bucket is still first');
+    assert.match(tabs, /Assigned \(0\)/);
+    assert.match(tabs, /Involved \(0\)/);
+    assert.match(tabs, /All \(0\)/, 'the fourth tab is All, and it counts only what it has read');
+    assert.equal(requests.length, 1, 'only the default bucket was read');
+    assert.equal(requests[0].bucketId, 'mine');
+    view.handleInput('tab');
+    view.handleInput('tab');
+    view.handleInput('tab');
+    await tick();
+    assert.equal(view.state.page, 3, 'All is the fourth and last tab');
+    assert.equal(requests[requests.length - 1].bucketId, 'all', 'All reads the whole open repository');
+    assert.match(strip(view.render(100)[2]), /All \(2\)/, 'the All tab counts the whole open repository');
+    const left = leftColumn(view, 100);
+    assert.match(left, /belt and braces/, 'an issue that also lists under My issues lists here too');
+    assert.match(left, /issue title 77/, 'the other open issue is listed');
+    assert.equal(left.split('belt and braces').length - 1, 1, 'the list holds no duplicate row');
+  });
+
+  test('returning to a visited bucket reuses its rows and page with no request and no loading flash', async () => {
+    const requests = [];
+    const { view } = makeView({
+      rows: 24,
+      loadIssuePage: (request) => {
+        requests.push(request);
+        return pageResult([cursorRow('p1', issue(1)), cursorRow('p2', issue(2))], { hasNextPage: true });
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    assert.equal(requests.length, 1, 'the mount read the first bucket once');
+    leftColumn(view, 100);
+    view.handleInput(']');
+    await tick();
+    assert.equal(requests.length, 2, 'paging reads the next page');
+    view.handleInput('tab');
+    await tick();
+    assert.equal(requests.length, 3, 'a bucket visited for the first time is read');
+    view.handleInput('shift+tab');
+    await tick();
+    assert.equal(requests.length, 3, 'returning to the visited bucket reads nothing');
+    assert.equal(view.state.loading, false, 'the switch never enters the loading state');
+    assert.equal(view.state.listPage, 2, 'the bucket keeps the page the reader left it on');
+    const rendered = strip(view.render(100).join('\n'));
+    assert.match(rendered, /issue title 2/, 'the loaded rows paint again');
+    assert.ok(!rendered.includes('loading'), 'no loading line and no loading flash on the reused frame');
+  });
+
+  test('every page request names its bucket, row budget and exact query, and a new query starts at the head', async () => {
+    const clock = manualScheduler();
+    const requests = [];
+    const { view } = makeView({
+      rows: 24,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssuePage: (request) => {
+        requests.push(request);
+        const head = request.cursor === null;
+        return pageResult([cursorRow(head ? 'q1' : 'q2', issue(head ? 1 : 2))], { hasNextPage: true, total: 2 });
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    assert.deepEqual(
+      requests[0],
+      { bucketId: 'mine', cursor: null, limit: 18, query: '' },
+      'the mount read names its bucket, its body-row budget and the empty query',
+    );
+    view.handleInput('T');
+    for (const ch of 'label:bug') view.handleInput(ch);
+    assert.equal(requests.length, 1, 'typing only schedules the read');
+    clock.fire();
+    await tick();
+    assert.equal(requests.length, 2, 'the settled burst is ONE request');
+    assert.deepEqual(
+      requests[1],
+      { bucketId: 'mine', cursor: null, limit: 18, query: 'label:bug' },
+      'the read carries the whole query, at the head of its own result set',
+    );
+    view.handleInput('enter');
+    leftColumn(view, 100);
+    view.handleInput(']');
+    await tick();
+    assert.deepEqual(
+      requests[2],
+      { bucketId: 'mine', cursor: 'q1', limit: 18, query: 'label:bug' },
+      'the next page starts after the last shown row of the same query',
+    );
+    view.handleInput('r');
+    await tick();
+    assert.deepEqual(
+      requests[3],
+      { bucketId: 'mine', cursor: 'q1', limit: 18, query: 'label:bug' },
+      'r re-reads the current page of the current query',
+    );
+    assert.equal(view.state.listPage, 2, 'the refresh keeps the page the reader is on');
+  });
+
+  test('a stale query answer never replaces the newer query state', async () => {
+    const clock = manualScheduler();
+    const pending = [];
+    const { view } = makeView({
+      rows: 24,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssuePage: (request) => {
+        const entry = deferred();
+        pending.push({ request, entry });
+        return entry.promise;
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    pending[0].entry.resolve(pageResult([cursorRow('m1', issue(1))], { total: 1 }));
+    await tick();
+    view.handleInput('T');
+    view.handleInput('a');
+    clock.fire();
+    assert.deepEqual(pending.slice(1).map((entry) => entry.request.query), ['a'], 'the settled query is read once');
+    view.handleInput('b');
+    clock.fire();
+    assert.deepEqual(pending.slice(1).map((entry) => entry.request.query), ['a', 'ab'], 'the next settled query reads its own');
+    pending[2].entry.resolve(pageResult([cursorRow('n1', issue(2, { title: 'ab match' }))], { total: 1 }));
+    await tick();
+    pending[1].entry.resolve(pageResult([cursorRow('o1', issue(3, { title: 'a only match' }))], { total: 1 }));
+    await tick();
+    const left = leftColumn(view, 100);
+    assert.match(left, /ab match/, 'the newest query answer paints');
+    assert.ok(!left.includes('a only match'), 'the answer for the older query never paints');
+    assert.equal(view.state.loading, false);
+  });
+
+  test('server answers are never re-filtered as literal text for GitHub operators', async () => {
+    const clock = manualScheduler();
+    const { view } = makeView({
+      rows: 24,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssuePage: () => pageResult([cursorRow('x1', issue(5, { title: 'crash on logout' }))], { total: 1 }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'label:bug') view.handleInput(ch);
+    clock.fire();
+    await tick();
+    assert.equal(view.state.query, 'label:bug');
+    const left = leftColumn(view, 100);
+    assert.match(
+      left,
+      /crash on logout/,
+      'a row the server matched for label:bug still lists although its title holds no operator word',
+    );
+  });
+
+  test('a search result that lands on the second server page is selectable and previews its detail', async () => {
+    const loads = [];
+    const { view } = makeView({
+      rows: 24,
+      loadIssuePage: (request) => (request.cursor === null
+        ? pageResult([cursorRow('s1', issue(41, { title: 'first hit' }))], { hasNextPage: true, total: 2 })
+        : pageResult([cursorRow('s2', issue(42, { title: 'second hit' }))], { hasNextPage: false, total: 2 })),
+      loadIssue: (n) => {
+        loads.push(n);
+        return { ok: true, issue: issue(n), comments: [] };
+      },
+    });
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'is:open') view.handleInput(ch);
+    await tick();
+    // The box holds the keyboard, so the filter is committed before paging.
+    view.handleInput('enter');
+    leftColumn(view, 100);
+    view.handleInput(']');
+    await tick();
+    const left = leftColumn(view, 100);
+    assert.match(left, /second hit/, 'the second page of the search answer is listed');
+    assert.ok(!left.includes('first hit'), 'the previous page is not repeated');
+    assert.ok(loads.includes(42), 'the second-page row previews its own detail');
+    assert.match(bodyOf(view, 100), /#42/, 'the focused row is the second-page issue');
+  });
+});
+
+// S14: the page indicator is fixed chrome on the search row — present even for
+// a single page — and the list spends its whole body budget on issues.
+describe('issues page indicator on the search row (S14)', () => {
+  test('the indicator sits beside Search always, including a single page', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[issue(1)], [], []]),
+      issues: [issue(1)],
+      rows: 24,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    for (const width of [80, 120]) {
+      const lines = view.render(width).map(strip);
+      assert.match(lines[1], /› Search/, 'the search widget keeps its row');
+      assert.match(lines[1], /page 1\/1/, `width ${width}: the indicator is fixed beside search, even for one page`);
+      assert.ok(!leftColumn(view, width).includes('page'), `width ${width}: the list spends no row on the indicator`);
+      assert.ok(!/page 1\/1/.test(lines[lines.length - 2]), 'the footer still carries keys only');
+    }
+    view.handleInput('T');
+    view.handleInput('1');
+    assert.match(strip(view.render(80)[1]), /page 1\/1/, 'the indicator stays while the query is typed');
+    view.handleInput('escape');
+    assert.match(strip(view.render(80)[1]), /page 1\/1/, 'and after the query is kept');
+  });
+
+  test('a server frame names its own page and marks only a confirmed next page', async () => {
+    const { view } = makeView({
+      rows: 24,
+      loadIssuePage: (request) => (request.cursor === null
+        ? { ok: true, issues: [cursorRow('n1', issue(1))], total: 2, hasNextPage: true }
+        : { ok: true, issues: [cursorRow('n2', issue(2))], total: 2, hasNextPage: false }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    assert.match(strip(view.render(100)[1]), /page 1\+/, 'a confirmed next page is marked');
+    leftColumn(view, 100);
+    view.handleInput(']');
+    await tick();
+    assert.match(strip(view.render(100)[1]), /page 2(?!\+)/, 'the last page carries no marker');
+    assert.ok(!leftColumn(view, 100).includes('page'), 'the list holds rows only');
+  });
+});
+
+// S10/S11: a write owns the view from its key until its answer, and the comment
+// caret marks the real insertion point. Every action is a deferred public seam,
+// so the busy frame, the key lock and the unlock are observed without timers.
+describe('issues view pending writes and comment caret (S10/S11)', () => {
+  const LOCKED_KEYS = ['ctrl+s', 'tab', 'shift+tab', 'escape', 'enter', 'y', 'j', 'k', 'down', 'up', 'T', 'q', 'x', 'r', 'right', 'left'];
+
+  test('a label save paints its busy frame first, locks every key, then unlocks on success', async () => {
+    const gate = deferred();
+    const calls = [];
+    let saved = ['bug'];
+    const rows = [issue(1, { labels: [{ name: 'bug' }] })];
+    const { view, paints } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      labels: [{ name: 'bug' }, { name: 'docs' }],
+      loadIssue: (n) => ({
+        ok: true,
+        issue: issue(n, { labels: saved.map((name) => ({ name })), permissions: EDITABLE }),
+        comments: [],
+      }),
+      actions: {
+        editLabels: (n, add, remove, created) => {
+          calls.push([n, add, remove, created]);
+          saved = ['bug', ...add];
+          return gate.promise;
+        },
+      },
+    });
+    await tick();
+    view.handleInput('L');
+    view.handleInput('down');
+    view.handleInput('space');
+    const before = paints.length;
+    view.handleInput('ctrl+s');
+    assert.ok(paints.length > before, 'the busy state repaints before the answer arrives');
+    assert.equal(view.state.saving, 'labels', 'the pending write is recorded at once');
+    const busy = strip(view.render(100).join('\n'));
+    assert.match(busy, /saving labels/, 'the busy frame names what is in flight');
+    for (const key of LOCKED_KEYS) view.handleInput(key);
+    assert.equal(calls.length, 1, 'no second write is sent');
+    assert.equal(view.state.mode, 'labels', 'the editor stays the visible state');
+    assert.equal(view.state.page, 0, 'no tab move while pending');
+    assert.equal(view.state.index, 0, 'no list move while pending');
+    assert.equal(view.state.searching, false, 'no typing while pending');
+    assert.equal(strip(view.render(100).join('\n')), busy, 'the pending frame is stable while keys arrive');
+    gate.resolve({ ok: true });
+    await tick();
+    assert.equal(view.state.saving, null, 'the answer unlocks the view');
+    assert.equal(view.state.mode, 'list');
+    const settled = bodyOf(view, 100);
+    assert.match(settled, /labels: bug, docs/, 'the refetched preview shows the saved labels');
+    assert.ok(!settled.includes('saving labels'), 'the busy line is gone once it settled');
+    assert.deepEqual(calls, [[1, ['docs'], [], []]], 'exactly one apply with the toggled delta');
+  });
+
+  test('a rejected label save unlocks and keeps the toggles', async () => {
+    const gate = deferred();
+    const rows = [issue(1, { labels: [{ name: 'bug' }] })];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      labels: [{ name: 'bug' }, { name: 'docs' }],
+      loadIssue: (n) => ({
+        ok: true,
+        issue: issue(n, { labels: [{ name: 'bug' }], permissions: EDITABLE }),
+        comments: [],
+      }),
+      actions: { editLabels: () => gate.promise },
+    });
+    await tick();
+    view.handleInput('L');
+    view.handleInput('down');
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    gate.resolve({ ok: false, error: 'permission denied by GitHub' });
+    await tick();
+    assert.equal(view.state.saving, null, 'a rejected save unlocks the view');
+    assert.equal(view.state.mode, 'labels', 'the editor stays open');
+    const body = bodyOf(view, 100);
+    assert.match(body, /permission denied by GitHub/, 'the real error is shown');
+    assert.match(body, /\[x\] docs/, 'the toggled label survives the rejection');
+    assert.ok(!body.includes('saving labels'), 'the busy line is gone');
+  });
+
+  test('an assignee save locks the view while pending and shows the saved state after', async () => {
+    const gate = deferred();
+    const calls = [];
+    let assignees = [{ login: 'bob' }];
+    const rows = [issue(1)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { permissions: EDITABLE, assignees }), comments: [] }),
+      loadAssignees: () => ({ ok: true, users: [{ login: 'ann', name: 'Ann' }, { login: 'bob', name: '' }] }),
+      actions: {
+        editAssignees: (n, changes) => {
+          calls.push([n, changes]);
+          assignees = [{ login: 'ann' }];
+          return gate.promise;
+        },
+      },
+    });
+    await tick();
+    view.handleInput('a');
+    await tick();
+    view.handleInput('space');
+    view.handleInput('down');
+    view.handleInput('space');
+    view.handleInput('ctrl+s');
+    assert.equal(view.state.saving, 'assignees');
+    assert.match(strip(view.render(100).join('\n')), /saving assignees/, 'the busy frame names the save');
+    for (const key of LOCKED_KEYS) view.handleInput(key);
+    assert.equal(calls.length, 1, 'no duplicate assignee write');
+    assert.match(bodyOf(view, 100), /\[x\] ann/, 'the pending frame keeps the draft toggles');
+    gate.resolve({ ok: true });
+    await tick();
+    assert.equal(view.state.saving, null, 'success unlocks the view');
+    assert.equal(view.state.mode, 'list');
+    assert.deepEqual(calls, [[1, { add: ['ann'], remove: ['bob'] }]], 'one delta write');
+    assert.match(bodyOf(view, 100), /assignees: ann/, 'the refetched preview shows the saved assignee');
+  });
+
+  test('a comment save locks typing while pending, then shows the posted comment', async () => {
+    const gate = deferred();
+    const calls = [];
+    let comments = [];
+    const rows = [issue(1)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: comments.slice() }),
+      actions: {
+        postComment: (n, text) => {
+          calls.push([n, text]);
+          comments = [{ author: 'octo', createdAt: new Date().toISOString(), body: text }];
+          return gate.promise;
+        },
+      },
+    });
+    await tick();
+    view.handleInput('c');
+    for (const ch of 'ship it') view.handleInput(ch);
+    view.handleInput('ctrl+s');
+    assert.equal(view.state.saving, 'comment');
+    assert.match(strip(view.render(100).join('\n')), /posting comment/, 'the busy frame names the post in flight');
+    for (const key of LOCKED_KEYS) view.handleInput(key);
+    for (const ch of 'xyz') view.handleInput(ch);
+    assert.equal(view.state.commentText, 'ship it', 'typing is locked while the post is pending');
+    assert.equal(view.state.mode, 'comment', 'esc cannot leave a pending post');
+    assert.equal(calls.length, 1, 'no second post');
+    gate.resolve({ ok: true });
+    await tick();
+    assert.equal(view.state.saving, null, 'success unlocks the view');
+    assert.equal(view.state.mode, 'list', 'success leaves the editor');
+    const settled = bodyOf(view, 100);
+    assert.match(settled, /ship it/, 'the posted comment is displayed');
+    assert.match(settled, /comment posted/);
+    assert.equal(view.state.commentText, '', 'the sent draft is cleared');
+  });
+
+  test('a close save locks the confirmation while pending and then drops the issue', async () => {
+    const gate = deferred();
+    const calls = [];
+    const rows = [issue(1), issue(2)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      actions: { setState: (n, state) => { calls.push([n, state]); return gate.promise; } },
+    });
+    await tick();
+    view.handleInput('x');
+    view.handleInput('enter');
+    assert.equal(view.state.saving, 'close');
+    assert.match(strip(view.render(100).join('\n')), /closing issue/, 'the busy frame names the close');
+    for (const key of LOCKED_KEYS) view.handleInput(key);
+    assert.equal(calls.length, 1, 'no duplicate close');
+    assert.equal(view.state.mode, 'confirm', 'the confirmation stays visible while pending');
+    gate.resolve({ ok: true });
+    await tick();
+    assert.equal(view.state.saving, null, 'success unlocks the view');
+    assert.equal(view.state.mode, 'list');
+    assert.deepEqual(calls, [[1, 'closed']], 'one close write');
+    assert.ok(!leftColumn(view, 100).includes('issue title 1'), 'the closed issue leaves the open list');
+    assert.match(leftColumn(view, 100), /issue title 2/, 'the remaining open issue stays listed');
+  });
+
+  test('a failed save keeps the draft and its error, and the view is usable again', async () => {
+    const gate = deferred();
+    const calls = [];
+    const rows = [issue(1)];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      actions: { postComment: (n, text) => { calls.push([n, text]); return gate.promise; } },
+    });
+    await tick();
+    view.handleInput('c');
+    for (const ch of 'keep this') view.handleInput(ch);
+    view.handleInput('ctrl+s');
+    gate.resolve({ ok: false, error: 'rate limited' });
+    await tick();
+    assert.equal(view.state.saving, null, 'a rejected save unlocks the view');
+    assert.equal(view.state.mode, 'comment', 'the editor and its draft survive the failure');
+    const body = bodyOf(view, 100);
+    assert.match(body, /rate limited/, 'the real error is shown');
+    assert.match(body, /keep this/, 'the draft is preserved');
+    assert.ok(!body.includes('posting comment'), 'the busy line is gone');
+    assert.equal(calls.length, 1);
+    view.handleInput('escape');
+    assert.equal(view.state.mode, 'comment', 'esc still asks before discarding a draft');
+    assert.match(strip(view.render(100).join('\n')), /Discard this draft/, 'the safe cancel behaviour is unchanged');
+  });
+
+  test('the comment editor paints the caret at the insertion point (S11)', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[issue(1)], [], []]),
+      issues: [issue(1)],
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    view.handleInput('c');
+    assert.match(bodyOf(view, 100), /█/, 'an empty draft shows where typing lands');
+    for (const ch of 'hi') view.handleInput(ch);
+    assert.match(bodyOf(view, 100), /hi█/, 'the caret follows the typed text');
+    view.handleInput('enter');
+    for (const ch of 'there') view.handleInput(ch);
+    const body = bodyOf(view, 100);
+    assert.match(body, /there█/, 'on a new line the caret sits after the last typed character');
+    assert.ok(!/h█i/.test(body), 'the caret is never detached from the insertion point');
+    view.handleInput('backspace');
+    assert.match(bodyOf(view, 100), /ther█/, 'Backspace moves the caret back with the text');
+  });
+});
+
+// S9 (round 3, second pass): remote search is debounced. The clock is injected
+// (scheduleQuery/cancelSchedule), so a burst of typing, the stale answer inside
+// the wait and every flush point are observed without wall-clock waits.
+describe('issues remote search scheduling (S9)', () => {
+  function scheduledServerView(clock, serve, overrides = {}) {
+    const requests = [];
+    const made = makeView({
+      rows: 24,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssuePage: (request) => {
+        requests.push(request);
+        return serve(request);
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      ...overrides,
+    });
+    return { ...made, requests };
+  }
+
+  test('a burst of typing schedules ONE read for the query it settles on', async () => {
+    const clock = manualScheduler();
+    const { view, requests, paints } = scheduledServerView(clock, () => pageResult([cursorRow('m1', issue(1))], { total: 1 }));
+    await tick();
+    assert.equal(requests.length, 1, 'the mount read is never debounced');
+    const before = paints.length;
+    view.handleInput('T');
+    for (const ch of 'crash') view.handleInput(ch);
+    assert.equal(view.state.query, 'crash', 'the query is recorded at once');
+    assert.match(strip(view.render(100)[1]), /› crash█/, 'the box shows the query and its caret at once');
+    assert.equal(requests.length, 1, 'no request per keystroke');
+    assert.ok(paints.length > before, 'each keystroke repaints the box');
+    assert.equal(view.state.searchPending, true, 'the scheduled read is visible state');
+    const waiting = strip(view.render(100).join('\n'));
+    assert.match(waiting, /searching/, 'the frame names the search being scheduled');
+    assert.match(waiting, /issue title 1/, 'the rows already loaded stay on screen');
+    assert.ok(!waiting.includes('loading issues'), 'no full-screen loader flash while typing');
+    assert.equal(clock.live().length, 1, 'one live callback, never one per keystroke');
+    assert.ok(clock.live()[0].delayMs >= 100 && clock.live()[0].delayMs <= 250,
+      `a short fixed debounce delay: ${clock.live()[0].delayMs}`);
+    clock.fire();
+    assert.equal(requests.length, 2, 'the settled query reads once');
+    assert.deepEqual(requests[1], { bucketId: 'mine', cursor: null, limit: 18, query: 'crash' });
+    assert.equal(view.state.searchPending, false, 'the wait ends when the read starts');
+  });
+
+  test('an answer for the previous query cannot paint while the new one waits', async () => {
+    const clock = manualScheduler();
+    const pending = [];
+    const { view } = makeView({
+      rows: 24,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssuePage: (request) => {
+        const entry = deferred();
+        pending.push({ request, entry });
+        return entry.promise;
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    pending[0].entry.resolve(pageResult([cursorRow('m1', issue(1, { title: 'mount row' }))], { total: 1 }));
+    await tick();
+    leftColumn(view, 100);
+    view.handleInput('T');
+    view.handleInput('a');
+    view.handleInput('enter');            // the 'a' read is in flight
+    assert.deepEqual(pending[1].request, { bucketId: 'mine', cursor: null, limit: 18, query: 'a' });
+    view.handleInput('T');
+    view.handleInput('b');                // 'ab' waits, so 'a' is already stale
+    pending[1].entry.resolve(pageResult([cursorRow('o1', issue(9, { title: 'a only match' }))], { total: 1 }));
+    await tick();
+    const waiting = leftColumn(view, 100);
+    assert.match(waiting, /mount row/, 'the rows on screen are the ones the reader last saw');
+    assert.ok(!waiting.includes('a only match'), 'the answer for the superseded query never paints');
+    clock.fire();
+    pending[2].entry.resolve(pageResult([cursorRow('n1', issue(3, { title: 'ab match' }))], { total: 1 }));
+    await tick();
+    assert.match(leftColumn(view, 100), /ab match/, 'only the newest query answer paints');
+    assert.equal(pending.length, 3, 'exactly three reads: mount, flushed query, settled query');
+  });
+
+  test('leaving the box reads the pending query once and never twice', async () => {
+    const clock = manualScheduler();
+    const { view, requests } = scheduledServerView(clock, () => pageResult([cursorRow('b1', issue(2))], { total: 1 }));
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'bug') view.handleInput(ch);
+    assert.equal(requests.length, 1, 'typing waits for the debounce');
+    view.handleInput('enter');
+    assert.equal(view.state.searching, false);
+    assert.equal(requests.length, 2, 'leaving the box issues the read now');
+    assert.deepEqual(requests[1], { bucketId: 'mine', cursor: null, limit: 18, query: 'bug' });
+    assert.equal(clock.live().length, 0, 'the pending callback is cancelled, not left to fire');
+    clock.fire();
+    assert.equal(requests.length, 2, 'a cancelled callback never reads');
+    view.handleInput('T');
+    view.handleInput('x');
+    view.handleInput('escape');
+    assert.equal(requests.length, 3, 'escape keeps the filter and reads it once too');
+    assert.equal(view.state.query, 'bugx', 'escape never changes the typed query');
+    assert.equal(clock.live().length, 0);
+  });
+
+  test('a refresh under a pending query reads page one of that query only once', async () => {
+    const clock = manualScheduler();
+    const { view, requests } = scheduledServerView(clock, () => pageResult([cursorRow('g1', issue(1))], { total: 2, hasNextPage: true }));
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'lab') view.handleInput(ch);
+    view.handleInput('enter');
+    leftColumn(view, 100);
+    view.handleInput('r');
+    assert.equal(requests.length, 3, 'the explicit refresh reads the current page of the current query');
+    assert.deepEqual(requests[2], { bucketId: 'mine', cursor: null, limit: 18, query: 'lab' },
+      'never an old cursor, never the previous query');
+    clock.fire();
+    assert.equal(requests.length, 3, 'no second request from a cancelled callback');
+  });
+
+  test('static local search stays immediate and never schedules', async () => {
+    const clock = manualScheduler();
+    const rows = [issue(1, { title: 'alpha crash' }), issue(2, { title: 'beta typo' })];
+    const { view } = makeView({
+      pages: pagesOf([rows, [], []]),
+      issues: rows,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'beta') view.handleInput(ch);
+    assert.equal(view.state.searchPending, false, 'a local list filters without a scheduled read');
+    assert.equal(clock.entries.length, 0, 'nothing is scheduled for local search');
+    const body = bodyOf(view, 100);
+    assert.match(body, /issue title 2/, 'the local filter applies at once');
+    assert.ok(!body.includes('alpha crash'), 'the other local row is filtered out');
+  });
+
+  test('a late answer after the reader closed paints nothing', async () => {
+    const clock = manualScheduler();
+    const gate = deferred();
+    const paints = [];
+    let settled = 'pending';
+    const view = createIssuesView({
+      rowsAvailable: () => 24,
+      helpers,
+      theme: plainTheme,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      requestRender: () => { paints.push(true); },
+      done: (result) => { settled = result; },
+      loadIssuePage: () => gate.promise,
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    view.handleInput('T');
+    view.handleInput('q');
+    view.handleInput('enter');
+    view.handleInput('escape');
+    assert.equal(settled, null, 'esc still closes with null');
+    const before = paints.length;
+    gate.resolve(pageResult([cursorRow('z1', issue(5))], { total: 1 }));
+    await tick();
+    assert.equal(paints.length, before, 'a late answer repaints nothing after close');
+  });
+
+  test('a failed page keeps the rows shown and never invents a count', async () => {
+    const clock = manualScheduler();
+    const { view, requests } = scheduledServerView(clock, (request) => (request.query === ''
+      ? pageResult([cursorRow('f1', issue(1)), cursorRow('f2', issue(2))], { total: 2 })
+      : { ok: false, error: 'GitHub issue search exceeds 1000 matches; narrow the filter', truncated: true }));
+    await tick();
+    view.handleInput('T');
+    view.handleInput('z');
+    view.handleInput('enter');
+    await tick();
+    assert.equal(requests.length, 2);
+    const body = bodyOf(view, 100);
+    assert.match(body, /1000 matches; narrow the filter/, 'the search cap is reported honestly');
+    assert.ok(!/1000\+/.test(body), 'no truncated result is claimed as the full dataset');
+    assert.match(body, /My issues \(2\)/, 'the count still describes the rows actually listed');
+    assert.equal(view.state.loading, false);
+  });
+});
+
+// S14: the fixed indicator is chrome, so an empty result and a long query keep
+// it — the query display is what gets clipped, never the page position.
+describe('issues fixed page indicator for empty and long results (S14)', () => {
+  function rightColumn(view, width, rows = 24) {
+    const panes = layout.paneWidths(layout.innerWidth(width));
+    return view.render(width)
+      .slice(4, Math.max(4, rows - 2))
+      .map((line) => [...strip(line)].slice(5 + panes.left, 5 + panes.left + panes.right).join(''))
+      .join('\n');
+  }
+
+  test('an empty result keeps page 1/1 beside Search', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[], [], []]),
+      issues: [],
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    const lines = view.render(100).map(strip);
+    assert.match(lines[1], /› Search/, 'the search widget keeps its row');
+    assert.match(lines[1], /page 1\/1/, 'the empty list still names its page position');
+    assert.ok(!leftColumn(view, 100).includes('page'), 'the list still holds rows only');
+    assert.match(bodyOf(view, 100), /no issues/i);
+  });
+
+  test('an empty server result names its page without inventing a total', async () => {
+    const clock = manualScheduler();
+    const { view } = makeView({
+      rows: 24,
+      scheduleQuery: clock.schedule,
+      cancelSchedule: clock.cancel,
+      loadIssuePage: () => pageResult([], { total: 0 }),
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    assert.match(strip(view.render(100)[1]), /page 1(?!\/)/, 'a server page names only its own number');
+    assert.ok(!/page 1\/1/.test(strip(view.render(100)[1])), 'no total is invented for a server page');
+    assert.match(rightColumn(view, 100), /no issues/, 'the empty pane says so honestly');
+  });
+
+  test('a long query is clipped in the display only: the marker and the caret stay', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[issue(1)]], [], []),
+      issues: [issue(1)],
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    const long = 'author:@me label:bug is:open no:assignee sort:updated-desc milestone:v1 project:roadmap';
+    view.handleInput('T');
+    for (const ch of long) view.handleInput(ch);
+    assert.equal(view.state.query, long, 'the stored query keeps every character');
+    const row = strip(view.render(80)[1]);
+    assert.match(row, /page 1\/1/, 'the marker is never clipped off the line');
+    assert.match(row, /…/, 'the displayed query is clamped');
+    assert.ok(row.endsWith('page 1/1 │') || row.includes('page 1/1'), `marker stays on the row: ${row}`);
+    assert.match(row, /█/, 'the caret stays visible where typing lands');
+    assert.ok(!row.includes(long), 'the full query is not shown at the cost of the marker');
+  });
+
+  test('a query the pane can hold is not touched', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[issue(1)]], [], []),
+      issues: [issue(1)],
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+    });
+    await tick();
+    view.handleInput('T');
+    for (const ch of 'bug') view.handleInput(ch);
+    assert.match(strip(view.render(120)[1]), /› bug█/, 'a short query renders verbatim');
+  });
+});
+
+// S16 (T6 hand-over): the Issues preview is the SAME formatter the worktree
+// detail uses — lib/issue-preview.js — so the two surfaces cannot drift.
+describe('issues preview shares lib/issue-preview.js (S16)', () => {
+  const { issueDetailLines } = require('../lib/issue-preview.js');
+
+  function rightColumn(view, width, rows = 24) {
+    const panes = layout.paneWidths(layout.innerWidth(width));
+    return view.render(width)
+      .slice(4, Math.max(4, rows - 2))
+      .map((line) => [...strip(line)].slice(5 + panes.left, 5 + panes.left + panes.right).join(''))
+      .join('\n');
+  }
+
+  const detail = issue(7, {
+    title: 'shared preview title',
+    labels: [{ name: 'bug' }, { name: 'urgent' }],
+    assignees: [{ login: 'ann' }, { login: 'bob' }],
+    projects: [{ title: 'Roadmap' }],
+    linkedPullRequestCount: 2,
+    reactions: { plusOne: 4 },
+    commentsCount: 2,
+    body: 'the body the preview renders',
+  });
+  const comments = [
+    { author: 'carol', createdAt: new Date(Date.now() - 300_000).toISOString(), body: 'first shared comment' },
+    { author: 'dave', createdAt: new Date(Date.now() - 60_000).toISOString(), body: 'second shared comment' },
+  ];
+
+  function previewView(theme = plainTheme) {
+    return makeView({
+      pages: pagesOf([[detail], [], []]),
+      issues: [detail],
+      rows: 40,
+      theme,
+      loadIssue: () => ({ ok: true, issue: detail, comments }),
+    });
+  }
+
+  test('the ready pane is exactly what issueDetailLines renders', async () => {
+    const { view } = previewView();
+    await tick();
+    const panes = layout.paneWidths(layout.innerWidth(100));
+    const expected = issueDetailLines(detail, comments, { width: panes.right })
+      .map((line) => line.trimEnd());
+    const actual = rightColumn(view, 100, 40).split('\n').map((line) => line.trimEnd());
+    // Trailing padding rows are frame, not preview.
+    while (expected.length > 0 && expected[expected.length - 1] === '') expected.pop();
+    while (actual.length > 0 && actual[actual.length - 1] === '') actual.pop();
+    assert.deepEqual(actual, expected, 'every field, label, count, blank line and end marker matches the shared formatter');
+  });
+
+  test('the preview title takes the accent role the shared formatter paints', async () => {
+    const calls = [];
+    const theme = {
+      fg: (role, text) => { calls.push([role, text]); return String(text); },
+      bg: (_role, text) => String(text),
+    };
+    const { view } = previewView(theme);
+    await tick();
+    view.render(100);
+    assert.ok(
+      calls.some(([role, text]) => role === 'accent' && text === '#7 shared preview title'),
+      'the title carries the shared formatter styling, not a second local variant',
+    );
+  });
+
+  test('the error and loading panes stay the view own status lines', async () => {
+    const failing = makeView({
+      pages: pagesOf([[detail], [], []]),
+      issues: [detail],
+      rows: 40,
+      loadIssue: () => ({ ok: false, error: 'gh timed out' }),
+    });
+    await tick();
+    assert.match(rightColumn(failing.view, 100, 40), /unreadable: gh timed out/,
+      'a failed detail read keeps its honest status line');
+  });
+});
+
+
+describe('round3 shared preview bindings and lossless comments', () => {
+  async function scrollingView(extra = {}) {
+    const rows = [issue(1), issue(2)];
+    const result = makeView({
+      pages: pagesOf([rows, [], []]), issues: rows, rows: 18,
+      loadIssue: (n) => ({ ok: true, issue: issue(n, { body: 'body line\n'.repeat(150) }), comments: [] }),
+      ...extra,
+    });
+    result.view.render(220);
+    await tick();
+    result.view.render(220);
+    return result;
+  }
+
+  test('extended and printable keys page before a case-folding host can select', async () => {
+    const { view, paints } = await scrollingView({ helpers: {
+      ...helpers,
+      matchesKey: (data, name) => name.length === 1
+        ? data.toLowerCase() === name.toLowerCase() : data === name,
+    } });
+    view.handleInput('pagedown');
+    const page = view.state.scroll;
+    assert.ok(page > 0);
+    for (const key of ['ctrl+shift+j', 'shift+ctrl+j', '\x1b[106;6u', '\x1b[27;6;106~', 'J']) {
+      view.handleInput('home');
+      view.handleInput(key);
+      assert.equal(view.state.scroll, page, key);
+      assert.equal(view.state.index, 0, 'paging never selects');
+      view.handleInput('K');
+      assert.equal(view.state.scroll, 0, 'printable up is a full page');
+    }
+    const before = paints.length;
+    view.handleInput('\x1b[106;6:3u');
+    assert.equal(view.state.scroll, 0);
+    assert.equal(paints.length, before, 'release never repaints');
+    for (const key of ['ctrl+j', 'ctrl+k', '\n', '\r', '\x0b', '\x1b[106;5u']) view.handleInput(key);
+    assert.equal(view.state.scroll, 0, 'old Enter/ctrl+j aliases are inert');
+    view.handleInput('ctrl+d');
+    assert.equal(view.state.scroll, Math.max(1, Math.floor(page / 2)), 'half-page stays distinct');
+    view.handleInput('j');
+    assert.equal(view.state.index, 1, 'lowercase still selects');
+    view.handleInput('T');
+    view.handleInput('J');
+    assert.equal(view.state.query, 'J', 'search receives text, not preview paging');
+  });
+
+  test('legend names negotiated capability, not platform or old ctrl+j', async () => {
+    for (const active of [false, true]) {
+      const { view } = await scrollingView({ helpers: { ...helpers, isKittyProtocolActive: () => active } });
+      const footer = strip(view.render(220).at(-2));
+      assert.ok(footer.includes(active ? 'ctrl+shift+j/k' : 'shift+j/k'), footer);
+      assert.ok(!footer.includes('ctrl+j/k'), footer);
+      assert.match(footer, /PgUp\/(?:Pg)?Dn/);
+    }
+  });
+
+  test('the Issues preview keeps every character of an overlong comment token', async () => {
+    const { view } = makeView({
+      pages: pagesOf([[issue(1)], [], []]), issues: [issue(1)],
+      loadIssue: () => ({ ok: true, issue: issue(1), comments: [{ author: 'writer', body: 'X'.repeat(2500) }] }),
+    });
+    view.render(110);
+    await tick();
+    let seen = '';
+    let previous = null;
+    for (let step = 0; step < 200; step += 1) {
+      const body = view.render(110).slice(4, -2).map(strip);
+      const scroll = view.state.scroll;
+      const overlap = previous === null ? 0 : Math.max(0, previous + body.length - scroll);
+      seen += body.slice(overlap).join('');
+      if (previous === scroll) break;
+      previous = scroll;
+      view.handleInput('pagedown');
+    }
+    assert.equal((seen.match(/X/g) || []).length, 2500);
+    assert.match(seen, /end of issue/);
   });
 });

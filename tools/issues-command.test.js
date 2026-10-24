@@ -1187,6 +1187,7 @@ describe('/herdr-gentle:issues mounted page seam (S5,D1)', () => {
         ['mine', 'My issues', null],
         ['assigned', 'Assigned', null],
         ['involved', 'Involved', null],
+        ['all', 'All', null],
       ], 'bucket metadata only: no accumulated rows are handed to the view');
       assert.equal(options.loadPages, undefined, 'the cached loader is not passed beside the fresh seam');
       assert.equal(typeof options.loadIssuePage, 'function', 'the fresh page seam is mounted');
@@ -1238,5 +1239,132 @@ describe('/herdr-gentle:issues mounted page seam (S5,D1)', () => {
     } finally {
       wide.restore();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S15/S9 (round 3): the interactive reader has FOUR buckets — the fourth is
+// `All`, the whole open repository, and it is deliberately not part of the
+// session cache/fallback bucket table. Its search box is a SERVER search, so a
+// query rides the page seam instead of filtering the loaded page.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues All bucket and server search query (S15,S9)', () => {
+  // The options the command mounts the view with, over the real injected gh.
+  async function capturedOptions(root) {
+    const base = makeIssuesRunner();
+    const capture = captureIssuesView();
+    try {
+      const { commands, mod, sessionStarts } = await loadExtension();
+      ghIssues.setGhRunner(base.runner);
+      const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+      await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+      mod.setIssuesTuiLoader(async () => stubTui);
+      const { ctx } = makeCtx({ cwd: root });
+      // The host calls the factory; the captured options live on it.
+      ctx.ui.custom = async (factory) => {
+        factory(makeHostTui(24).tui, {}, {}, () => {});
+        return null;
+      };
+      await commands.get('herdr-gentle:issues').handler('', ctx);
+      assert.ok(capture.holder.options, 'the command mounts the view');
+      return { options: capture.holder.options, calls: base.calls, restore: capture.restore };
+    } catch (err) {
+      capture.restore();
+      throw err;
+    }
+  }
+
+  test('the mounted view carries the fourth All bucket after the three disjoint ones', async () => {
+    const root = makeRepo({ tag: 'issues-buckets' });
+    const run = await capturedOptions(root);
+    try {
+      assert.deepEqual(run.options.pages.map((page) => page.id), ['mine', 'assigned', 'involved', 'all'],
+        'All is the last interactive bucket');
+      assert.equal(run.options.pages[3].label, 'All');
+    } finally {
+      run.restore();
+    }
+  });
+
+  test('the All bucket reads every open issue of the repository through the search seam', async () => {
+    const root = makeRepo({ tag: 'issues-all' });
+    const run = await capturedOptions(root);
+    try {
+      const before = run.calls.length;
+      const asked = await run.options.loadIssuePage({ bucketId: 'all', cursor: null, limit: 5 });
+      assert.equal(asked.ok, true, 'the real client answered the All page');
+      assert.deepEqual(searchQueries(run.calls.slice(before)), ['sort:updated-desc'],
+        'the All search is the whole open repository: the client adds repo/is:issue/is:open, and no bucket query narrows it');
+      const rows = JSON.parse(fixture('gh-issue-list.json')).length;
+      assert.equal(asked.total, rows, 'the whole open set is the bucket total, never a deduplicated slice');
+      assert.equal(asked.issues.length, Math.min(5, rows), 'the caller limit bounds the page');
+    } finally {
+      run.restore();
+    }
+  });
+
+  test('a reader query is appended to the scoped bucket search, and an absent one leaves it byte for byte', async () => {
+    const root = makeRepo({ tag: 'issues-query' });
+    const run = await capturedOptions(root);
+    try {
+      const before = run.calls.length;
+      const asked = await run.options.loadIssuePage({
+        bucketId: 'mine', cursor: 'row-2', limit: 7, query: '  label:bug is:open  ',
+      });
+      assert.equal(asked.ok, true, 'the real client answered the searched page');
+      assert.deepEqual(searchQueries(run.calls.slice(before)), ['author:@me sort:updated-desc label:bug is:open'],
+        'the bucket scope stays, the typed operators ride along, and nothing is trimmed twice');
+
+      const bare = await run.options.loadIssuePage({ bucketId: 'assigned', cursor: null, limit: 5 });
+      assert.equal(bare.ok, true);
+      // No `query` field at all: the legacy caller keeps the bare bucket search.
+      assert.deepEqual(searchQueries(run.calls.slice(-1)), ['assignee:@me sort:updated-desc'],
+        'no query means no extra search text');
+
+      const blank = await run.options.loadIssuePage({ bucketId: 'involved', cursor: null, limit: 5, query: '   ' });
+      assert.equal(blank.ok, true);
+      assert.deepEqual(searchQueries(run.calls.slice(-1)), ['involves:@me -author:@me sort:updated-desc'],
+        'a blank query is absent, never a trailing space');
+    } finally {
+      run.restore();
+    }
+  });
+
+  test('a search that exceeds the GitHub cap is reported, never presented as the whole dataset', async () => {
+    const root = makeRepo({ tag: 'issues-cap' });
+    const run = await capturedOptions(root);
+    const original = ghIssues.getIssuePage;
+    const capped = {
+      ok: false,
+      error: 'GitHub issue search exceeds 1000 matches; narrow the filter',
+      truncated: true,
+    };
+    ghIssues.getIssuePage = () => capped;
+    try {
+      const asked = await run.options.loadIssuePage({ bucketId: 'all', cursor: null, limit: 10, query: 'is:open' });
+      assert.deepEqual(asked, capped, 'the client error passes through unchanged: no rows, no invented total');
+    } finally {
+      ghIssues.getIssuePage = original;
+      run.restore();
+    }
+  });
+
+  test('the fourth tab is reachable and lists the whole open set, with no snapshot re-prime', async () => {
+    const root = makeRepo({ tag: 'issues-all-render' });
+    const { runner, calls } = makeIssuesRunner();
+    const { component } = await openIssues(root, { runner });
+    const rows = JSON.parse(fixture('gh-issue-list.json')).length;
+    const frame = () => clean(component.render(110).join('\n'));
+    assert.match(frame(), /▸ My issues/);
+    component.handleInput('tab');
+    component.handleInput('tab');
+    component.handleInput('tab');
+    await tick();
+    assert.equal(component.state.page, 3, 'All is the fourth tab');
+    assert.deepEqual(searchQueries(calls).slice(-1), ['sort:updated-desc'], 'All read the whole open set');
+    assert.match(frame(), new RegExp(`All \\(${rows}\\)`), 'the All tab names the whole open count');
+    const snapshots = calls.filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql'
+      && call.argv.some((entry) => entry.includes('issues(states: OPEN')));
+    assert.deepEqual(snapshots, [], 'the interactive reader never re-primes the session snapshot');
   });
 });

@@ -281,9 +281,11 @@ function graphqlSearchPage(model, argv) {
   const search = String(graphqlVariable(argv, 'search') || '');
   const first = Number(graphqlVariable(argv, 'first'));
   const cursor = graphqlVariable(argv, 'cursor');
+  // S15: a search that names no membership scope is the `All` bucket — the
+  // whole open repository — while the three scoped buckets name their own.
   const bucket = /-author:@me/.test(search) ? 'involved'
-    : (/assignee:@me/.test(search) ? 'assigned' : 'mine');
-  const members = model.buckets[bucket];
+    : (/assignee:@me/.test(search) ? 'assigned' : (/author:@me/.test(search) ? 'mine' : null));
+  const members = bucket === null ? null : model.buckets[bucket];
   const rows = [...model.issues.entries()]
     .filter(([, record]) => record.state === 'open')
     .filter(([number]) => members === null || members.has(number))
@@ -494,10 +496,12 @@ describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: f
 
       const after = model.calls.slice(before);
       // The viewer mounts on the first bucket and reads ONE page, bounded by
-      // the reader's own row budget: the 24-row host leaves 17 list rows, so
-      // the request is 17 — never a fixed count and never the whole set.
+      // the reader's own row budget: the 24-row host leaves 18 list rows (the
+      // frame's 6 chrome rows plus nothing else — the page marker moved to the
+      // search row, S14), so the request is 18 — never a fixed count and never
+      // the whole set.
       assert.equal(searchPages(after).length, 1, `one fresh page for the bucket on screen: ${JSON.stringify(after)}`);
-      assert.deepEqual(searchLimits(after), [17], 'bounded by the row budget');
+      assert.deepEqual(searchLimits(after), [18], 'bounded by the row budget');
       assert.deepEqual(searchQueries(after), [
         'repo:octo/repo is:issue is:open author:@me sort:updated-desc',
       ], 'the page carries its bucket\'s own S2 search, never the snapshot connection');
@@ -778,7 +782,7 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
 
       assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
       assert.equal(searchPages(after).length, 1, 'the bucket on screen is read fresh');
-      assert.deepEqual(searchLimits(after), [17], 'the request is the row budget, never a fixed count');
+      assert.deepEqual(searchLimits(after), [18], 'the request is the row budget, never a fixed count');
       assert.match(firstFrame, /My issues \(45\+\)/, 'the tab names the server total');
 
       // A second open reads the same first page again: fresh rows every time,
@@ -791,6 +795,42 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       assert.equal(snapshotPages(again).length, 0, 'never a second snapshot');
       assert.equal(searchPages(again).length, 1, 'a refresh is a fresh page, not a cache hit');
       assert.match(secondFrame, /My issues \(45\+\)/);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the fourth All tab lists the whole open set through the search seam, never a cached bundle', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('viewer-all');
+      const model = fakeGitHub();
+      // Each of the three S2 buckets holds ONE issue; #4 and #5 belong to none
+      // of them. All is the whole open repository, so it must list all five —
+      // it is not the union of the other tabs.
+      model.buckets.mine = new Set([1]);
+      model.buckets.assigned = new Set([2]);
+      model.buckets.involved = new Set([3]);
+      for (const number of [1, 2, 3, 4, 5]) model.set(number, 'open', `2024-05-0${number}T00:00:00Z`);
+      ghIssues.setGhRunner(model.runner);
+      const { commands, handlers } = await loadExtension();
+      await Promise.all(sessions(handlers, makeCtx(root).ctx));
+
+      const before = model.calls.length;
+      const opened = makeCtx(root);
+      await commands.get('herdr-gentle:issues').handler('', opened.ctx);
+      assert.match(await viewerFrame(opened), /My issues \(1\)/, 'the scoped bucket still lists only its own issue');
+      for (let at = 0; at < 3; at += 1) opened.mounted.component.handleInput('tab');
+      const frame = await viewerFrame(opened);
+      const after = model.calls.slice(before);
+
+      assert.match(frame, /All \(5\)/, 'All counts every open issue, not the other tabs\' rows');
+      assert.match(frame, /issue title 4/, 'an issue outside every scoped bucket lists here');
+      assert.match(frame, /issue title 5/, 'and so does the last one');
+      assert.deepEqual(searchQueries(after).slice(-1), ['repo:octo/repo is:issue is:open sort:updated-desc'],
+        'the All page is the plain open-repository search');
+      assert.equal(snapshotPages(after).length, 0, 'the All tab never re-primes the assignment snapshot');
+      assert.deepEqual(opensOf(after, 'open'), [], 'the All tab never reads the legacy list cache');
     } finally {
       restoreEnv();
     }

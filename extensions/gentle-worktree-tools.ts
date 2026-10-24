@@ -8906,6 +8906,26 @@ const ISSUES_PAGE_QUERIES = [
   { id: "assigned", label: "Assigned", query: "assignee:@me sort:updated-desc" },
   { id: "involved", label: "Involved", query: "involves:@me -author:@me sort:updated-desc" },
 ];
+// S15 (round 3): the INTERACTIVE reader has a fourth bucket, `All` — every
+// open issue of the repository, with nothing inferred or deduplicated against
+// the three scoped tabs. It lives in its own table and is deliberately NOT
+// part of ISSUES_PAGE_QUERIES: the session cache and the no-UI fallback keep
+// their three disjoint buckets, so no total is counted twice and no extra
+// full read is paid per prime.
+const ISSUES_INTERACTIVE_BUCKETS = [
+  ...ISSUES_PAGE_QUERIES,
+  { id: "all", label: "All", query: "sort:updated-desc" },
+];
+
+// S9 (round 3): the reader's search box is a SERVER search, so its text is
+// appended to the bucket's own scope instead of filtering the loaded page. An
+// absent or blank query keeps the bare bucket search byte for byte, which is
+// what query-less callers (and the cached paths) still pass.
+function issuesPageQuery(spec, rawQuery) {
+  const extra = typeof rawQuery === "string" ? rawQuery.trim() : "";
+  return extra === "" ? spec.query : `${spec.query} ${extra}`;
+}
+
 // S18: the viewer toggles between exactly these two states; `all` is never
 // requested (a closed issue never counts as open).
 const ISSUES_FETCH_PAGE_SIZE = 30;
@@ -9051,12 +9071,16 @@ async function executeIssues(rawArgs, ctx) {
     return;
   }
   // S5/D1: one page per request, straight through the real client. The bucket
-  // id selects the EXACT source query (the same three searches the cached
-  // path used, so a bucket is never widened or re-filtered here), and the
-  // cursor/limit come from the reader's own row budget. An unknown bucket is
-  // an explicit failure and never reaches a subprocess.
+  // id selects the EXACT source query (the three S2 searches plus S15's `All`,
+  // whose only scope is the open repository the client already prepends), and
+  // the cursor/limit come from the reader's own row budget. S9: a typed query
+  // rides along as additional search text, so the read searches the COMPLETE
+  // bucket instead of the page on screen. An unknown bucket is an explicit
+  // failure and never reaches a subprocess, and a client error (including the
+  // GitHub 1000-match search cap) passes through unchanged — the reader must
+  // never present a failed or capped search as the whole dataset.
   const loadIssuePage = (request = {}) => {
-    const spec = ISSUES_PAGE_QUERIES.find((bucket) => bucket.id === request.bucketId);
+    const spec = ISSUES_INTERACTIVE_BUCKETS.find((bucket) => bucket.id === request.bucketId);
     if (!spec) return { ok: false, error: `unknown issues bucket "${String(request.bucketId)}"` };
     const asked = Number(request.limit);
     // The client accepts 1..1000 per request; the row budget is the upper
@@ -9064,7 +9088,10 @@ async function executeIssues(rawArgs, ctx) {
     const limit = Number.isFinite(asked) ? Math.min(1000, Math.max(1, Math.floor(asked))) : 1;
     const cursor = request.cursor == null || request.cursor === "" ? null : String(request.cursor);
     return issuesWrapFailure(
-      gh.getIssuePage({ query: spec.query, after: cursor, first: limit }, { cwd: checkoutRoot }),
+      gh.getIssuePage(
+        { query: issuesPageQuery(spec, request.query), after: cursor, first: limit },
+        { cwd: checkoutRoot },
+      ),
       "cannot read issues",
     );
   };
@@ -9144,7 +9171,8 @@ async function executeIssues(rawArgs, ctx) {
       (hostTui, theme, _keybindings, done) => perfTraceView("issues", libRequire("issues-view.js").createIssuesView({
         // S5: bucket metadata only (ids and labels); the rows arrive page by
         // page through `loadIssuePage`, so no accumulated list is handed over.
-        pages: ISSUES_PAGE_QUERIES.map((spec) => ({ id: spec.id, label: spec.label, issues: null })),
+        // S15: the four interactive buckets, `All` last.
+        pages: ISSUES_INTERACTIVE_BUCKETS.map((spec) => ({ id: spec.id, label: spec.label, issues: null })),
         loadIssuePage,
         loadLabels,
         loadAssignees,
