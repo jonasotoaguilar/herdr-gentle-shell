@@ -6171,6 +6171,25 @@ function setWarpCloseRunner(runner) {
   warpCloseRunner = runner;
 }
 
+// S4 (round 3): the keyboard delete's confirmation text and the evidence it
+// discloses live in lib/warp-delete-confirm.js — ONE builder for both
+// keyboard surfaces, so neither the panel's ctrl+d nor the extended list's
+// Ctrl+D can drift into a prompt that hides what it removes. `undefined`
+// means "not loaded yet"; `null` means the module is missing, which refuses
+// the delete instead of prompting without evidence.
+let warpDeleteConfirmModule;
+
+function warpDeleteConfirmLib() {
+  if (warpDeleteConfirmModule === undefined) {
+    try {
+      warpDeleteConfirmModule = libRequire("warp-delete-confirm.js");
+    } catch {
+      warpDeleteConfirmModule = null;
+    }
+  }
+  return warpDeleteConfirmModule;
+}
+
 // Warp-selector delete eligibility: a checkout row is deletable only when
 // it is a REGISTERED agent worktree of this project. The principal
 // checkout (by resolved identity, never by name alone — a branch whose
@@ -7147,8 +7166,9 @@ async function executeWorktreeDetail(rawArgs, ctx) {
 // git/fs/registry/workspace mutations, while acceptance reuses the shared
 // executeWorktreeClose exactly once with hasUI:false (the Ctrl+D
 // confirmation IS the approval, so no second prompt — tool semantics for
-// dirty/unmerged/protected/foreign checkouts stay intact). The delete is
-// reachable from the EXTENDED list (`v`, then Ctrl+D) and never touches
+// dirty/unmerged/protected/foreign checkouts stay intact, and no permission
+// mode waives that confirmation). The delete is reachable from the PANEL's
+// ctrl+d and from the EXTENDED list (`v`, then Ctrl+D), and never touches
 // the principal checkout, the current checkout or an unregistered row.
 async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
   let viewLib = null;
@@ -7325,60 +7345,51 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       // Protected row (principal/current/unregistered) or a stale path:
       // safe no-op, the loop simply re-reads and re-mounts.
       if (!target || !canDelete(targetPath)) continue;
-      // S61: the deletion confirmation always names the checkout's
-      // pending changes when it has any (N files +N/-N through
-      // lib/worktree-changes.js); a clean checkout omits the dirty
-      // warning. This confirmation IS the targeted human approval: an
-      // explicit Yes for a dirty row passes force:true deliberately to
-      // the shared close for exactly that row (never the principal —
-      // not deletable here — never protected/foreign, whose refusals
-      // inside the close stay intact because they run before any
-      // removal).
-      let deleteDirtyLine = '';
-      let deleteIsDirty = false; // positive evidence of pending changes
-      let deleteClean = false; // positive evidence of none
-      try {
-        const deleteChangesLib = libRequire('worktree-changes.js');
-        const deleteSummary = await deleteChangesLib.summarizeChanges(target.path, { git });
-        if (deleteSummary && deleteSummary.ok === true) {
-          deleteIsDirty = deleteSummary.files > 0;
-          deleteClean = !deleteIsDirty;
-          if (deleteIsDirty) {
-            deleteDirtyLine = ` Pending changes: ${deleteSummary.files} file${deleteSummary.files === 1 ? '' : 's'}, +${deleteSummary.added}/-${deleteSummary.deleted}.`;
-          }
-        }
-      } catch {
-        deleteDirtyLine = '';
-        deleteIsDirty = false;
-        deleteClean = false;
+      // S4 (round 3): a keyboard delete ALWAYS asks a human, whatever the
+      // permission mode is. gentle-shell's YOLO grant waives the
+      // `worktree_close` TOOL's own dialog (untouched, a different caller);
+      // it never waives this keypress, because deleting a checkout on a key
+      // alone is what the report named as the bug.
+      //
+      // S61: the prompt names the checkout's pending changes and the commits
+      // it has that `main` does not (both read asynchronously and bounded by
+      // lib/warp-delete-confirm.js; a read that fails is reported as unknown,
+      // never as clean). This confirmation IS the targeted human approval: an
+      // explicit Yes for a dirty row passes force:true deliberately to the
+      // shared close for exactly that row (never the principal — not
+      // deletable here — never protected/foreign, whose refusals inside the
+      // close stay intact because they run before any removal).
+      const deleteConfirm = warpDeleteConfirmLib();
+      if (!deleteConfirm
+        || typeof deleteConfirm.readWarpDeleteEvidence !== "function"
+        || typeof deleteConfirm.warpDeletePrompt !== "function") {
+        notify?.("warp: the deletion confirmation is unavailable; nothing was deleted.", "error");
+        continue;
       }
-      // gentle-shell YOLO waives this confirmation for a positively clean row
-      // only: a dirty row keeps asking because the Yes below is what authorizes
-      // force, and an unreadable summary is neither dirty nor clean, so it
-      // keeps asking too.
-      const deleteWaived = deleteClean && await yoloActiveFor(ctx);
-      if (!deleteWaived && typeof ctx?.ui?.confirm !== "function") {
+      if (typeof ctx?.ui?.confirm !== "function") {
         notify?.("warp: the host UI cannot confirm worktree deletion here; nothing was deleted.", "error");
         continue;
       }
-      let approved = deleteWaived;
-      if (!approved) {
-        try {
-          approved = await ctx.ui.confirm(
-            `Delete worktree '${target.name}'?`,
-            `Delete worktree checkout at ${target.path} for branch '${target.branch}'? This removes the checkout but keeps the branch.` + deleteDirtyLine,
-          );
-        } catch {
-          approved = false;
-        }
+      const deleteEvidence = await deleteConfirm.readWarpDeleteEvidence(target.path, { git });
+      const deletePrompt = deleteConfirm.warpDeletePrompt(
+        { name: target.name, path: target.path, branch: target.branch },
+        deleteEvidence,
+      );
+      let approved = false;
+      try {
+        approved = await ctx.ui.confirm(deletePrompt.title, deletePrompt.body);
+      } catch {
+        approved = false;
       }
       if (!approved) continue;
+      // The close runs with hasUI:false (below), so the Yes above is the only
+      // dialog this delete ever shows: the shared close neither asks twice nor
+      // re-prompts for a dirty row.
       const closeCtx = ctx && typeof ctx === "object" ? { ...ctx, hasUI: false } : ctx;
       const runner = typeof warpCloseRunner === "function" ? warpCloseRunner : executeWorktreeClose;
       // Force travels ONLY here and only on positive evidence of pending
-      // changes, so the approval above — an explicit Yes, never the YOLO
-      // waiver, which requires a row proven clean — is what authorizes it.
-      const closeParams = deleteIsDirty ? { path: target.path, force: true } : { path: target.path };
+      // changes, so the approval above is what authorizes it.
+      const closeParams = deletePrompt.force === true ? { path: target.path, force: true } : { path: target.path };
       let closed;
       try {
         closed = await runner(closeParams, closeCtx);

@@ -251,6 +251,15 @@ function addRegisteredWorktree(root, branch) {
   return real;
 }
 
+// S4 (round 3): these repositories are created with `git init`, whose default
+// branch is `master`, so the deletion prompt's ahead-of-MAIN read has no base
+// to compare with. A test that creates `main` here pins a KNOWN ahead count
+// (0 unless the target gained commits); a test that omits it is deliberately
+// the "main missing" case whose evidence must read as unknown, never as 0.
+function addMainBranch(root) {
+  git(root, ['branch', 'main', 'HEAD']);
+}
+
 // SessionManager double: the warp resolves the class from the instance's own
 // constructor when the package import does not resolve (plain-node copies),
 // so this fake is what makes a real move observable.
@@ -546,6 +555,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('wired-delete');
+      addMainBranch(root);
       const target = addRegisteredWorktree(root, 'feat/del');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
@@ -559,15 +569,19 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       });
       const { commands, mod } = await loadExtension();
       const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => {
+      const closeCtxs = [];
+      mod.setWarpCloseRunner(async (params, closeCtx) => {
         closeCalls.push(params);
+        closeCtxs.push(closeCtx);
         return { isError: false, text: 'removed: feat-del \u00b7 feat/del', details: {} };
       });
       await warpDef(commands).handler('', built.ctx);
       assert.equal(built.confirms.length, 1, 'the principal row is never deletable');
       assert.equal(built.confirms[0][0], `Delete worktree 'feat-del'?`);
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch.`);
+      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch.`,
+        'a clean row with no commits of its own raises no false warning');
       assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once for the approved row');
+      assert.equal(closeCtxs[0].hasUI, false, 'the confirmed delete shows no second dialog');
       assert.deepEqual(built.notes, [['removed: feat-del \u00b7 feat/del', 'info']], 'the success text is unchanged');
       assert.equal(driver.mounts(), 2, 'the selector reopened after the delete');
     } finally {
@@ -579,7 +593,8 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('wired-delete-cancel');
-      addRegisteredWorktree(root, 'feat/del');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
@@ -591,10 +606,16 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const { commands, mod } = await loadExtension();
       const closeCalls = [];
       mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      const registryFile = registryLib.registryPath(root);
+      const before = fs.readFileSync(registryFile);
+      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
       await warpDef(commands).handler('', built.ctx);
       assert.equal(built.confirms.length, 1);
       assert.deepEqual(closeCalls, [], 'a refusal removes nothing');
       assert.deepEqual(built.notes, [], 'a refusal notifies nothing');
+      assert.deepEqual(fs.readFileSync(registryFile), before, 'a refusal writes no registry entry');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'a refusal leaves every checkout live');
+      assert.ok(fs.existsSync(target), 'the refused checkout still exists');
       assert.equal(driver.mounts(), 2, 'the selector reopened');
     } finally {
       restoreEnv();
@@ -608,6 +629,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
       git(root, ['add', 'a.txt']);
       git(root, ['commit', '-m', 'seed']);
+      addMainBranch(root);
       const target = addRegisteredWorktree(root, 'feat/del');
       fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
       const calls = [];
@@ -623,24 +645,115 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
       await warpDef(commands).handler('', built.ctx);
       assert.equal(built.confirms.length, 1);
-      assert.match(built.confirms[0][1], /Pending changes: 1 file, \+1\/-0\.$/, 'the dirty row names its pending changes');
+      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Pending changes: 1 file, +1/-0.`,
+        'the dirty row names its pending changes and nothing else');
       assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes carries force for that row');
     } finally {
       restoreEnv();
     }
   });
 
-  test('YOLO active waives the deletion confirmation for a clean row', async () => {
+  test('a dirty row with commits of its own discloses BOTH the pending changes and the commits ahead of main', async () => {
     setEnv(warpStateEnv());
     try {
-      const root = makeRepo('wired-delete-yolo');
+      const root = makeRepo('wired-delete-dirty-ahead');
+      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
+      git(root, ['add', 'a.txt']);
+      git(root, ['commit', '-m', 'seed']);
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del');
+      // Two commits that `main` does not have, plus one pending change.
+      git(target, ['commit', '--allow-empty', '-m', 'ahead one']);
+      git(target, ['commit', '--allow-empty', '-m', 'ahead two']);
+      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => true,
+      });
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'the warning never replaces the confirmation');
+      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Pending changes: 1 file, +1/-0. Commits ahead of main: 2.`,
+        'both the pending changes and the commits ahead of main are named');
+      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes carries force for that row');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a HEAD that only has commits ahead of main warns about them too', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('wired-delete-ahead-only');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del');
+      git(target, ['commit', '--allow-empty', '-m', 'ahead one']);
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => true,
+      });
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Commits ahead of main: 1.`,
+        'a clean checkout ahead of main warns without claiming pending changes');
+      assert.deepEqual(closeCalls, [{ path: target }], 'a clean row is closed without force');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('missing ahead-of-main evidence is reported as unknown, never as zero and never as safe', async () => {
+    setEnv(warpStateEnv());
+    try {
+      // No `main` branch: the ahead-of-main comparison cannot be answered.
+      const root = makeRepo('wired-delete-no-main');
       const target = addRegisteredWorktree(root, 'feat/del');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
       const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      // confirmImpl refuses everything: the row must be deleted without ever
-      // consulting it, which is what proves the waiver.
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => false,
+      });
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'unknown evidence still asks');
+      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Commits ahead of main: unknown (base branch not found: main).`,
+        'the unreadable comparison is named, not silently dropped');
+      assert.ok(!/Commits ahead of main: 0/.test(built.confirms[0][1]), 'unknown is never reported as zero');
+      assert.deepEqual(closeCalls, [], 'a refusal deletes nothing');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('YOLO active still asks before deleting a clean row and a refusal deletes nothing', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('wired-delete-yolo');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      // The row is provably clean and YOLO is ON: the keypress alone must
+      // still never delete, so the refusal below removes nothing.
       const built = makeWiredCtx({
         cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
         mount: driver.mount, confirmImpl: () => false,
@@ -649,9 +762,46 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const { commands, mod } = await loadExtension();
       const closeCalls = [];
       mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
       await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 0, 'YOLO waives the clean row confirmation');
+      assert.equal(built.confirms.length, 1, 'YOLO never waives a keyboard delete');
+      assert.equal(built.confirms[0][0], `Delete worktree 'feat-del'?`);
+      assert.deepEqual(closeCalls, [], 'the refusal under YOLO removed nothing');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'no checkout disappeared');
+      assert.equal(driver.mounts(), 2, 'the selector reopened');
+    } finally {
+      restoreEnv();
+      resetYolo();
+    }
+  });
+
+  test('YOLO active still asks before deleting a clean row and the Yes deletes exactly once', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('wired-delete-yolo-yes');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => true,
+      });
+      answerYolo('ON');
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      const closeCtxs = [];
+      mod.setWarpCloseRunner(async (params, closeCtx) => {
+        closeCalls.push(params);
+        closeCtxs.push(closeCtx);
+        return { isError: false, text: 'removed', details: {} };
+      });
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'exactly one confirmation under YOLO');
       assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once, without force');
+      assert.equal(closeCtxs[0].hasUI, false, 'the explicit Yes is the only dialog');
       assert.deepEqual(built.notes, [['removed', 'info']], 'the success text is unchanged');
     } finally {
       restoreEnv();
@@ -686,6 +836,36 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
     } finally {
       restoreEnv();
       resetYolo();
+    }
+  });
+
+  test('a host without a confirm dialog deletes nothing', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('wired-delete-noui');
+      addMainBranch(root);
+      addRegisteredWorktree(root, 'feat/del');
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+        mount: driver.mount, confirmImpl: () => true,
+      });
+      delete built.ctx.ui.confirm;
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 0, 'no dialog could be asked');
+      assert.deepEqual(closeCalls, [], 'no confirmation means no delete');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'no checkout disappeared');
+      assert.deepEqual(built.notes, [['warp: the host UI cannot confirm worktree deletion here; nothing was deleted.', 'error']],
+        'the refusal is stated once');
+    } finally {
+      restoreEnv();
     }
   });
 
