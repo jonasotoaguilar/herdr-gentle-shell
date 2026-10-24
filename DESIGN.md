@@ -645,18 +645,29 @@ overlay over the current checkout's `odd/tasks/*.md` (name list plus styled
 document), implemented in `lib/odd-docs.js` (discovery/read),
 `lib/odd-markdown.js` (renderer) and `lib/odd-view.js` (view) — it writes
 nothing and never leaves the checkout; `/herdr-gentle:issues` opens a
-three-page overlay (My issues / Assigned / Involved) over the current
-checkout's repository GitHub issues (issue list plus the selected issue
-with its comments), implemented in `lib/gh-issues.js` (the only place
-that runs `gh`), `lib/issues-view.js` (the pure view) and the command in
-`extensions/gentle-worktree-tools.ts` next to `/herdr-gentle:odd` —
-listing, search, paging, filtering and scrolling never write; only
-the assignment save, the label edit, the comment and the close/reopen
-write. The viewers retain shortcut legends rather than a duplicate `?`
-help overlay. ODD and Issues remain registered with Worktree tools disabled,
-but their association toggles and saves are unavailable; save callbacks also
-re-read the mode before writing. Warp itself is registered only with
-Worktree tools enabled. The sidebar and Moshi actions stay inline in
+four-tab overlay (My issues / Assigned / Involved / All) over the current
+checkout's repository GitHub issues, implemented in `lib/gh-issues.js`
+(the only place that runs `gh`), `lib/issues-view.js` (the pure view) and
+the command in `extensions/gentle-worktree-tools.ts`. The interactive pager
+searches the whole active bucket through GitHub, debounces typing, keeps
+query-bound cursors, reuses loaded tabs and explicitly refreshes with `r`.
+It never adds All to the shared three-bucket snapshot's totals. The shared
+40/60 geometry and lossless title wrapping live in `lib/view-layout.js`;
+complete metadata and comments use `lib/issue-preview.js` on both Issues
+and worktree detail. Preview keys and capability-based legends use
+`lib/preview-scroll-keys.js`, not OS guesses or a Pi host fork.
+
+Listing, search, paging and scrolling never write. Issues permits only its
+explicit label, assignee, comment and close actions; it paints saving before
+invoking a callback and locks input until completion. Checkout association
+writes belong to worktree detail, not the read-only ODD/Issues viewers.
+Detail mounts stored associations and cached facts before slow GitHub/Git
+reads, marks unresolved data as loading rather than empty, and blocks saving
+until initialization is verified. Enrichment applies to the mounted instance;
+closed-view outcomes cannot authorize registry writes. The viewers retain
+one-row shortcut legends rather than a duplicate `?` overlay. ODD and Issues
+remain registered with Worktree tools disabled; assignment savers re-read
+the mode before writing. Warp is registered only with Worktree tools enabled. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
@@ -860,8 +871,11 @@ anything: copy unversioned env files only when present, untracked, and
 absent at the target (never overwrite, never copy a tracked file);
 install dependencies for every lockfile-detected stack (a missing binary
 is `skipped`, a non-zero exit is `failed` plus a warning, never fatal);
-symlink `odd/` always (created in the principal first when absent) and
-`.agents/` / `.claude/` only when present, never `.codegraph/`; run
+link `.agents/`, `.pi/`, `.claude/` and `odd/` to their principal counterparts
+only when each source exists as a directory, Git tracks nothing under it and
+Git ignores it. Tracked entries arrive via checkout; untracked but nonignored
+entries are not linked. Existing targets are never removed or replaced, and
+missing source directories are never created. Never share `.codegraph/`; run
 `codegraph init` when the CLI is available. Hook outcomes travel inside
 the success `details`, never turning a verified creation into an error.
 The pre-existing `~/.config/herdr` `worktree-hooks` plugin stays
@@ -881,8 +895,9 @@ change (`enabled !== toolsRegistered`, i.e. enabling while the runtime
 loaded disabled or vice versa), which `customize status` reports. Create never
 prompts — a create touches no existing data; close prompts when the host
 offers dialog UI, waived under gentle-shell YOLO only for a checkout proven
-clean; list is read-only
-and never prompts.
+clean. Warp keyboard deletion is separate: it always prompts, even under YOLO,
+and discloses pending changes and commits ahead of main (or unknown evidence).
+List is read-only and never prompts.
 
 ### Known limitations (stated, not solved here)
 

@@ -1,15 +1,15 @@
 # Agent worktree tools (`worktree_*`)
 
-Four Pi extension tools plus one mode command, so an agent can manage its
+Five Pi extension tools plus one mode command, so an agent can manage its
 own checkout the way `~/.pi/agent/AGENTS.md` prescribes — one worktree per
 thread — and open delegated Pi sessions inside those checkouts —
-without hand-rolled `git worktree` argv. without hand-rolled `git worktree` argv. Everything below is
+without hand-rolled `git worktree` argv. Everything below is
 checkable against `extensions/gentle-worktree-tools.ts` and
 `lib/worktree-*.js`; nothing here is plan, only code.
 
 ## Tools
 
-All four are registered with `pi.registerTool()` from
+All five are registered with `pi.registerTool()` from
 `extensions/gentle-worktree-tools.ts` (listed in the Pi package's
 `pi.extensions`). Failures return `isError: true` with structured
 `details`; success output is terse, one line per worktree at most. Every
@@ -18,12 +18,16 @@ through `renderShell: "self"`): one git-branch glyph (⎇) and the
 warning theme role — the closest documented role to git orange, since the
 Pi theme schema exposes no orange — on the opening rule, the `ctrl+o to
 expand`/`to collapse` hint and the evidence-backed duration right-aligned
-on the closing rule, and ordered short body lines in the collapsed card
-(create: `branch:`/`path:` plus `issues:` when present; list: `current:`
-plus the checkout count, plus one `odd: <name> · <docs>` row per entry
-that holds odd documents, with the full rows only when expanded; close:
-`removed:` plus branch kept/removed; session open: `worktree:` plus
-`session:`, marked when resumed). The cards follow gentle-shell's float
+on the closing rule. Collapsed bodies identify the action and outcome only:
+create/update names the worktree; list says `listed: N checkouts` without
+inferring the current checkout from array order; close says `removed:` plus
+branch kept/deleted; session open names its worktree/session and a resume;
+warp names the source and destination. Expanded bodies use ordered labelled
+rows for paths, branches, associations, status and warnings, rather than
+repeating raw output dumps: a listing entry keeps its ASSOCIATED document
+(`odd: <name>`, `-` when known empty) apart from the documents its checkout
+merely holds (`available odd: <name>, <name>`), so an available document is
+never presented as an assignment. Failure diagnostics remain visible. The cards follow gentle-shell's float
 recipe (`gentle-shell/lib/shell-card.ts`, `CARD_STYLE.FLOAT`): one-column
 transparent margins, every row padded to the full target width, a blank
 padding row above the heading and between heading and body, and every row
@@ -33,7 +37,18 @@ is used nowhere in gentle-shell), re-armed after every inner reset; a
 theme without the role, or a width under 10, keeps the outlined card, and
 the duration rides the closing rule only when it fits, never as a
 placeholder dash. The agent-facing text stays precise and
-short; the longer prose lives in `details` and the expanded view. The
+short; the longer prose lives in `details` and the expanded view.
+
+The registered tool result text is built from the SAME `details` object by
+`lib/worktree-model-result.js` (`formatWorktreeModelResult`): ordered
+`label: value` rows, one fact per row, no `key=value` dump, no repeated tool
+name, no truncation, and every untrusted value folded onto one escape-free
+line. A failure, a partial result, or details that cannot describe the
+outcome are returned UNCHANGED, so diagnostics never turn into a fabricated
+success row. The presentation adapter only rewrites text content: `details`,
+`isError` and non-text content pass through untouched, and the exported
+`executeWorktree*` helpers keep the terse line format the commands and the
+backend tests pin. The
 declared `min_herdr_version` in `herdr-plugin/herdr-plugin.toml` tracks
 the version this code has actually been exercised against: `0.9.4`,
 verified read-only (`herdr --version`, `herdr plugin list --json`, and
@@ -45,11 +60,11 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
-| `worktree_upsert` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the ONE odd `.md` to associate, must exist, exactly like supplied `issues`; a LIST is refused with an error that names the rule, never silently reduced to one) | None — a create touches no existing data: the checkout and its registry row are both new, so it never asks, exactly as the panel's create path never did | `created: <name> · <branch>` / `path: <path>` (plus `issues: <n,n>` only when issues were given and `odd: <doc>` only when odd docs are stored; the already-owned checkout says `· already exists` on the first line, an update says `updated: <name> · <branch>`). A real creation additionally ends with `changes: already registered for this session` when gentle-shell's `session_worktree_register` host tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when that tool is unavailable or its call fails, nothing is appended and the create still succeeds. The `.agents`/`.claude`/`.odd` symlinks (below) are silent and never add a line |
-| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | The session's own checkout first — the principal or a registered worktree — then the principal line when the session is not in it, then the remaining `worktree list: …` agent rows |
-| `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`), naming pending changes as `Pending changes: N files, +N/-N` when dirty and nothing when clean; waived only when gentle-shell YOLO is active for this live session AND the checkout is proven clean — a dirty checkout and an unreadable summary both keep asking. A refusal keeps checkout and entry, and `force` still comes only from the caller | `removed: <name> · <branch>` / `branch kept` (`branch deleted` when the branch went with it), plus `session warped to principal` when a live session was warped out first, plus `herdr workspace step skipped (…)` when the Herdr workspace step was skipped (see the close sequence) |
-| `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `opened: <worktree> · <session-id>` / `path: <path>` (`resumed` instead of the path line when an existing session is resumed) |
-| `worktree_warp` | `name: string` (required — the worktree NAME `worktree list` prints, or the checkout path; name first then path), `changes?: string \| string[]` (optional — pending changes to copy into the destination checkout: omit or pass `""` or `[]` for no copy, `"all"` for everything, a list of files for selected changes only; there is no selector in the tool) | None — never opens a selector (selectors are human-only); warping to the checkout the session already runs in changes nothing | `moved: <source name>` / `to: <target name>` plus `path: now in "<path>"` / `branch: now in "<branch>"`, and a continuation turn keeps working in the new checkout |
+| `worktree_upsert` | `branch: string` (required), `issues: number[]` (optional), `odd: string` (optional — the path of the ONE odd `.md` to associate, must exist, exactly like supplied `issues`; a LIST is refused with an error that names the rule, never silently reduced to one) | None — a create touches no existing data: the checkout and its registry row are both new, so it never asks, exactly as the panel's create path never did | `outcome: created` (or `updated` / `already existed`), then `name: <slug>`, `branch:`, `path:`, `issues: #n, #n` (`-` when none) and `odd: <doc>` (`-` when the stored value is a known empty association), then `changes: registered` when the created checkout joined the current session's scope, then one `warning:` row per summarized warning. A real creation registers the checkout through gentle-shell's `session_worktree_register` host tool when that tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when it is unavailable or its call fails, nothing is appended and the create still succeeds. The four principal-directory links are handled by the creation hooks described below |
+| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | `worktrees: <count> (name · branch · path · kind · status · associations)` then one ` · `-joined row per checkout in listing order (principal, the session checkout when distinct, then the rest), each ending `issues #n, #n` (`-` when empty) and `odd <assigned doc>` (`-` when the entry is known to hold none, omitted when unknown), then one `warning:` row per prune warning |
+| `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`), naming pending changes as `Pending changes: N files, +N/-N` when dirty and nothing when clean; waived only when gentle-shell YOLO is active for this live session AND the checkout is proven clean — a dirty checkout and an unreadable summary both keep asking. A refusal keeps checkout and entry, and `force` still comes only from the caller | `outcome: removed`, then `name:`, `branch:`, `path:` and `branch state: kept|deleted`, plus `session: warped to <name> · <path>` when a live session was warped out first, `herdr workspace: <status> · <notice>` when that step reconciled, skipped or half-failed, and one `warning:` row per summarized warning (including the associations a registry write had to drop) |
+| `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `outcome: opened|resumed`, then `worktree:`, `branch:`, `path:`, `session:`, `workspace:`, `pane:` and `agent:` — the routing ids the caller needs to reach the session it just started |
+| `worktree_warp` | `name: string` (required — the worktree NAME `worktree list` prints, or the checkout path; name first then path), `changes?: string \| string[]` (optional — pending changes to copy into the destination checkout: omit or pass `""` or `[]` for no copy, `"all"` for everything, a list of files for selected changes only; there is no selector in the tool) | None — never opens a selector (selectors are human-only); warping to the checkout the session already runs in changes nothing | `outcome: moved|already there`, then `from: <source name> · <path>`, `to: <name> · <path>` (the continuation target) and `branch:`; a continuation turn keeps working in the new checkout |
 
 The session moves between checkouts through `/herdr-gentle:warp <name>` (its own command for humans — a selector, or an explicit name) and through the `worktree_warp` agent tool (a required name-or-path, an optional `changes` selection, no selector, then a continuation turn so the agent keeps working). The command's success text is the two-line compact `moved: <name> · <branch>` / `to: <name> · <branch>` (a raw path only when the checkout left sits outside every known checkout); the tool's result text is the S42 card rows (`moved: <name>` / `to: <name>` plus `path: now in "<path>"` / `branch: now in "<branch>"`). Warping to the checkout the session already runs in returns `worktree warp: <name> (already there)` (byte-identical text) but shows nothing and changes nothing.
 
@@ -59,7 +74,7 @@ Deleting a checkout confirms first unless gentle-shell YOLO is active for this l
 
 Structured `details` on success:
 
-- create: `{path, branch, issues, created, branchCreated, hooks, warnings, pruned, replacedRows, symlinks, changesRegistered}` — `created`
+- create: `{path, branch, issues, created, branchCreated, hooks, warnings, pruned, replacedRows, changesRegistered}` — `created`
   is `false` when the call returned the thread's existing checkout (see
   per-thread ownership); `branchCreated` is `false` when the worktree
   adopted an existing branch and `true` when the branch was created with
@@ -69,8 +84,8 @@ Structured `details` on success:
   `git worktree prune` recovery dropped (empty when nothing was stale);
   `replacedRows` lists the stale registry rows dropped by the one-owner-per-path
   rule below (`[{branch, path}]`, empty when nothing shared the target path);
-  `symlinks` is the silent principal dot-dir report (`{created, skippedTracked}`,
-  see below — never text, details only); `changesRegistered` is `true` when the
+  The `link-principal-entries` hook reports directory-link outcomes in
+  `hooks.steps`; `changesRegistered` is `true` when the
   created checkout was registered on the current session via
   `session_worktree_register` (the trailing `changes:` line is then present)
   and `false` otherwise;
@@ -85,17 +100,27 @@ Structured `details` on success:
   the conflict line naming that checkout; on the adopt path, the adoption
   line naming the adopted branch (plus the Herdr-association outcome when
   it failed).
-- list: `{worktrees: [{name, path, branch, thread, issues, status, kind}], count,
+- list: `{worktrees: [{name, path, branch, thread, issues, odd, assignedOdd, status, kind}], count,
   all, pruned, warnings, pruneError}` — `name` is the printed first column (slug or `principal`); `path` is the absolute checkout path; `status` is `live`, `missing`
   (registered and still on disk but no live checkout, or a non-absolute
   path that can never name one), or `unregistered` (only with `all:
   true`); `kind` is `principal` for the principal checkout, `agent` for a
-  registry row, or `unregistered` (only with `all: true`). `pruned` lists the registry paths dropped by the self-heal
+  registry row, or `unregistered` (only with `all: true`). `odd` is the
+  checkout's AVAILABLE inventory (the associated document first, then
+  whatever `odd/*.md` it holds right now); `assignedOdd` is the ONE
+  document the stored registry entry actually associates — the stored
+  path string, `null` when the entry is known to hold none, and absent for
+  a listing entry that has no registry row. Consumers read the association
+  from `assignedOdd` only: the inventory order never stands in for it.
+  `pruned` lists the registry paths dropped by the self-heal
   below (empty when nothing was dead, or when the prune write failed —
   then `pruneError` carries the cause); `warnings` carries the one line
   naming them (see below) and is empty otherwise.
-- close: `{path, branch, removed: true, branchKept: true, thread}` —
-  `thread` is the owning thread, or `null` when none was recorded. The
+- close: `{path, branch, removed: true, branchKept: true, thread}`,
+  plus `warnings` and `droppedOdd` when the registry write had to drop
+  legacy associations (`droppedOdd` names them, `warnings` carries the one
+  summary sentence) — `thread` is the owning thread, or `null` when none
+  was recorded. The
   checkout is selected by `name`, `path`, or `branch` (at most one): a
   `name` is the flattened branch slug the listing prints (or `principal`)
   resolved through the same resolver the warp uses — and `name` also
@@ -131,7 +156,28 @@ Structured `details` on success:
   by this call names that workspace id so no half-created workspace goes
   unmentioned.
 
-List line format (pinned by the tool tests):
+Model-facing listing text (pinned by the tool and model-result tests) —
+the registered tool returns the rows below, built from `details`:
+
+```text
+worktrees: <count> (name · branch · path · kind · status · associations)
+<name> · <branch> · <path> · principal · live · issues - · odd -
+<name> · <branch> · <path> · agent · live · issues #12, #13 · odd odd/tasks/active.md
+<name> · <branch> · <path> · agent · missing · issues - · odd -
+<name> · <branch> · <path> · unregistered · unregistered · issues - · odd -   # only with all: true
+warning: <summarized prune warning>                                          # only when something was pruned
+```
+
+The `odd` cell is the ASSOCIATED document — `-` when the entry is known to
+hold none — and never the checkout's document inventory: the inventory stays
+in `details.worktrees[].odd` for the expanded card, which labels it
+separately (`available odd: <name>, <name>`) instead of presenting an
+available document as an assignment. The cell is omitted entirely for an
+entry a producer did not describe, so an unknown association is never
+asserted empty.
+
+The exported `executeWorktreeList` helper (and the commands that call it)
+keep the terse line format the backend tests pin:
 
 ```text
 worktree list: <name> <branch> principal
@@ -140,14 +186,13 @@ worktree list: <name> <branch> thread=<thread> issues=<n,n> missing
 worktree list: <name> <branch> unregistered        # only with all: true
 ```
 
-Every agent row carries the checkout's odd documents (`odd=` suffix, only
-when the checkout holds any): the ONE associated document first, then
+Every raw helper row carries the checkout's odd documents (`odd=` suffix,
+only when the checkout holds any): the ONE associated document first, then
 whatever `odd/*.md` the worktree holds right now, auto-detected from
-inside that worktree — no manual bookkeeping. This is a LISTING of what
-the checkout offers, never the entity's field: the row itself holds at
-most one document (see *One odd document per worktree*). The listing
-carries the same list in `details.worktrees[].odd`, alongside the
-absolute checkout `path` every row keeps.
+inside that worktree — no manual bookkeeping. That list is a LISTING of what
+the checkout offers, never the entity's field, which is why the registered
+tool text and the card name the association (`assignedOdd` / `odd:`) from
+the stored entry instead of echoing it.
 
 The FIRST column is the NAME (S24): the flattened branch slug
 (`feat/worktree-warp` → `feat-worktree-warp`), or `principal` for the
@@ -167,23 +212,23 @@ The principal checkout (S19) is the main worktree of git's listing — the
 entry whose resolved path equals the main root recovered from the shared
 common dir (`<principal>/.git` is the common dir for a normal
 repository). It is always listed when git's listing names it, printed
-distinguished as `principal` (never with `thread=`/`issues=`), never
+distinguished as `principal` (never carrying an agent thread/issue
+association), never
 pruned (the registry holds agent rows only), and never reported as
-`unregistered`. When git's listing names no such entry, no principal line
+`unregistered`. When git's listing names no such entry, no principal row
 is invented. `worktree list: none` is retired: with no agent worktrees the
-output is exactly the principal line.
+output is exactly the principal row.
 
-The session's own checkout is the FIRST line, whether that is the
-principal or a registered worktree: the checkout containing or equal to
-the tool context's working directory, deepest match winning, the principal
-as a candidate. A session inside a registered worktree sees that worktree
-(with its `thread=`/`issues=`) first, then the principal, then the
-remaining agent rows in registry order. A session in the principal, or
-outside every checkout, sees the principal first. A session in an
-unregistered checkout sees the principal first too, unless `all: true`
-asks for unregistered checkouts: then that checkout leads the listing and
-the order of everything else is unchanged. The agent-row text is
-unchanged.
+The session's own checkout is the FIRST row after the header, whether that
+is the principal or a registered worktree: the checkout containing or equal
+to the tool context's working directory, deepest match winning, the
+principal as a candidate. A session inside a registered worktree sees that
+worktree first, then the principal, then the remaining agent rows in
+registry order. A session in the principal, or outside every checkout, sees
+the principal first. A session in an unregistered checkout sees the
+principal first too, unless `all: true` asks for unregistered checkouts:
+then that checkout leads the listing and the order of everything else is
+unchanged. Every row keeps its identity cells regardless of position.
 
 `all: true` appends live checkouts the registry does not know about,
 sorted by path — except the session's own unregistered checkout, which
@@ -264,8 +309,8 @@ re-implementing it.
 
 Discovery registers the canonical principal once and places its row first.
 Repeated discovery preserves its associations and leaves unchanged registry
-bytes alone. Tool listing shows the current checkout first, then principal
-when distinct; the warp destination list pins principal first. A principal
+bytes alone. Tool listing places the principal first, then the session's
+checkout when distinct. The warp destination list pins the principal first. A principal
 metadata row never grants permission to remove that checkout.
 
 Reads tolerate damage: a missing file reads as empty, malformed content is
@@ -434,7 +479,8 @@ anything it does not own:
    removal below already retires the workspace with the checkout. Any other
    Herdr failure (unavailable CLI, failed lookup) skips this step with a
    short visible notice (`herdr workspace step skipped (…)`, in the result
-   text and `details.herdrWorkspace`) while the checkout removal still
+   rows as `herdr workspace: skipped · <notice>` and in
+   `details.herdrWorkspace`) while the checkout removal still
    proceeds.
 4. **Only then remove the checkout exactly as before** (`git worktree
    remove` + registry deletion, herdr-first with the git fallback and
@@ -553,6 +599,15 @@ warning and never aborts the remaining steps.
   runner failure), and does not already exist in the worktree. Never
   overwrites, never copies a tracked file, never fails for a missing
   source.
+- **Principal directory links.** `link-principal-entries` handles exactly
+  `.agents/`, `.pi/`, `.claude/` and `odd/`. Each existing source directory
+  is linked independently only if Git tracks nothing under it and ignores it
+  in the principal checkout. Untracked but nonignored entries are skipped.
+  Tracked entries arrive through checkout. An occupied destination is never
+  deleted or replaced; a correct existing link is idempotent. Missing sources
+  are not created, and unreadable Git evidence skips linking rather than
+  guessing. The same policy runs once in the synchronous agent-tool and
+  asynchronous command hooks; outcomes and warnings are in `hooks.steps`.
 - **Dependency install by detected lockfile.** Every detected stack runs,
   in table order: `bun.lockb`/`bun.lock` → `bun install`,
   `pnpm-lock.yaml` → `pnpm install --frozen-lockfile`, `yarn.lock` →
@@ -564,29 +619,12 @@ warning and never aborts the remaining steps.
 - **`codegraph init`** when the CLI is on `PATH` (`skipped` with a reason
   when absent). The tools do not index for you beyond this.
 
-Creation links the principal dot-dirs (T42/S51, superseding the S21 "no
-symlinks" rule for exactly these three names): on every real creation,
-for each of `.agents`, `.claude` and `.odd`, when that entry exists in
-the PRINCIPAL checkout — the source is always the principal, never the
-current checkout — a symlink to it is created inside the new worktree,
-replacing any entry already there. The step is ALL-OR-NOTHING on the
-repository's tracked state (the principal's git state, read with `git
-ls-files`, never guessed): when ANY of the three is tracked, no symlink
-is created for any of them; only when NONE is tracked do the symlinks
-apply. No symlink ever points at a missing target (an absent or
-dangling source is skipped). The step is a silent hook: it adds NOTHING
-to the create output in any branch and never fails the create.
-
-What remains unchanged besides the three links: untracked env
-copies, stack-detected dependency installs, and `codegraph init` when
-available. Two consequences are recorded rather than hidden: a worktree
-reaches `odd/` only when the repository tracks it — a tracked `odd/` is
-checked out as a real directory, so a session there finds it both as the
-worktree-relative `odd/…` and as the principal's absolute path, while an
-untracked `odd/` is reachable in the principal alone; and closing a
-tool-created checkout still needs `force` wherever env copies or a
-`codegraph init` leave untracked files (a checkout with neither closes
-without `force`).
+The source of these links is the principal checkout, never whichever linked
+checkout invoked creation. The hook does not copy directory contents or share
+`.codegraph/`. A tracked `odd/` arrives as a regular checkout directory; a
+Git-ignored `odd/` can be shared through its principal link. Closing may still
+need `force` when creation hooks leave untracked files or links; those files
+are never silently removed by setup.
 
 The principal checkout is recovered from the shared common dir (for a
 normal repository, `<principal>/.git` is the common dir), not assumed
@@ -736,8 +774,7 @@ opens it empty, any other printable opens it with that character, and once
 open every printable — space included — is text), pagination with
 `pgUp`/`pgDn`, and `esc` to step back to the panel. Both data lines are
 honest: branch, the registry's assigned issues and its one odd document
-(the `odd` count is therefore 0 or 1 — see *One odd document per
-worktree*), the
+(`issues: #76, #77`, `odd: document-name`), the
 change size as LINE counts (`changes +A −D` — the tracked diff plus the
 lines each untracked file adds), the commits ahead/behind `main` and both
 ages (`created <age> · modified <age>`). Creation uses an actual recorded
@@ -748,8 +785,8 @@ activity is unavailable rather than dated before creation. Otherwise activity
 uses the newer readable commit or dirty-file timestamp. A measured zero is
 omitted from the line for the change size and for each of `↑`/`↓`
 independently — a clean checkout therefore shows neither, and only the
-non-zero direction of ahead/behind appears — while issues and odd always
-show their count, `0` included (never `none`). `unavailable` is not a zero
+non-zero direction of ahead/behind appears. Association identities are shown
+instead of counts; a readable empty association is `-`. `unavailable` is not a zero
 and stays on the line, with its reason where one was supplied, whenever git
 or the registry cannot answer (S9) or an untracked file's lines cannot be
 read (S16), so "nothing to report" and "could not read it" never look
@@ -757,48 +794,37 @@ alike. Every label on a data line is English (`branch`, `issues`, `odd`,
 `changes`, `created`, `modified`). The current worktree's line reads the same
 way as the focused one (S4a). The principal checkout comes first among destinations when it is not current.
 Other rows are ordered by readable activity, newest first; unavailable activity
-sorts after known activity. Counts for issues and ODD remain numeric (including
-zero); a data line never lists their IDs or document paths. Detail/edit retains
-the full associations.
+sorts after known activity. ODD uses the document name, not its stored path;
+issue ids carry `#`. Detail/edit retains the full associations.
 
-The focused checkout is editable with `e` (S13): the SAME single panel
-opens in editing mode with the type and the name FROZEN — it renders the
-checkout's own branch and path verbatim, never a re-derived one — and the
-Issues and Odd panes open with the checkout's currently assigned values
-pre-selected. `tab`, `space`, the filters, the paging and the previews
-belong to this editing mode (the create surface has none of them). The Odd
-pane is a SELECT, not a multi-toggle: `space` marks the focused document as
-the active one and REPLACES whatever was marked before, marking the active
-document again clears the association, and two documents can never be
-marked at once (`selected: <n> odd` is therefore always 0 or 1). The
-issues pane keeps its toggle, because a worktree may carry several
-issues; `enter`/`ctrl+s` persists BOTH assigned fields in
-ONE registry write through the same guarded saver the odd and issues
-viewers use (a created row takes the checkout's real branch and thread, a
-refusal writes nothing), and `esc` cancels with nothing written. The
-selector then reopens — with the fresh values after a save, unchanged
-after a cancel — and a refusing registry shows its error without changing
-what the panel displays. Both panes are handed their SOURCE order
-verbatim (issues from `sort:updated-desc`, odd documents from
-`lib/odd-docs.js`'s modification ordering) and the extension never
-re-sorts them (S15). Both datasets render their handed source order unchanged; switching datasets
-preserves each cursor, filter and selection.
+`e` opens the separate fullscreen worktree detail, never the bottom create
+panel. Its three header rows show checkout facts, `issues: #…`, then
+`odd: name` (`-` when absent). It mounts stored associations and cached facts
+first; verification, the complete open-issue snapshot and full facts enrich
+that same instance after mount. Pending/failed initialization is named and
+blocks saving rather than inventing empty data. Closing prevents late UI
+updates, notifications and registry writes; an already queued read may still
+start or finish without applying its result.
 
-The create completion is a TWO-STEP flow in the same bottom panel (S6),
-never a list of panes: step 1 picks the change type, step 2 types the change
-name, and `enter` on the name creates. The header stacks Type above Name,
-followed by the derived branch and checkout path. There is no Issues pane,
-no Odd pane, no `Search Issues:`/`Search Odd:` row, no association counts
-and no preview column: a brand-new row is born without an association, so
-the create surface asks for exactly those two things. The Issues/Odd panes,
-their selections, filters, paging and previews exist ONLY in the editing
-mode described below.
+`tab` switches Issues/ODD, arrows page the active list, and Search filters its
+loaded complete eligible set. `space` toggles issue assignments or selects
+one ODD document, replacing the previous one; `enter` selects the focused
+ODD document without saving. `ctrl+s` persists both fields in one guarded
+registry update. A failed save preserves the draft. `esc` closes without
+saving the draft; initial verification may separately reconcile proven-closed
+or missing assignments. The selector reopens when detail closes and reflects
+any successful save. Source order and each dataset's cursor/filter/selection
+are preserved. See [Viewer feedback](viewer-feedback.md) for header, paging,
+preview keys and loading-state details.
 
-`↑`/`↓` move Type ↔ Name. On Type, `←`/`→` cycle the type and `enter` opens
-its change-type picker. Name retains text editing and is the last step:
-`enter` there creates, `ctrl+s` creates from any field, and `esc` cancels
-(unwinding the type picker first). `tab` is inert while creating — it is the
-editing mode's dataset toggle — and no `?` help overlay exists.
+Creation uses a compact bottom panel with **Type · Name** tabs and only the
+active field visible. `tab`/`shift+tab` or `←`/`→` switch fields; `↑`/`↓`
+choose the type. `enter` advances or confirms, `ctrl+s` submits from either
+field, and `esc` cancels. Typing on Type starts Name. The derived branch and
+path appear above the tabs; both remain neutral `-` until a valid candidate
+exists. A refused submission names its error without colouring an incomplete
+preview red. No Issues/ODD selector or association state is added to human
+creation. See [Tabbed bottom creation](warp-create-feedback.md).
 The type plus the typed name derives branch `<type>/<slug>` and checkout
 `<type>-<slug>` per the branch-pr skill's
 `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`,
@@ -817,12 +843,15 @@ refusals keep their exact shape; an empty or unrepresentable name refuses
 with an actionable message, and a duplicate branch refuses with the create
 tool's own message; an
 explicit `<name>` skips the selector and also resolves a lone unregistered
-checkout. Deleting a checkout from the selector lives in the extended
-list: `Ctrl+D` on a focused row opens the same explicit confirmation the
-close tool uses (naming the target, its absolute path and, when dirty,
-`Pending changes: N files, +N/-N`) — waived under gentle-shell YOLO only for
-a row proven clean, never for a dirty one — and an explicit Yes then reuses the
-shared close exactly once with `force: true` for exactly that approved row.
+checkout. In either the panel or extended list, `Ctrl+D` on an eligible
+focused row always requests explicit human confirmation, even with YOLO active.
+The dialog names the target/path, pending changes (`N files, +N/-N`) and commits
+ahead of local `main` when present. Unavailable evidence is reported as unknown,
+not zero; a missing `main` is never silently replaced with an upstream ref.
+Cancellation or an unavailable confirmation UI deletes nothing. An explicit Yes
+then invokes the guarded close once; only positive dirty evidence adds
+`force: true`. This keyboard confirmation is not waived by the separately
+invoked agent close tool's permission policy.
 Only a REGISTERED agent worktree is deletable — the principal checkout,
 the current checkout and an unregistered live checkout are safe no-ops,
 and the `view all worktrees` row is not a checkout. The project's live checkouts are discovered at session startup
@@ -1045,12 +1074,10 @@ each call it resolves the touched `.md` path against the principal
 checkout's `odd/` directory and associates it with the worktree of the
 **agent's context** — the invoking context's working directory matched to
 the longest enclosing registry entry — never from the file path itself.
-Since S21 removed the creation symlinks, a worktree reaches an `odd/` of
-its own only when the repository tracks one: the per-call leg resolves
-the touched path against the principal checkout's `odd/`, so a tracked
-`odd/` is associated both as the worktree-relative document and as the
-principal's absolute path; the re-scan leg below only converges documents
-when the worktree has an `odd/` directory at all. The detector is
+The per-call leg resolves the touched path against the principal checkout's
+`odd/`. A worktree can contain its own tracked `odd/`, or a principal link
+when that directory is Git-ignored; the re-scan leg below converges documents
+when the worktree has a readable `odd/` directory. The detector is
 INACTIVE while the session runs in the principal checkout (S30): no odd
 is detected for or assigned there, so the many documents created in the
 root checkout never pile up — detection stays active inside agent
@@ -1122,10 +1149,30 @@ document now being edited. Both triggers sit behind the worktree-tools
 toggle: with it off the handler reads the mode first and returns before any
 naming, so neither trigger can fire.
 
+## Viewport capacity and search
+
+There is no fixed 20-item page. `H` is the host terminal's current row count:
+
+- Issues reserves six chrome rows: body budget `max(1, H - 6)`.
+- ODD reserves four: `max(1, H - 4)`.
+- Worktree detail normally reserves five plus the actual wrapped header rows;
+  its row planner clips chrome/header only on tiny terminals and preserves a
+  body row when possible.
+
+Each item spends the rows its complete wrapped label needs, so a two-line
+item costs two rows. Pages contain whole items; a taller-than-page item gets
+its own page. With 40 terminal rows and single-line items, Issues fits 34,
+ODD 36, and detail 32 when its header occupies three rows. A narrower pane
+or longer header reduces that capacity through measured row costs, not a
+second guessed item limit. The shared width rule allocates roughly 40/60,
+reserving the divider and narrow-terminal minimums.
+
 ## Issue snapshot cache (S10/S7d)
 
-The issues viewer and the worktree detail share ONE open-issue snapshot per
-repository and session, keyed by the repository's shared git common dir.
+Worktree assignment evidence uses ONE complete open-issue snapshot per
+repository and session, keyed by its shared Git common directory. The
+interactive Issues list is a separate server-paged reader, not a projection
+of that snapshot.
 Session start takes it in full through GitHub's own cursor pagination
 (`lib/gh-issues.js`, `listAllOpenIssues`): `gh api graphql` asks
 `repository.issues(states: OPEN, first: 100, after: $cursor)` for
@@ -1133,24 +1180,29 @@ Session start takes it in full through GitHub's own cursor pagination
 then a repository lookup plus one request per 100 issues — never a repeated
 download of the whole set, and no fixed issue cutoff. GraphQL is used instead
 of `gh issue list --search` because the search API caps its own result set.
-Every later `/herdr-gentle:issues` open merges only the newest-20-UPDATED
-margin (one `--state all --limit 20` call) instead of re-listing the
-repository, and a repeated `session_start` reuses the primed snapshot — or
-the prime still in flight — rather than resetting it.
+An Issues open refreshes a primed snapshot's newest-20-UPDATED margin
+(one `--state all --limit 20` call) after mounting, separately from the
+interactive page read. It never primes a cold assignment snapshot just to
+show that list. Repeated `session_start` reuses the primed snapshot or the
+prime already in flight rather than resetting it.
 
-The viewer's three pages (`My issues`, `Assigned`, `Involved`) are cached the
-same way and in the same startup read. Their full read is bounded by the
-snapshot's own count: a bucket is a SUBSET of the open issues, so asking gh
-for `count + 1` rows proves the bucket arrived whole whenever fewer come
-back, and a fetch that fills that bound is a failed proof, not a page
-(`cannot prove the … page is complete`) — no heuristic re-categorization is
-ever used to fill a page. Each open then merges the bucket's own newest 20
-rows and keeps everything older, so a follow-up open costs three 20-row
-requests and one shared margin, never a 500-row re-download. The margin the
-shared cache just fetched also decides which cached rows may have left a
-query: a number it reports that the bucket no longer returns (closed,
-unassigned, edited away) is removed, while numbers outside that 20-issue
-window are left alone rather than guessed at.
+Interactive Issues reads My issues, Assigned, Involved and All independently
+through GitHub cursor search. Request size comes from available body rows;
+wrapped titles determine how many fetched items are actually shown, and the
+next cursor follows the last shown item. Search covers the complete active
+bucket rather than filtering only its loaded page, with a short debounce and
+query-bound cursors. Loaded tabs/pages are reused until explicit `r` or a
+successful write invalidates them. GitHub search above 1000 matches is
+reported as a limit requiring a narrower filter, never silently truncated.
+
+The retained three-bucket snapshot helpers serve the noninteractive fallback;
+All is not added to their totals. Their count-based completeness proof is not
+the interactive pager's loading strategy. Worktree detail instead needs the
+whole verified open set for local assignment search; a cold read starts after
+mount while its stored selection remains visible and saving is disabled.
+ODD discovery is local and bounded; its paging/search is over the discovered
+inventory, and `r` rediscovers it. See [Issues viewer](issues-viewer.md) and
+[ODD viewer](odd-viewer.md) for their limits.
 
 Completeness is checked, page by page, and reported instead of assumed. A
 page carrying GraphQL errors, a `hasNextPage` without a new non-empty cursor,
