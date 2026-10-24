@@ -32,8 +32,14 @@ function track(dir) {
   return dir;
 }
 
+// S3/L4: git-ignore rules decide link eligibility, so every fixture pins the
+// caller's global/system git config away. Otherwise the host's own global
+// ignore file (it already names .pi/.claude/.agents) would answer instead of
+// the repository's .gitignore, and a test could prove the wrong thing.
+const GIT_ISOLATION = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+
 function git(cwd, args) {
-  const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, ...GIT_ISOLATION } });
   assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
   return (result.stdout || '').trim();
 }
@@ -111,12 +117,17 @@ function runHooks(principal, worktree, opts = {}) {
 }
 
 function envWithBin(stub) {
-  return { ...process.env, PATH: `${stub.dir}${path.delimiter}${process.env.PATH || ''}`, HOOK_SHIM_LOG: stub.log };
+  return {
+    ...process.env,
+    ...GIT_ISOLATION,
+    PATH: `${stub.dir}${path.delimiter}${process.env.PATH || ''}`,
+    HOOK_SHIM_LOG: stub.log,
+  };
 }
 
 function envWithBinIsolated(stub) {
   // PATH contains ONLY the stub dir: anything without a stub reads as missing.
-  return { ...process.env, PATH: stub.dir, HOOK_SHIM_LOG: stub.log };
+  return { ...process.env, ...GIT_ISOLATION, PATH: stub.dir, HOOK_SHIM_LOG: stub.log };
 }
 
 function stepByName(result, name) {
@@ -337,65 +348,234 @@ describe('worktree-hooks: dependency install', () => {
       // recorded argv proves exactly one install ran.
       hasBinary: (bin) => bin === 'custom-bin',
     });
-    assert.deepEqual(seen, ['custom-bin sync --offline']);
+    // The same injected runner serves the link step's two git reads, so the
+    // install argv is the only non-git call.
+    assert.deepEqual(seen.filter((line) => !line.startsWith('git ')), ['custom-bin sync --offline']);
+    assert.deepEqual(seen.filter((line) => line.startsWith('git ')), [
+      'git ls-files -- .agents .pi .claude odd',
+      'git check-ignore -- .agents .pi .claude odd',
+    ], 'the link step reads tracking and ignore state once each');
     assert.equal(stepByName(result, 'install:custom').status, 'done');
   });
 });
 
 // ---------------------------------------------------------------------------
-// No symlinks (S21: the S8 symlink hook is removed entirely).
+// S3/L4 (final user selection "Las cuatro como symlinks hacia main"): the
+// principal's `.agents`, `.pi`, `.claude` and `odd` entries are LINKED into a
+// new worktree ONLY when git ignores them there. A tracked entry arrives with
+// the checkout, an untracked-but-not-ignored entry is not eligible, and
+// neither the source nor an occupied target is ever removed or replaced.
+// Nothing is copied: the existing env-file copy keeps its own contract.
 // ---------------------------------------------------------------------------
 
-describe('worktree-hooks: no symlinks', () => {
-  test('creation creates no symlinks even when the sources exist in the principal', () => {
-    const principal = makePrincipal('nosymlink');
-    const worktree = addLinkedWorktree(principal, 'hooks/nosymlink');
-    fs.mkdirSync(path.join(principal, 'odd'));
-    fs.writeFileSync(path.join(principal, 'odd', 'notes.md'), 'hi\n');
-    fs.mkdirSync(path.join(principal, '.agents'));
-    fs.writeFileSync(path.join(principal, '.agents', 'note.md'), 'hi\n');
-    fs.mkdirSync(path.join(principal, '.claude'));
-    fs.writeFileSync(path.join(principal, '.claude', 'note.md'), 'hi\n');
+const LINKABLE_NAMES = ['.agents', '.pi', '.claude', 'odd'];
+
+// Ignored entries in the principal, each with one file whose bytes prove what
+// the link resolves to.
+function writeIgnoredEntries(principal, names, extra = {}) {
+  fs.writeFileSync(path.join(principal, '.gitignore'), `${names.map((n) => `${n}/`).join('\n')}\n`);
+  for (const name of names) {
+    fs.mkdirSync(path.join(principal, name), { recursive: true });
+    fs.writeFileSync(path.join(principal, name, 'note.md'), `${name} source\n`);
+  }
+  for (const [rel, body] of Object.entries(extra)) {
+    fs.mkdirSync(path.dirname(path.join(principal, rel)), { recursive: true });
+    fs.writeFileSync(path.join(principal, rel), body);
+  }
+}
+
+function writePlainEntries(principal, names) {
+  for (const name of names) {
+    fs.mkdirSync(path.join(principal, name), { recursive: true });
+    fs.writeFileSync(path.join(principal, name, 'note.md'), `${name} source\n`);
+  }
+}
+
+describe('worktree-hooks: git-ignored principal entries become links (S3/L4)', { concurrency: false }, () => {
+  test('an ignored entry is linked to the principal, never copied', () => {
+    const principal = makePrincipal('linkignored');
+    const worktree = addLinkedWorktree(principal, 'hooks/linkignored');
+    writeIgnoredEntries(principal, LINKABLE_NAMES);
     const stub = makeStubBin({ bins: [] });
-    const result = runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
-    // No symlink step of any kind is reported.
-    assert.ok(!(result.steps || []).some((s) => s.name.startsWith('link:')), `no symlink steps: ${JSON.stringify((result.steps || []).map((s) => s.name))}`);
-    assert.ok(!(result.steps || []).some((s) => /symlink/i.test(s.name)), 'no step name mentions symlinks');
-    // Nothing is linked into the worktree, whatever exists upstream.
-    for (const subdir of ['odd', '.agents', '.claude']) {
-      assert.equal(fs.existsSync(path.join(worktree, subdir)), false, `${subdir} is not created in the worktree`);
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    assert.equal(result.ok, true);
+    const step = stepByName(result, 'link-principal-entries');
+    assert.ok(step, `expected a link step: ${JSON.stringify(result.steps)}`);
+    assert.equal(step.status, 'done');
+    for (const name of LINKABLE_NAMES) {
+      const link = path.join(worktree, name);
+      assert.equal(fs.lstatSync(link).isSymbolicLink(), true, `${name} is a symlink`);
+      assert.equal(fs.readlinkSync(link), path.join(principal, name), `${name} points at the principal entry`);
+      assert.equal(fs.readFileSync(path.join(link, 'note.md'), 'utf8'), `${name} source\n`, `${name} resolves to the principal bytes`);
+      // The source is untouched: still a real directory with the same bytes.
+      assert.equal(fs.lstatSync(path.join(principal, name)).isSymbolicLink(), false, `${name} source stays a real directory`);
+      assert.equal(fs.readFileSync(path.join(principal, name, 'note.md'), 'utf8'), `${name} source\n`);
     }
-    // The principal sources are left exactly as they were (real dirs).
-    assert.equal(fs.lstatSync(path.join(principal, 'odd')).isSymbolicLink(), false);
-    assert.equal(fs.readFileSync(path.join(principal, 'odd', 'notes.md'), 'utf8'), 'hi\n');
-    // What remains is unchanged: env copies, stack installs, codegraph.
-    assert.ok(stepByName(result, 'copy-unversioned'), 'env-copy step still reported');
-    assert.ok(stepByName(result, 'install'), 'install step still reported');
-    assert.ok(stepByName(result, 'codegraph-init'), 'codegraph step still reported');
+    // No directory copy: the env copy step never names these entries.
+    const copy = stepByName(result, 'copy-unversioned');
+    assert.ok(copy, 'env copy step still reported');
+    for (const name of LINKABLE_NAMES) {
+      assert.ok(!String(copy.detail).includes(name), `copy step does not copy ${name}: ${copy.detail}`);
+    }
+    assert.deepEqual(result.warnings, []);
+  });
+
+  test('a fifth historical spelling is not linked: only the four requested names travel', () => {
+    const principal = makePrincipal('linklegacy');
+    const worktree = addLinkedWorktree(principal, 'hooks/linklegacy');
+    // `.agents` proves the step ran; `.odd` is an ignored directory that is
+    // NOT one of the four requested names, so it must stay in the principal.
+    writeIgnoredEntries(principal, ['.agents', '.odd']);
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    assert.equal(fs.lstatSync(path.join(worktree, '.agents')).isSymbolicLink(), true, 'an eligible name is still linked');
+    assert.equal(fs.existsSync(path.join(worktree, '.odd')), false, '`.odd` is not a fifth eligible spelling');
+    assert.equal(fs.lstatSync(path.join(principal, '.odd')).isDirectory(), true, 'the principal entry is untouched');
+    assert.equal(fs.readFileSync(path.join(principal, '.odd', 'note.md'), 'utf8'), '.odd source\n');
+    assert.deepEqual(result.warnings, []);
+    // The rendered outcome never even names it.
+    assert.ok(!String(stepByName(result, 'link-principal-entries').detail).includes('.odd'));
+  });
+
+  test('an untracked entry git does not ignore is never linked', () => {
+    const principal = makePrincipal('linknotignored');
+    const worktree = addLinkedWorktree(principal, 'hooks/linknotignored');
+    writePlainEntries(principal, LINKABLE_NAMES);
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    const step = stepByName(result, 'link-principal-entries');
+    assert.equal(step.status, 'skipped');
+    assert.match(String(step.detail), /not git-ignored/);
+    for (const name of LINKABLE_NAMES) {
+      assert.equal(fs.existsSync(path.join(worktree, name)), false, `${name} is not linked into the worktree`);
+      assert.equal(fs.readFileSync(path.join(principal, name, 'note.md'), 'utf8'), `${name} source\n`, `${name} source untouched`);
+    }
     assert.equal(result.ok, true);
   });
 
-  test('odd/ is NOT created in the principal: the link-only directory is gone', () => {
+  test('a tracked entry arrives with the checkout and is neither linked nor copied', () => {
+    const principal = makePrincipal('linktracked');
+    writeIgnoredEntries(principal, ['.agents'], { '.agents/extra.json': '{}\n' });
+    git(principal, ['add', '-f', '.agents/note.md']);
+    git(principal, ['commit', '-m', 'track agents']);
+    const worktree = addLinkedWorktree(principal, 'hooks/linktracked');
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    const step = stepByName(result, 'link-principal-entries');
+    assert.match(String(step.detail), /tracked/);
+    const target = path.join(worktree, '.agents');
+    assert.equal(fs.lstatSync(target).isSymbolicLink(), false, 'the checkout entry is a real directory');
+    assert.equal(fs.readFileSync(path.join(target, 'note.md'), 'utf8'), '.agents source\n', 'the committed content is what arrives');
+    assert.equal(fs.existsSync(path.join(target, 'extra.json')), false, 'an ignored extra is not brought along');
+    assert.equal(fs.existsSync(path.join(principal, '.agents', 'extra.json')), true, 'the source keeps its ignored extra');
+  });
+
+  test('an occupied target is preserved, never removed or replaced', () => {
+    const principal = makePrincipal('linkoccupied');
+    const worktree = addLinkedWorktree(principal, 'hooks/linkoccupied');
+    writeIgnoredEntries(principal, ['.agents']);
+    fs.mkdirSync(path.join(worktree, '.agents'));
+    fs.writeFileSync(path.join(worktree, '.agents', 'mine.md'), 'mine\n');
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    const step = stepByName(result, 'link-principal-entries');
+    assert.match(String(step.detail), /\.agents: target exists/);
+    assert.equal(fs.lstatSync(path.join(worktree, '.agents')).isSymbolicLink(), false, 'the occupant is not a link');
+    assert.equal(fs.readFileSync(path.join(worktree, '.agents', 'mine.md'), 'utf8'), 'mine\n', 'the occupant is untouched');
+    assert.equal(fs.existsSync(path.join(worktree, '.agents', 'note.md')), false, 'nothing was merged in');
+    assert.equal(fs.readFileSync(path.join(principal, '.agents', 'note.md'), 'utf8'), '.agents source\n');
+  });
+
+  test('a missing source is harmless', () => {
+    const principal = makePrincipal('linkmissing');
+    const worktree = addLinkedWorktree(principal, 'hooks/linkmissing');
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    const step = stepByName(result, 'link-principal-entries');
+    assert.equal(step.status, 'skipped');
+    assert.match(String(step.detail), /missing source/);
+    assert.deepEqual(result.warnings, []);
+    assert.equal(result.ok, true);
+    assert.equal(fs.existsSync(path.join(worktree, 'odd')), false);
+  });
+
+  test('an existing correct link is idempotent (no write, reported as existing)', () => {
+    const principal = makePrincipal('linkidem');
+    const worktree = addLinkedWorktree(principal, 'hooks/linkidem');
+    writeIgnoredEntries(principal, ['.agents']);
+    const stub = makeStubBin({ bins: [] });
+    const first = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    assert.deepEqual(stepByName(first, 'link-principal-entries').status, 'done');
+    const link = path.join(worktree, '.agents');
+    const before = fs.lstatSync(link);
+    const second = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    const after = fs.lstatSync(link);
+    const step = stepByName(second, 'link-principal-entries');
+    assert.match(String(step.detail), /already linked \.agents/);
+    assert.equal(after.ino, before.ino, 'the existing link is not recreated');
+    assert.equal(after.mtimeMs, before.mtimeMs, 'no write happened on the second run');
+    assert.equal(fs.readlinkSync(link), path.join(principal, '.agents'));
+    assert.deepEqual(second.warnings, []);
+  });
+
+  test('git cannot answer: nothing is linked (fail closed, creation still succeeds)', () => {
+    const principal = makePrincipal('linkunknown');
+    const worktree = addLinkedWorktree(principal, 'hooks/linkunknown');
+    writeIgnoredEntries(principal, LINKABLE_NAMES);
+    const stub = makeStubBin({ bins: [] });
+    const result = runHooks(principal, worktree, {
+      env: envWithBinIsolated(stub),
+      run: () => ({ status: 128, stdout: '', stderr: 'git failed', error: null }),
+    });
+    const step = stepByName(result, 'link-principal-entries');
+    assert.equal(step.status, 'skipped');
+    assert.match(String(step.detail), /status unknown/);
+    for (const name of LINKABLE_NAMES) {
+      assert.equal(fs.existsSync(path.join(worktree, name)), false, `${name} is not linked without a git answer`);
+    }
+    assert.equal(result.ok, true, 'an unknown git answer never fails the creation');
+  });
+
+  test('the async twin links exactly what the sync runner links', async () => {
+    const syncPrincipal = makePrincipal('linkparity-sync');
+    const syncWorktree = addLinkedWorktree(syncPrincipal, 'hooks/linkparity-sync');
+    writeIgnoredEntries(syncPrincipal, LINKABLE_NAMES);
+    const asyncPrincipal = makePrincipal('linkparity-async');
+    const asyncWorktree = addLinkedWorktree(asyncPrincipal, 'hooks/linkparity-async');
+    writeIgnoredEntries(asyncPrincipal, LINKABLE_NAMES);
+    const syncStub = makeStubBin({ bins: [] });
+    const asyncStub = makeStubBin({ bins: [] });
+    const syncRes = runHooks(syncPrincipal, syncWorktree, { env: envWithBin(syncStub), hasBinary: () => false });
+    const asyncRes = await hooksLib().runCreationHooksAsync({
+      principalRoot: asyncPrincipal,
+      worktreePath: asyncWorktree,
+      root: asyncPrincipal,
+      env: envWithBin(asyncStub),
+      hasBinary: () => false,
+    });
+    const syncStep = stepByName(syncRes, 'link-principal-entries');
+    const asyncStep = stepByName(asyncRes, 'link-principal-entries');
+    assert.equal(asyncStep.status, syncStep.status, 'same link status');
+    assert.equal(asyncStep.detail, syncStep.detail, 'same link detail');
+    for (const name of LINKABLE_NAMES) {
+      for (const [principal, worktree] of [[syncPrincipal, syncWorktree], [asyncPrincipal, asyncWorktree]]) {
+        const link = path.join(worktree, name);
+        assert.equal(fs.lstatSync(link).isSymbolicLink(), true, `${name} linked on both runners`);
+        assert.equal(fs.readlinkSync(link), path.join(principal, name));
+      }
+    }
+    assert.equal(asyncRes.ok, syncRes.ok);
+  });
+
+  test('odd/ is never created in the principal, linked or otherwise', () => {
     const principal = makePrincipal('noodd');
     const worktree = addLinkedWorktree(principal, 'hooks/noodd');
     assert.equal(fs.existsSync(path.join(principal, 'odd')), false);
     const stub = makeStubBin({ bins: [] });
-    const result = runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
-    assert.equal(fs.existsSync(path.join(principal, 'odd')), false, 'the hooks no longer create odd/ upstream');
-    assert.equal(fs.existsSync(path.join(worktree, 'odd')), false, 'and link nothing downstream');
-    assert.equal(stepByName(result, 'link:odd'), null, 'no link:odd step is reported');
-  });
-
-  test('a worktree-owned .agents/ directory is left untouched', () => {
-    const principal = makePrincipal('ownagents');
-    const worktree = addLinkedWorktree(principal, 'hooks/ownagents');
-    fs.mkdirSync(path.join(principal, '.agents'));
-    fs.mkdirSync(path.join(worktree, '.agents'));
-    fs.writeFileSync(path.join(worktree, '.agents', 'mine.md'), 'mine\n');
-    const stub = makeStubBin({ bins: [] });
-    runHooks(principal, worktree, { env: envWithBinIsolated(stub) });
-    assert.equal(fs.lstatSync(path.join(worktree, '.agents')).isSymbolicLink(), false);
-    assert.equal(fs.readFileSync(path.join(worktree, '.agents', 'mine.md'), 'utf8'), 'mine\n');
+    const result = runHooks(principal, worktree, { env: envWithBin(stub), hasBinary: () => false });
+    assert.equal(fs.existsSync(path.join(principal, 'odd')), false, 'the hooks never create odd/ upstream');
+    assert.equal(fs.existsSync(path.join(worktree, 'odd')), false, 'nothing is linked downstream');
+    assert.ok(stepByName(result, 'link-principal-entries'), 'the link step reports its own skip');
   });
 });
 
@@ -584,15 +764,10 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
       const result = await tool.execute('call-1', { branch: 'feat/hooked', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `hooks must never fail creation: ${JSON.stringify(result)}`);
       const text = (result.content || []).map((p) => p.text || '').join('\n');
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-hooked · feat/hooked',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
-      // Hook side effects happened: the env copy lands, and S21 means no
-      // odd/ symlink is created in the worktree.
+      assert.deepEqual(text.split('\n'), ['created: feat-hooked · feat/hooked', `path: ${target}`, 'issues: 35']);
+      // The env copy lands; no ODD source exists to qualify for a link.
       assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'HOOKED=1\n');
-      assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'creation creates no symlinks');
+      assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'no link is invented without an eligible principal source');
       // Hook steps + warnings are reported inside details and failures visible.
       assert.ok(result.details && result.details.hooks, 'expected details.hooks');
       assert.ok(Array.isArray(result.details.hooks.steps), 'expected steps array');
@@ -642,11 +817,7 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
       const result = await tool.execute('call-1', { branch: 'feat/hookfail', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, 'hooks never turn success into error');
       const text = (result.content || []).map((p) => p.text || '').join('\n');
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-hookfail · feat/hookfail',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(text.split('\n'), ['created: feat-hookfail · feat/hookfail', `path: ${target}`, 'issues: 35']);
       const failed = (result.details.hooks.steps || []).filter((s) => s.status === 'failed');
       assert.ok(failed.length >= 1, `a failed step is visible: ${JSON.stringify(result.details.hooks.steps)}`);
       assert.ok((result.details.hooks.warnings || []).length >= 1, 'a warning is recorded');
@@ -750,7 +921,7 @@ describe('worktree-hooks: S63 async counterpart (nonblocking)', { concurrency: f
       env: process.env,
       unversionedCandidates: [],
       installTable: table,
-      run: (bin, args) => ({ status: 0, stdout: `${bin}`, stderr: '', error: null }),
+      run: (bin, _args) => ({ status: 0, stdout: `${bin}`, stderr: '', error: null }),
       hasBinary: (bin) => bin === 'custom-bin',
     });
     const asyncRes = await lib.runCreationHooksAsync({
@@ -822,7 +993,7 @@ describe('worktree-hooks: S63 async counterpart (nonblocking)', { concurrency: f
         env: process.env,
         unversionedCandidates: ['custom.secret'],
         installTable: [],
-        runAsync: async (bin, args) => ({ status: 1, stdout: '', stderr: '', error: null }),
+        runAsync: async (_bin, _args) => ({ status: 1, stdout: '', stderr: '', error: null }),
         hasBinary: () => false,
         copyAsync: async (src, dest) => {
           await new Promise((resolve) => setTimeout(resolve, 200));
@@ -881,7 +1052,7 @@ async function pidGone(pid, label) {
     try {
       process.kill(pid, 0);
       alive = true;
-    } catch (err) {
+    } catch {
       alive = false;
     }
     if (!alive) return;

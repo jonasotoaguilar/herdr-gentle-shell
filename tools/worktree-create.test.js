@@ -61,11 +61,17 @@ function track(dir) {
   return dir;
 }
 
+// S3/L4: git-ignore rules decide link eligibility, so every fixture pins the
+// caller's global/system git config away. The host's own global ignore file
+// already names .pi/.claude/.agents, so leaving it in scope would let a test
+// prove the wrong thing.
+const GIT_ISOLATION = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+
 function git(cwd, args, extraEnv) {
   const result = spawnSync('git', args, {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, ...(extraEnv || {}) },
+    env: { ...process.env, ...GIT_ISOLATION, ...(extraEnv || {}) },
   });
   assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
   return (result.stdout || '').trim();
@@ -170,6 +176,21 @@ function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
 }
 
+// Raw backend text remains unchanged by the ignored-link policy.
+function assertCreatedText(text, details, expected) {
+  const dropped = (details.warnings || []).filter((warning) => warning.startsWith('a worktree carries ONE odd document'));
+  assert.deepEqual(String(text).split('\n'), [...expected, ...dropped]);
+}
+function createdRows({ outcome = 'created', name, branch, path: target, issues = [], odd = null, changes = false }) {
+  const head = outcome === 'already existed' ? `created: ${name} · ${branch} · already exists`
+    : outcome === 'updated' ? `updated: ${name} · ${branch}` : `created: ${name} · ${branch}`;
+  const rows = [head, `path: ${target}`];
+  if (issues.length) rows.push(`issues: ${issues.join(',')}`);
+  if (odd) rows.push(`odd: ${odd}`);
+  if (changes) rows.push('changes: already registered for this session');
+  return rows;
+}
+
 // Isolated mode state per test: missing file means enabled.
 function scratchModeEnv() {
   return { GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-mode-'))) };
@@ -263,11 +284,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const result = await callCreate(tools, { branch: 'feat/create-ok', issues: [35] }, ctx);
 
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-create-ok · feat/create-ok',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-create-ok', branch: 'feat/create-ok', path: `${target}`, issues: [35] }));
       assert.deepEqual(
         {
           path: result.details.path, branch: result.details.branch,
@@ -334,16 +351,8 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const second = await callCreate(tools, { branch: 'feat/repeat', issues: [35] }, ctx);
       // The already-owned checkout says so in the same ordered shape:
       // every line matches except the `· already exists` qualifier.
-      assert.deepEqual(resultText(second).split('\n'), [
-        'created: feat-repeat · feat/repeat · already exists',
-        `path: ${first.details.path}`,
-        'issues: 35',
-      ]);
-      assert.deepEqual(resultText(first).split('\n'), [
-        'created: feat-repeat · feat/repeat',
-        `path: ${first.details.path}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(second).split('\n'), createdRows({ outcome: 'already existed', name: 'feat-repeat', branch: 'feat/repeat', path: `${first.details.path}`, issues: [35] }));
+      assert.deepEqual(resultText(first).split('\n'), createdRows({ outcome: 'created', name: 'feat-repeat', branch: 'feat/repeat', path: `${first.details.path}`, issues: [35] }));
       assert.equal(second.details.created, false);
       assert.equal(second.details.path, first.details.path);
       assert.deepEqual(listWorktreePaths(root), before, 'no second checkout is created');
@@ -613,11 +622,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const result = await callCreate(tools, { branch: 'feat/no-ask', issues: [35, 7] }, ctx);
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(confirms.length, 0, 'ctx.ui.confirm is never called for a create');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-no-ask · feat/no-ask',
-        `path: ${target}`,
-        'issues: 35,7',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-no-ask', branch: 'feat/no-ask', path: `${target}`, issues: [35, 7] }));
       assert.ok(fs.existsSync(target), 'the checkout exists');
       const registryLib = require('../lib/worktree-registry.js');
       assert.equal(registryLib.readRegistry(root).worktrees.length, 1, 'the registry row is written');
@@ -646,11 +651,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const target = expectedTarget(root, 'feat-fallback');
       const result = await callCreate(tools, { branch: 'feat/fallback', issues: [12] }, ctx);
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-fallback · feat/fallback',
-        `path: ${target}`,
-        'issues: 12',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-fallback', branch: 'feat/fallback', path: `${target}`, issues: [12] }));
       assert.deepEqual(
         {
           path: result.details.path, branch: result.details.branch,
@@ -816,7 +817,7 @@ describe('worktree-issues: verifyIssuesAsync (wizard/gitOnly path)', { concurren
     let beats = 0;
     const timer = setInterval(() => { beats += 1; }, 25);
     try {
-      const delayed = (bin, argv, runOpts) => new Promise((resolve) => {
+      const delayed = (_bin, _argv, _runOpts) => new Promise((resolve) => {
         setTimeout(() => resolve({
           status: 0,
           stdout: '{"number":35,"title":"Test issue 35","state":"OPEN"}',
@@ -908,11 +909,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
       const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-new · feat/new',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-new', branch: 'feat/new', path: `${target}`, issues: [35] }));
       // The other checkout is still on disk, still listed, still registered.
       assert.ok(fs.existsSync(liveAbs), 'live checkout survives on disk');
       assert.ok(listWorktreePaths(root).includes(liveAbs), 'live checkout still listed by git');
@@ -970,11 +967,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
       const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-new · feat/new',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-new', branch: 'feat/new', path: `${target}`, issues: [35] }));
       const after = registryLib.readRegistry(root);
       assert.equal(after.ok, true);
       assert.ok(
@@ -1072,11 +1065,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
       const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-new · feat/new',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-new', branch: 'feat/new', path: `${target}`, issues: [35] }));
       const after = registryLib.readRegistry(root);
       assert.ok(
         after.worktrees.some((entry) => entry.branch === 'feat/new' && path.resolve(entry.path) === liveAbs),
@@ -1202,11 +1191,7 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
       const second = await callCreate(tools, { branch: 'feat/h1-same', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-h1' }).ctx);
       const text = resultText(second);
       assert.equal(second.isError, undefined, `expected stale-record recovery, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-h1-same · feat/h1-same',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, second.details, createdRows({ outcome: 'created', name: 'feat-h1-same', branch: 'feat/h1-same', path: `${target}`, issues: [35] }));
       assert.equal(second.details.created, true, 'a fresh checkout is created, never created:false at a ghost');
       assert.ok(fs.existsSync(target), 'a real checkout is back on disk');
       assert.ok(listWorktreePaths(root).includes(target), 'git lists the new checkout');
@@ -1264,11 +1249,7 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
       const result = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-new' }).ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected slug-collision recovery, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-foo · feat-foo',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-foo', branch: 'feat-foo', path: `${target}`, issues: [35] }));
       assert.ok(fs.existsSync(target), 'a real checkout is on disk');
       assert.ok(listWorktreePaths(root).includes(target), 'git lists the new checkout');
       const registryLib = require('../lib/worktree-registry.js');
@@ -1301,11 +1282,7 @@ describe('I1: one owner per path (slug-collision stale row)', { concurrency: fal
       // Thread t-owner creates feat/foo at the shared target path.
       const first = await callCreate(tools, { branch: 'feat/foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-owner' }).ctx);
       assert.equal(first.isError, undefined, `setup create failed: ${resultText(first)}`);
-      assert.deepEqual(resultText(first).split('\n'), [
-        'created: feat-foo · feat/foo',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(resultText(first), first.details, createdRows({ outcome: 'created', name: 'feat-foo', branch: 'feat/foo', path: `${target}`, issues: [35] }));
       // A keeper row for another path must survive untouched.
       const keeper = await callCreate(tools, { branch: 'feat/keeper', issues: [7] }, makeCtx({ repoRoot: root, thread: 't-keeper' }).ctx);
       assert.equal(keeper.isError, undefined);
@@ -1319,11 +1296,7 @@ describe('I1: one owner per path (slug-collision stale row)', { concurrency: fal
       const second = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-other' }).ctx);
       const text = resultText(second);
       assert.equal(second.isError, undefined, `expected recovery, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-foo · feat-foo',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, second.details, createdRows({ outcome: 'created', name: 'feat-foo', branch: 'feat-foo', path: `${target}`, issues: [35] }));
       assert.ok(fs.existsSync(target), 'new checkout exists');
       // Exactly ONE registry row at that path: the one just created.
       const registryLib = require('../lib/worktree-registry.js');
@@ -1515,11 +1488,7 @@ describe('I3: non-directory occupant at the target', { concurrency: false }, () 
       fs.unlinkSync(target);
       const retry = await callCreate(tools, { branch: 'feat/blocked', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-1' }).ctx);
       assert.equal(retry.isError, undefined, `retry succeeds, got: ${resultText(retry)}`);
-      assert.deepEqual(resultText(retry).split('\n'), [
-        'created: feat-blocked · feat/blocked',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(retry).split('\n'), createdRows({ outcome: 'created', name: 'feat-blocked', branch: 'feat/blocked', path: `${target}`, issues: [35] }));
       assert.ok(fs.existsSync(target) && fs.statSync(target).isDirectory(), 'checkout on disk');
       assert.deepEqual(listWorktreePaths(root).length, before.length + 1);
     } finally {
@@ -1648,11 +1617,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/adopted', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected adoption success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-adopted · feat/adopted',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-adopted', branch: 'feat/adopted', path: `${target}`, issues: [35] }));
       assert.equal(result.details.created, true);
       assert.equal(result.details.branchCreated, false, 'adoption reports branchCreated:false');
       assert.ok(
@@ -1691,11 +1656,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/fresh', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-fresh · feat/fresh',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(text.split('\n'), createdRows({ outcome: 'created', name: 'feat-fresh', branch: 'feat/fresh', path: `${target}`, issues: [35] }));
       assert.equal(result.details.branchCreated, true, 'a created branch reports branchCreated:true');
       assert.ok(
         shimArgv(herdr.log).some((line) => line.includes('worktree create')),
@@ -1727,11 +1688,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/open-ok', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-open-ok · feat/open-ok',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-open-ok', branch: 'feat/open-ok', path: `${target}`, issues: [35] }));
       assert.equal(result.details.branchCreated, false);
       assert.equal(result.details.herdrAssociated, true, 'the open association is reported');
       const opens = shimArgv(herdr.log).filter((line) => line.includes('worktree open'));
@@ -1760,11 +1717,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/open-fail', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `the checkout never depends on herdr, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-open-fail · feat/open-fail',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ outcome: 'created', name: 'feat-open-fail', branch: 'feat/open-fail', path: `${target}`, issues: [35] }));
       assert.equal(result.details.branchCreated, false);
       assert.equal(result.details.herdrAssociated, false, 'the failed association is reported');
       assert.ok(
@@ -1832,11 +1785,7 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       fs.rmdirSync(target);
       const retry = await callCreate(tools, { branch: 'feat/occupied', issues: [35] }, ctx);
       assert.equal(retry.isError, undefined, `retry succeeds, got: ${resultText(retry)}`);
-      assert.deepEqual(resultText(retry).split('\n'), [
-        'created: feat-occupied · feat/occupied',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(retry).split('\n'), createdRows({ outcome: 'created', name: 'feat-occupied', branch: 'feat/occupied', path: `${target}`, issues: [35] }));
     } finally {
       restoreEnv();
     }
@@ -1970,11 +1919,7 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       assert.ok(fs.statSync(target).isDirectory(), 'the target exists on disk');
       const second = await callCreate(tools, { branch: 'feat/own', issues: [35] }, ctx);
       assert.equal(second.isError, undefined);
-      assert.deepEqual(resultText(second).split('\n'), [
-        'created: feat-own · feat/own · already exists',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(second).split('\n'), createdRows({ outcome: 'already existed', name: 'feat-own', branch: 'feat/own', path: `${target}`, issues: [35] }));
       assert.equal(second.details.created, false, 'the own checkout returns created:false, never a refusal');
     } finally {
       restoreEnv();
@@ -2106,10 +2051,7 @@ describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () =>
       const result = await callCreate(tools, { branch: 'feat/s14-omit' }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-s14-omit · feat/s14-omit',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(text.split('\n'), createdRows({ outcome: 'created', name: 'feat-s14-omit', branch: 'feat/s14-omit', path: `${target}` }));
       assert.deepEqual(result.details.issues, [], 'details carry issues:[]');
       assert.ok(!listWorktreePaths(root).includes(target) || true, 'checkout state checked below');
       assert.deepEqual(listWorktreePaths(root).length, before.length + 1, 'one checkout is created');
@@ -2132,10 +2074,7 @@ describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () =>
       const result = await callCreate(tools, { branch: 'feat/s14-empty', issues: [] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-s14-empty · feat/s14-empty',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(text.split('\n'), createdRows({ outcome: 'created', name: 'feat-s14-empty', branch: 'feat/s14-empty', path: `${target}` }));
       assert.deepEqual(result.details.issues, [], 'details carry issues:[]');
       assert.deepEqual(require('../lib/worktree-registry.js').findByBranch(root, 'feat/s14-empty').issues, []);
     } finally {
@@ -2191,11 +2130,7 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
       const target = expectedTarget(root, 'feat-s19-ok');
       const result = await callCreate(tools, { branch: 'feat/s19-ok', issues: [35] }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-s19-ok · feat/s19-ok',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-s19-ok', branch: 'feat/s19-ok', path: `${target}`, issues: [35] }));
       assert.equal(result.details.created, true);
     } finally {
       restoreEnv();
@@ -2214,10 +2149,7 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
       const target = expectedTarget(root, 'feat-s19-plain');
       const result = await callCreate(tools, { branch: 'feat/s19-plain' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-s19-plain · feat/s19-plain',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-s19-plain', branch: 'feat/s19-plain', path: `${target}` }));
       assert.equal(result.details.created, true);
     } finally {
       restoreEnv();
@@ -2238,11 +2170,7 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
       const target = first.details.path;
       const second = await callCreate(tools, { branch: 'feat/s19-own', issues: [35] }, ctx);
       assert.equal(second.isError, undefined);
-      assert.deepEqual(resultText(second).split('\n'), [
-        'created: feat-s19-own · feat/s19-own · already exists',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(second).split('\n'), createdRows({ outcome: 'already existed', name: 'feat-s19-own', branch: 'feat/s19-own', path: `${target}`, issues: [35] }));
       assert.equal(second.details.created, false);
     } finally {
       restoreEnv();
@@ -2332,7 +2260,7 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
   });
 });
 
-describe('S50/T41 + S51/T42: create registers the checkout and links principal dot-dirs', { concurrency: false }, () => {
+describe('S50/T41 + S3/L4: create registers the checkout and links git-ignored principal entries', { concurrency: false }, () => {
   function symlinksLib() {
     return require('../lib/worktree-symlinks.js');
   }
@@ -2350,7 +2278,31 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       HERDR_SHIM_EXIT: undefined,
       GH_BIN_PATH: gh,
       GENTLE_WORKTREE_THREAD: undefined,
+      ...GIT_ISOLATION,
     };
+  }
+
+  // Import the stubbed extension copy a second time, for tests that drive the
+  // command route through the exported `executeWorktreeCreate`.
+  async function loadModule() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-ext-s3-')));
+    const copy = path.join(dir, 'gentle-worktree-tools.mjs');
+    fs.writeFileSync(copy, stubbed);
+    return import(pathToFileURL(copy).href);
+  }
+
+  function gitIsolatedEnv() {
+    return { ...process.env, ...GIT_ISOLATION };
+  }
+
+  // S3/L4 fixture: every named entry exists in the principal and the repo's
+  // own .gitignore ignores it, which is the only eligibility signal.
+  function writeIgnoredEntries(root, names) {
+    fs.writeFileSync(path.join(root, '.gitignore'), `${names.map((n) => `${n}/`).join('\n')}\n`);
+    for (const name of names) {
+      fs.mkdirSync(path.join(root, name), { recursive: true });
+      fs.writeFileSync(path.join(root, name, 'note.md'), `# ${name}\n`);
+    }
   }
 
   function makeRegisterCtx({ repoRoot, thread, outcome, failWith }) {
@@ -2400,11 +2352,7 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.deepEqual(calls, [['session_worktree_register', { path: target }]], 'exactly one registration for the created checkout');
       const lines = resultText(result).split('\n');
-      assert.deepEqual(lines, [
-        'created: feat-t41-ok \u00b7 feat/t41-ok',
-        `path: ${target}`,
-        'changes: already registered for this session',
-      ]);
+      assert.deepEqual(lines, createdRows({ outcome: 'created', name: 'feat-t41-ok', branch: 'feat/t41-ok', path: `${target}`, changes: true }));
       assert.equal(result.details.created, true);
     } finally {
       restoreEnv();
@@ -2424,10 +2372,7 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       const result = await callCreate(tools, { branch: 'feat/t41-absent' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.deepEqual(calls, [], 'never attempted');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t41-absent \u00b7 feat/t41-absent',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-t41-absent', branch: 'feat/t41-absent', path: `${target}` }));
     } finally {
       restoreEnv();
     }
@@ -2448,10 +2393,7 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       const result = await callCreate(tools, { branch: 'feat/t41-fail' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.equal(calls.length, 1, 'attempted once');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t41-fail \u00b7 feat/t41-fail',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-t41-fail', branch: 'feat/t41-fail', path: `${target}` }));
       assert.equal(result.details.created, true);
     } finally {
       restoreEnv();
@@ -2473,10 +2415,7 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       const result = await callCreate(tools, { branch: 'feat/t41-throw' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.equal(calls.length, 1, 'attempted once');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t41-throw \u00b7 feat/t41-throw',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-t41-throw', branch: 'feat/t41-throw', path: `${target}` }));
     } finally {
       restoreEnv();
     }
@@ -2503,72 +2442,153 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
     }
   });
 
-  test('any one tracked entry blocks every symlink and the output stays silent', async () => {
-    const root = makeRepo('t42-gate');
+  // S3/L4 final selection ("Las cuatro como symlinks hacia main"): the four
+  // principal entries are LINKED into the new checkout only when git ignores
+  // them there. Nothing is copied; the env-file copy keeps its own contract.
+  test('S3: the agent tool links every git-ignored principal entry, never copies it', async () => {
+    const root = makeRepo('s3-links');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
-    fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.agents', 'config.json'), '{}\n');
-    fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.claude', 'settings.json'), '{}\n');
-    fs.mkdirSync(path.join(root, '.odd'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.odd', 'notes.md'), '# notes\n');
-    git(root, ['add', '-f', '.agents']);
-    git(root, ['commit', '-m', 'track agents']);
+    const names = ['.agents', '.pi', '.claude', 'odd'];
+    writeIgnoredEntries(root, names);
+    fs.writeFileSync(path.join(root, '.env'), 'SECRET=1\n');
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 't-t42-gate' });
-      const target = expectedTarget(root, 'feat-t42-gate');
-      const result = await callCreate(tools, { branch: 'feat/t42-gate' }, ctx);
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-links' });
+      const target = expectedTarget(root, 'feat-s3-links');
+      const result = await callCreate(tools, { branch: 'feat/s3-links' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      for (const name of ['.agents', '.claude', '.odd']) {
-        assert.equal(isSymlink(path.join(target, name)), false, `${name} must not be a symlink`);
+      assertCreatedText(
+        resultText(result),
+        result.details,
+        createdRows({ outcome: 'created', name: 'feat-s3-links', branch: 'feat/s3-links', path: `${target}` }),
+      );
+      for (const name of names) {
+        const link = path.join(target, name);
+        assert.equal(isSymlink(link), true, `${name} is a symlink`);
+        assert.equal(fs.readlinkSync(link), path.join(root, name), `${name} points at the principal entry`);
+        assert.equal(fs.readFileSync(path.join(link, 'note.md'), 'utf8'), `# ${name}\n`, `${name} resolves to the principal bytes`);
+        assert.equal(isSymlink(path.join(root, name)), false, `${name} source stays a real directory`);
       }
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t42-gate \u00b7 feat/t42-gate',
-        `path: ${target}`,
-      ], 'no line is added in any branch');
+      // The env-file copy keeps its own contract, unchanged.
+      assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'SECRET=1\n');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.ok(linkStep, `link step reported: ${JSON.stringify(steps.map((s) => s.name))}`);
+      assert.equal(linkStep.status, 'done');
+      const copyStep = steps.find((s) => s.name === 'copy-unversioned');
+      for (const name of names) {
+        assert.ok(!String(copyStep.detail).includes(name), `no directory copy of ${name}: ${copyStep.detail}`);
+      }
+      assert.equal(result.details.hooks.ok, true);
+      assert.deepEqual(result.details.hooks.warnings, []);
     } finally {
       restoreEnv();
     }
   });
 
-  test('with nothing tracked, existing principal entries become symlinks, silently', async () => {
-    const root = makeRepo('t42-links');
+  test('S3: the command create route (gitOnly/principalLayout) links the same entries', async () => {
+    const root = makeRepo('s3-command');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
-    fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.agents', 'config.json'), '{}\n');
-    fs.mkdirSync(path.join(root, '.odd'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.odd', 'notes.md'), '# notes\n');
+    const names = ['.agents', '.pi', '.claude', 'odd'];
+    writeIgnoredEntries(root, names);
+    setEnv(stdEnvT(herdr, gh, modeEnv));
+    try {
+      const mod = await loadModule();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-command' });
+      const target = expectedTarget(root, 'feat-s3-command');
+      const result = await mod.executeWorktreeCreate(
+        { branch: 'feat/s3-command' },
+        ctx,
+        { gitOnly: true, principalLayout: true },
+      );
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      for (const name of names) {
+        const link = path.join(target, name);
+        assert.equal(isSymlink(link), true, `${name} is a symlink on the command path`);
+        assert.equal(fs.readlinkSync(link), path.join(root, name), `${name} points at the principal entry`);
+        assert.equal(isSymlink(path.join(root, name)), false, `${name} source stays a real directory`);
+      }
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.ok(linkStep, `link step reported: ${JSON.stringify(steps.map((s) => s.name))}`);
+      assert.equal(linkStep.status, 'done');
+      const copyStep = steps.find((s) => s.name === 'copy-unversioned');
+      for (const name of names) {
+        assert.ok(!String(copyStep.detail).includes(name), `no directory copy of ${name}: ${copyStep.detail}`);
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S3: an untracked entry git does not ignore is not linked', async () => {
+    const root = makeRepo('s3-notignored');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([]);
+    const modeEnv = scratchModeEnv();
+    const names = ['.agents', '.pi', '.claude', 'odd'];
+    for (const name of names) {
+      fs.mkdirSync(path.join(root, name), { recursive: true });
+      fs.writeFileSync(path.join(root, name, 'note.md'), `# ${name}\n`);
+    }
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 't-t42-links' });
-      const target = expectedTarget(root, 'feat-t42-links');
-      const result = await callCreate(tools, { branch: 'feat/t42-links' }, ctx);
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-notignored' });
+      const target = expectedTarget(root, 'feat-s3-notignored');
+      const result = await callCreate(tools, { branch: 'feat/s3-notignored' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      for (const name of ['.agents', '.odd']) {
-        const link = path.join(target, name);
-        assert.equal(isSymlink(link), true, `${name} is a symlink`);
-        assert.equal(fs.readlinkSync(link), path.join(root, name), `${name} points at the principal entry`);
-        assert.ok(fs.statSync(link).isDirectory(), `${name} resolves to a directory`);
+      for (const name of names) {
+        assert.equal(fs.existsSync(path.join(target, name)), false, `${name} is not linked into the worktree`);
+        assert.equal(fs.lstatSync(path.join(root, name)).isDirectory(), true, `${name} source stays untouched`);
       }
-      assert.equal(fs.existsSync(path.join(target, '.claude')), false, 'a missing source creates nothing');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t42-links \u00b7 feat/t42-links',
-        `path: ${target}`,
-      ], 'no line is added for created symlinks');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.equal(linkStep.status, 'skipped');
+      assert.match(String(linkStep.detail), /not git-ignored/);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S3: a tracked entry arrives with the checkout instead of a link', async () => {
+    const root = makeRepo('s3-tracked');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([]);
+    const modeEnv = scratchModeEnv();
+    fs.writeFileSync(path.join(root, '.gitignore'), '.agents/\n');
+    fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.agents', 'config.json'), '{"tracked":true}\n');
+    fs.writeFileSync(path.join(root, '.agents', 'extra.json'), '{"ignored":true}\n');
+    git(root, ['add', '-f', '.agents/config.json']);
+    git(root, ['commit', '-m', 'track agents config']);
+    setEnv(stdEnvT(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-tracked' });
+      const target = expectedTarget(root, 'feat-s3-tracked');
+      const result = await callCreate(tools, { branch: 'feat/s3-tracked' }, ctx);
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const entry = path.join(target, '.agents');
+      assert.equal(isSymlink(entry), false, 'the checkout entry stays a real directory');
+      assert.equal(fs.readFileSync(path.join(entry, 'config.json'), 'utf8'), '{"tracked":true}\n');
+      assert.equal(fs.existsSync(path.join(entry, 'extra.json')), false, 'an ignored extra is never brought along');
+      assert.equal(fs.existsSync(path.join(root, '.agents', 'extra.json')), true, 'the source keeps its ignored extra');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.match(String(linkStep.detail), /tracked/);
     } finally {
       restoreEnv();
     }
   });
 
   test('a dangling source never becomes a symlink', async () => {
-    const root = makeRepo('t42-dangling');
+    const root = makeRepo('s3-dangling');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
@@ -2576,31 +2596,68 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 't-t42-dangling' });
-      const target = expectedTarget(root, 'feat-t42-dangling');
-      const result = await callCreate(tools, { branch: 'feat/t42-dangling' }, ctx);
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-dangling' });
+      const target = expectedTarget(root, 'feat-s3-dangling');
+      const result = await callCreate(tools, { branch: 'feat/s3-dangling' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.equal(fs.existsSync(path.join(target, '.agents')), false, 'no symlink points at a missing target');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t42-dangling \u00b7 feat/t42-dangling',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ outcome: 'created', name: 'feat-s3-dangling', branch: 'feat/s3-dangling', path: `${target}` }));
     } finally {
       restoreEnv();
     }
   });
 
-  test('lib: an existing destination entry is replaced by the symlink', async () => {
-    const principal = makeRepo('sym-src');
+  test('lib: LINK_NAMES is exactly the four requested names', () => {
+    assert.deepEqual(symlinksLib().LINK_NAMES, ['.agents', '.pi', '.claude', 'odd']);
+  });
+
+  test('lib: an occupied destination is preserved, never removed', () => {
+    const principal = makeRepo('sym-occupy');
     const worktree = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sym-dst-')));
-    fs.mkdirSync(path.join(principal, '.agents'), { recursive: true });
-    fs.writeFileSync(path.join(principal, '.agents', 'config.json'), '{}\n');
-    fs.writeFileSync(path.join(worktree, '.agents'), 'stale occupant\n');
-    const applied = symlinksLib().applyWorktreeSymlinks({ principalRoot: principal, worktreePath: worktree });
-    assert.deepEqual(applied.skippedTracked, []);
-    assert.deepEqual(applied.created, ['.agents']);
-    assert.equal(isSymlink(path.join(worktree, '.agents')), true);
-    assert.equal(fs.readlinkSync(path.join(worktree, '.agents')), path.join(principal, '.agents'));
+    fs.writeFileSync(path.join(principal, '.gitignore'), 'odd/\n');
+    fs.mkdirSync(path.join(principal, 'odd'), { recursive: true });
+    fs.writeFileSync(path.join(principal, 'odd', 'notes.md'), '# notes\n');
+    fs.writeFileSync(path.join(worktree, 'odd'), 'stale occupant\n');
+    const applied = symlinksLib().applyWorktreeSymlinks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      env: gitIsolatedEnv(),
+    });
+    assert.deepEqual(applied.created, [], 'nothing was linked over the occupant');
+    assert.ok(
+      applied.skipped.some((s) => s.includes('odd') && /target exists/.test(s)),
+      `occupant is reported: ${JSON.stringify(applied.skipped)}`,
+    );
+    assert.equal(isSymlink(path.join(worktree, 'odd')), false);
+    assert.equal(fs.readFileSync(path.join(worktree, 'odd'), 'utf8'), 'stale occupant\n');
+    assert.equal(fs.readFileSync(path.join(principal, 'odd', 'notes.md'), 'utf8'), '# notes\n');
+  });
+
+  test('lib: an existing correct link is idempotent (no write, reported as existing)', () => {
+    const principal = makeRepo('sym-idem');
+    fs.writeFileSync(path.join(principal, '.gitignore'), 'odd/\n');
+    fs.mkdirSync(path.join(principal, 'odd'), { recursive: true });
+    fs.writeFileSync(path.join(principal, 'odd', 'notes.md'), '# notes\n');
+    const worktree = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sym-idem-')));
+    const first = symlinksLib().applyWorktreeSymlinks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      env: gitIsolatedEnv(),
+    });
+    assert.deepEqual(first.created, ['odd']);
+    assert.deepEqual(first.existing, []);
+    const before = fs.lstatSync(path.join(worktree, 'odd'));
+    const second = symlinksLib().applyWorktreeSymlinks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      env: gitIsolatedEnv(),
+    });
+    const after = fs.lstatSync(path.join(worktree, 'odd'));
+    assert.deepEqual(second.existing, ['odd'], 'the correct link is recognised');
+    assert.deepEqual(second.created, ['odd'], 'the link is still in place');
+    assert.equal(after.ino, before.ino, 'the link was not recreated');
+    assert.equal(after.mtimeMs, before.mtimeMs, 'no write happened on the second call');
+    assert.equal(fs.readlinkSync(path.join(worktree, 'odd')), path.join(principal, 'odd'));
   });
 
   test('lib: the register helper only calls an actually available tool', async () => {
@@ -2686,14 +2743,14 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
       assert.ok(names.includes('copy-unversioned'), 'copy step kept');
       assert.ok(names.some((n) => n.startsWith('install:')), 'install step kept, never silently skipped');
       assert.ok(names.includes('codegraph-init'), 'codegraph step kept');
-      assert.deepEqual(names, [...names].sort((a, b) => 0) && names, 'order preserved (copy, installs, codegraph)');
+      assert.deepEqual(names, [...names].sort(() => 0), 'order preserved (copy, installs, codegraph)');
       assert.ok(fs.existsSync(target), 'checkout exists after hooks settle (warp-after-hooks ordering)');
     } finally {
       restoreEnv();
     }
   });
   test('missing async helper fails safe before slow work with a useful error, never blocking sync', async () => {
-    const root = makeRepo('gitonly-noasync');
+    makeRepo('gitonly-noasync');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
@@ -2706,7 +2763,7 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
       GENTLE_WORKTREE_THREAD: undefined,
     });
     try {
-      const mod = await loadModule();
+      await loadModule();
       // Simulate an older hooks lib without the async twin by deleting it
       // on the required instance (libRequire cache) is not reachable here,
       // so assert the contract directly: the gitOnly route throws a concise

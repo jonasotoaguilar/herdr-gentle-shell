@@ -1173,11 +1173,12 @@ async function executeWorktreeCreate(params, ctx, opts) {
     );
   }
 
-  // (i2) Creation hooks (S8 as narrowed by S21, P2-S3): copy unversioned
-  // files, install by detected stack, codegraph init when available.
-  // The hooks themselves create no symlinks of any kind (the
-  // `.agents`/`.claude`/`.odd` principal links are the separate silent
-  // step (k) below). Hooks never turn a
+  // (i2) Creation hooks (S8 as narrowed by S21, P2-S3, round-3 S3/L4): copy
+  // unversioned files, install by detected stack, codegraph init when
+  // available, and link the principal's git-ignored agent/ODD entries
+  // (`.agents`, `.pi`, `.claude`, `odd`) — ONCE, inside the hooks themselves,
+  // identically for the sync and async runners, never over an existing path.
+  // The create therefore adds no link step of its own. Hooks never turn a
   // successful creation into an error: every outcome, including a thrown
   // hook, is reported inside `details.hooks`, and the exact success text
   // stays unchanged. A failed step stays visible via steps + warnings.
@@ -1260,25 +1261,6 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // association happened. The checkout succeeding never depends on herdr.
   const adoptionDetails = { branchCreated };
   if (herdrAssociated !== null) adoptionDetails.herdrAssociated = herdrAssociated;
-  // (k) T42/S51 principal dot-dir symlinks (silent hook): `.agents`,
-  // `.claude` and `.odd` from the PRINCIPAL checkout — recovered from
-  // the shared common dir exactly like the hooks above, never the
-  // current checkout — with the all-or-nothing tracked gate. Adds
-  // NOTHING to the output text in any branch; outcomes travel in
-  // details only. Never fails the create.
-  let symlinkDetails = { created: [], skippedTracked: [] };
-  try {
-    const symlinksLib = libRequire("worktree-symlinks.js");
-    const principalForLinks = path.basename(repo.commonDir) === ".git"
-      ? path.dirname(repo.commonDir)
-      : repo.root;
-    const applied = symlinksLib.applyWorktreeSymlinks({ principalRoot: principalForLinks, worktreePath: target });
-    if (applied && Array.isArray(applied.created) && Array.isArray(applied.skippedTracked)) {
-      symlinkDetails = { created: applied.created.slice(), skippedTracked: applied.skippedTracked.slice() };
-    }
-  } catch {
-    // Best effort only; the create stands regardless.
-  }
   // (l) T41/S50 changes registration: register the checkout just
   // created on the CURRENT session through gentle-shell's
   // `session_worktree_register` host tool, but ONLY when that tool is
@@ -1303,7 +1285,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
   ].join("\n");
   return textResult(
     successBody,
-    { path: target, branch, issues: issueNumbers, odd: oddSupplied ? oddDoc : null, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), symlinks: symlinkDetails, changesRegistered, ...(storedDropped.length > 0 ? { droppedOdd: storedDropped } : {}), ...adoptionDetails, ...backupDetails },
+    { path: target, branch, issues: issueNumbers, odd: oddSupplied ? oddDoc : null, created: true, hooks, warnings, pruned: prunedStale, replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })), changesRegistered, ...(storedDropped.length > 0 ? { droppedOdd: storedDropped } : {}), ...adoptionDetails, ...backupDetails },
     false,
   );
 }
