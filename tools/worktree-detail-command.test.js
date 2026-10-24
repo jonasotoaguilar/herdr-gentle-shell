@@ -61,6 +61,7 @@ after(() => {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
   ghIssues.setGhRunner(null);
+  yoloResponder = null;
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
 });
@@ -143,12 +144,28 @@ async function loadExtension() {
       handlers.get(event).push(handler);
       return () => {};
     },
-    events: { emit: () => {} },
+    events: {
+      emit: (channel, payload) => {
+        if (typeof yoloResponder === 'function') yoloResponder(channel, payload);
+      },
+    },
   };
   process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
   const mod = await import(pathToFileURL(copy).href);
   mod.default(pi);
   return { tools, commands, handlers, mod };
+}
+
+// gentle-shell answers YOLO questions on this channel with an adapter whose
+// read() is 'ON' only while the live session holds the grant. `null` stands
+// for a host that never answers, which is the default here.
+let yoloResponder = null;
+
+function answerYolo(display) {
+  yoloResponder = (channel, payload) => {
+    if (channel !== 'gentle:yolo:host-ui') return;
+    payload.respond({ read: async () => display, dispose: () => {} });
+  };
 }
 
 function addRegisteredWorktree(root, branch, { issues = [], odd = null } = {}) {
@@ -165,6 +182,22 @@ function addRegisteredWorktree(root, branch, { issues = [], odd = null } = {}) {
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text), bold: (text) => String(text) };
 const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+// S18: the detail mounts BEFORE its slow reads, so a test that asserts data or
+// saves must wait for that enrichment. Polling the component's own observable
+// state keeps the wait deterministic instead of guessing a tick count.
+async function waitForDetail(component, predicate, label = 'the detail data') {
+  for (let step = 0; step < 400; step += 1) {
+    if (predicate()) return true;
+    await flush();
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+const detailReady = (component) => {
+  const data = component && component.state && component.state.dataState;
+  return Boolean(data && data.issues === 'ready' && data.assigned === 'ready');
+};
 
 // A mount delegate that records every overlay it receives and drives each
 // mounted component with the scripted step for that mount index. A step that
@@ -319,11 +352,17 @@ describe('S7: `e` opens the full-screen worktree detail', { concurrency: false }
       const target = addRegisteredWorktree(root, 'feat/detail-one');
       stubGh([7]);
       const { commands } = await loadExtension();
+      // The detail is measured while it is OPEN: a closed view paints nothing
+      // (S18), so the frame is captured before the close key.
+      let detailLines = [];
       const built = scriptedCtx({
         cwd: root,
         steps: [
           ['e'],            // warp panel: edit the focused row
-          ['\x1b'],         // detail: close
+          (component) => {  // detail: measure the live frame, then close
+            detailLines = component.render(100);
+            component.handleInput('\x1b');
+          },
           ['\x1b'],         // warp panel: close
         ],
       });
@@ -332,11 +371,10 @@ describe('S7: `e` opens the full-screen worktree detail', { concurrency: false }
       assert.equal(built.mounts.length, 3, 'the panel, the detail, then the panel again');
       // The FIRST mount is the warp panel, the SECOND the detail.
       assert.equal(built.mounts[0].component.state.tab, undefined, 'the warp panel is not the detail');
-      const detail = detailOf(built.mounts, 1);
+      detailOf(built.mounts, 1);
       assert.deepEqual(built.mounts[1].options, FULLSCREEN, 'the detail is a full-screen overlay');
-      const lines = detail.render(100);
-      assert.equal(lines.length, 24, 'it fills every terminal row');
-      for (const line of lines) assert.equal(clean(line).length, 100, 'and every column');
+      assert.equal(detailLines.length, 24, 'it fills every terminal row');
+      for (const line of detailLines) assert.equal(clean(line).length, 100, 'and every column');
       assert.deepEqual(built.mounts[2].options.overlayOptions.anchor, 'bottom-center', 'the panel comes back as the panel');
       assert.deepEqual(built.notes, [], 'closing is silent');
       assert.ok(fs.existsSync(target), 'nothing was created or removed');
@@ -362,7 +400,15 @@ describe('S7: `e` opens the full-screen worktree detail', { concurrency: false }
         cwd: root,
         steps: [
           ['e'],
-          (component) => { rendered = clean(component.render(120).join('\n')); component.handleInput('\x1b'); },
+          async (component) => {
+            await waitForDetail(
+              component,
+              () => /^│[^│]*created (now|\d)/m.test(clean(component.render(120).join('\n'))),
+              'the header facts',
+            );
+            rendered = clean(component.render(120).join('\n'));
+            component.handleInput('\x1b');
+          },
           ['\x1b'],
         ],
       });
@@ -467,7 +513,10 @@ describe('S8/S7c: saving one ODD document and every open issue', { concurrency: 
         let selectedOdd = null;
         const built = scriptedCtx({
           cwd: target,
-          steps: [(component) => {
+          steps: [async (component) => {
+            // S18: the stored assignment paints at once but the write path opens
+            // only once the list and the verification have settled.
+            await waitForDetail(component, () => detailReady(component), 'the detail initialization');
             // Switch to the ODD tab and keep the stored document selected, then
             // add one more open issue on the Issues tab.
             component.handleInput('tab');
@@ -514,6 +563,7 @@ describe('S8/S7c: saving one ODD document and every open issue', { concurrency: 
       const built = scriptedCtx({
         cwd: root,
         steps: [async (component) => {
+          await waitForDetail(component, () => detailReady(component), 'the detail initialization');
           component.handleInput('tab');
           component.handleInput('ctrl+s');
           // The refusal arrives on the save's own microtask.
@@ -537,11 +587,16 @@ describe('S24: the panel delete marker reaches the existing authority', { concur
     setEnv(stdEnv());
     try {
       const root = makeRepo('panel-delete');
+      // S4 (round 3): a real `main` so the prompt's ahead-of-main read is a
+      // KNOWN answer (0) instead of the unknown branch of the message.
+      git(root, ['branch', 'main', 'HEAD']);
       const target = addRegisteredWorktree(root, 'feat/del-one');
       const { commands, mod } = await loadExtension();
       const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => {
+      const closeCtxs = [];
+      mod.setWarpCloseRunner(async (params, closeCtx) => {
         closeCalls.push(params);
+        closeCtxs.push(closeCtx);
         return { isError: false, text: 'removed: feat-del-one', details: {} };
       });
       // The panel's first row is the agent worktree (the session sits in the
@@ -554,9 +609,43 @@ describe('S24: the panel delete marker reaches the existing authority', { concur
       await commands.get('herdr-gentle:warp').handler('', built.ctx);
       assert.equal(built.confirms.length, 1, 'exactly one confirmation');
       assert.equal(built.confirms[0][0], "Delete worktree 'feat-del-one'?");
+      // A clean row with no commits of its own raises no warning: the panel
+      // route and the extended list word the same body.
+      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del-one'? This removes the checkout but keeps the branch.`);
       assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once for that row');
+      assert.equal(closeCtxs[0].hasUI, false, 'the confirmed delete shows no second dialog');
       assert.deepEqual(built.notes, [['removed: feat-del-one', 'info']]);
     } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the panel route always asks: YOLO never deletes a clean row on the keypress alone', async () => {
+    setEnv(stdEnv());
+    try {
+      const root = makeRepo('panel-delete-yolo');
+      git(root, ['branch', 'main', 'HEAD']);
+      const target = addRegisteredWorktree(root, 'feat/kept-yolo');
+      const { commands, mod } = await loadExtension();
+      const closeCalls = [];
+      mod.setWarpCloseRunner(async (params) => {
+        closeCalls.push(params);
+        return { isError: false, text: 'removed', details: {} };
+      });
+      answerYolo('ON');
+      // The row is provably clean and YOLO is ON: the dialog is still asked,
+      // and its refusal removes nothing.
+      const built = scriptedCtx({ cwd: root, confirm: false, steps: [['\x04'], ['\x1b']] });
+      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
+      await commands.get('herdr-gentle:warp').handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'YOLO never waives a keyboard delete');
+      assert.equal(built.confirms[0][0], "Delete worktree 'feat-kept-yolo'?");
+      assert.deepEqual(closeCalls, [], 'the refusal under YOLO removed nothing');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'no checkout disappeared');
+      assert.ok(fs.existsSync(target), 'the refused checkout still exists');
+      assert.equal(built.mounts.length, 2, 'the panel reopened');
+    } finally {
+      yoloResponder = null;
       restoreEnv();
     }
   });
