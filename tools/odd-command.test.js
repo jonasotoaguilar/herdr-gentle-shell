@@ -310,7 +310,7 @@ describe('/herdr-gentle:odd read-only association (S10b)', () => {
     const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
     writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
     const { component, notes } = await openOdd(root);
-    const body = clean(component.render(100).join('\n'));
+    const body = clean(component.render(220).join('\n'));
     const rows = listRows(body);
     assert.equal(rows.length, 2, 'both documents still list');
     assert.ok(rows.every((line) => !/[✓✎]/.test(line)), 'no association mark on any row');
@@ -319,7 +319,7 @@ describe('/herdr-gentle:odd read-only association (S10b)', () => {
     assert.ok(!body.includes('unsaved'), 'no unsaved claim exists');
     assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
     assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
-    assert.match(body, /ctrl\+j\/k scroll/, 'the reading legend stays');
+    assert.match(body, /shift\+j\/k scroll/, 'the reading legend names the effective fallback');
     assert.match(body, /› Search /, 'the search row names the filter alone, with no key above (S4)');
     assert.ok(!/› Search \(T\)/.test(body), 'the search row never carries the (T) key hint (S4)');
     assert.match(body, /T search/, 'the filter key lives in the footer instead (S4)');
@@ -374,7 +374,7 @@ describe('/herdr-gentle:odd read-only association (S10b)', () => {
     const root = makeRepo({ docs: { 'alpha.md': `${long}\n`, 'beta.md': `${longBeta}\n` } });
     writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
     const { component, notes, done } = await openOdd(root);
-    component.handleInput('ctrl+j');
+    component.handleInput('ctrl+shift+j');
     assert.ok(component.state.scroll > 0, 'the preview still scrolls');
     component.handleInput('T');
     component.handleInput('b');
