@@ -17,7 +17,8 @@
 // worktree is left out (S4c, reconciled in L2) and never when everything
 // fits; the legend is exactly ONE row (S2); S5 rows are the checkout NAMES
 // alone (the branch lives in a data line, never repeated on the row); a data
-// line carries branch, the issue and odd COUNTS, the change size as LINE
+// line carries branch, the associated issue IDS and ODD NAMES (never counts;
+// a readable empty association is `-`), the change size as LINE
 // COUNTS (`changes +A −D`, S16), `↑N ↓M` and both ages, omits a measured zero
 // for the change size and for each of `↑`/`↓`, and says `unavailable` — never
 // `0` — for a fact it cannot read, while an unreadable AGE is the brief `—`
@@ -76,7 +77,7 @@ const CHECKOUTS = [
 const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
 // The same facts rendered, so an assertion names the behaviour, not the
 // formatter's punctuation.
-const DEFAULT_LINE = 'branch feat/alpha · issues 1 · odd 1 · changes +2 −1 · ↑1 · created 28d ago · modified —';
+const DEFAULT_LINE = 'branch feat/alpha · issues: #12 · odd: w1-a · changes +2 −1 · ↑1 · created 28d ago · modified —';
 // S15: the two ages are the facts that carry a prose reason when they are
 // unreadable, so a compact preview line names them with a dash instead of
 // repeating that explanation. The reason itself stays in the data.
@@ -277,7 +278,7 @@ describe('current worktree data line (S4a)', () => {
       facts: (path) => (path === CURRENT.path ? CURRENT_FACTS : { ...CURRENT_FACTS, branch: 'main' }),
     });
     const frame = panel(view, WIDE);
-    assert.equal(frame.currentData, 'branch feat/odd-viewer · issues 1 · odd 0 · ↓2 · created 2d ago · modified 1h ago');
+    assert.equal(frame.currentData, 'branch feat/odd-viewer · issues: #3 · odd: - · ↓2 · created 2d ago · modified 1h ago');
     assert.ok(frame.focusData.startsWith('branch main'), 'the focused line keeps its own worktree');
   });
 
@@ -286,7 +287,7 @@ describe('current worktree data line (S4a)', () => {
     const frame = panel(view, WIDE);
     assert.equal(
       frame.currentData,
-      `branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`,
+      `branch unavailable · issues: unavailable · odd: unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`,
     );
     assert.ok(!frame.currentData.includes(' 0'), 'a failed read never claims a number');
   });
@@ -294,7 +295,7 @@ describe('current worktree data line (S4a)', () => {
 
 describe('focused checkout facts (S4d, S9)', () => {
   const BASE = { branch: 'main', issues: [7], odd: ['w9-x'], changes: { added: 12, deleted: 3 }, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
-  const FULL = 'branch main · issues 1 · odd 1 · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
+  const FULL = 'branch main · issues: #7 · odd: w9-x · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
 
   test('the focused checkout reports branch, issues, odd, the change-size line counts, ahead/behind and created-at', async () => {
     const { view } = await opened({ facts: () => BASE });
@@ -306,22 +307,22 @@ describe('focused checkout facts (S4d, S9)', () => {
   test('every fact that cannot be read renders unavailable, never zero', async () => {
     const { view } = await opened({ facts: () => null });
     const frame = panel(view, WIDE);
-    assert.equal(frame.focusData, `branch unavailable · issues unavailable · odd unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`);
+    assert.equal(frame.focusData, `branch unavailable · issues: unavailable · odd: unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`);
   });
 
-  test('more associations never widen the line: only their counts render', async () => {
+  test('more associations widen the line with their ids and names instead of a count', async () => {
     const { view } = await opened({ facts: () => ({ ...BASE, issues: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], odd: ['a', 'b', 'c'] }) });
     const frame = panel(view, WIDE);
-    assert.ok(frame.focusData.includes('issues 10 · odd 3'), `counts render: ${frame.focusData}`);
-    assert.ok(!/issues #/.test(frame.focusData), `no issue numbers: ${frame.focusData}`);
-    assert.ok(!/odd a/.test(frame.focusData), `no odd names: ${frame.focusData}`);
+    assert.ok(frame.focusData.includes('issues: #1, #2, #3, #4, #5, #6, #7, #8, #9, #10'), `every id renders: ${frame.focusData}`);
+    assert.ok(frame.focusData.includes('odd: a, b, c'), `every name renders: ${frame.focusData}`);
+    assert.ok(!/issues 10|odd 3/.test(frame.focusData), `no association count survives: ${frame.focusData}`);
   });
 
   test('each single unavailable fact is reported on its own while the others survive', async () => {
     const cases = [
       ['branch', 'branch unavailable'],
-      ['issues', 'issues unavailable'],
-      ['odd', 'odd unavailable'],
+      ['issues', 'issues: unavailable'],
+      ['odd', 'odd: unavailable'],
       ['changes', 'changes unavailable'],
       ['ahead', '↑unavailable'],
       ['behind', '↓unavailable'],
@@ -337,16 +338,16 @@ describe('focused checkout facts (S4d, S9)', () => {
     }
   });
 
-  test('a measured zero is omitted for the change size and both arrows, while issues and odd still show 0', async () => {
+  test('a measured zero is omitted for the change size and both arrows, while an empty association is `-`', async () => {
     const { view } = await opened({ facts: () => ({ ...BASE, changes: { added: 0, deleted: 0 }, ahead: 0, behind: 0, issues: [], odd: [] }) });
-    assert.equal(panel(view, WIDE).focusData, 'branch main · issues 0 · odd 0 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(view, WIDE).focusData, 'branch main · issues: - · odd: - · created 1mo ago · modified 1d ago');
   });
 
   test('a one-sided ahead shows only ↑N, and a one-sided behind only ↓M', async () => {
     const aheadOnly = await opened({ facts: () => ({ ...BASE, behind: 0 }) });
-    assert.equal(panel(aheadOnly.view, WIDE).focusData, 'branch main · issues 1 · odd 1 · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(aheadOnly.view, WIDE).focusData, 'branch main · issues: #7 · odd: w9-x · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
     const behindOnly = await opened({ facts: () => ({ ...BASE, ahead: 0 }) });
-    assert.equal(panel(behindOnly.view, WIDE).focusData, 'branch main · issues 1 · odd 1 · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(behindOnly.view, WIDE).focusData, 'branch main · issues: #7 · odd: w9-x · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
   });
 
   test('the change size is the tracked and untracked LINE counts, never a file count', async () => {
@@ -1078,5 +1079,48 @@ describe('S24: Ctrl+D on a deletable panel row', () => {
     assert.match(panel(view, WIDE).legend, /ctrl\+d delete/, 'moving onto a deletable row names the real key');
     view.handleInput('\x04');
     assert.deepEqual(results, [{ delete: DELETABLE }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ui-consistency-round3 T6 S2: the warp's association facts are the ASSIGNED
+// identities — issue ids with `#`, the ODD document's name — never a count,
+// and an absent association is `-` while an unreadable read stays
+// `unavailable` (the two are different truths and never share a symbol).
+// ---------------------------------------------------------------------------
+describe('round 3 S2: associations render as ids and names, not counts', () => {
+  const line = (facts) => formatFactsLine(facts, { now: NOW });
+  const BASE = { branch: 'feat/x', changes: { added: 1, deleted: 0 }, ahead: 1, createdAt: '2026-02-01' };
+
+  test('issue ids carry `#` and the ODD is its document name', () => {
+    const facts = line({ ...BASE, issues: [76, 77], odd: ['alpha'] });
+    assert.ok(facts.includes('issues: #76, #77'), facts);
+    assert.ok(facts.includes('odd: alpha'), facts);
+    assert.ok(!facts.includes('issues 2') && !facts.includes('odd 1'), `no counts: ${facts}`);
+  });
+
+  test('a stored odd path renders as its document name', () => {
+    assert.ok(line({ ...BASE, issues: [], odd: ['odd/tasks/w1-a.md'] }).includes('odd: w1-a'));
+    assert.ok(line({ ...BASE, issues: [], odd: 'odd/tasks/w1-a.md' }).includes('odd: w1-a'), 'a bare string is accepted');
+  });
+
+  test('a readable empty association is `-`, never 0', () => {
+    const facts = line({ ...BASE, issues: [], odd: [] });
+    assert.ok(facts.includes('issues: -'), facts);
+    assert.ok(facts.includes('odd: -'), facts);
+    assert.ok(!/issues: 0|odd: 0/.test(facts), `no zero for an empty association: ${facts}`);
+  });
+
+  test('an unreadable association keeps `unavailable` instead of pretending to be empty', () => {
+    const facts = line({ ...BASE, issues: null, odd: 'unavailable' });
+    assert.ok(facts.includes('issues: unavailable'), facts);
+    assert.ok(facts.includes('odd: unavailable'), facts);
+  });
+
+  test('the panel forces the wide line so the names are never truncated away', async () => {
+    const { view } = await opened({ facts: () => ({ ...BASE, issues: [76, 77], odd: ['alpha'] }) });
+    const frame = panel(view, WIDE);
+    assert.ok(frame.focusData.includes('issues: #76, #77 · odd: alpha'), frame.focusData);
+    assert.ok(!frame.focusData.includes(' 2 '), 'a count never stands in for the association');
   });
 });

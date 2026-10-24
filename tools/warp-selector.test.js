@@ -1345,7 +1345,8 @@ describe('T12: `e` opens the worktree detail (S7, S13)', { concurrency: false },
         assert.equal(row.odd, 'odd/tasks/w1-b.md', 'the chosen odd document replaced the stored one, never joined it');
         assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
         const reopened = await waitForFactsFooter(driver.views[2]);
-        assert.match(reopened, /issues 2/, `the reopened popup shows the saved issue count\n${reopened}`);
+        assert.match(reopened, /issues: #2, #7/, `the reopened selector shows the saved issue identities\n${reopened}`);
+        assert.match(reopened, /odd: w1-b/, 'the saved document appears by name');
         assert.deepEqual(built.notes, [], 'a successful save is silent');
       } finally {
         watcher.restore();
