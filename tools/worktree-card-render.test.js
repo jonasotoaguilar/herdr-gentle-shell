@@ -8,6 +8,9 @@
 // supplied width at 30/60/100 columns, collapsed cards stay compact, the
 // frame keeps its left-accent structure — plus collapsed/expanded, error/
 // partial/empty/malformed details, and one semantic summary per tool.
+// S12 adds the two halves of the card contract: the collapsed body says
+// only what happened, and the expanded body is ordered, labelled detail
+// read from the same details object instead of the raw content dump.
 // Text presence alone is never the assertion: width bounds, line budgets
 // and frame structure travel with every case.
 
@@ -88,7 +91,7 @@ function resultFor(tool) {
       return {
         content: [{ type: 'text', text: 'worktree list: feat-cards feat/cards thread=t issues=12' }],
         details: {
-          worktrees: [{ name: 'feat-cards', path: '/repo/../feat-cards', branch: 'feat/cards' }],
+          worktrees: [{ name: 'feat-cards', path: '/repo/../feat-cards', branch: 'feat/cards', assignedOdd: null, odd: [] }],
           count: 1, all: true, pruned: [], warnings: [],
         },
       };
@@ -189,10 +192,13 @@ describe('renderResult geometry and states', () => {
       }
     });
 
-    test(`${tool}: expanded preserves the full result text`, () => {
+    // S12: with usable details the expanded body formats them instead of
+    // echoing the content text, so the FALLBACK is what this pins — a
+    // result the details cannot describe still reaches the reader whole.
+    test(`${tool}: expanded keeps a result the details cannot describe`, () => {
       const card = createWorktreeCardRenderer(tool);
       const longText = ['line one', 'line two', 'line three', 'line four', 'line five'].join('\n');
-      const result = { content: [{ type: 'text', text: longText }], details: resultFor(tool).details };
+      const result = { content: [{ type: 'text', text: longText }], details: {} };
       const collapsed = renderLines(card.renderResult(result, { expanded: false }, THEME, {}), 100);
       const expanded = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 100);
       assertFits(expanded, 100);
@@ -716,10 +722,10 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
 
   test('collapsed bodies are ordered short lines per tool', () => {
     const cases = [
-      ['worktree_upsert', ['created: feat-cards · feat/cards', 'path: /repo/../feat-cards', 'issues: 12']],
-      ['worktree_list', ['current: feat-cards', '1 checkout']],
+      ['worktree_upsert', ['created: feat-cards · feat/cards']],
+      ['worktree_list', ['listed: 1 checkout']],
       ['worktree_close', ['removed: feat-cards · feat/cards', 'branch kept']],
-      ['worktree_session_open', ['opened: feat-cards · abc123', 'path: /repo/../feat-cards']],
+      ['worktree_session_open', ['opened: feat-cards · abc123']],
     ];
     for (const entry of cases) {
       const tool = entry[0];
@@ -782,7 +788,7 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
     assert.ok(!plain.includes('1.2s'), 'no duration without host evidence');
   });
 
-  test('expanded list shows every row while compact shows current plus count', () => {
+  test('expanded list shows every row while compact shows the action and count', () => {
     const card = createWorktreeCardRenderer('worktree_list');
     const words = ['worktree list: a-x feat/x thread=t1 issues=1', 'worktree list: b-y feat/y thread=t2 issues=2'];
     const result = {
@@ -796,8 +802,9 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
       },
     };
     const compact = renderLines(card.renderResult(result, { expanded: false }, THEME, {}), 100).map(stripAnsi).join('\n');
-    assert.ok(compact.includes('current: a-x'), 'compact names the current checkout');
-    assert.ok(compact.includes('2 checkouts'), 'compact names the count');
+    assert.ok(compact.includes('listed: 2 checkouts'), 'compact names the action and the count');
+    assert.ok(!compact.includes('current'), 'compact never claims which checkout is current');
+    assert.ok(!compact.includes('a-x'), 'compact never names the first row as the current checkout');
     assert.ok(!compact.includes('b-y'), 'compact stays short instead of listing rows');
     const expanded = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 100).map(stripAnsi).join('\n');
     assert.ok(expanded.includes('a-x') && expanded.includes('b-y'), 'expanded keeps the full listing');
@@ -845,9 +852,9 @@ describe('S19: bounded compact per tool plus card parity', () => {
 
   test('collapsed bodies are the ordered short lines of the new contract', () => {
     const cases = [
-      ['worktree_upsert', ['created: feat-cards · feat/cards', 'path: /repo/../feat-cards', 'issues: 12']],
+      ['worktree_upsert', ['created: feat-cards · feat/cards']],
       ['worktree_close', ['removed: feat-cards · feat/cards', 'branch kept']],
-      ['worktree_session_open', ['opened: feat-cards · abc123', 'path: /repo/../feat-cards']],
+      ['worktree_session_open', ['opened: feat-cards · abc123']],
     ];
     for (const entry of cases) {
       const tool = entry[0];
@@ -874,7 +881,7 @@ describe('S19: bounded compact per tool plus card parity', () => {
     };
     assert.deepStrictEqual(
       bodyRows(renderLines(createCard.renderResult(owned, { expanded: false }, THEME, {}), 60)),
-      ['created: feat-cards · feat/cards · already exists', 'path: /repo/../feat-cards'],
+      ['created: feat-cards · feat/cards · already exists'],
     );
     const closeCard = createWorktreeCardRenderer('worktree_close');
     const dropped = {
@@ -958,7 +965,7 @@ describe('warp message renderer (S20)', () => {
     return {
       roles,
       fg: (role, text) => { roles.push(role); return text; },
-      bg: (role, text) => text,
+      bg: (_role, text) => text,
     };
   }
 
@@ -1048,10 +1055,10 @@ describe('warp message renderer (S20)', () => {
 
   test('tool expanded wraps a long body line with no ellipsis', () => {
     const card = createWorktreeCardRenderer('worktree_list');
-    const longLine = `worktree list: feat-cards feat/cards thread=t issues=12 odd=${'odd-doc-'.repeat(20)}.md`;
+    const longPath = `/repo/${'odd-doc-'.repeat(20)}checkout`;
     const result = {
-      content: [{ type: 'text', text: longLine }],
-      details: { worktrees: [{ name: 'feat-cards', path: '/repo/x', branch: 'feat/cards' }], count: 1, all: true, pruned: [], warnings: [] },
+      content: [{ type: 'text', text: 'worktree list: feat-cards feat/cards' }],
+      details: { worktrees: [{ name: 'feat-cards', path: longPath, branch: 'feat/cards' }], count: 1, all: true, pruned: [], warnings: [] },
     };
     const lines = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 60);
     assertFits(lines, 60);
@@ -1063,7 +1070,7 @@ describe('warp message renderer (S20)', () => {
       .map((line) => stripAnsi(line).replace(/^\s*\u258E\s?/, '').replace(/\s+$/, ''))
       .filter((row) => !row.includes('\u2500') && !row.includes('ctrl+o'))
       .join('');
-    assert.ok(content.includes(longLine), 'S39: the long line survives whole across the wrapped rows');
+    assert.ok(content.includes(longPath), 'S39: the long value survives whole across the wrapped rows');
   });
 
   test('outputPad is honoured and widths 30/60/100 all fit', () => {
@@ -1265,7 +1272,7 @@ describe('S24 float card recipe (T17 RED)', () => {
     const bgRoles = [];
     return {
       bgRoles,
-      fg: (role, text) => text,
+      fg: (_role, text) => text,
       bg: (role, text) => { bgRoles.push(role); return `${BG_OPEN}${text}${BG_RESET}`; },
       ...(over || {}),
     };
@@ -1327,7 +1334,7 @@ describe('S24 float card recipe (T17 RED)', () => {
   });
 
   test('the opener is re-armed after every inner reset', () => {
-    const theme = floatTheme({ fg: (role, text) => `\x1b[32m${text}\x1b[0m` });
+    const theme = floatTheme({ fg: (_role, text) => `\x1b[32m${text}\x1b[0m` });
     for (const tool of TOOLS) {
       const card = createWorktreeCardRenderer(tool);
       for (const lines of [
@@ -1429,7 +1436,15 @@ describe('S24 float card recipe (T17 RED)', () => {
   });
 });
 
-describe('S25: collapsed listing card carries each entry odd document', () => {
+describe('S2/S6: the listing separates the assigned association from the available inventory', () => {
+  // S25 asked for each listed entry's odd documents; the corrected contract
+  // (S2/S6/T8) is that the registry stores ONE associated document per
+  // checkout and that the checkout's `odd/` inventory is a different fact.
+  // The expanded card therefore never labels an inventory document as the
+  // association and never promotes the first one: `odd:` carries the
+  // assignment the details name (or `-` when the entry is known to have
+  // none), and the inventory is exposed under its own label. The collapsed
+  // card carries neither (S12: compact precision).
   function bodyRows(lines) {
     return lines.map((line) => stripAnsi(line).replace(/^\s*\u258E\s?/, '').replace(/\s+$/, ''))
       .filter((row) => !row.includes('\u2500'));
@@ -1442,41 +1457,474 @@ describe('S25: collapsed listing card carries each entry odd document', () => {
     };
   }
 
-  test('collapsed list shows one odd row per entry that holds odd docs', () => {
+  test('expanded list prints the assigned document, never the inventory order', () => {
     const card = createWorktreeCardRenderer('worktree_list');
     const result = listResult([
-      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', odd: ['odd/x.md'] },
-      { name: 'b-y', path: '/repo/b-y', branch: 'feat/y', odd: [] },
-      { name: 'c-z', path: '/repo/c-z', branch: 'feat/z', odd: ['odd/z-one.md', 'odd/z-two.md'] },
-    ], 3);
+      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', assignedOdd: 'odd/x.md', odd: ['odd/x-extra.md', 'odd/x.md'] },
+      { name: 'b-y', path: '/repo/b-y', branch: 'feat/y', assignedOdd: null, odd: ['odd/y-held.md'] },
+      { name: 'c-z', path: '/repo/c-z', branch: 'feat/z', assignedOdd: 'odd/assigned.md', odd: ['odd/assigned.md', 'odd/z-two.md'] },
+      { name: 'principal', path: '/repo', branch: 'main', assignedOdd: null, odd: [] },
+    ], 4);
     for (const width of [60, 100]) {
-      const rows = bodyRows(renderLines(card.renderResult(result, { expanded: false }, THEME, {}), width));
+      const rows = bodyRows(renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width));
       assert.deepStrictEqual(rows, [
-        'current: a-x',
-        '3 checkouts',
-        'odd: a-x \u00B7 odd/x.md',
-        'odd: c-z \u00B7 odd/z-one.md,odd/z-two.md',
-      ], `collapsed odd rows at ${width}`);
+        'checkouts: 4',
+        'a-x \u00B7 feat/x',
+        'path: /repo/a-x',
+        'issues: -',
+        'odd: x',
+        'available odd: x-extra, x',
+        'b-y \u00B7 feat/y',
+        'path: /repo/b-y',
+        'issues: -',
+        'odd: -',
+        'available odd: y-held',
+        'c-z \u00B7 feat/z',
+        'path: /repo/c-z',
+        'issues: -',
+        'odd: assigned',
+        'available odd: assigned, z-two',
+        'principal \u00B7 main',
+        'path: /repo',
+        'issues: -',
+        'odd: -',
+      ], `expanded association rows at ${width}`);
+    }
+    const rows = bodyRows(renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 60));
+    for (const doc of ['x-extra', 'y-held', 'z-two']) {
+      assert.ok(!rows.includes(`odd: ${doc}`), `an inventory document is never labelled as the association: ${doc}`);
     }
   });
 
-  test('entries without odd docs add no row, and smuggled escapes are stripped', () => {
+  test('an entry the details do not describe prints no association row at all', () => {
+    const card = createWorktreeCardRenderer('worktree_list');
+    const rows = bodyRows(renderLines(card.renderResult(listResult([
+      { name: 'd-w', path: '/repo/d-w', branch: 'feat/w', odd: ['odd/w.md'] },
+    ], 1), { expanded: true }, THEME, {}), 60));
+    assert.deepStrictEqual(rows, [
+      'checkouts: 1',
+      'd-w \u00B7 feat/w',
+      'path: /repo/d-w',
+      'issues: -',
+      'available odd: w',
+    ], 'unknown association is omitted, never asserted absent or guessed from the inventory');
+  });
+
+  test('the collapsed list carries no odd rows, and escapes stay stripped', () => {
     const card = createWorktreeCardRenderer('worktree_list');
     const clean = listResult([
-      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', odd: [] },
+      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', assignedOdd: 'odd/x.md', odd: ['odd/x.md'] },
     ], 1);
     assert.deepStrictEqual(
       bodyRows(renderLines(card.renderResult(clean, { expanded: false }, THEME, {}), 60)),
-      ['current: a-x', '1 checkout'],
+      ['listed: 1 checkout'],
+      'S12: the collapsed card says what happened, not which odd docs exist',
     );
     const evil = listResult([
-      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', odd: ['\x1b[31modd/evil.md\x1b[0m'] },
+      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', assignedOdd: '\x1b[31modd/evil.md\x1b[0m', odd: [] },
     ], 1);
-    const lines = renderLines(card.renderResult(evil, { expanded: false }, THEME, {}), 60);
+    const lines = renderLines(card.renderResult(evil, { expanded: true }, THEME, {}), 60);
     for (const line of lines) assert.ok(!line.includes('\x1b'), 'escape leaked: ' + JSON.stringify(line));
     assert.ok(
-      bodyRows(lines).includes('odd: a-x \u00B7 odd/evil.md'),
+      bodyRows(lines).includes('odd: evil'),
       'the cleaned doc still shows: ' + JSON.stringify(bodyRows(lines)),
     );
+  });
+});
+
+describe('S12: compact precision and formatted expanded detail (T8)', () => {
+  // The user's report (Image#7): the collapsed card must say only what
+  // happened, and the expanded card must read as ordered, labelled,
+  // multi-line detail — never the raw `key=value` dump the transcript
+  // showed (`worktree list: … thread=t issues=1 odd=a,b,c`) with a giant
+  // ODD list on one line. Every row is read from the SAME details object
+  // execute() returns; the content text is the model-facing half owned
+  // elsewhere and stays out of the formatted body, except as the honest
+  // fallback when the details cannot describe the result at all.
+  function rowsOf(lines) {
+    return lines.map((line) => stripAnsi(line).replace(/^\s*\u258E\s?/, '').replace(/\s+$/, ''))
+      .filter((row) => !row.includes('\u2500'));
+  }
+
+  function compactRows(tool, result, width = 100) {
+    const card = createWorktreeCardRenderer(tool);
+    return rowsOf(renderLines(card.renderResult(result, { expanded: false }, THEME, {}), width));
+  }
+
+  function expandedRows(tool, result, width = 100) {
+    const card = createWorktreeCardRenderer(tool);
+    return rowsOf(renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width)).filter(
+      (row) => !row.includes('ctrl+o'),
+    );
+  }
+
+  // The one guard every expectation below shares: no raw legacy prefix and
+  // no key=value pair survives into a formatted body.
+  function assertFormatted(rows, label) {
+    const text = rows.join('\n');
+    assert.ok(!/thread=|issues=|odd=/.test(text), `${label}: no raw key=value pairs: ${JSON.stringify(rows)}`);
+    assert.ok(
+      !/^worktree (list|create|close|session open|warp):/m.test(text),
+      `${label}: no repeated legacy prefix: ${JSON.stringify(rows)}`,
+    );
+  }
+
+  // One row shape per tool, pinned exactly: identities first, then the
+  // labels that carry status, path and associations in a stable order.
+  const EXPANDED = {
+    worktree_upsert: [
+      'name: feat-cards',
+      'branch: feat/cards',
+      'status: created',
+      'path: /repo/../feat-cards',
+      'issues: #12',
+      'odd: -',
+    ],
+    worktree_list: [
+      'checkouts: 1',
+      'feat-cards \u00B7 feat/cards',
+      'path: /repo/../feat-cards',
+      'issues: -',
+      'odd: -',
+    ],
+    worktree_close: [
+      'name: feat-cards',
+      'branch: feat/cards',
+      'path: /repo/../feat-cards',
+      'branch state: kept',
+    ],
+    worktree_session_open: [
+      'worktree: feat-cards',
+      'session: abc123',
+      'path: /repo/../feat-cards',
+      'status: opened',
+    ],
+    worktree_warp: [
+      'moved: principal',
+      'to: feat-cards',
+      'path: now in "/repo/../feat-cards"',
+      'branch: now in "feat/cards"',
+    ],
+  };
+
+  const COMPACT = {
+    worktree_upsert: ['created: feat-cards \u00B7 feat/cards'],
+    worktree_list: ['listed: 1 checkout'],
+    worktree_close: ['removed: feat-cards \u00B7 feat/cards', 'branch kept'],
+    worktree_session_open: ['opened: feat-cards \u00B7 abc123'],
+    worktree_warp: ['moved: principal', 'to: feat-cards'],
+  };
+
+  test('expanded renders ordered, labelled rows per tool — never the raw dump', () => {
+    for (const tool of TOOLS) {
+      const rows = expandedRows(tool, resultFor(tool));
+      assert.deepStrictEqual(rows, EXPANDED[tool], `${tool} expanded rows`);
+      assertFormatted(rows, tool);
+    }
+  });
+
+  test('compact shows only the action and the identity it acted on', () => {
+    for (const tool of TOOLS) {
+      const rows = compactRows(tool, resultFor(tool));
+      assert.deepStrictEqual(rows, COMPACT[tool], `${tool} compact rows`);
+      assertFormatted(rows, `${tool} compact`);
+      assert.ok(!rows.join('\n').includes('/repo/'), `${tool}: no full path while collapsed: ${JSON.stringify(rows)}`);
+      assert.ok(rows.length <= 3, `${tool}: compact stays to three rows, got ${rows.length}`);
+    }
+  });
+
+  test('compact never reports a create that only updated or already existed', () => {
+    const updated = {
+      content: [{ type: 'text', text: 'updated: feat-cards \u00B7 feat/cards' }],
+      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: false, updated: true },
+    };
+    assert.deepStrictEqual(compactRows('worktree_upsert', updated), ['updated: feat-cards \u00B7 feat/cards']);
+    assert.deepStrictEqual(
+      expandedRows('worktree_upsert', updated).slice(0, 3),
+      ['name: feat-cards', 'branch: feat/cards', 'status: updated'],
+    );
+    const owned = {
+      content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards \u00B7 already exists' }],
+      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: false },
+    };
+    assert.deepStrictEqual(
+      compactRows('worktree_upsert', owned),
+      ['created: feat-cards \u00B7 feat/cards \u00B7 already exists'],
+    );
+    assert.ok(
+      expandedRows('worktree_upsert', owned).includes('status: already existed'),
+      'the skipped create says so in the detail: ' + JSON.stringify(expandedRows('worktree_upsert', owned)),
+    );
+  });
+
+  test('expanded renders the assigned odd NAME and - for absent associations', () => {
+    const result = {
+      content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards' }],
+      details: {
+        path: '/repo/../feat-cards',
+        branch: 'feat/cards',
+        issues: [12, 13],
+        created: true,
+        odd: 'odd/2026-02-01-native-tool-output.md',
+      },
+    };
+    const rows = expandedRows('worktree_upsert', result);
+    assert.ok(rows.includes('issues: #12, #13'), 'issue numbers carry #: ' + JSON.stringify(rows));
+    assert.ok(
+      rows.includes('odd: 2026-02-01-native-tool-output'),
+      'odd renders its NAME, not its path: ' + JSON.stringify(rows),
+    );
+    assert.ok(!rows.some((row) => row.includes('.md')), 'the odd path never renders: ' + JSON.stringify(rows));
+    const bare = {
+      content: [{ type: 'text', text: 'created: feat-cards' }],
+      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: true, odd: null },
+    };
+    const bareRows = expandedRows('worktree_upsert', bare);
+    assert.ok(
+      bareRows.includes('issues: -') && bareRows.includes('odd: -'),
+      'missing associations read - instead of vanishing: ' + JSON.stringify(bareRows),
+    );
+  });
+
+  test('a large listing expands to one labelled block per entry, no giant odd line', () => {
+    // Screenshot-shaped data: many checkouts, each with its own thread,
+    // issue numbers, ONE associated odd document and the documents its
+    // checkout holds.
+    function docsFor(index) {
+      if (index % 3 === 0) return ['odd/a.md', 'odd/b.md', 'odd/c.md'];
+      if (index % 3 === 1) return ['odd/a.md'];
+      return [];
+    }
+    const entries = [];
+    for (let index = 0; index < 12; index += 1) {
+      const docs = docsFor(index);
+      entries.push({
+        name: `feat-${index}`,
+        path: `/repo/wt/feat-${index}`,
+        branch: `feat/branch-${index}`,
+        thread: index === 0 ? 'unknown' : `thread-${index}`,
+        issues: index % 2 === 0 ? [70 + index, 90 + index] : [],
+        assignedOdd: docs.length > 0 ? 'odd/a.md' : null,
+        odd: docs,
+        status: index === 11 ? 'missing' : 'live',
+        kind: 'agent',
+      });
+    }
+    const result = {
+      content: [{
+        type: 'text',
+        text: entries
+          .map((row) => `worktree list: ${row.name} ${row.branch} thread=${row.thread} issues=${row.issues.join(',')} odd=${row.odd.join(',')}`)
+          .join('\n'),
+      }],
+      details: { worktrees: entries, count: entries.length, all: true, pruned: [], warnings: [] },
+    };
+    const card = createWorktreeCardRenderer('worktree_list');
+    const rows = expandedRows('worktree_list', result);
+    assertFormatted(rows, 'large listing');
+    assert.strictEqual(rows[0], 'checkouts: 12');
+    for (const entry of entries) {
+      assert.strictEqual(
+        rows.filter((row) => row === `${entry.name} \u00B7 ${entry.branch}`).length,
+        1,
+        `${entry.name} has exactly one identity row: ${JSON.stringify(rows)}`,
+      );
+    }
+    assert.strictEqual(rows.filter((row) => row === 'odd: -').length, 4, 'a known-empty association reads odd: -');
+    assert.strictEqual(
+      rows.filter((row) => row === 'odd: a').length,
+      8,
+      'the ASSOCIATED document is the only value the odd row ever carries',
+    );
+    assert.strictEqual(rows.filter((row) => row === 'available odd: a, b, c').length, 4, 'the inventory is labelled separately');
+    assert.strictEqual(rows.filter((row) => row === 'available odd: a').length, 4, 'one inventory row per entry');
+    assert.ok(!rows.some((row) => row.includes('.md')), 'no odd path or .md suffix leaks into the card');
+    assert.ok(!rows.some((row) => /^odd: .*,/.test(row)), 'odd documents are never a comma list');
+    assert.ok(rows.includes('issues: #70, #90'), 'issue numbers carry #: ' + JSON.stringify(rows));
+    assert.ok(rows.includes('issues: -'), 'an entry without issues reads -');
+    assert.ok(rows.includes('thread: thread-1'), 'a known thread is detail, not noise');
+    assert.ok(!rows.includes('thread: unknown'), 'the unknown thread placeholder never renders');
+    assert.strictEqual(rows.filter((row) => row === 'status: missing').length, 1, 'the missing status survives');
+    for (const width of [30, 60, 100]) {
+      const lines = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width);
+      assertFits(lines, width);
+      assertFrame(lines);
+    }
+  });
+
+  test('expanded failures keep the honest prose and invent no success row', () => {
+    for (const tool of TOOLS) {
+      const failed = {
+        content: [{ type: 'text', text: `worktree ${tool}: refused, the checkout is still listed` }],
+        details: resultFor(tool).details,
+        isError: true,
+      };
+      const rows = expandedRows(tool, failed);
+      assert.ok(
+        rows.some((row) => row.includes('the checkout is still listed')),
+        `${tool}: the failure text reaches the expanded card: ${JSON.stringify(rows)}`,
+      );
+      assert.ok(
+        !rows.some((row) => /^status: (created|opened|resumed|updated|live)/.test(row)),
+        `${tool}: no success status is invented for a failure: ${JSON.stringify(rows)}`,
+      );
+    }
+  });
+
+  test('preserve: an expanded failure keeps every prose line, the collapsed one stays bounded', () => {
+    for (const tool of TOOLS) {
+      const prose = ['refused: the branch is checked out elsewhere', 'hint: run worktree list', 'hint: close it first', 'hint: then retry', 'note: the registry was left untouched'];
+      const failed = { content: [{ type: 'text', text: prose.join('\n') }], details: {}, isError: true };
+      const expanded = expandedRows(tool, failed);
+      for (const line of prose) {
+        assert.ok(expanded.some((row) => row.includes(line)), `${tool}: expanded keeps ${JSON.stringify(line)}`);
+      }
+      const collapsed = compactRows(tool, failed);
+      assert.ok(collapsed.length <= 5, `${tool}: the collapsed failure stays bounded: ${JSON.stringify(collapsed)}`);
+      assert.ok(collapsed[0].includes('error') || collapsed[0].includes('refused'), `${tool}: the failure head survives`);
+    }
+  });
+
+  test('a partial result still marks itself receiving in the expanded form', () => {
+    for (const tool of TOOLS) {
+      const card = createWorktreeCardRenderer(tool);
+      const rows = rowsOf(renderLines(
+        card.renderResult(resultFor(tool), { expanded: true, isPartial: true }, THEME, {}), 100,
+      )).filter((row) => !row.includes('ctrl+o'));
+      assert.strictEqual(rows[rows.length - 1], 'receiving\u2026', `${tool}: expanded partial says receiving`);
+    }
+  });
+
+  test('expanded never invents a value the details do not carry', () => {
+    const close = {
+      content: [{ type: 'text', text: 'worktree close: /repo/../feat-ghost (branch feat/ghost)' }],
+      details: { path: '/repo/../feat-ghost', removed: true, branchKept: false },
+    };
+    const rows = expandedRows('worktree_close', close);
+    assert.deepStrictEqual(rows, ['name: feat-ghost', 'path: /repo/../feat-ghost', 'branch state: deleted']);
+    assert.ok(!rows.some((row) => row.includes('feat/ghost')), 'no branch row without a branch value');
+    const bare = {
+      content: [{ type: 'text', text: 'opened: feat-cards \u00B7 abc123' }],
+      details: {},
+    };
+    assert.ok(
+      expandedRows('worktree_session_open', bare).includes('opened: feat-cards \u00B7 abc123'),
+      'undescribable details fall back to the content instead of an empty body',
+    );
+  });
+
+  test('expanded wraps a long value instead of cutting it, at every width', () => {
+    const longPath = `/repo/very-long-checkout-path-${'x'.repeat(120)}`;
+    const result = {
+      content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards' }],
+      details: {
+        path: longPath,
+        branch: 'feat/cards',
+        issues: [12],
+        created: true,
+        odd: 'odd/deep/nested/design-doc.md',
+      },
+    };
+    const card = createWorktreeCardRenderer('worktree_upsert');
+    for (const width of [30, 60, 100]) {
+      const lines = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width);
+      assertFits(lines, width);
+      assertFrame(lines);
+      const rows = rowsOf(lines).filter((row) => !row.includes('ctrl+o'));
+      assert.ok(!rows.join('').includes('\u2026'), `${width}: expanded never truncates values`);
+      assert.ok(rows.join('').includes(longPath), `${width}: the whole path survives across wrapped rows`);
+    }
+  });
+
+  test('every labelled row keeps its label at every width', () => {
+    for (const tool of TOOLS) {
+      const wideRows = expandedRows(tool, resultFor(tool), 100);
+      for (const width of [30, 60]) {
+        const text = expandedRows(tool, resultFor(tool), width).join('\n');
+        for (const row of wideRows) {
+          if (!row.includes(': ')) continue;
+          const label = row.slice(0, row.indexOf(': ') + 1);
+          assert.ok(text.includes(label), `${tool}: ${label} survives ${width}: ${JSON.stringify(text)}`);
+        }
+      }
+    }
+  });
+
+  test('a listing never claims a current checkout the result does not name', () => {
+    // executeWorktreeList puts the PRINCIPAL first and the session's own
+    // checkout SECOND when they differ, and no details field names which row
+    // is current — so `current: <rows[0].name>` read `current: principal`
+    // for a session sitting in a linked worktree. Array order is never an
+    // identity: the compact card names the action and the count only.
+    const withLinkedSession = {
+      content: [{
+        type: 'text',
+        text: 'worktree list: principal main principal\nworktree list: feat-cards feat/cards thread=t1 issues=12',
+      }],
+      details: {
+        count: 2,
+        all: false,
+        pruned: [],
+        warnings: [],
+        worktrees: [
+          { name: 'principal', path: '/repo', branch: 'main', thread: null, issues: [], odd: [], status: 'live', kind: 'principal' },
+          { name: 'feat-cards', path: '/repo/feat-cards', branch: 'feat/cards', thread: 't1', issues: [12], odd: [], status: 'live', kind: 'agent' },
+        ],
+      },
+    };
+    const reversed = {
+      ...withLinkedSession,
+      details: { ...withLinkedSession.details, worktrees: [...withLinkedSession.details.worktrees].reverse() },
+    };
+    for (const entry of [['principal first', withLinkedSession], ['agent first', reversed]]) {
+      const label = entry[0];
+      const result = entry[1];
+      for (const width of [30, 60, 100]) {
+        const rows = compactRows('worktree_list', result, width);
+        const text = rows.join('\n');
+        assert.ok(!text.includes('current'), `${label} at ${width}: no current claim: ${JSON.stringify(rows)}`);
+        assert.ok(!text.includes('principal'), `${label} at ${width}: the principal is not named as current: ${JSON.stringify(rows)}`);
+        assert.ok(!text.includes('feat-cards'), `${label} at ${width}: no checkout is named: ${JSON.stringify(rows)}`);
+        assert.ok(/^listed: 2 checkouts$/.test(rows[0]), `${label} at ${width}: the action reads: ${JSON.stringify(rows)}`);
+      }
+    }
+    const expanded = expandedRows('worktree_list', withLinkedSession).join('\n');
+    assert.ok(
+      expanded.includes('principal \u00B7 main') && expanded.includes('feat-cards \u00B7 feat/cards'),
+      'the expanded detail still names every checkout: ' + JSON.stringify(expandedRows('worktree_list', withLinkedSession)),
+    );
+  });
+
+  test('an unknown or zero count stays truthful in the compact card', () => {
+    const noCount = {
+      content: [{ type: 'text', text: 'worktree list: principal main principal' }],
+      details: { worktrees: [{ name: 'principal', path: '/repo', branch: 'main' }] },
+    };
+    assert.deepStrictEqual(
+      compactRows('worktree_list', noCount),
+      ['worktree list: principal main principal'],
+      'without a count the honest first line stands in, never a guessed total',
+    );
+    const empty = { content: [{ type: 'text', text: 'worktree list: none' }], details: { worktrees: [], count: 0 } };
+    assert.deepStrictEqual(compactRows('worktree_list', empty), ['no worktrees']);
+    assert.ok(!compactRows('worktree_list', empty).join('').includes('current'), 'an empty listing claims no current checkout');
+    const noText = { content: [{ type: 'text', text: '' }], details: { worktrees: [], count: 0 } };
+    assert.deepStrictEqual(compactRows('worktree_list', noText), ['no worktrees', '(no output)']);
+  });
+
+  test('preserve: close and warp keep their S19/S42 rows on both states', () => {
+    assert.deepStrictEqual(compactRows('worktree_close', resultFor('worktree_close')), [
+      'removed: feat-cards \u00B7 feat/cards',
+      'branch kept',
+    ]);
+    assert.deepStrictEqual(compactRows('worktree_warp', resultFor('worktree_warp')), [
+      'moved: principal',
+      'to: feat-cards',
+    ]);
+    const warpRows = expandedRows('worktree_warp', resultFor('worktree_warp'));
+    assert.deepStrictEqual(warpRows.slice(2), [
+      'path: now in "/repo/../feat-cards"',
+      'branch: now in "feat/cards"',
+    ], 'S42: expanded appends path then branch after the names');
   });
 });

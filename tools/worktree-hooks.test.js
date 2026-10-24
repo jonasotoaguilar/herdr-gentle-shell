@@ -764,7 +764,16 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
       const result = await tool.execute('call-1', { branch: 'feat/hooked', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `hooks must never fail creation: ${JSON.stringify(result)}`);
       const text = (result.content || []).map((p) => p.text || '').join('\n');
-      assert.deepEqual(text.split('\n'), ['created: feat-hooked · feat/hooked', `path: ${target}`, 'issues: 35']);
+      assert.deepEqual(text.split('\n'), [
+        'outcome: created',
+        'name: feat-hooked',
+        'branch: feat/hooked',
+        `path: ${target}`,
+        'issues: #35',
+        'odd: -',
+        ...(result.details.changesRegistered === true ? ['changes: registered'] : []),
+        ...(result.details.warnings || []).map((warning) => `warning: ${warning}`),
+      ]);
       // The env copy lands; no ODD source exists to qualify for a link.
       assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'HOOKED=1\n');
       assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'no link is invented without an eligible principal source');
@@ -817,7 +826,16 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
       const result = await tool.execute('call-1', { branch: 'feat/hookfail', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, 'hooks never turn success into error');
       const text = (result.content || []).map((p) => p.text || '').join('\n');
-      assert.deepEqual(text.split('\n'), ['created: feat-hookfail · feat/hookfail', `path: ${target}`, 'issues: 35']);
+      assert.deepEqual(text.split('\n'), [
+        'outcome: created',
+        'name: feat-hookfail',
+        'branch: feat/hookfail',
+        `path: ${target}`,
+        'issues: #35',
+        'odd: -',
+        ...(result.details.changesRegistered === true ? ['changes: registered'] : []),
+        ...(result.details.warnings || []).map((warning) => `warning: ${warning}`),
+      ]);
       const failed = (result.details.hooks.steps || []).filter((s) => s.status === 'failed');
       assert.ok(failed.length >= 1, `a failed step is visible: ${JSON.stringify(result.details.hooks.steps)}`);
       assert.ok((result.details.hooks.warnings || []).length >= 1, 'a warning is recorded');

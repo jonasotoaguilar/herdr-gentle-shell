@@ -176,18 +176,35 @@ function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
 }
 
-// Raw backend text remains unchanged by the ignored-link policy.
+// S12/T8 model-facing create text: ordered label rows built from the SAME
+// details the card reads. The exact cell contract is pinned by
+// tools/worktree-model-result.test.js; these suites pin order, identity and
+// associations. A known-empty association reads `-` (S6).
+// The create result appends one `warning:` row per summarized warning (a
+// dropped association, an adopted branch, a skipped Herdr step); the ordered
+// create rows always lead, so a warning can never displace them and none is
+// silently dropped.
 function assertCreatedText(text, details, expected) {
-  const dropped = (details.warnings || []).filter((warning) => warning.startsWith('a worktree carries ONE odd document'));
-  assert.deepEqual(String(text).split('\n'), [...expected, ...dropped]);
+  const rows = String(text).split('\n');
+  assert.deepEqual(rows.slice(0, expected.length), expected);
+  const warnings = Array.isArray(details && details.warnings) ? details.warnings : [];
+  assert.deepEqual(
+    rows.slice(expected.length),
+    warnings.map((warning) => `warning: ${warning}`),
+    'every summary warning follows the created rows exactly once',
+  );
 }
+
 function createdRows({ outcome = 'created', name, branch, path: target, issues = [], odd = null, changes = false }) {
-  const head = outcome === 'already existed' ? `created: ${name} · ${branch} · already exists`
-    : outcome === 'updated' ? `updated: ${name} · ${branch}` : `created: ${name} · ${branch}`;
-  const rows = [head, `path: ${target}`];
-  if (issues.length) rows.push(`issues: ${issues.join(',')}`);
-  if (odd) rows.push(`odd: ${odd}`);
-  if (changes) rows.push('changes: already registered for this session');
+  const rows = [
+    `outcome: ${outcome}`,
+    `name: ${name}`,
+    `branch: ${branch}`,
+    `path: ${target}`,
+    `issues: ${issues.length > 0 ? issues.map((number) => `#${number}`).join(', ') : '-'}`,
+    `odd: ${odd === null ? '-' : odd}`,
+  ];
+  if (changes) rows.push('changes: registered');
   return rows;
 }
 
@@ -1213,8 +1230,11 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
       );
       assert.equal(closed.isError, undefined, `close must act on the new row, got: ${resultText(closed)}`);
       assert.deepEqual(resultText(closed).split('\n'), [
-        'removed: feat-h1-same · feat/h1-same',
-        'branch kept',
+        'outcome: removed',
+        'name: feat-h1-same',
+        'branch: feat/h1-same',
+        `path: ${target}`,
+        'branch state: kept',
       ]);
       assert.ok(!listWorktreePaths(root).includes(target), 'checkout removed');
     } finally {

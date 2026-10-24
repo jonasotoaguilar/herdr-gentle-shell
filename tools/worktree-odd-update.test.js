@@ -159,7 +159,7 @@ function addUnregistered(root, branch) {
 }
 
 describe('T18/S25: list carries the auto-detected odd document', { concurrency: false }, () => {
-  test('a worktree with odd/*.md lists it in text and details with the path', async () => {
+  test('available documents stay in details while model text reports the actual association', async () => {
     const root = makeRepo('list-odd');
     setEnv(stdEnv());
     try {
@@ -176,7 +176,9 @@ describe('T18/S25: list carries the auto-detected odd document', { concurrency: 
       assert.ok(Array.isArray(row.odd) && row.odd.length > 0, `row carries odd docs: ${JSON.stringify(row)}`);
       assert.ok(row.odd.some((o) => String(o).includes('notes.md')), `odd names notes.md: ${JSON.stringify(row.odd)}`);
       const line = text.split('\n').find((l) => l.includes('feat/odd-list'));
-      assert.ok(line && line.includes('notes.md'), `agent text carries the odd doc: ${text}`);
+      assert.strictEqual(row.assignedOdd, null, 'available documents are not assignments');
+      assert.equal(line, `feat-odd-list · feat/odd-list · ${target} · agent · live · issues - · odd -`);
+      assert.doesNotMatch(text, /notes\.md/, 'model text omits the available-document inventory');
     } finally {
       restoreEnv();
     }

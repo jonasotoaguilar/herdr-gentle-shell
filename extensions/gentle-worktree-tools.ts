@@ -421,6 +421,25 @@ function withWorktreeCardRenderer(tool) {
   } catch {
     // Rendering stays generic; the tool itself is unaffected.
   }
+  // Model text and visual cards are independent presentation layers. Keep
+  // backend helpers unchanged so runtime callers retain their raw contract.
+  try {
+    const format = libRequire("worktree-model-result.js").formatWorktreeModelResult;
+    const execute = tool.execute;
+    if (typeof format === "function" && typeof execute === "function") {
+      tool.execute = async function (...args) {
+        const result = await execute.apply(this, args);
+        try {
+          return format(tool.name, result);
+        } catch {
+          // A presentation failure must not hide a completed tool's result.
+          return result;
+        }
+      };
+    }
+  } catch {
+    // An unavailable formatter leaves execution and diagnostics untouched.
+  }
   return tool;
 }
 
@@ -1437,7 +1456,10 @@ async function executeWorktreeList(params, ctx) {
     const principalBranch = principalEntry.branch || "(detached)";
     // S24: the first column is the NAME (`principal`), never the path.
     principalLine = `worktree list: principal ${principalBranch} principal`;
-    principalItem = { name: "principal", path: principalPath, branch: principalBranch, thread: null, issues: [], status: "live", kind: "principal" };
+    // S2/S6: `assignedOdd` is the association slot; the principal holds no
+    // registry row, so its known-empty association is an explicit null
+    // (never an inferred document).
+    principalItem = { name: "principal", path: principalPath, branch: principalBranch, thread: null, issues: [], assignedOdd: null, status: "live", kind: "principal" };
   }
   const agentRows = [];
   const deadPaths = [];
@@ -1506,7 +1528,13 @@ async function executeWorktreeList(params, ctx) {
       line: `worktree list: ${rowName} ${shownBranch} thread=${thread} issues=${issues.join(",")}`
         + (liveHit ? "" : " missing")
         + (oddDocs.length > 0 ? ` odd=${oddDocs.join(",")}` : ""),
-      item: { name: rowName, path: entry.path, branch: shownBranch, thread, issues, odd: oddDocs, status, kind: "agent" },
+      // S2/S6 association truth: `odd` stays the checkout's AVAILABLE
+      // inventory (associated document first, then whatever `odd/*.md` it
+      // holds now), while `assignedOdd` carries the ONE document the stored
+      // registry entry actually associates — the stored string, or null when
+      // the entry holds none. Consumers must never read the inventory as the
+      // association, and no document is inferred from the inventory order.
+      item: { name: rowName, path: entry.path, branch: shownBranch, thread, issues, odd: oddDocs, assignedOdd: storedOdd, status, kind: "agent" },
     });
   }
   // Prune exactly the dead rows in one atomic registry write, best
@@ -1684,7 +1712,10 @@ async function executeWorktreeList(params, ctx) {
       }
       extraLines.push({
         line: `worktree list: ${extraName} ${branch} unregistered`,
-        item: { name: extraName, path: shown, branch, thread: null, issues: [], status: "unregistered", kind: "unregistered" },
+        // An unregistered checkout has no registry row, so it carries no
+        // association; its document inventory is not scanned and stays
+        // absent rather than asserted empty.
+        item: { name: extraName, path: shown, branch, thread: null, issues: [], assignedOdd: null, status: "unregistered", kind: "unregistered" },
       });
     }
     const primaryExtra = sessionExtra >= 0 ? extraLines[0] : null;
@@ -2749,6 +2780,15 @@ async function executeWorktreeClose(params, ctx, opts) {
   if (preRemoval.warp !== null) successLines.push("session warped to principal");
   for (const notice of preRemoval.notices) successLines.push(notice);
   const successDetails = { path: target, branch, removed: true, branchKept: true, thread: owner };
+  // S8b/S12: the warning that a registry write collapsed a legacy odd list
+  // belongs to the OUTCOME, so it travels in details beside the structured
+  // list of discarded documents — the model text and the card are built from
+  // details, and a warning that only lived in the raw lines would vanish in
+  // both. Nothing is added when no association was dropped.
+  if (Array.isArray(dropped.dropped) && dropped.dropped.length > 0) {
+    successDetails.warnings = [droppedOddWarning(dropped.dropped)];
+    successDetails.droppedOdd = dropped.dropped.slice();
+  }
   if (preRemoval.warp !== null) successDetails.warp = preRemoval.warp;
   if (preRemoval.herdrWorkspace !== null) successDetails.herdrWorkspace = preRemoval.herdrWorkspace;
   return textResult(
