@@ -63,9 +63,11 @@ T11 | S19,S20 | route: parent RED 3 new view tests then GREEN 132/132 view + 34/
 T12 | S21 | route: worker converted every interactive child to the async runner, RED timer-lag test first (create 0 ticks/4814 ms frozen, warp delete 875 ms max gap); GREEN 430 ticks/29 ms and 404 ticks/44 ms at a 400 ms child; parent repaired the two argv assertions that had gone vacuous and ran the full suite 2185/2185, 433 suites, 0 fail (baseline d96c120: 2183, 0 fail); residual sync: Herdr reconcile on closing your OWN checkout, and the memoized rev-parse probe | status: done | commit: f874508
 T13 | S19-S21 | route: full suite plus real-TTY acceptance by the human | status: pending | commit: pending
 S22. Repeated registry and identity work is memoized: the shared git common dir resolves once per checkout, and the parsed registry is cached per file identity, invalidated by every write, so a cached read can never outlive a write from this process or another one.
+S24. Closing the checkout the session is inside never blocks the host while it reconciles the Herdr workspace group: the same argv, order, timeouts and result shapes are awaited on the async runner.
 S23. A reading view never re-wraps unchanged content on a repaint: wrapped body lines and list label rows are memoized by exact content plus width, a cursor move reuses them, and any content or width change recomputes exactly once.
 
 T14 | S22 | route: parent RED 5 spawn-count/write-visibility tests then GREEN, shared commonDirFor in worktree-git, registry + warp-session + change-summary callers; readRegistry 18.8 ms to 0.016 ms; full suite 2190/2190 | status: done | commit: b161f17
+T16 | S24 | route: parent added `reconcileHerdrWorkspaceAsync` (same argv/order/timeouts/results, shared pure helpers), wired the self-close path to it, parity test on four outcomes plus a slow-Herdr loop probe (async 60+ ticks, <250 ms gaps; the sync twin measures 0 ticks over the same 1.6 s); full suite 2206/2206 | status: done | commit: pending
 T15 | S23 | route: worker measured the paint cost first, memoized the issue-preview body and both list labels, differential 122 frames 0 differing; preview 0.79 to 0.02 ms, detail 0.94 to 0.15 ms at 80 columns; RED by undefined cache on base | status: done | commit: pending
 
 ## Log

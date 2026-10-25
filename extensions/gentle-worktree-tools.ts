@@ -2325,20 +2325,28 @@ async function closePreRemovalSequence({ git, repo, target, branch, force, ctx, 
       anchorRoot = repo.root;
     }
     runRoot = anchorRoot;
-    // `reconcileHerdrWorkspace` walks its own children sequentially and reads
-    // their results synchronously, so it stays the one Herdr step this
-    // sequence cannot await per call: it only runs when the session warped
-    // out of the doomed checkout (closing your OWN checkout), never on the
-    // ordinary selector delete. Its calls still go through the fixed-argv
-    // runner and its failure handling is unchanged.
-    const reconciled = closeHerdr.reconcileHerdrWorkspace({
-      run: (argv, timeoutMs) => git.runArgv(herdrBinary(), argv, { cwd: runRoot, timeoutMs }),
-      repoRoot: anchorRoot,
-      resolvedTarget,
-      principalPath: warp.path,
-      session: { file: warp.sessionFile, id: ourSessionId },
-      force,
-    });
+    // S24: the reconcile runs when the session warped OUT of the doomed
+    // checkout (closing your OWN checkout), which is exactly when the reader
+    // is still watching: its Herdr children are awaited on the async runner
+    // with the same argv, order and timeouts, so the host never freezes on
+    // them. The sync twin remains for non-interactive callers.
+    const reconciled = typeof closeHerdr.reconcileHerdrWorkspaceAsync === "function"
+      ? await closeHerdr.reconcileHerdrWorkspaceAsync({
+        runAsync: (argv, timeoutMs) => git.runArgvAsync(herdrBinary(), argv, { cwd: runRoot, timeoutMs }),
+        repoRoot: anchorRoot,
+        resolvedTarget,
+        principalPath: warp.path,
+        session: { file: warp.sessionFile, id: ourSessionId },
+        force,
+      })
+      : closeHerdr.reconcileHerdrWorkspace({
+        run: (argv, timeoutMs) => git.runArgv(herdrBinary(), argv, { cwd: runRoot, timeoutMs }),
+        repoRoot: anchorRoot,
+        resolvedTarget,
+        principalPath: warp.path,
+        session: { file: warp.sessionFile, id: ourSessionId },
+        force,
+      });
     if (reconciled.status === "reconciled") {
       herdrWorkspace = {
         status: "reconciled",
