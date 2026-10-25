@@ -4687,6 +4687,31 @@ function oddRelFor(absPath, worktreePath, principalRoot) {
 // Bounded (`.md` only) listing of the worktree's own `odd/` directory,
 // relative to it (`tasks/plan.md`). Never throws: any unreadable directory
 // contributes nothing.
+// Hot path: `repoIdentity` spawns two git children (~17ms here) and the ODD
+// capture runs on EVERY tool_call and tool_result. A session's cwd resolves to
+// the same root/common dir for its whole life, so the answer is memoized per
+// cwd instead of respawned twice per tool call. Bounded LRU: a long session
+// visiting many checkouts keeps the most recent ones, never unbounded state.
+const REPO_IDENTITY_CACHE_LIMIT = 32;
+const repoIdentityCache = new Map();
+
+function cachedRepoIdentity(git, cwd) {
+  const key = String(cwd);
+  const hit = repoIdentityCache.get(key);
+  if (hit !== undefined) {
+    // Refresh recency so the checkout in use is never the one evicted.
+    repoIdentityCache.delete(key);
+    repoIdentityCache.set(key, hit);
+    return hit;
+  }
+  const value = git.repoIdentity(key);
+  repoIdentityCache.set(key, value);
+  if (repoIdentityCache.size > REPO_IDENTITY_CACHE_LIMIT) {
+    repoIdentityCache.delete(repoIdentityCache.keys().next().value);
+  }
+  return value;
+}
+
 function scanOddMarkdowns(oddDir) {
   const rels = [];
   const visited = new Set();
@@ -4765,7 +4790,7 @@ function captureOddFromToolEvent(event, ctx, pi, allowPhaseTrigger) {  // M1: th
   const registry = libRequire("worktree-registry.js");
   let repo;
   try {
-    repo = git.repoIdentity(cwd);
+    repo = cachedRepoIdentity(git, cwd);
   } catch {
     return; // Unknown context: not a repository, nothing to associate.
   }
@@ -4816,19 +4841,27 @@ function captureOddFromToolEvent(event, ctx, pi, allowPhaseTrigger) {  // M1: th
   if (allowPhaseTrigger === true) {
     autoNameSessionFromPhase(pi, entry, sessionId, oddToolNameOf(event));
   }
-  // Complement: record anything the per-call capture never observed.
-  // Runs on every pipeline event so opaque calls (e.g. `bash`) still
-  // converge the registry towards the worktree's `odd/` contents.
-  try {
-    for (const rel of scanOddMarkdowns(path.join(entry.path, "odd"))) {
-      const full = `odd/${rel}`;
-      if (!known.has(full)) {
-        known.add(full);
-        candidates.push(full);
+  // Complement: record anything the per-call capture never observed. Runs on
+  // every pipeline event so opaque calls (e.g. `bash`) still converge the
+  // registry towards the worktree's `odd/` contents.
+  //
+  // It can only ever FILL an empty association, so it is skipped entirely once
+  // the row already holds one, and skipped when this very event already found a
+  // candidate: the scan would only append documents the write path never reads.
+  // That removes a bounded directory walk (500 files / 5000 entries) from the
+  // steady-state hot path of every tool call.
+  if (associated === null && candidates.length === 0) {
+    try {
+      for (const rel of scanOddMarkdowns(path.join(entry.path, "odd"))) {
+        const full = `odd/${rel}`;
+        if (!known.has(full)) {
+          known.add(full);
+          candidates.push(full);
+        }
       }
+    } catch {
+      // Best effort: the observed paths above are still recorded.
     }
-  } catch {
-    // Best effort: the observed paths above are still recorded.
   }
   if (associated === null) {
     // ONE document: the first candidate is the association, and the ones
@@ -9179,6 +9212,10 @@ async function executeIssues(rawArgs, ctx) {
         assigned,
         checkoutName,
         assignmentEnabled,
+        // The interactive reader reads all four tabs ONCE at open: a tab that
+        // was never visited showed `(0)` while the repository did have issues,
+        // and every switch refetched its own page.
+        prefetchBuckets: true,
         // S16: `includeMetadata` is what carries the authoritative repository
         // role, current assignees and linked PR count into the view. Without
         // it the view sees no confirmed capability and offers no editors.

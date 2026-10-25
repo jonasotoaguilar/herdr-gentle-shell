@@ -527,7 +527,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
               view.handleInput('\x1b[A'); // and back to Feature, the expected type
               view.handleInput('\t'); // Tab hands the flow to the name field
               for (const char of 'panel-change') view.handleInput(char);
-              view.handleInput('\x13'); // ctrl+s creates
+              view.handleInput('enter'); // enter creates
             } catch (err) {
               clearTimeout(timer);
               reject(err);
@@ -1789,7 +1789,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           assert.equal(view.state.name, 'nothing-yet', 'the name field kept every character');
           assert.deepEqual(watcher.kinds(), [], 'navigating and typing before the confirm wrote nothing');
           confirmedAt = watcher.events.length;
-          view.handleInput('\x13'); // the explicit confirm
+          view.handleInput('enter'); // the explicit confirm key
         }]);
         const built = wiredCtx(root, driver);
         const { commands, mod } = await loadExtension();
@@ -1830,7 +1830,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           view.handleInput('\x1b[B');
           for (const char of 'refused-create') view.handleInput(char);
           confirmedAt = watcher.events.length;
-          view.handleInput('\x13'); // the explicit confirm
+          view.handleInput('enter'); // the explicit confirm key
         }]);
         const built = makeWiredCtx({
           cwd: root,

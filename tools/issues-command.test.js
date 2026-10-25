@@ -498,8 +498,13 @@ describe('/herdr-gentle:issues overlay', () => {
     // S5/D1: the source asks gh for last-update ordering with the EXACT bucket
     // query; Involved excludes the viewer's own issues so the two buckets are
     // disjoint at the source, before any client filter.
-    assert.deepEqual(searchQueries(calls), ['author:@me sort:updated-desc'],
-      'the mount reads the active bucket fresh with its own exact query');
+    assert.deepEqual(searchQueries(calls), [
+      'author:@me sort:updated-desc',
+      'assignee:@me sort:updated-desc',
+      'involves:@me -author:@me sort:updated-desc',
+      'sort:updated-desc',
+    ],
+      'the mount reads every tab once with its own exact query');
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues/, 'first page tab');
     assert.match(body, /Assigned/, 'second page tab');
@@ -852,7 +857,12 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
     // seam — the accumulated list API is not part of this path at all.
     const lists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
     assert.deepEqual(lists, [], 'the fresh viewer never reads the session list cache');
-    assert.deepEqual(searchQueries(calls), ['author:@me sort:updated-desc'], 'one fresh page for the bucket on screen');
+    assert.deepEqual(searchQueries(calls), [
+      'author:@me sort:updated-desc',
+      'assignee:@me sort:updated-desc',
+      'involves:@me -author:@me sort:updated-desc',
+      'sort:updated-desc',
+    ], 'one fresh page per tab at open');
   });
 
   test('the removed state key is inert and a reload re-reads the current page', async () => {
@@ -862,7 +872,12 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
     await tick();
     const reads = () => searchQueries(calls);
     const primed = reads();
-    assert.deepEqual(primed, ['author:@me sort:updated-desc'], 'the mount read the active bucket once');
+    assert.deepEqual(primed, [
+      'author:@me sort:updated-desc',
+      'assignee:@me sort:updated-desc',
+      'involves:@me -author:@me sort:updated-desc',
+      'sort:updated-desc',
+    ], 'the mount read every bucket once');
     const before = clean(component.render(110).join('\n'));
     component.handleInput('f');
     await tick();
@@ -1063,26 +1078,31 @@ describe('/herdr-gentle:issues mounted wiring (S8,S16)', () => {
 // while Involved excludes the authored bucket at the source.
 // ---------------------------------------------------------------------------
 describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => {
-  test('the mount reads only the bucket it shows, and every bucket reads its own exact query', async () => {
+  test('the mount reads every tab once, each with its own exact query, and a switch reads nothing', async () => {
     const root = makeRepo({ tag: 'issues-parallel' });
     const { runner, calls } = makeIssuesRunner();
     const { component } = await openIssues(root, { runner });
     await tick();
-    assert.deepEqual(searchQueries(calls), ['author:@me sort:updated-desc'],
-      'one fresh page for the bucket on screen, no eager prefetch of the others');
-    component.handleInput('tab');
-    await tick();
+    // Round 3: the mount reads ALL FOUR tabs once — a tab that was never
+    // visited showed `(0)` for issues the repository does have.
     assert.deepEqual(searchQueries(calls), [
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
-    ], 'selecting a bucket reads its own page fresh');
+      'involves:@me -author:@me sort:updated-desc',
+      'sort:updated-desc',
+    ], 'every tab is read once at open, each with its own exact query');
+    component.handleInput('tab');
+    await tick();
+    component.handleInput('tab');
+    await tick();
     component.handleInput('tab');
     await tick();
     assert.deepEqual(searchQueries(calls), [
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-    ], 'Involved excludes authored issues at the source');
+      'sort:updated-desc',
+    ], 'switching tabs reads nothing again');
   });
 
   test('no page read ever uses the list API or widens to all states', async () => {

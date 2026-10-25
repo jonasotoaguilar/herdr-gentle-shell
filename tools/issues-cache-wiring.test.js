@@ -500,11 +500,16 @@ describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: f
       // frame's 6 chrome rows plus nothing else — the page marker moved to the
       // search row, S14), so the request is 18 — never a fixed count and never
       // the whole set.
-      assert.equal(searchPages(after).length, 1, `one fresh page for the bucket on screen: ${JSON.stringify(after)}`);
-      assert.deepEqual(searchLimits(after), [18], 'bounded by the row budget');
+      // Every tab is read ONCE at open (round 3): a tab nobody visited used to
+      // sit at a false `(0)`, and each switch then refetched its own page.
+      assert.equal(searchPages(after).length, 4, `one fresh page per tab: ${JSON.stringify(after)}`);
+      assert.deepEqual(searchLimits(after), [18, 18, 18, 18], 'each bounded by the row budget');
       assert.deepEqual(searchQueries(after), [
         'repo:octo/repo is:issue is:open author:@me sort:updated-desc',
-      ], 'the page carries its bucket\'s own S2 search, never the snapshot connection');
+        'repo:octo/repo is:issue is:open assignee:@me sort:updated-desc',
+        'repo:octo/repo is:issue is:open involves:@me -author:@me sort:updated-desc',
+        'repo:octo/repo is:issue is:open sort:updated-desc',
+      ], 'each page carries its own bucket\'s S2 search, never the snapshot connection');
       for (const argv of searchPages(after)) {
         assert.ok(!argv.some((entry) => entry.startsWith('cursor=')), 'the first page starts the connection');
         assert.ok(!argv.some((entry) => entry.startsWith('owner=')), 'the search seam replaces the snapshot connection');
@@ -558,9 +563,13 @@ describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: f
       assert.equal(margins[0][margins[0].indexOf('--limit') + 1], '20',
         'the margin is the shared cache\'s bounded newest-20 window');
       // The rows the reader sees still come from the fresh server page only.
-      assert.deepEqual(searchQueries(after), ['repo:octo/repo is:issue is:open author:@me sort:updated-desc'],
-        'the margin never replaces or adds to the viewer\'s page source');
-      assert.equal(searchPages(after).length, 1, 'exactly one fresh viewer page');
+      assert.deepEqual(searchQueries(after), [
+        'repo:octo/repo is:issue is:open author:@me sort:updated-desc',
+        'repo:octo/repo is:issue is:open assignee:@me sort:updated-desc',
+        'repo:octo/repo is:issue is:open involves:@me -author:@me sort:updated-desc',
+        'repo:octo/repo is:issue is:open sort:updated-desc',
+      ], 'the margin never replaces or adds to the viewer\'s page source');
+      assert.equal(searchPages(after).length, 4, 'exactly one fresh page per tab');
       assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
       // The first frame is the truthful loading state: mounting never waits for
       // a network read, and the margin in particular starts after it.
@@ -781,8 +790,8 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       const after = model.calls.slice(before);
 
       assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
-      assert.equal(searchPages(after).length, 1, 'the bucket on screen is read fresh');
-      assert.deepEqual(searchLimits(after), [18], 'the request is the row budget, never a fixed count');
+      assert.equal(searchPages(after).length, 4, 'each tab is read fresh once at open');
+      assert.deepEqual(searchLimits(after), [18, 18, 18, 18], 'the request is the row budget, never a fixed count');
       assert.match(firstFrame, /My issues \(45\+\)/, 'the tab names the server total');
 
       // A second open reads the same first page again: fresh rows every time,
@@ -793,7 +802,7 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       const secondFrame = await viewerFrame(second);
       const again = model.calls.slice(beforeSecond);
       assert.equal(snapshotPages(again).length, 0, 'never a second snapshot');
-      assert.equal(searchPages(again).length, 1, 'a refresh is a fresh page, not a cache hit');
+      assert.equal(searchPages(again).length, 4, 'a reopen is a fresh page per tab, not a cache hit');
       assert.match(secondFrame, /My issues \(45\+\)/);
     } finally {
       restoreEnv();

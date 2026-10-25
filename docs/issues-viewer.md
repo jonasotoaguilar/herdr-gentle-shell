@@ -26,9 +26,12 @@ preview use the shared 40/60 split and titles wrap in full.
 Typing sends a debounced GitHub search over the complete active bucket,
 not just the loaded page: title words and qualifiers such as `label:bug`
 work before every page is fetched. A settled query resets its page cursor;
-a stale response cannot overwrite a newer query. Already loaded tabs reuse
-their rows and position immediately. `r` explicitly refreshes the current
-page, while successful writes invalidate affected cached pages.
+a stale response cannot overwrite a newer query. Opening the viewer reads
+all four tabs once, so switching between them never fetches again and no tab
+can show a false `0` for issues the repository does have; a tab whose read is
+still in flight shows `–` instead. Already loaded tabs reuse their rows and
+position immediately. `r` explicitly refreshes the current page, while
+successful writes invalidate affected cached pages.
 
 Only open issues are listed (S10a): the state toggle is gone, no other state
 is ever requested, and a page that arrives carrying a closed row counts only

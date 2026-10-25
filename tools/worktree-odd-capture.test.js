@@ -173,6 +173,40 @@ async function dispatch(handlers, eventName, event, ctx) {
 }
 
 describe('worktree odd capture', { concurrency: false }, () => {
+  // Round-3 performance: the capture runs on EVERY tool_call and tool_result.
+  // Resolving the repo identity spawns two git children, so the same cwd must
+  // not respawn them per event: that was ~35ms of blocked event loop per tool
+  // call, and it is what made the agent and the TUI feel slow.
+  test('repeated tool events resolve the repository once, not per event', async () => {
+    const { target } = makeRepoWithWorktree('hotpath');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    const childProcess = require('node:child_process');
+    const realSpawnSync = childProcess.spawnSync;
+    let spawns = 0;
+    childProcess.spawnSync = function counted(...args) {
+      spawns += 1;
+      return realSpawnSync.apply(this, args);
+    };
+    // The library destructures spawnSync when it loads, so drop the cached
+    // copy: the counted function must be the one it binds.
+    delete require.cache[require.resolve('../lib/worktree-git.js')];
+    try {
+      const { handlers } = await loadExtension();
+      const ctx = ctxFor(target);
+      await dispatch(handlers, 'tool_call', toolEvent('bash', '/tmp/not-an-odd-path'), ctx);
+      const afterFirst = spawns;
+      assert.ok(afterFirst > 0, `the first event resolves the repository (${afterFirst} git children)`);
+      for (let event = 0; event < 12; event += 1) {
+        await dispatch(handlers, 'tool_call', toolEvent('bash', '/tmp/not-an-odd-path'), ctx);
+        await dispatch(handlers, 'tool_result', toolEvent('bash', '/tmp/not-an-odd-path'), ctx);
+      }
+      assert.equal(spawns, afterFirst, `no git child per event after the first (${spawns} total)`);
+    } finally {
+      childProcess.spawnSync = realSpawnSync;
+      delete require.cache[require.resolve('../lib/worktree-git.js')];
+    }
+  });
+
   test('a read/edit/write of an odd/*.md inside a registered worktree records the FIRST document once', async () => {
     const { root, target, branch } = makeRepoWithWorktree('capture');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });

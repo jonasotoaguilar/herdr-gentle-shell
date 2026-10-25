@@ -155,6 +155,13 @@ function openPanel(overrides = {}) {
 function focusName(view) {
   view.handleInput('\t'); // type -> name
 }
+// Creation has ONE confirm key: `enter` on the Name field. Nothing here
+// presses `ctrl+s`, which the user reported as a duplicate of `enter` and which
+// now only saves the assignment panes in editing mode.
+function createNow(view) {
+  if (view.state.focus !== 'name') view.handleInput('\t');
+  view.handleInput('enter');
+}
 function focusIssues(view) {
   view.handleInput('\t');
 }
@@ -190,7 +197,7 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.ok(!text.includes('Choose the change type'), 'the type is a list in place, not a second pop-up surface');
     assert.match(text, /↑\/↓ type/, 'the footer names the type-selection keys');
     assert.match(text, /Enter confirm/, 'the footer names the confirm key');
-    assert.match(text, /Ctrl\+S create/, 'the keys footer names ctrl+s');
+    assert.ok(!/Ctrl\+S create/.test(text), 'the footer never advertises a duplicate create key');
     assert.match(text, /Esc cancel/, 'the keys footer names esc');
     assert.ok(!text.includes('? help'), 'the footer never advertises a help key');
     // The Name tab is the name field alone: the type row and its list belong
@@ -229,7 +236,7 @@ describe('the rendered panel', { concurrency: false }, () => {
     // A refusal adds a row, so the same guard covers the tightest host that
     // fits the fixed form plus its message.
     const refused = openPanel({ rowsAvailable: () => 8 });
-    refused.view.handleInput('\x13');
+    createNow(refused.view);
     const tight = renderedLines(refused.view, 60);
     assert.equal(tight.length, 1, 'the refusal never overflows a too-short host');
   });
@@ -266,7 +273,7 @@ describe('the rendered panel', { concurrency: false }, () => {
     const typed = renderedLines(view, 100);
     assert.equal(findLine(typed, 'preview branch:').trim(), 'preview branch: -', 'an underivable name stays blank');
     assert.equal(findLine(typed, 'preview path:').trim(), 'preview path: -');
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(finished, [], 'an invalid name still never creates');
     assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
@@ -283,7 +290,7 @@ describe('the rendered panel', { concurrency: false }, () => {
       'preview branch: -',
       'an underivable branch stays blank instead of going red',
     );
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(finished, [], 'the refusal creates nothing');
     assert.match(allText(renderedLines(view, 100)), /cannot create: invalid branch name: feat\/-bad/);
   });
@@ -299,7 +306,7 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.ok(!text.includes('name-change'), 'the placeholder disappears once there is a value');
     // The placeholder is not a name: creating from it is refused.
     view.handleInput('\x7f');
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(finished, [], 'a ghost placeholder never creates anything');
     assert.match(allText(renderedLines(view, 100)), /cannot create: name is empty/);
   });
@@ -422,7 +429,7 @@ describe('S12: two fields, nothing else', { concurrency: false }, () => {
       initialIssues: [12],
       initialOdd: '/odd/alpha.md',
     });
-    view.handleInput('\x13');
+    createNow(view);
     assert.equal(finished.length, 1);
     assert.deepEqual(finished[0], { ok: true, type: 'feat', name: 'new-change' });
     assert.deepEqual(Object.keys(finished[0]).sort(), ['name', 'ok', 'type'], 'no issues/odd/mode fields ride along');
@@ -438,7 +445,7 @@ describe('S12: two fields, nothing else', { concurrency: false }, () => {
     view.handleInput('enter');
     view.handleInput('enter');
     typeText(view, 'new-change');
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(calls, [], 'neither source is asked for a list');
     assert.deepEqual(reads, { issues: [], odd: [] }, 'no preview is ever read');
   });
@@ -457,21 +464,21 @@ describe('completion', { concurrency: false }, () => {
     const { view, finished } = openPanel({ cwd: REPO });
     focusName(view);
     typeText(view, 'new-change');
-    view.handleInput('\x13');
-    view.handleInput('\x13');
+    createNow(view);
+    createNow(view);
     assert.equal(finished.length, 1, 'completion fires exactly once');
     assert.deepEqual(finished[0], { ok: true, type: 'feat', name: 'new-change' });
   });
 
   test('creation is refused while the branch is invalid, and the reason is shown', () => {
     const { view, finished } = openPanel();
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(finished, [], 'an empty name never creates');
     assert.match(allText(renderedLines(view, 100)), /cannot create: name is empty/);
     focusName(view);
     typeText(view, 'new-change');
     assert.ok(!allText(renderedLines(view, 100)).includes('cannot create'), 'fixing the name clears the refusal');
-    view.handleInput('\x13');
+    createNow(view);
     assert.equal(finished.length, 1);
   });
 
@@ -504,7 +511,7 @@ describe('completion', { concurrency: false }, () => {
     assert.ok(!after.includes('? help'), 'the footer never advertises a help key');
     assert.equal('help' in view.state, false, 'the surface keeps no help overlay state');
     assert.match(after, /Enter confirm/);
-    assert.match(after, /Ctrl\+S create/);
+    assert.ok(!/Ctrl\+S create/.test(after), 'the one create key is enter: no duplicate is advertised');
     assert.match(after, /Esc cancel/);
   });
 });
@@ -533,7 +540,7 @@ describe('the create panel never reads the issue or odd libraries (S6)', { concu
       const text = allText(renderedLines(view, 100));
       assert.ok(!text.includes('alpha'), 'no odd document row is listed');
       assert.ok(!text.includes('Fix the crash'), 'no issue row is listed');
-      view.handleInput('\x13');
+      createNow(view);
       assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change' }], 'creation needs no source at all');
       assert.deepEqual(seen, [], 'gh never ran');
     } finally {
@@ -816,7 +823,7 @@ describe('the editing mode (S13)', { concurrency: false }, () => {
     assert.equal(view.state.typeIndex, 1, '↑/↓ pick the type in place');
     view.handleInput('\t');
     assert.equal(view.state.focus, 'name', 'tab still moves to the name');
-    view.handleInput('\x13');
+    createNow(view);
     assert.equal(finished.length, 1);
     assert.ok(!('mode' in finished[0]), 'a creation carries no mode marker');
     assert.deepEqual(Object.keys(finished[0]).sort(), ['name', 'ok', 'type']);
@@ -853,7 +860,7 @@ describe('S7: Type|Name tabs and a neutral preview', { concurrency: false }, () 
     renderedLines(view, 100);
     assert.ok(!roles.includes('error'), 'a picked type alone is not an error');
     // The refusal appears only after the user actually asks to create.
-    view.handleInput('\x13');
+    createNow(view);
     const refused = renderedLines(view, 100);
     assert.ok(roles.includes('error'), 'a refused submit is painted as an error');
     assert.match(allText(refused), /cannot create: name is empty/);
@@ -905,7 +912,6 @@ describe('S7: Type|Name tabs and a neutral preview', { concurrency: false }, () 
     typeText(confirmed.view, 'new-change');
     confirmed.view.handleInput('enter');
     confirmed.view.handleInput('enter');
-    confirmed.view.handleInput('\x13');
     assert.deepEqual(
       confirmed.finished,
       [{ ok: true, type: 'feat', name: 'new-change' }],

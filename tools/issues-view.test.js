@@ -453,6 +453,79 @@ describe('issues view right pane', () => {
 // S1: extended paging and printable Shift+J/K share a full-page action;
 // ctrl+d/u retain their half-page action and j/k select. These also exercise
 // the installed matcher with the bytes a terminal emits.
+describe('round3: every tab is read at open, and a switch never refetches', { concurrency: false }, () => {
+  // The reported defect: opening Issues showed `All (0)` while the repository
+  // had open issues, and each tab refetched on every switch. The reader must
+  // read all four buckets ONCE when it opens, show their real totals, and reuse
+  // them while switching.
+  function serverView(extra = {}) {
+    const requests = [];
+    const queue = [];
+    const view = createIssuesView({
+      helpers,
+      prefetchBuckets: true,
+      rowsAvailable: () => 24,
+      requestRender: () => {},
+      done: () => {},
+      loadIssuePage: (request) => {
+        requests.push(request);
+        return new Promise((resolve) => queue.push({ request, resolve }));
+      },
+      loadIssue: (n) => ({ ok: true, issue: issue(n), comments: [] }),
+      ...extra,
+    });
+    return { view, requests, queue };
+  }
+
+  function answer(queue, bucketId, numbers, total = numbers.length) {
+    const at = queue.findIndex((entry) => entry.request.bucketId === bucketId);
+    assert.ok(at >= 0, `no pending request for ${bucketId}`);
+    const [entry] = queue.splice(at, 1);
+    entry.resolve({ ok: true, issues: numbers.map((n) => ({ ...issue(n), cursor: `c${n}` })), total, hasNextPage: false });
+  }
+
+  test('all four buckets are requested when the view opens', async () => {
+    const { view, requests } = serverView();
+    view.render(120);
+    await tick();
+    assert.deepEqual(requests.map((entry) => entry.bucketId).sort(), ['all', 'assigned', 'involved', 'mine']);
+  });
+
+  test('an unvisited tab shows its real total instead of a false zero, and switching reads nothing', async () => {
+    const { view, requests, queue } = serverView();
+    // ONE layout: a resize legitimately invalidates recorded page boundaries,
+    // so the reuse assertion belongs to a stable viewport.
+    view.render(160);
+    await tick();
+    answer(queue, 'mine', [1]);
+    answer(queue, 'assigned', []);
+    answer(queue, 'involved', []);
+    answer(queue, 'all', [1], 1);
+    await tick();
+    const frame = bodyOf(view, 160);
+    assert.match(frame, /All \(1\)/, `All reports the repository total: ${frame.split('\n')[2]}`);
+    assert.match(frame, /My issues \(1\)/, 'the active bucket keeps its own count');
+    const before = requests.length;
+    for (let step = 0; step < 3; step += 1) {
+      view.handleInput('tab');
+      await tick();
+    }
+    assert.equal(requests.length, before, 'switching between loaded tabs reads nothing again');
+  });
+
+  test('a bucket that has not answered yet is unknown, never a zero', async () => {
+    const { view, queue } = serverView();
+    view.render(120);
+    await tick();
+    // The active bucket answers; the other three are still in flight.
+    answer(queue, 'mine', [1]);
+    await tick();
+    const tabs = bodyOf(view, 160).split('\n').find((line) => line.includes('My issues')) ?? '';
+    assert.match(tabs, /Assigned \(–\)/, `unread bucket is unknown: ${tabs}`);
+    assert.doesNotMatch(tabs, /Assigned \(0\)/, 'an unread bucket never claims zero');
+  });
+});
+
 describe('issues view preview scroll variants (S15)', () => {
   const skipReal = realTui ? false : 'requires @earendil-works/pi-tui';
   const longBody = Array.from({ length: 100 }, (_, i) => `body line ${i + 1}`).join('\n');
@@ -2302,9 +2375,9 @@ describe('issues view All tab, tab cache and server search (S9/S13/S15)', () => 
     await tick();
     const tabs = strip(view.render(100)[2]);
     assert.match(tabs, /▸ My issues \(1\)/, 'the default bucket is still first');
-    assert.match(tabs, /Assigned \(0\)/);
-    assert.match(tabs, /Involved \(0\)/);
-    assert.match(tabs, /All \(0\)/, 'the fourth tab is All, and it counts only what it has read');
+    assert.match(tabs, /Assigned \(–\)/);
+    assert.match(tabs, /Involved \(–\)/);
+    assert.match(tabs, /All \(–\)/, 'an unread tab is unknown, never a false zero');
     assert.equal(requests.length, 1, 'only the default bucket was read');
     assert.equal(requests[0].bucketId, 'mine');
     view.handleInput('tab');
