@@ -1255,6 +1255,20 @@ several times per tool event and per repaint. Two caches remove that:
 Measured here: `readRegistry` went from 18.8 ms to 0.016 ms per call, which is
 what made every tool call and every list/detail/selector read feel heavy.
 
+## Paint cost (S23)
+
+The reading views never re-wrap content that did not change. The issue preview
+(shared by the Issues viewer and the worktree detail) memoizes its wrapped body
+and comments by exact text plus width in a bounded cache, and the ODD and
+worktree-detail lists memoize their label rows by exact label, width and row
+prefix, so moving the cursor costs one wrap of the newly focused row, not the
+list. Any content or width change recomputes once; a stale row is unpaintable.
+
+Measured here, per repaint at 80 columns: the issue preview 0.79 ms → 0.02 ms,
+a 300-issue detail list 1.60 ms → 0.26 ms, a 500-document ODD list 1.70 ms →
+0.20 ms. The ODD document body was already width-keyed before this change, so
+it is unchanged on purpose.
+
 ## Known limitations
 
 - **Closing normally needs `force: true`.** `git worktree remove`
