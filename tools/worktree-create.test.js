@@ -1612,13 +1612,30 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
   // the real runner so behavior is unchanged.
   function recordArgv() {
     const gitLib = require('../lib/worktree-git.js');
+    // S21: the interactive paths run their children on the async runner, so
+    // recording only the sync one would make the argv assertions below pass
+    // without ever seeing a real call. Both runners are recorded.
     const orig = gitLib.runArgv;
+    const origAsync = gitLib.runArgvAsync;
     const seen = [];
     gitLib.runArgv = (bin, args, opts) => {
       seen.push({ bin: String(bin), args: args.slice() });
       return orig(bin, args, opts);
     };
-    return { gitLib, orig, seen };
+    gitLib.runArgvAsync = (bin, args, opts) => {
+      seen.push({ bin: String(bin), args: args.slice() });
+      return origAsync(bin, args, opts);
+    };
+    return {
+      gitLib,
+      orig,
+      origAsync,
+      seen,
+      restore: () => {
+        gitLib.runArgv = orig;
+        gitLib.runArgvAsync = origAsync;
+      },
+    };
   }
 
   test('a branch created by hand is adopted: no -b, ref untouched, branchCreated:false + warning', async () => {
@@ -1657,7 +1674,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
         `herdr worktree create never ran: ${JSON.stringify(shimArgv(herdr.log))}`,
       );
     } finally {
-      rec.gitLib.runArgv = rec.orig;
+      rec.restore();
       restoreEnv();
     }
   });
@@ -1686,10 +1703,12 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       assert.ok(createLine.includes('--branch feat/fresh'), `herdr create names the branch: ${createLine}`);
       // Herdr succeeded, so the git fallback never ran: no `worktree add`
       // in any git argv the tool itself invoked.
-      const gitArgs = rec.seen.filter((call) => call.bin === 'git').flatMap((call) => call.args);
-      assert.ok(!gitArgs.includes('worktree'), `no git worktree argv when herdr wins: ${JSON.stringify(gitArgs)}`);
+      // The listing reads are legitimate; the FALLBACK is what must not run.
+      const fallbacks = rec.seen.filter((call) => call.bin === 'git'
+        && call.args[0] === 'worktree' && call.args[1] === 'add');
+      assert.deepEqual(fallbacks, [], 'no git worktree add when herdr wins');
     } finally {
-      rec.gitLib.runArgv = rec.orig;
+      rec.restore();
       restoreEnv();
     }
   });

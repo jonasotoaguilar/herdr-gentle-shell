@@ -1225,6 +1225,20 @@ pages shifts the counts and makes that snapshot fail rather than half-apply.
 Each page runs under the runner's bounded timeout (30 s), and a runaway page
 counter stops a connection that never terminates.
 
+## Responsiveness (S21)
+
+Every subprocess reached from an interactive path — the create panel and the
+create tool, close/delete, warp, open/enter, the worktree detail and the warp
+selector's per-row reads — runs through the async runner and is awaited, so a
+slow or hanging child can never freeze repaint or keyboard input. What does not
+change: the binary, the fixed argv and its element order, the per-call timeout,
+the refusal and confirmation text, and the order of side effects.
+
+Two sync children remain by design, and neither can stretch to a timeout
+freeze: the memoized `git rev-parse` identity probe (~20 ms, once per
+directory) and the Herdr reconcile that only runs when the session closes its
+OWN checkout after warping out of it.
+
 ## Known limitations
 
 - **Closing normally needs `force: true`.** `git worktree remove`

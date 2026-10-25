@@ -36,6 +36,24 @@ function libRequire(name) {
   return require(path.join(dir, name));
 }
 
+// S21 (round 3): no INTERACTIVE path may block the host event loop. Every
+// child reached from a session command, a tool handler or a TUI action —
+// create, close, warp, list/open/enter, delete-from-warp, and their
+// preflight/evidence reads — goes through this seam, the shared async
+// runner, and is awaited. `spawnSync` there froze the whole session for the
+// child's lifetime (timeouts reach 120 s), which is what the user hit when a
+// create or a Warp delete stalled Pi beyond recovery.
+//
+// What does NOT change: the binary, the fixed argv and its element order, the
+// per-call timeout, the refusal/approval text and the order of side effects.
+// The runner resolves the same `{status, stdout, stderr, error}` shape, so the
+// callers above are byte-identical; only the wait moved off the loop.
+function libRunner(git) {
+  // The convention every lib helper uses for its injected runner:
+  // `(bin, args, cwd) => Promise<{status, stdout, stderr, error}>`.
+  return (bin, args, cwd) => git.runArgvAsync(bin, args, { cwd });
+}
+
 // S16/S16a: render timing for this package's OWN views. The wrapper measures
 // each frame a view this package renders (warp, odd, issues, create) and writes
 // one allowlisted `render` event per frame. Pi's own transcript renderer is not
@@ -461,9 +479,12 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // a hanging child aborts on its bound instead of freezing the
   // interactive session on the main thread.
   const gitOnly = !!(opts && opts.gitOnly === true);
-  const runGit = gitOnly && typeof git.runArgvAsync === "function"
-    ? (bin, argv, runOpts) => git.runArgvAsync(bin, argv, runOpts)
-    : (bin, argv, runOpts) => git.runArgv(bin, argv, runOpts);
+  // S21: BOTH routes are interactive (the tool handler and the create
+  // panel), so both wait for their children on the async runner. The
+  // security property is unchanged: fixed argv arrays, values as separate
+  // elements, never a shell string.
+  const runAsync = libRunner(git);
+  const runGit = (bin, argv, runOpts) => git.runArgvAsync(bin, argv, runOpts);
 
   const branch = params ? params.branch : undefined;
   const issues = params ? params.issues : undefined;
@@ -485,8 +506,9 @@ async function executeWorktreeCreate(params, ctx, opts) {
     );
   }
 
-  // (b) Branch validation, refusing with the returned reason.
-  const validated = git.validateBranch(branch);
+  // (b) Branch validation, refusing with the returned reason. The
+  // authority is still `git check-ref-format --branch`, awaited.
+  const validated = await git.validateBranchAsync(branch, { runAsync });
   if (!validated.ok) {
     return errorResult(
       `invalid branch name ${JSON.stringify(branch)}: ${validated.reason}`,
@@ -516,7 +538,9 @@ async function executeWorktreeCreate(params, ctx, opts) {
   const issuesSupplied = issues !== undefined;
   let issueNumbers = [];
   if (!issuesOmitted) {
-    const verified = (gitOnly && issuesLib && typeof issuesLib.verifyIssuesAsync === "function")
+    // The same verification, the same refusals and the same bounded `gh`
+    // read — awaited on every interactive path (S21).
+    const verified = (issuesLib && typeof issuesLib.verifyIssuesAsync === "function")
       ? await issuesLib.verifyIssuesAsync(issues, { cwd })
       : issuesLib.verifyIssues(issues, { cwd });
     if (!verified.ok) {
@@ -552,17 +576,21 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // (d) Repository identity and target path.
   let repo;
   try {
-    repo = git.repoIdentity(cwd);
+    repo = await git.repoIdentityAsync(cwd, { runAsync });
   } catch (err) {
     return errorResult(`not a git repository: ${cwd}`, { branch, issues: issueNumbers });
   }
-  const target = opts && opts.principalLayout && typeof git.canonicalWorktreePath === "function"
-    ? git.canonicalWorktreePath(repo.root, branch)
-    : git.worktreePath(repo.root, branch);
+  // The layouts are pure functions of the identity just read, so the create
+  // never spawns git a second time for a path it already knows.
+  const target = opts && opts.principalLayout && typeof git.canonicalWorktreePathOf === "function"
+    ? git.canonicalWorktreePathOf(repo, branch)
+    : typeof git.worktreePathOf === "function"
+      ? git.worktreePathOf(repo, branch)
+      : git.worktreePath(repo.root, branch);
   const resolvedTarget = path.resolve(target);
   let listed;
   try {
-    listed = git.listWorktrees(repo.root);
+    listed = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return errorResult(
       `cannot list worktrees: ${(err && err.message) || err}`,
@@ -813,7 +841,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
     }
     let relisted;
     try {
-      relisted = git.listWorktrees(repo.root);
+      relisted = await git.listWorktreesAsync(repo.root, { runAsync });
     } catch (err) {
       return errorResult(
         `cannot create worktree for branch '${branch}': the branch or target path is recorded at ${stalePaths.join(", ")} but no live checkout exists there, and the worktree list could not be re-read after pruning (${(err && err.message) || err}); the registry was left untouched`,
@@ -859,7 +887,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
       );
     }
   }
-  if (git.isPathInAnyCheckout(repo.root, target)) {
+  if (await git.isPathInAnyCheckoutAsync(repo.root, target, { runAsync, identity: repo, listed })) {
     return errorResult(
       `target path ${target} is inside an existing checkout: pick another branch`,
       { branch, issues: issueNumbers, path: target, pruned: prunedStale },
@@ -1059,7 +1087,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // be present at the target path.
   let after;
   try {
-    after = git.listWorktrees(repo.root);
+    after = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return errorResult(
       `worktree creation could not be verified at ${target}: ${(err && err.message) || err}`,
@@ -1211,18 +1239,16 @@ async function executeWorktreeCreate(params, ctx, opts) {
     const principalRoot = path.basename(repo.commonDir) === ".git"
       ? path.dirname(repo.commonDir)
       : repo.root;
-    if (gitOnly) {
-      // S63: the wizard path never runs the blocking sync hooks. The async
-      // twin owns every child until settle (timeout/abort SIGTERMs, waits a
-      // bounded grace for close, then SIGKILLs and reaps — POSIX group-wide)
-      // while the event loop stays responsive, and awaiting it here preserves
-      // ready-before-warp ordering (hooks settle before the warp) without
-      // blocking Pi input/render. No fallback to the sync runner: a missing
-      // async helper fails safe before the slow work with a useful error.
-      if (typeof hooksLib.runCreationHooksAsync !== 'function') {
-        throw new Error('creation hooks async runner is unavailable (runCreationHooksAsync missing)');
-      }
-      const runAsync = (bin, argv, runOpts) => git.runArgvAsync(bin, argv, {
+    if (typeof hooksLib.runCreationHooksAsync === 'function') {
+      // S21: EVERY create runs the async twin now — the tool handler is as
+      // interactive as the wizard. It owns every child until settle
+      // (timeout/abort SIGTERMs, waits a bounded grace for close, then
+      // SIGKILLs and reaps — POSIX group-wide) while the event loop stays
+      // responsive, and awaiting it here preserves ready-before-warp ordering
+      // (hooks settle before the warp) without blocking Pi input/render. Both
+      // routes take this branch, so the sync runner is never reached; the
+      // fallback below only survives for a lib build that predates the twin.
+      const runHooksAsync = (bin, argv, runOpts) => git.runArgvAsync(bin, argv, {
         ...runOpts,
         // Abort reaches the effective runner only when the caller supplies
         // a signal (the wizard currently passes none, so none is claimed).
@@ -1233,7 +1259,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
         worktreePath: target,
         root: repo.root,
         env: process.env,
-        runAsync,
+        runAsync: runHooksAsync,
         ...(opts && opts.signal ? { signal: opts.signal } : {}),
         ...(opts && Number.isFinite(opts.killGraceMs) && opts.killGraceMs > 0 ? { killGraceMs: opts.killGraceMs } : {}),
       });
@@ -1377,8 +1403,10 @@ async function executeWorktreeList(params, ctx) {
   }
 
   let repo;
+  const runAsync = libRunner(git);
   try {
-    repo = git.repoIdentity(cwd);
+    // S21: awaited reads only — listing worktrees is an interactive tool.
+    repo = await git.repoIdentityAsync(cwd, { runAsync });
   } catch (err) {
     return errorResult(`not a git repository: ${cwd}`, { tool: "worktree_list" });
   }
@@ -1392,7 +1420,7 @@ async function executeWorktreeList(params, ctx) {
   }
   let live;
   try {
-    live = git.listWorktrees(repo.root);
+    live = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return errorResult(
       `cannot list worktrees: ${(err && err.message) || err}`,
@@ -1831,7 +1859,10 @@ function herdrWorkspaceId(stdout, resolvedTarget, repoRoot) {
 // comparison falls back to an existence check on the pre-removal live
 // paths: a pre-removal live checkout whose directory no longer exists has
 // vanished. Every probe is absolute and never consults the process cwd.
-function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
+async function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
+  // S21: the only child here is a fallback listing, awaited like every other
+  // interactive read so a slow repository never freezes the host.
+  const runAsync = libRunner(git);
   // Identity through the consolidated predicate: compare resolved
   // realpaths (absolute fallback), never bare spellings, so a symlink
   // spelling of a surviving checkout is not misreported as vanished. The
@@ -1862,7 +1893,7 @@ function vanishedCheckouts(git, repoRoot, live, resolvedTarget, after) {
   let current = after;
   if (!current) {
     try {
-      current = git.listWorktrees(repoRoot);
+      current = await git.listWorktreesAsync(repoRoot, { runAsync });
     } catch {
       current = null;
     }
@@ -2227,11 +2258,15 @@ async function closePreRemovalSequence({ git, repo, target, branch, force, ctx, 
   // Subprocess cwd, re-anchored onto the principal after a warp (below)
   // so no Herdr call ever runs inside the checkout being removed.
   let runRoot = repo.root;
-  const runHerdr = (argv, timeoutMs) => git.runArgv(herdrBinary(), argv, { cwd: runRoot, timeoutMs });
+  // S21: this sequence is reached by the interactive close (and by the warp
+  // selector's Ctrl+D), so its Herdr children are awaited on the async
+  // runner: same binary, same argv, same timeouts, same `{status, stdout,
+  // stderr, error}` consumption — only the wait leaves the event loop.
+  const runHerdrAsync = (argv, timeoutMs) => git.runArgvAsync(herdrBinary(), argv, { cwd: runRoot, timeoutMs });
   const ourSessionId = closeSessionString(ctx, "getSessionId");
   let agents = [];
   try {
-    const listed = runHerdr(["agent", "list"], 60000);
+    const listed = await runHerdrAsync(["agent", "list"], 60000);
     if (listed && listed.status === 0) {
       agents = closeHerdr.agentsInCheckout(listed.stdout, resolvedTarget, repo.root, ourSessionId);
     }
@@ -2285,13 +2320,19 @@ async function closePreRemovalSequence({ git, repo, target, branch, force, ctx, 
   let anchorRoot = repo.root;
   if (warp !== null) {
     try {
-      anchorRoot = git.repoIdentity(warp.path).root;
+      anchorRoot = (await git.repoIdentityAsync(warp.path, { runAsync: libRunner(git) })).root;
     } catch {
       anchorRoot = repo.root;
     }
     runRoot = anchorRoot;
+    // `reconcileHerdrWorkspace` walks its own children sequentially and reads
+    // their results synchronously, so it stays the one Herdr step this
+    // sequence cannot await per call: it only runs when the session warped
+    // out of the doomed checkout (closing your OWN checkout), never on the
+    // ordinary selector delete. Its calls still go through the fixed-argv
+    // runner and its failure handling is unchanged.
     const reconciled = closeHerdr.reconcileHerdrWorkspace({
-      run: (argv, timeoutMs) => runHerdr(argv, timeoutMs),
+      run: (argv, timeoutMs) => git.runArgv(herdrBinary(), argv, { cwd: runRoot, timeoutMs }),
       repoRoot: anchorRoot,
       resolvedTarget,
       principalPath: warp.path,
@@ -2422,6 +2463,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   const rawBranch = params ? params.branch : undefined;
   const rawName = params ? params.name : undefined;
   const force = !!params && params.force === true;
+  const runAsync = libRunner(git);
   const hasPath = typeof rawPath === "string" && rawPath.length > 0;
   const hasBranch = typeof rawBranch === "string" && rawBranch.length > 0;
   const hasName = typeof rawName === "string" && rawName.length > 0;
@@ -2443,7 +2485,9 @@ async function executeWorktreeClose(params, ctx, opts) {
 
   let repo;
   try {
-    repo = git.repoIdentity(cwd);
+    // S21: awaited, so a slow `git rev-parse` cannot freeze the confirmed
+    // delete's repaint or keyboard input.
+    repo = await git.repoIdentityAsync(cwd, { runAsync });
   } catch (err) {
     return errorResult(`not a git repository: ${cwd}`, { force });
   }
@@ -2466,7 +2510,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   if (hasName) {
     let liveForName;
     try {
-      liveForName = git.listWorktrees(repo.root);
+      liveForName = await git.listWorktreesAsync(repo.root, { runAsync });
     } catch (err) {
       return errorResult(
         `cannot list worktrees: ${(err && err.message) || err}`,
@@ -2556,7 +2600,7 @@ async function executeWorktreeClose(params, ctx, opts) {
 
   let live;
   try {
-    live = git.listWorktrees(repo.root);
+    live = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return errorResult(
       `cannot list worktrees: ${(err && err.message) || err}`,
@@ -2658,7 +2702,9 @@ async function executeWorktreeClose(params, ctx, opts) {
   let removedBy = null;
   let removeError = null;
   let workspace = null;
-  const listed = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: effectiveRoot }), {
+  // S21: herdr is an interactive child here — awaited on the async runner with
+  // the same argv order and the same timeouts.
+  const listed = await git.runArgvAsync(herdrBinary(), git.herdrArgv("list", { cwd: effectiveRoot }), {
     cwd: effectiveRoot,
     timeoutMs: 60000,
   });
@@ -2668,7 +2714,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   if (workspace) {
     const removeParams = { workspace };
     if (force) removeParams.force = true;
-    const removed = git.runArgv(herdrBinary(), git.herdrArgv("remove", removeParams), {
+    const removed = await git.runArgvAsync(herdrBinary(), git.herdrArgv("remove", removeParams), {
       cwd: effectiveRoot,
       timeoutMs: 120000,
     });
@@ -2687,7 +2733,7 @@ async function executeWorktreeClose(params, ctx, opts) {
     const argv = ["worktree", "remove"];
     if (force) argv.push("--force");
     argv.push(resolvedTarget);
-    const fallen = git.runArgv("git", argv, { cwd: effectiveRoot, timeoutMs: 120000 });
+    const fallen = await git.runArgvAsync("git", argv, { cwd: effectiveRoot, timeoutMs: 120000 });
     if (fallen.status === 0) {
       removedBy = "git";
     } else {
@@ -2700,7 +2746,7 @@ async function executeWorktreeClose(params, ctx, opts) {
     // deleted a checkout other than the target on its way out, so the
     // vanished comparison runs BEFORE this early return, never after it.
     // Either way the registry entry is kept; only the message differs.
-    const vanishedOnFailure = vanishedCheckouts(git, effectiveRoot, live, resolvedTarget);
+    const vanishedOnFailure = await vanishedCheckouts(git, effectiveRoot, live, resolvedTarget);
     if (vanishedOnFailure.length > 0) {
       return errorResult(
         `worktree removal failed (${removeError || "failed to remove worktree"}) and removed an unexpected checkout at ${vanishedOnFailure[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
@@ -2721,9 +2767,9 @@ async function executeWorktreeClose(params, ctx, opts) {
   // unverifiable-removal message. Covers both the herdr and git paths.
   let after;
   try {
-    after = git.listWorktrees(effectiveRoot);
+    after = await git.listWorktreesAsync(effectiveRoot, { runAsync });
   } catch (err) {
-    const vanishedWithoutList = vanishedCheckouts(git, effectiveRoot, live, resolvedTarget, null);
+    const vanishedWithoutList = await vanishedCheckouts(git, effectiveRoot, live, resolvedTarget, null);
     if (vanishedWithoutList.length > 0) {
       return errorResult(
         `worktree removal removed an unexpected checkout at ${vanishedWithoutList[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
@@ -2741,7 +2787,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   // successful, and the registry entry is left in place. Covers both the
   // herdr and the git removal paths; a legitimate single-checkout removal
   // (only the target gone) never trips it.
-  const vanished = vanishedCheckouts(git, effectiveRoot, live, resolvedTarget, after);
+  const vanished = await vanishedCheckouts(git, effectiveRoot, live, resolvedTarget, after);
   if (vanished.length > 0) {
     return errorResult(
       `worktree removal removed an unexpected checkout at ${vanished[0]}: expected only ${target} to be removed; the checkout and the registry entry were left for inspection`,
@@ -3465,8 +3511,11 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   }
 
   let repo;
+  // S21: opening/entering a worktree is interactive, so every read below is
+  // awaited on the async runner instead of blocking the host event loop.
+  const runAsync = libRunner(git);
   try {
-    repo = git.repoIdentity(cwd);
+    repo = await git.repoIdentityAsync(cwd, { runAsync });
   } catch (err) {
     return errorResult(`not a git repository: ${cwd}`, { worktree: rawWorktree });
   }
@@ -3476,7 +3525,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   }
   let live;
   try {
-    live = git.listWorktrees(repo.root);
+    live = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return errorResult(
       `cannot list worktrees: ${(err && err.message) || err}`,
@@ -3572,7 +3621,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
 
   // (c) The worktree's Herdr workspace: `herdr worktree list
   // --cwd <root>`, reading `open_workspace_id` for that branch/path.
-  const listed = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
+  const listed = await git.runArgvAsync(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
     cwd: repo.root,
     timeoutMs: 60000,
   });
@@ -3594,7 +3643,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   let openedHere = false;
   if (workspaceId !== null) {
     // Reuse: the workspace's ROOT pane from `herdr pane list`.
-    const panes = git.runArgv(herdrBinary(), git.herdrArgv("pane-list", { workspace: workspaceId }), {
+    const panes = await git.runArgvAsync(herdrBinary(), git.herdrArgv("pane-list", { workspace: workspaceId }), {
       cwd: repo.root,
       timeoutMs: 60000,
     });
@@ -3630,12 +3679,12 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
     // an ALREADY-OPEN worktree is deliberately not assumed idempotent:
     // when it fails, one fresh list decides whether a workspace appeared
     // anyway (proceed through reuse) or the failure stands.
-    const opened = git.runArgv(herdrBinary(), git.herdrArgv("open", { branch, cwd: repo.root, noFocus: true }), {
+    const opened = await git.runArgvAsync(herdrBinary(), git.herdrArgv("open", { branch, cwd: repo.root, noFocus: true }), {
       cwd: repo.root,
       timeoutMs: 60000,
     });
     if (opened.status !== 0) {
-      const relisted = git.runArgv(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
+      const relisted = await git.runArgvAsync(herdrBinary(), git.herdrArgv("list", { cwd: repo.root }), {
         cwd: repo.root,
         timeoutMs: 60000,
       });
@@ -3694,7 +3743,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
       openedHere = true;
     }
     if (paneId === null && workspaceId !== null) {
-      const panes = git.runArgv(herdrBinary(), git.herdrArgv("pane-list", { workspace: workspaceId }), {
+      const panes = await git.runArgvAsync(herdrBinary(), git.herdrArgv("pane-list", { workspace: workspaceId }), {
         cwd: repo.root,
         timeoutMs: 60000,
       });
@@ -3724,7 +3773,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   // (d) Start Pi in the pane. The pane belongs to the worktree's own
   // workspace and its cwd is inside the worktree, so Pi's session
   // directory is the worktree's: no `--session-dir`.
-  const started = git.runArgv(herdrBinary(), git.herdrArgv("agent-start", {
+  const started = await git.runArgvAsync(herdrBinary(), git.herdrArgv("agent-start", {
     name: agentName, kind: "pi", pane: paneId,
     timeout: String(AGENT_START_TIMEOUT_MS), agentArgs: piArgs,
   }), {
@@ -3973,9 +4022,11 @@ async function executeWorktreeWarpTool(params, ctx, opts) {
   const warpSessions = libRequire("worktree-warp-sessions.js");
   const raw = params && typeof params.name === "string" ? params.name.trim() : "";
   const fromCwd = toolCwd(ctx);
+  // S21: the warp is interactive too, so its preflight reads are awaited.
+  const runAsync = libRunner(git);
   let repo;
   try {
-    repo = git.repoIdentity(fromCwd);
+    repo = await git.repoIdentityAsync(fromCwd, { runAsync });
   } catch (err) {
     return errorResult(notGitRepositoryLine(fromCwd), { tool: "worktree_warp" });
   }
@@ -3985,7 +4036,7 @@ async function executeWorktreeWarpTool(params, ctx, opts) {
   }
   let live;
   try {
-    live = git.listWorktrees(repo.root);
+    live = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return errorResult(`worktree warp: cannot list worktrees: ${(err && err.message) || err}`, { tool: "worktree_warp" });
   }
@@ -5351,9 +5402,12 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   }
   await ctx.waitForIdle();
   const fromCwd = typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+  // S21: the same awaited preflight reads as the tool, so a slow repository
+  // never freezes the session that is being moved.
+  const runAsync = libRunner(git);
   let repo;
   try {
-    repo = git.repoIdentity(fromCwd);
+    repo = await git.repoIdentityAsync(fromCwd, { runAsync });
   } catch (err) {
     return warpFail(`worktree warp: not a git repository: ${fromCwd}`, { name, alreadyThere: false, cancelled: false });
   }
@@ -5363,7 +5417,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   }
   let live;
   try {
-    live = git.listWorktrees(repo.root);
+    live = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     return warpFail(`worktree warp: cannot list worktrees: ${(err && err.message) || err}`, { name, alreadyThere: false, cancelled: false });
   }
@@ -7265,9 +7319,13 @@ async function executeWorktreeDetail(rawArgs, ctx) {
   const git = libRequire("worktree-git.js");
   const registry = libRequire("worktree-registry.js");
   const fromCwd = toolCwd(ctx);
+  // S21: the full-screen detail is interactive; its preflight reads are
+  // awaited so a slow repository cannot freeze the host before the overlay
+  // paints.
+  const runAsync = libRunner(git);
   let repo;
   try {
-    repo = git.repoIdentity(fromCwd);
+    repo = await git.repoIdentityAsync(fromCwd, { runAsync });
   } catch {
     if (typeof notify === "function") notify(notGitRepositoryLine(fromCwd), "info");
     return;
@@ -7285,7 +7343,7 @@ async function executeWorktreeDetail(rawArgs, ctx) {
   }
   let live;
   try {
-    live = git.listWorktrees(repo.root);
+    live = await git.listWorktreesAsync(repo.root, { runAsync });
   } catch (err) {
     if (typeof notify === "function") notify(`worktree: cannot list worktrees: ${(err && err.message) || err}`, "error");
     return;
@@ -7349,6 +7407,10 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
   } catch {
     helpers = null;
   }
+  // S21: every child this loop needs is awaited (`git list`, the delete's
+  // close, the detail's reads), so the panel keeps repainting and taking keys
+  // between them.
+  const runAsync = libRunner(git);
   let assignmentsSwept = false;
   for (;;) {
     let freshRead;
@@ -7364,7 +7426,9 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
     }
     let freshLive;
     try {
-      freshLive = git.listWorktrees(repo.root);
+      // S21: the selector re-reads the live listing on every iteration, so it
+      // is awaited — the panel stays repaintable and keyed between reads.
+      freshLive = await git.listWorktreesAsync(repo.root, { runAsync });
     } catch (err) {
       notify?.(`warp: cannot list worktrees: ${(err && err.message) || err}`, "error");
       return undefined;
@@ -7384,10 +7448,10 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       ...entry,
       isPrincipal: !!(principal && entry.path === principal.path),
     }));
-    const reload = () => {
+    const reload = async () => {
       try {
         const read = registry.readRegistry(repo.root);
-        const live = git.listWorktrees(repo.root);
+        const live = await git.listWorktreesAsync(repo.root, { runAsync });
         if (!read || read.ok !== true) return null;
         noteWarpDiscovery(repo.root, live);
         const principal = principalForName(git, repo.root, repo, live);
@@ -7605,9 +7669,11 @@ function registerWarpCommand(pi) {
       const git = libRequire("worktree-git.js");
       const registry = libRequire("worktree-registry.js");
       const fromCwd = typeof ctx?.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd : process.cwd();
+      // S21: the command's own fresh scan is awaited too.
+      const runAsync = libRunner(git);
       let repo;
       try {
-        repo = git.repoIdentity(fromCwd);
+        repo = await git.repoIdentityAsync(fromCwd, { runAsync });
       } catch (err) {
         notify?.(notGitRepositoryLine(fromCwd), "info");
         return;
@@ -7619,7 +7685,7 @@ function registerWarpCommand(pi) {
       }
       let live;
       try {
-        live = git.listWorktrees(repo.root);
+        live = await git.listWorktreesAsync(repo.root, { runAsync });
       } catch (err) {
         notify?.(`warp: cannot list worktrees: ${(err && err.message) || err}`, "error");
         return;
