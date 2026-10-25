@@ -60,7 +60,7 @@ S20. `enter` is the ONLY create key in the warp create panel. `ctrl+s` must not 
 S21. No interactive path may block the host event loop. Create, delete, warp and their evidence reads run children through the async runner; a slow or hanging child must never freeze repaint or keyboard input. Every argv, timeout, refusal text, dirty/ahead disclosure and side-effect order stays exactly as it is.
 
 T11 | S19,S20 | route: parent RED 3 new view tests then GREEN 132/132 view + 34/34 command + 17/17 cache wiring; ctrl+s removal 89/89 across create/selector/odd-capture; docs updated | status: done | commit: d96c120
-T12 | S21 | route: worker on the async conversion, RED timer-lag test first, existing suites re-run | status: in_progress | commit: pending
+T12 | S21 | route: worker converted every interactive child to the async runner, RED timer-lag test first (create 0 ticks/4814 ms frozen, warp delete 875 ms max gap); GREEN 430 ticks/29 ms and 404 ticks/44 ms at a 400 ms child; parent repaired the two argv assertions that had gone vacuous and ran the full suite 2185/2185, 433 suites, 0 fail (baseline d96c120: 2183, 0 fail); residual sync: Herdr reconcile on closing your OWN checkout, and the memoized rev-parse probe | status: done | commit: f874508
 T13 | S19-S21 | route: full suite plus real-TTY acceptance by the human | status: pending | commit: pending
 
 L1. Original user request, verbatim (screenshots supplied inline as Image#1–Image#11):
