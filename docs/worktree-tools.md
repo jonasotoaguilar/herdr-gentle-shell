@@ -1239,6 +1239,22 @@ freeze: the memoized `git rev-parse` identity probe (~20 ms, once per
 directory) and the Herdr reconcile that only runs when the session closes its
 OWN checkout after warping out of it.
 
+## Registry and identity reads (S22)
+
+The registry lives at `<git-common-dir>/pi-worktrees.json`, and locating it used
+to cost two `spawnSync` git probes on EVERY read and write — around 19 ms here,
+several times per tool event and per repaint. Two caches remove that:
+
+- the shared git common dir is resolved once per checkout and reused by the
+  registry, the warp-session store and the change summary;
+- the parsed registry is cached per file identity (inode, size, nanosecond
+  mtime), and every write invalidates it, so a cached read can never outlive a
+  write — ours or another process's. Callers receive a clone, including the
+  non-enumerable drop report a later write needs.
+
+Measured here: `readRegistry` went from 18.8 ms to 0.016 ms per call, which is
+what made every tool call and every list/detail/selector read feel heavy.
+
 ## Known limitations
 
 - **Closing normally needs `force: true`.** `git worktree remove`
