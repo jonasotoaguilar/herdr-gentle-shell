@@ -82,8 +82,11 @@ unavailable rather than a date before the checkout existed.
   time: `createdAt` is unavailable with the reason from the failed read, and the
   directory's birth time is **not** substituted for it.
 - A checkout whose dirty summary or commit read fails reports the reason and
-  keeps `value: null`; the other facts (branch, issues, odd, changes,
-  ahead/behind) are unaffected, exactly as before.
+  keeps `value: null`; the other facts (branch, changes, ahead/behind,
+  createdAt, lastActivity) are unaffected, exactly as before. The facts carry
+  no `issues` and no `odd`: a worktree has no issue and no ODD association
+  (S1), so `lib/checkout-facts.js` stopped reading them and the warp view is
+  never handed an association cell.
 
 ## Cost
 

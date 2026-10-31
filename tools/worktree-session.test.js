@@ -161,15 +161,13 @@ function openRows({ outcome = 'opened', worktree, branch, path: target, session,
 }
 
 function listHeader(count) {
-  return `worktrees: ${count} (name · branch · path · kind · status · associations)`;
+  return `worktrees: ${count} (name · branch · path · kind · status)`;
 }
 
-function listRow({ name, branch, path: target, kind, status, issues = [], odd = null }) {
-  const cells = [name, branch, target, kind, status];
-  cells.push(`issues ${issues.length > 0 ? issues.map((number) => `#${number}`).join(', ') : '-'}`);
-  if (odd === null) cells.push('odd -');
-  else if (odd.length > 0) cells.push(`odd ${odd}`);
-  return cells.join(' · ');
+// S1: a listing row is the checkout's identity alone — issue numbers and ODD
+// documents are not part of a worktree and never render.
+function listRow({ name, branch, path: target, kind, status }) {
+  return [name, branch, target, kind, status].join(' · ');
 }
 
 function scratchModeEnv() {
@@ -244,7 +242,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       const { tools } = await loadExtension();
       assert.deepEqual(
         [...tools.keys()].sort(),
-        ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_upsert', 'worktree_warp'],
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
       );
       const params = tools.get('worktree_session_open').parameters;
       assert.deepEqual(Object.keys(params.properties).sort(), ['name', 'notify', 'session', 'worktree']);
@@ -261,7 +259,7 @@ describe('worktree_session_open registration (S25)', { concurrency: false }, () 
       require('../lib/worktree-mode.js').writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.deepEqual([...tools.keys()], [], 'no worktree tool is registered while disabled');
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the current-worktree detail command stays discoverable (S11)');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the removed worktree detail command is never registered (S5)');
     } finally {
       restoreEnv();
     }
@@ -979,18 +977,18 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
       const { tools, commands } = await loadExtension();
       assert.deepEqual(
         [...tools.keys()].sort(),
-        ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_upsert', 'worktree_warp'],
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
       );
       assert.deepEqual(
-        Object.keys(tools.get('worktree_upsert').parameters.properties).sort(),
-        ['branch', 'issues', 'odd'],
+        Object.keys(tools.get('worktree_create').parameters.properties).sort(),
+        ['branch'],
       );
       assert.deepEqual(
         Object.keys(tools.get('worktree_close').parameters.properties).sort(),
         ['branch', 'force', 'name', 'path'],
       );
       assert.ok(tools.get('worktree_list'), 'worktree_list stays registered');
-      assert.ok(commands.has('herdr-gentle:worktree'), 'the current-worktree detail command stays discoverable (S11)');
+      assert.ok(!commands.has('herdr-gentle:worktree'), 'the removed worktree detail command is never registered (S5)');
       // List still answers the principal row when nothing else is registered.
       const listResult = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       assert.equal(listResult.isError, undefined);

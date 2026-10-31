@@ -23,8 +23,8 @@ The result remains `{ok:true,type,name}`; no association state is added.
 The view derives content height from its fixed rows and visible type-list rows.
 A terminal too short for the form gets an enlargement message rather than an
 overflow. `warpCreateAndEnter` mounts with `WARP_PANEL_OVERLAY`: bottom-center,
-100% width, no margin, maximum 24 rows. Editing uses the separate fullscreen
-worktree detail, never this create flow.
+100% width, no margin, maximum 24 rows. There is no editing surface any more:
+a worktree is created here and never modified from the warp popup.
 
 Cancel, field navigation and typing create no branch, checkout or registry write.
 Only confirmation enters the guarded creation path; creation precedes the single

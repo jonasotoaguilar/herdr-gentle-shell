@@ -1,9 +1,17 @@
 'use strict';
 // T8 / S8b migration regressions: a registry row written by an older version
-// carries `odd[]`. The entity rule keeps ONE document, so every read and
-// every WRITE normalizes it deterministically to its FIRST entry, and the
-// write that persisted the collapse reports the entries left behind once
+// carries `odd[]`. The entity rule keeps ONE document, so every read
+// normalizes it deterministically to its FIRST entry, and a write that
+// COLLAPSES an addressed row reports the entries left behind once
 // (`dropped: [...]`) — a stored association never disappears silently.
+//
+// S1 narrowed that further: the worktree no longer carries an association at
+// all, so the write paths that rewrite the whole file for an UNRELATED row
+// must not normalize anything on the way through. Those rows keep their
+// stored documents byte for byte, which is why no drop report reaches a
+// worktree output any more. This file pins both halves: preservation for the
+// rows a write does not address, and the one-document rule plus its report
+// for the row it does.
 //
 // These cases are independent of tools/worktree-registry-odd.test.js: they
 // pin the migration behaviour of the WRITE paths that rewrite the whole file
@@ -23,7 +31,6 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const registryLib = require('../lib/worktree-registry.js');
-const oddLib = require('../lib/worktree-odd.js');
 
 const LEGACY = ['odd/tasks/first.md', 'odd/tasks/second.md', 'odd/tasks/third.md'];
 
@@ -103,55 +110,56 @@ describe('S8b migration: legacy odd[] rows normalize to ONE document', { concurr
     assert.equal(fs.readFileSync(file, 'utf8'), before, 'reading migrated nothing: the bytes are identical');
   });
 
-  test('a write to an UNRELATED row normalizes the legacy row and reports its drop once', () => {
+  test('a write to an UNRELATED row leaves the legacy row byte for byte, with no report', () => {
     const { root, other } = legacyRepo('unrelated');
     // Nothing about the legacy row is supplied: the write still persists the
-    // whole file, so it is the operation that normalizes it.
+    // whole file, and it must carry that row through untouched.
     const written = registryLib.upsertWorktree(root, {
       branch: 'feat/other', path: other.path, thread: 'thread-feat/other', issues: [7],
     });
     assert.equal(written.ok, true, `expected the write to succeed: ${JSON.stringify(written)}`);
-    assert.deepEqual(written.dropped, LEGACY.slice(1), 'the unrelated write reports what it collapsed');
-    assert.equal(oddOf(root, 'feat/legacy'), LEGACY[0], 'the surviving document is the first entry');
-    assert.equal(storedRow(root, 'feat/legacy').odd, LEGACY[0], 'and the file now holds one document');
+    assert.equal('dropped' in written, false, 'a row nobody addressed lost nothing, so nothing is reported');
+    assert.equal(oddOf(root, 'feat/legacy'), LEGACY[0], 'the in-memory view keeps ONE document');
+    assert.deepEqual(storedRow(root, 'feat/legacy').odd, LEGACY, 'the stored list survives verbatim');
 
     const again = registryLib.updateWorktree(root, 'feat/other', { issues: [7, 8] });
     assert.equal(again.ok, true);
-    assert.equal('dropped' in again, false, 'the drop is reported ONCE, not on every later write');
+    assert.equal('dropped' in again, false, 'and still nothing to report');
+    assert.deepEqual(storedRow(root, 'feat/legacy').odd, LEGACY, 'after every write');
   });
 
-  test('removeWorktree normalizes the surviving row and reports its drop', () => {
+  test('removeWorktree leaves the surviving legacy row byte for byte', () => {
     const { root, other } = legacyRepo('remove');
     const removed = registryLib.removeWorktree(root, 'feat/other');
     assert.equal(removed.ok, true, `expected the removal to succeed: ${JSON.stringify(removed)}`);
-    assert.deepEqual(removed.dropped, LEGACY.slice(1), 'the removal write reports the collapse');
-    assert.equal(storedRow(root, 'feat/legacy').odd, LEGACY[0], 'only the first document survives');
+    assert.equal('dropped' in removed, false, 'removing one row destroys nothing of another');
+    assert.deepEqual(storedRow(root, 'feat/legacy').odd, LEGACY, 'every stored document survives');
     assert.equal(registryLib.findByBranch(root, 'feat/other'), null, 'the removed row is gone');
   });
 
-  test('removeWorktreeByPath normalizes the surviving row and reports its drop', () => {
+  test('removeWorktreeByPath leaves the surviving legacy row byte for byte', () => {
     const { root, other } = legacyRepo('remove-path');
     const removed = registryLib.removeWorktreeByPath(root, other.path);
     assert.equal(removed.ok, true, `expected the removal to succeed: ${JSON.stringify(removed)}`);
-    assert.deepEqual(removed.dropped, LEGACY.slice(1));
-    assert.equal(storedRow(root, 'feat/legacy').odd, LEGACY[0]);
+    assert.equal('dropped' in removed, false);
+    assert.deepEqual(storedRow(root, 'feat/legacy').odd, LEGACY);
   });
 
-  test('removeWorktreeExact normalizes the surviving row and reports its drop', () => {
+  test('removeWorktreeExact leaves the surviving legacy row byte for byte', () => {
     const { root, other } = legacyRepo('remove-exact');
     const removed = registryLib.removeWorktreeExact(root, other.branch, other.path);
     assert.equal(removed.ok, true, `expected the removal to succeed: ${JSON.stringify(removed)}`);
-    assert.deepEqual(removed.dropped, LEGACY.slice(1));
-    assert.equal(storedRow(root, 'feat/legacy').odd, LEGACY[0]);
+    assert.equal('dropped' in removed, false);
+    assert.deepEqual(storedRow(root, 'feat/legacy').odd, LEGACY);
   });
 
-  test('pruneWorktrees normalizes the surviving row and reports its drop', () => {
+  test('pruneWorktrees leaves the surviving legacy row byte for byte', () => {
     const { root, other } = legacyRepo('prune');
     const pruned = registryLib.pruneWorktrees(root, [other.path]);
     assert.equal(pruned.ok, true, `expected the prune to succeed: ${JSON.stringify(pruned)}`);
     assert.deepEqual(pruned.pruned, [other.path], 'the dead row was pruned');
-    assert.deepEqual(pruned.dropped, LEGACY.slice(1), 'the prune write reports the collapse');
-    assert.equal(storedRow(root, 'feat/legacy').odd, LEGACY[0]);
+    assert.equal('dropped' in pruned, false, 'the prune write destroys nothing of a row it kept');
+    assert.deepEqual(storedRow(root, 'feat/legacy').odd, LEGACY);
   });
 
   test('addOddDoc over a legacy row replaces it, reporting the drop and the replacement', () => {
@@ -201,37 +209,16 @@ describe('S8b migration: legacy odd[] rows normalize to ONE document', { concurr
     assert.ok(!raw.includes('oddDropped'), `the non-enumerable marker never reaches the file:\n${raw}`);
     assert.ok(!raw.includes('"dropped"'), 'and neither does the report');
     const stored = JSON.parse(raw).worktrees.find((entry) => entry.branch === 'feat/legacy');
-    assert.equal(stored.odd, LEGACY[0], 'the row holds the single surviving document');
+    assert.deepEqual(stored.odd, LEGACY, 'the row still holds every stored document');
     assert.equal('oddDropped' in stored, false);
 
-    // The marker exists only on the in-memory read, where the next write can
-    // still find it; it never survives serialization.
+    // The marker exists only on the in-memory read, where a write that
+    // addresses this row can still find it; it never survives serialization
+    // and is never an observable field of the row.
     const reread = registryLib.readRegistry(root).worktrees.find((entry) => entry.branch === 'feat/legacy');
-    assert.equal('oddDropped' in reread, false, 'a normalized row carries no pending report');
+    assert.equal(Object.keys(reread).includes('oddDropped'), false, 'the stamp is invisible to a caller');
+    assert.equal(JSON.stringify(reread).includes('oddDropped'), false, 'and never serializes');
+    assert.equal(reread.odd, LEGACY[0], 'the in-memory view keeps ONE document');
   });
 });
 
-describe('S8 boundary: oddDocsForCheckout takes the normalized field', { concurrency: false }, () => {
-  function checkoutWithDocs(tag, docs) {
-    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-mig-docs-${tag}-`)));
-    fs.mkdirSync(path.join(dir, 'odd', 'tasks'), { recursive: true });
-    for (const doc of docs) fs.writeFileSync(path.join(dir, 'odd', 'tasks', doc), `# ${doc}\n`);
-    return dir;
-  }
-
-  test('a normalized string, null and a raw legacy array all keep the association first', () => {
-    const checkout = checkoutWithDocs('boundary', ['a.md', 'b.md']);
-
-    const normalized = oddLib.oddDocsForCheckout('odd/tasks/b.md', checkout);
-    assert.deepEqual(normalized, ['odd/tasks/b.md', 'odd/tasks/a.md'], 'the association leads the listing');
-
-    const none = oddLib.oddDocsForCheckout(null, checkout);
-    assert.deepEqual(none, ['odd/tasks/a.md', 'odd/tasks/b.md'], 'no association lists the detected documents only');
-
-    // The boundary is documented as normalized input; a caller that hands a
-    // raw legacy array forward still loses no association.
-    const legacy = oddLib.oddDocsForCheckout(['odd/tasks/b.md', 'odd/tasks/a.md'], checkout);
-    assert.deepEqual(legacy, normalized, 'a legacy array collapses to its first entry');
-    assert.equal(new Set(legacy).size, legacy.length, 'and the listing stays deduplicated');
-  });
-});

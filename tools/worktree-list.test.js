@@ -120,19 +120,17 @@ function resultText(result) {
 }
 
 // S12/T8 model-facing listing text: one header row plus one ` · `-joined row
-// per checkout, `-` for a known-empty association. The exact cell contract is
-// pinned by tools/worktree-model-result.test.js; these suites pin WHICH rows
-// exist, in which order, with which identity.
+// per checkout. S1 removed issue and ODD associations from every worktree
+// surface, so a row is the checkout's identity alone — the legacy registry
+// fields still reach `details` (preserved data) and never the text. The exact
+// cell contract is pinned by tools/worktree-model-result.test.js; these suites
+// pin WHICH rows exist, in which order, with which identity.
 function listHeader(count) {
-  return `worktrees: ${count} (name · branch · path · kind · status · associations)`;
+  return `worktrees: ${count} (name · branch · path · kind · status)`;
 }
 
-function listRow({ name, branch, path: target, kind, status, issues = [], odd = null }) {
-  const cells = [name, branch, target, kind, status];
-  cells.push(`issues ${issues.length > 0 ? issues.map((number) => `#${number}`).join(', ') : '-'}`);
-  if (odd === null) cells.push('odd -');
-  else if (odd.length > 0) cells.push(`odd ${odd}`);
-  return cells.join(' · ');
+function listRow({ name, branch, path: target, kind, status }) {
+  return [name, branch, target, kind, status].join(' · ');
 }
 
 function livePaths(root) {
@@ -431,7 +429,7 @@ describe('consolidated checkout liveness: files + relative git listing', { concu
         const text = resultText(result);
         assert.equal(result.isError, undefined, `expected success, got: ${text}`);
         assert.ok(text.includes('feat/filerow') && text.includes('missing'), `file row is missing, never live: ${text}`);
-        assert.ok(!text.split('\n').some((line) => line.includes('feat/filerow') && !line.includes(' · missing · ')), 'never reported live');
+        assert.ok(!text.split('\n').some((line) => line.includes('feat/filerow') && !line.includes(' · missing')), 'never reported live');
         assert.deepEqual(result.details.pruned, [], 'a file row is never pruned');
         const row = result.details.worktrees.find((item) => item.path === realFile);
         assert.ok(row, 'file row stays in details');
@@ -485,7 +483,7 @@ describe('consolidated checkout liveness: files + relative git listing', { concu
         text.split('\n').includes(listRow({ name: 'feat-live', branch: 'feat/live', path: live, kind: 'agent', status: 'live', issues: [35] })),
         `live checkout stays live, not missing: ${text}`,
       );
-      assert.ok(!text.split('\n').some((line) => line.includes('feat/live') && line.includes(' · missing · ')), 'must not mislabel live as missing');
+      assert.ok(!text.split('\n').some((line) => line.includes('feat/live') && line.includes(' · missing')), 'must not mislabel live as missing');
       assert.ok(!text.includes('ghost-relative'), `non-existent extra never reported: ${text}`);
       assert.ok(!result.details.worktrees.some((item) => item.path.includes('ghost-relative')), 'ghost absent from details');
       for (const item of result.details.worktrees) {
@@ -518,7 +516,7 @@ describe('H2: one liveness predicate everywhere in the list', { concurrency: fal
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const aliasLine = text.split('\n').find((line) => line.includes('feat/alias'));
       assert.ok(aliasLine, `the alias row is listed: ${text}`);
-      assert.ok(!aliasLine.includes(' · missing · '), `a symlink to a live checkout is live, never missing: ${aliasLine}`);
+      assert.ok(!aliasLine.includes(' · missing'), `a symlink to a live checkout is live, never missing: ${aliasLine}`);
       const aliasItem = result.details.worktrees.find((item) => item.branch === 'feat/alias');
       assert.ok(aliasItem, 'the alias row is in details');
       assert.equal(aliasItem.status, 'live');
@@ -556,8 +554,9 @@ describe('S19/S9: principal checkout distinguished, then the session checkout, t
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       // The retired `worktree list: none` never appears: the principal row stands alone.
       assert.deepEqual(text.split('\n'), [listHeader(1), principalRow(root)]);
+      // S1: an entry is its identity — no issue and no ODD association key.
       assert.deepEqual(result.details.worktrees, [
-        { name: 'principal', path: root, branch: principalBranch(root), thread: null, issues: [], assignedOdd: null, status: 'live', kind: 'principal' },
+        { name: 'principal', path: root, branch: principalBranch(root), thread: null, status: 'live', kind: 'principal' },
       ]);
       assert.equal(result.details.count, 1);
     } finally {
@@ -690,7 +689,7 @@ describe('S19/S9: principal checkout distinguished, then the session checkout, t
       assert.equal(principalItem.path, root);
       assert.equal(principalItem.status, 'live');
       assert.ok(
-        !text.split('\n').some((line) => line.startsWith('principal · ') && line.includes(' · unregistered · ')),
+        !text.split('\n').some((line) => line.startsWith('principal · ') && line.includes(' · unregistered')),
         'the principal is never unregistered',
       );
       assert.ok(text.split('\n').includes(principalRow(root)), 'the principal keeps its live principal row');
@@ -1021,8 +1020,12 @@ describe('S24: the listing identifies checkouts by NAME (T33 RED)', { concurrenc
   });
 });
 
-describe('S14 list tolerates missing issues (T7)', { concurrency: false }, () => {
-  test('an entry with issues:[] lists without failure as issues= empty', async () => {
+describe('S14/S1: legacy association shapes never break or reach the listing', { concurrency: false }, () => {
+  // S14 kept the listing tolerant of a registry row whose `issues` is empty,
+  // absent or malformed; S1 removed the association from the worktree surface
+  // entirely, so every one of those shapes now lists the same identity row and
+  // publishes no association — tolerant input, no association output.
+  test('an entry with issues:[] lists and publishes no association', async () => {
     const root = makeRepo('s14-list-empty');
     setEnv(stdEnv());
     try {
@@ -1031,40 +1034,60 @@ describe('S14 list tolerates missing issues (T7)', { concurrency: false }, () =>
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      const target = fs.realpathSync(path.join(path.dirname(root), `${path.basename(root)}-wt-feat-noissue`));
       assert.ok(
-        text.split('\n').includes(listRow({ name: 'feat-noissue', branch: 'feat/noissue', path: fs.realpathSync(path.join(path.dirname(root), `${path.basename(root)}-wt-feat-noissue`)), kind: 'agent', status: 'live' })),
-        `lists with empty issues as -: ${text}`,
+        text.split('\n').includes(listRow({ name: 'feat-noissue', branch: 'feat/noissue', path: target, kind: 'agent', status: 'live' })),
+        `the emptiest association lists as plain identity: ${text}`,
       );
       const row = result.details.worktrees.find((item) => item.branch === 'feat/noissue');
-      assert.deepEqual(row.issues, []);
+      assert.deepEqual(
+        Object.hasOwn(row, 'issues') || Object.hasOwn(row, 'assignedOdd') || Object.hasOwn(row, 'odd'),
+        false,
+        `no association is published: ${JSON.stringify(row)}`,
+      );
+      assert.equal(row.path, target);
+      assert.equal(row.thread, 'thread-1');
     } finally {
       restoreEnv();
     }
   });
 
-  test('an entry whose issues field is absent lists without failure and invents nothing', async () => {
+  test('an entry whose issues field is absent or malformed lists identically', async () => {
     const root = makeRepo('s14-list-absent');
     setEnv(stdEnv());
     try {
       const target = addRegistered(root, 'feat/absent', { thread: 'thread-1', issues: [35] });
+      const malformed = addRegistered(root, 'feat/malformed', { thread: 'thread-2', issues: [7] });
       const registryLib = require('../lib/worktree-registry.js');
-      const read = registryLib.readRegistry(root);
-      assert.equal(read.ok, true);
       const file = registryLib.registryPath(root);
       const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-      delete doc.worktrees[0].issues;
+      const absentRow = doc.worktrees.find((entry) => entry.branch === 'feat/absent');
+      delete absentRow.issues;
+      const malformedRow = doc.worktrees.find((entry) => entry.branch === 'feat/malformed');
+      malformedRow.issues = 'nope';
+      malformedRow.odd = { not: 'a document' };
       fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+      const bytesAfterEdit = fs.readFileSync(file);
+
       const tools = await loadExtension();
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       assert.ok(
         text.split('\n').includes(listRow({ name: 'feat-absent', branch: 'feat/absent', path: target, kind: 'agent', status: 'live' })),
-        `the row lists with empty issues, inventing nothing: ${text}`,
+        `the absent association lists as plain identity, inventing nothing: ${text}`,
       );
-      const row = result.details.worktrees.find((item) => item.branch === 'feat/absent');
-      assert.deepEqual(row.issues, []);
-      assert.equal(row.path, target);
+      assert.ok(
+        text.split('\n').includes(listRow({ name: 'feat-malformed', branch: 'feat/malformed', path: malformed, kind: 'agent', status: 'live' })),
+        `the malformed association lists the same way: ${text}`,
+      );
+      for (const branch of ['feat/absent', 'feat/malformed']) {
+        const row = result.details.worktrees.find((item) => item.branch === branch);
+        for (const key of ['issues', 'assignedOdd', 'odd']) {
+          assert.equal(Object.hasOwn(row, key), false, `${branch} publishes no ${key}: ${JSON.stringify(row)}`);
+        }
+      }
+      assert.deepEqual(fs.readFileSync(file), bytesAfterEdit, 'a listing rewrites no stored association byte');
     } finally {
       restoreEnv();
     }
@@ -1347,20 +1370,21 @@ describe('S10/S32: principal registration and close protection (verifier probes)
   });
 });
 
-describe('S2/S6/S12: the listing publishes the ASSIGNED odd document, never the inventory (T8)', { concurrency: false }, () => {
-  // The registry stores ONE associated odd document per checkout; the
-  // checkout's own `odd/` directory is an AVAILABLE inventory and a
-  // different fact. Listing details therefore carry the association as
-  // `assignedOdd` (the stored entry value, or null when the checkout is
-  // known to hold none) beside the untouched `odd` inventory, and the
-  // model-facing text names only the association. No row may infer the
-  // association from the first inventory document.
+describe('S1: the listing publishes no issue or ODD association, in text or details', { concurrency: false }, () => {
+  // S1 removed issue and ODD associations from every worktree surface: a
+  // worktree carries neither. The registry keeps its legacy records (no
+  // stored byte is rewritten by a listing), but the tool's public output —
+  // both the raw text and `details.worktrees[]` — describes the checkout's
+  // identity only. The available-document scan is gone with the association,
+  // so a listing never reads a checkout's `odd/` directory either.
   function header(count) {
-    return `worktrees: ${count} (name · branch · path · kind · status · associations)`;
+    return `worktrees: ${count} (name · branch · path · kind · status)`;
   }
 
-  test('the stored association reaches details and the model text; other docs stay inventory-only', async () => {
-    const root = makeRepo('assigned-odd');
+  const ASSOCIATION_KEYS = ['issues', 'assignedOdd', 'odd', 'droppedOdd'];
+
+  test('text and details carry no association while the stored legacy row is untouched', async () => {
+    const root = makeRepo('no-assoc');
     setEnv(stdEnv());
     try {
       const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
@@ -1371,59 +1395,93 @@ describe('S2/S6/S12: the listing publishes the ASSIGNED odd document, never the 
       assert.equal(registryLib.upsertWorktree(root, {
         branch: 'feat/live', path: live, thread: 'thread-1', issues: [35], odd: 'odd/tasks/active.md',
       }).ok, true);
+      const registryFile = registryLib.registryPath(root);
+      const bytesBefore = fs.readFileSync(registryFile);
 
       const tools = await loadExtension();
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      const agent = result.details.worktrees.find((item) => item.kind === 'agent');
-      assert.equal(agent.assignedOdd, 'odd/tasks/active.md', 'the assignment is the stored entry value');
-      assert.deepEqual(
-        agent.odd,
-        ['odd/tasks/active.md', 'odd/discovered-only.md'],
-        'the available inventory stays exactly as detected',
-      );
       assert.deepEqual(text.split('\n'), [
         header(2),
-        `principal · ${git(root, ['branch', '--show-current'])} · ${root} · principal · live · issues - · odd -`,
-        `feat-live · feat/live · ${live} · agent · live · issues #35 · odd odd/tasks/active.md`,
-      ], 'the model text names the assignment and never the inventory');
-      assert.ok(!text.includes('discovered-only'), `an available document never reaches the model: ${text}`);
+        `principal · ${git(root, ['branch', '--show-current'])} · ${root} · principal · live`,
+        `feat-live · feat/live · ${live} · agent · live`,
+      ], 'the text is the checkout identity alone');
+      assert.ok(!/issues=|odd=|assignedOdd|available odd/i.test(text), `no association cell or key: ${text}`);
+      assert.ok(!text.includes('discovered-only') && !text.includes('active.md'), `no ODD document: ${text}`);
+
+      for (const item of result.details.worktrees) {
+        for (const key of ASSOCIATION_KEYS) {
+          assert.equal(Object.hasOwn(item, key), false, `${item.kind} entry carries no ${key}: ${JSON.stringify(item)}`);
+        }
+      }
+      // Unrelated listing facts are untouched.
+      assert.equal(result.details.count, 2);
+      assert.equal(result.details.all, false);
+      const agent = result.details.worktrees.find((item) => item.kind === 'agent');
+      assert.deepEqual(
+        { name: agent.name, path: agent.path, branch: agent.branch, thread: agent.thread, status: agent.status, kind: agent.kind },
+        { name: 'feat-live', path: live, branch: 'feat/live', thread: 'thread-1', status: 'live', kind: 'agent' },
+        'name, path, branch, thread, status and kind stay in details',
+      );
       const principal = result.details.worktrees.find((item) => item.kind === 'principal');
-      assert.strictEqual(principal.assignedOdd, null, 'the principal carries no association, explicitly');
-      assert.equal(Object.hasOwn(principal, 'odd'), false, 'an unscanned principal inventory stays unknown, not invented empty');
+      assert.equal(principal.name, 'principal');
+      assert.equal(principal.thread, null);
+      assert.equal(principal.path, root);
+
+      // Legacy data preservation: the stored record and the file are unchanged.
+      assert.deepEqual(fs.readFileSync(registryFile), bytesBefore, 'the registry bytes are untouched');
+      const stored = registryLib.readRegistry(root).worktrees.find((entry) => entry.branch === 'feat/live');
+      assert.deepEqual(stored.issues, [35], 'the stored issue list survives');
+      assert.equal(stored.odd, 'odd/tasks/active.md', 'the stored ODD association survives');
     } finally {
       restoreEnv();
     }
   });
 
-  test('a checkout with no stored association is known-empty, not its first discovered document', async () => {
-    const root = makeRepo('assigned-odd-none');
-    setEnv(stdEnv());
+  test('a checkout holding odd documents is listed without scanning them', async () => {
+    const root = makeRepo('no-odd-scan');
+    // A lib copy whose `worktree-odd.js` records any inventory scan instead of
+    // performing one: the listing must never reach for it.
+    const libCopy = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-list-lib-')));
+    for (const entry of fs.readdirSync(LIB_DIR)) {
+      if (!entry.endsWith('.js') || entry === 'worktree-odd.js') continue;
+      fs.copyFileSync(path.join(LIB_DIR, entry), path.join(libCopy, entry));
+    }
+    const marker = path.join(libCopy, 'scan-marker.txt');
+    fs.writeFileSync(path.join(libCopy, 'worktree-odd.js'), [
+      "'use strict';",
+      "const fs = require('node:fs');",
+      'module.exports = {',
+      '  oddDocsForCheckout() {',
+      "    fs.writeFileSync(process.env.GENTLE_ODD_SCAN_MARKER, 'scanned');",
+      '    return [];',
+      '  },',
+      '};',
+      '',
+    ].join('\n'));
+    setEnv({ ...stdEnv(), GENTLE_WORKTREE_LIB_DIR: libCopy, GENTLE_ODD_SCAN_MARKER: marker });
     try {
-      const live = addRegistered(root, 'feat/none', { thread: 'thread-1', issues: [] });
+      const live = addRegistered(root, 'feat/held', { thread: 'thread-1', issues: [7] });
       fs.mkdirSync(path.join(live, 'odd'), { recursive: true });
-      fs.writeFileSync(path.join(live, 'odd', 'discovered-only.md'), '# discovered\n');
+      fs.writeFileSync(path.join(live, 'odd', 'held.md'), '# held\n');
 
       const tools = await loadExtension();
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      const agent = result.details.worktrees.find((item) => item.kind === 'agent');
-      assert.strictEqual(agent.assignedOdd, null, 'the stored entry has no association');
-      assert.deepEqual(agent.odd, ['odd/discovered-only.md'], 'the inventory is still reported as available');
-      assert.ok(
-        text.split('\n').includes(`feat-none · feat/none · ${live} · agent · live · issues - · odd -`),
-        `a known-empty association reads -, never the discovered doc: ${text}`,
-      );
-      assert.ok(!text.includes('discovered-only'), `the inventory never reaches the model: ${text}`);
+      assert.ok(text.includes(`feat-held · feat/held · ${live} · agent · live`), `the row still lists: ${text}`);
+      assert.equal(fs.existsSync(marker), false, 'the listing never scanned the checkout for ODD documents');
+      const row = result.details.worktrees.find((item) => item.branch === 'feat/held');
+      assert.equal(Object.hasOwn(row, 'odd'), false, 'and no inventory is published');
+      assert.equal(Object.hasOwn(row, 'assignedOdd'), false, 'and no association is published');
     } finally {
       restoreEnv();
     }
   });
 
-  test('an unregistered checkout carries no association and no invented inventory', async () => {
-    const root = makeRepo('assigned-odd-unregistered');
+  test('an unregistered checkout carries no association keys at all', async () => {
+    const root = makeRepo('no-assoc-unregistered');
     setEnv(stdEnv());
     try {
       const ghost = path.join(path.dirname(root), `${path.basename(root)}-wt-ghost`);
@@ -1439,13 +1497,47 @@ describe('S2/S6/S12: the listing publishes the ASSIGNED odd document, never the 
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       const extra = result.details.worktrees.find((item) => item.kind === 'unregistered');
       assert.ok(extra, `the unregistered checkout is listed: ${text}`);
-      assert.strictEqual(extra.assignedOdd, null, 'an unregistered checkout cannot carry an association');
-      assert.ok(!Array.isArray(extra.odd), 'no inventory is invented for an unregistered row');
+      for (const key of ASSOCIATION_KEYS) {
+        assert.equal(Object.hasOwn(extra, key), false, `an unregistered entry carries no ${key}: ${JSON.stringify(extra)}`);
+      }
       assert.ok(
-        text.split('\n').includes(`feat-ghost · feat/ghost · ${realGhost} · unregistered · unregistered · issues - · odd -`),
-        `the unregistered row names no odd document: ${text}`,
+        text.split('\n').includes(`feat-ghost · feat/ghost · ${realGhost} · unregistered · unregistered`),
+        `the unregistered row is its identity: ${text}`,
       );
       assert.ok(!text.includes('held.md'), `no document is inferred for it: ${text}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('pruning a dead row reports the prune and no association notice', async () => {
+    const root = makeRepo('no-assoc-prune');
+    setEnv(stdEnv());
+    try {
+      const live = addRegistered(root, 'feat/live', { thread: 'thread-1', issues: [35] });
+      const dead = addRegistered(root, 'feat/dead', { thread: 'thread-2', issues: [7] });
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.upsertWorktree(root, {
+        branch: 'feat/dead', path: dead, thread: 'thread-2', issues: [7], odd: ['odd/legacy-a.md', 'odd/legacy-b.md'],
+      }).ok, true);
+      git(root, ['worktree', 'remove', '--force', dead]);
+
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.deepEqual(result.details.pruned, [dead], 'the dead row is pruned');
+      assert.ok(
+        result.details.warnings.some((warning) => warning.startsWith('pruned 1 stale worktree path(s)')),
+        `the prune is still reported: ${JSON.stringify(result.details.warnings)}`,
+      );
+      assert.ok(
+        !result.details.warnings.some((warning) => /odd/i.test(warning)),
+        `no association notice is emitted: ${JSON.stringify(result.details.warnings)}`,
+      );
+      assert.ok(!/odd/i.test(text), `and none reaches the text: ${text}`);
+      assert.ok(text.includes(`feat-live · feat/live · ${live} · agent · live`), 'the live row is unaffected');
+      assert.equal(result.details.worktrees.some((item) => Object.hasOwn(item, 'odd')), false, 'no row publishes an inventory');
     } finally {
       restoreEnv();
     }

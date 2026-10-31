@@ -1,5 +1,5 @@
 'use strict';
-// Tool exposure (S1/S2): `worktree_upsert`, `worktree_close` and
+// Tool exposure (S1/S2): `worktree_create`, `worktree_close` and
 // `worktree_session_open` declare `exposure: "codemode"` so Pi stops
 // declaring them to the model on every turn, while `worktree_list` and
 // `worktree_warp` stay direct (Pi's default: the field is absent, not
@@ -48,7 +48,7 @@ const stubbed = srcText
   );
 assert.ok(stubbed !== srcText, 'expected both package import lines to be stubbed');
 
-const CODEmode_TOOLS = ['worktree_upsert', 'worktree_close', 'worktree_session_open'];
+const CODEmode_TOOLS = ['worktree_create', 'worktree_close', 'worktree_session_open'];
 const DIRECT_TOOLS = ['worktree_list', 'worktree_warp'];
 
 const scratchDirs = [];

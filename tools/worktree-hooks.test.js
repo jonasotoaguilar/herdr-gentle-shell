@@ -1,6 +1,6 @@
 'use strict';
 // P2-S3 tests (test-first): creation hooks — lib/worktree-hooks.js plus the
-// `worktree_upsert` wiring in extensions/gentle-worktree-tools.ts.
+// `worktree_create` wiring in extensions/gentle-worktree-tools.ts.
 //
 // Every test builds isolated fixtures under os.tmpdir(): a real principal
 // repository (`git init` + one commit) plus a real linked worktree (`git
@@ -50,7 +50,12 @@ function makePrincipal(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 function addLinkedWorktree(principal, branch) {
@@ -631,7 +636,7 @@ describe('worktree-hooks: idempotency', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Extension wiring: worktree_upsert reports hook steps in details.
+// Extension wiring: worktree_create reports hook steps in details.
 // ---------------------------------------------------------------------------
 
 const TYPE_STUB = [
@@ -730,7 +735,7 @@ async function loadExtension() {
   return tools;
 }
 
-describe('worktree_upsert hook wiring', { concurrency: false }, () => {
+describe('worktree_create hook wiring', { concurrency: false }, () => {
   test('a created worktree keeps the exact success text and reports hook steps in details', async () => {
     const root = makePrincipal('extok');
     // Unversioned file in the principal is copied into the new worktree.
@@ -752,8 +757,8 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
     });
     try {
       const tools = await loadExtension();
-      const tool = tools.get('worktree_upsert');
-      assert.ok(tool, 'expected worktree_upsert to be registered');
+      const tool = tools.get('worktree_create');
+      assert.ok(tool, 'expected worktree_create to be registered');
       const ctx = {
         cwd: root,
         hasUI: false,
@@ -765,15 +770,14 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
       assert.equal(result.isError, undefined, `hooks must never fail creation: ${JSON.stringify(result)}`);
       const text = (result.content || []).map((p) => p.text || '').join('\n');
       assert.deepEqual(text.split('\n'), [
-        'outcome: created',
-        'name: feat-hooked',
-        'branch: feat/hooked',
+        'created: feat-hooked \u00B7 feat/hooked',
         `path: ${target}`,
-        'issues: #35',
-        'odd: -',
-        ...(result.details.changesRegistered === true ? ['changes: registered'] : []),
+        'registered: new',
+        'codegraph: initialized',
+        ...(result.details.changesRegistered === true ? ['changes: already registered for this session'] : []),
         ...(result.details.warnings || []).map((warning) => `warning: ${warning}`),
       ]);
+      assert.deepEqual(result.details.codegraph, { status: 'done', detail: '' }, 'the one CodeGraph fact travels in details');
       // The env copy lands; no ODD source exists to qualify for a link.
       assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'HOOKED=1\n');
       assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'no link is invented without an eligible principal source');
@@ -815,7 +819,7 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
     });
     try {
       const tools = await loadExtension();
-      const tool = tools.get('worktree_upsert');
+      const tool = tools.get('worktree_create');
       const ctx = {
         cwd: root,
         hasUI: false,
@@ -827,13 +831,11 @@ describe('worktree_upsert hook wiring', { concurrency: false }, () => {
       assert.equal(result.isError, undefined, 'hooks never turn success into error');
       const text = (result.content || []).map((p) => p.text || '').join('\n');
       assert.deepEqual(text.split('\n'), [
-        'outcome: created',
-        'name: feat-hookfail',
-        'branch: feat/hookfail',
+        'created: feat-hookfail \u00B7 feat/hookfail',
         `path: ${target}`,
-        'issues: #35',
-        'odd: -',
-        ...(result.details.changesRegistered === true ? ['changes: registered'] : []),
+        'registered: new',
+        'codegraph: initialized',
+        ...(result.details.changesRegistered === true ? ['changes: already registered for this session'] : []),
         ...(result.details.warnings || []).map((warning) => `warning: ${warning}`),
       ]);
       const failed = (result.details.hooks.steps || []).filter((s) => s.status === 'failed');

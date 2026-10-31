@@ -11,9 +11,9 @@
 //   - the cache is a pure accelerator: the rendered bytes do not change.
 //
 // Two seams count recomputation, both public:
-//   - `createWrapCache()` / the shared `defaultWrapCache` expose
-//     `stats.wraps` (actual wraps performed) and `stats.hits`, so the issue
-//     preview path can assert "zero wraps on a repaint" exactly;
+//   - `createWrapCache()` exposes `stats.wraps` (actual wraps performed) and
+//     `stats.hits`, so the issue preview path can assert "zero wraps on a
+//     repaint" exactly;
 //   - the injected TUI helpers count how often a wrapped probe reaches the
 //     width measurement. A list label is wrapped by measuring candidate joins
 //     of its atoms, and none of those probes is ever a painted row, so probes
@@ -24,12 +24,10 @@
 const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { createWorktreeDetailView } = require('../lib/worktree-detail-view.js');
 const { createOddView } = require('../lib/odd-view.js');
 const {
   issueDetailLines,
   createWrapCache,
-  defaultWrapCache,
 } = require('../lib/issue-preview.js');
 
 function strip(value) {
@@ -158,113 +156,6 @@ describe('issue preview formatter (S23)', () => {
     const text = changed.join('\n');
     assert.ok(text.includes(REPLACED), 'the new body is shown');
     assert.ok(!text.includes(CONTENT), 'no stale row from the previous body survives');
-  });
-});
-
-describe('worktree detail view (S23)', () => {
-  function makeView({ issues, loadIssue, documents = [], loadDocument, recorder: rec, rows = 30 }) {
-    return createWorktreeDetailView({
-      worktree: { name: 'w1', path: '/repo/w1', branch: 'feat/w1', changes: 1 },
-      issues,
-      assignedIssues: [],
-      documents,
-      odd: null,
-      loadIssue,
-      loadDocument: loadDocument || (() => ({ ok: false, error: 'none' })),
-      save: () => ({ ok: true }),
-      helpers: rec.helpers,
-      theme: plainTheme,
-      rowsAvailable: () => rows,
-      requestRender: () => {},
-      done: () => {},
-    });
-  }
-
-  test('the second paint of an unchanged issue preview re-wraps nothing and paints the same rows', () => {
-    const rec = recorder();
-    const issue = detailIssue();
-    const list = comments(2);
-    const view = makeView({
-      recorder: rec,
-      issues: [issue],
-      loadIssue: () => ({ ok: true, issue, comments: list }),
-    });
-
-    const first = view.render(80);
-    const wrapsAfterFirst = defaultWrapCache.stats.wraps;
-    assert.ok(wrapsAfterFirst >= 0);
-
-    const second = view.render(80);
-    assert.equal(defaultWrapCache.stats.wraps, wrapsAfterFirst, 'a repaint re-wraps no line of the preview');
-    assert.deepEqual(second, first, 'the second paint is byte-identical to the first');
-  });
-
-  test('a width change re-wraps the preview once and refills every row to the new width', () => {
-    const rec = recorder();
-    const issue = detailIssue();
-    const view = makeView({ recorder: rec, issues: [issue], loadIssue: () => ({ ok: true, issue, comments: [] }) });
-
-    const narrow = view.render(80);
-    view.render(80);
-    const wrapsBeforeWide = defaultWrapCache.stats.wraps;
-
-    const wide = view.render(180);
-    assert.ok(defaultWrapCache.stats.wraps > wrapsBeforeWide, 'a changed width wraps the preview again');
-    assert.equal(wide.length, narrow.length, 'the frame keeps its row count');
-    for (const line of wide) assert.equal(cells(line), 180, `not 180 cells: "${strip(line)}"`);
-    assert.notDeepEqual(wide, narrow, 'the wider pane paints wider rows instead of the cached ones');
-  });
-
-  test('a new issue list re-wraps and paints the new titles, never the previous ones', () => {
-    const rec = recorder();
-    const firstIssue = { number: 1, title: longName(BEGIN, '001'), state: 'open', body: 'body' };
-    const nextIssue = { number: 2, title: longName(REPLACED, '002'), state: 'open', body: 'body' };
-    const view = makeView({
-      recorder: rec,
-      issues: [firstIssue],
-      // The read answers for the focused row, so the preview follows the list.
-      loadIssue: (number) => ({
-        ok: true,
-        issue: number === 2 ? nextIssue : firstIssue,
-        comments: [],
-      }),
-    });
-
-    const first = view.render(80);
-    assert.ok(rec.probes() > 0, 'the first paint wraps the long title');
-    assert.ok(first.join('\n').includes(BEGIN), 'the first title is listed');
-
-    rec.reset();
-    view.render(80);
-    assert.equal(rec.probes(), 0, 'the unchanged list is not wrapped again');
-
-    view.apply({ issues: [nextIssue] });
-    rec.reset();
-    const changed = view.render(80);
-    const text = changed.join('\n');
-    assert.ok(rec.probes() > 0, 'the new title is wrapped');
-    assert.ok(text.includes(REPLACED), 'the new title is listed');
-    assert.ok(!text.includes(BEGIN), 'no stale row from the old title survives');
-  });
-
-  test('the ODD tab document body is wrapped once per width, not once per paint', () => {
-    const rec = recorder();
-    const body = longBody(`${CONTENT} document`);
-    const doc = { name: 'long-doc', path: '/repo/w1/odd/tasks/long-doc.md', text: body };
-    const view = makeView({
-      recorder: rec,
-      issues: [],
-      loadIssue: () => ({ ok: false, error: 'none' }),
-      documents: [doc],
-      loadDocument: () => ({ ok: true, text: body }),
-    });
-
-    view.handleInput('\t');
-    const first = view.render(80);
-    rec.reset();
-    const second = view.render(80);
-    assert.equal(rec.longer(150), 0, 'the cached body is not wrapped again');
-    assert.deepEqual(second, first, 'the repaint is byte-identical');
   });
 });
 

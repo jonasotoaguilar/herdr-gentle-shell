@@ -162,6 +162,9 @@ function countingRunner() {
   };
 }
 
+// A LEGACY registry row: it still stores an issue association and ONE odd
+// document, which S1 preserves as stored data while the public facts payload
+// carries no association field at all.
 const fullRow = (wtPath, branch) => ({
   branch,
   path: wtPath,
@@ -354,8 +357,13 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.deepEqual(got.aheadBehind.value, {
       ahead: 0, behind: 0, base: 'main', baseSource: 'conventional',
     });
-    assert.deepEqual(got.issues, { available: true, value: ['#12', '#31'], reason: null });
-    assert.deepEqual(got.odd, { available: true, value: ['odd/tasks/warp-popup.md'], reason: null });
+    // S1: a worktree receives no issue and no ODD document, so neither field
+    // reaches the payload even though the registry row still stores both.
+    assert.equal('issues' in got, false, 'no issue association reaches the payload');
+    assert.equal('odd' in got, false, 'no ODD association reaches the payload');
+    assert.deepEqual(Object.keys(got).sort(), [
+      'aheadBehind', 'branch', 'cached', 'changes', 'checkout', 'createdAt', 'fetchedAt', 'lastActivity',
+    ], 'the payload is exactly the facts the selector renders');
     assert.deepEqual(got.createdAt, { available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry' });
     const commitMs = Number(git(wt, ['log', '-1', '--format=%ct'])) * 1000;
     assert.deepEqual(got.lastActivity, {
@@ -453,8 +461,9 @@ describe('checkout-facts', { concurrency: false }, () => {
     const root = makeRepo('unreadable');
     const broken = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-broken-')));
     fs.writeFileSync(path.join(broken, 'file.txt'), 'x\n');
-    // A registry row exists for this path, so the failure must be scoped:
-    // the registry facts stay available while the git facts go unavailable.
+    // A registry row exists for this path, so the failure must be scoped: the
+    // git facts go unavailable while the registry-sourced creation and every
+    // other fact keep their own answer.
     writeRow(root, fullRow(broken, 'feat/broken'));
     const got = await makeFacts(root).facts(broken);
     for (const field of ['branch', 'changes', 'aheadBehind', 'lastActivity']) {
@@ -463,19 +472,18 @@ describe('checkout-facts', { concurrency: false }, () => {
       assert.equal(typeof got[field].reason, 'string');
       assert.ok(got[field].reason.length > 0);
     }
-    assert.deepEqual(got.issues, { available: true, value: ['#12', '#31'], reason: null });
+    assert.deepEqual(got.createdAt, { available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry' });
+    assert.equal('issues' in got, false, 'a broken git read never brings an association back');
+    assert.equal('odd' in got, false);
   });
 
-  test('a checkout with no registry row reports issues/odd unavailable and createdAt from the birth time', async () => {
+  test('a checkout with no registry row reports createdAt from the birth time, never an association', async () => {
     const root = makeRepo('no-row');
     const wt = addWorktree(root, 'feat/no-row');
     const birth = 1_700_000_000_000;
     const got = await makeFacts(root, { fs: birthFs(birth) }).facts(wt);
-    for (const field of ['issues', 'odd']) {
-      assert.equal(got[field].available, false, `${field} must be unavailable`);
-      assert.equal(got[field].value, null, `${field} must not carry a value`);
-      assert.match(got[field].reason, /registry/i);
-    }
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
     assert.deepEqual(got.createdAt, {
       available: true, value: new Date(birth).toISOString(), reason: null, source: 'birthtime',
     });
@@ -485,15 +493,13 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.equal(got.aheadBehind.available, true);
   });
 
-  test('a malformed registry makes only the registry facts unavailable', async () => {
+  test('a malformed registry only makes the registry-sourced creation unavailable', async () => {
     const root = makeRepo('bad-row');
     const wt = addWorktree(root, 'feat/bad-row');
     fs.writeFileSync(path.join(root, '.git', 'pi-worktrees.json'), '{not json');
     const got = await makeFacts(root).facts(wt);
-    for (const field of ['issues', 'odd']) {
-      assert.equal(got[field].available, false);
-      assert.match(got[field].reason, /registry/i);
-    }
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
     // A malformed registry has no row, so the birth-time fallback answers.
     assert.equal(got.createdAt.available, true);
     assert.equal(got.createdAt.source, 'birthtime');
@@ -811,22 +817,81 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.equal(Date.parse(got.lastActivity.value), dirtyMs);
   });
 
-  // PRESERVE: S8 migrated the row to ONE odd document while the fact keeps
-  // the LIST shape its consumers count.
-  test('the odd fact still derives a one-element list from a single stored document', async () => {
-    const root = makeRepo('odd-single');
-    const wt = addWorktree(root, 'feat/odd-single');
-    writeRow(root, { ...fullRow(wt, 'feat/odd-single'), odd: 'odd/tasks/one.md' });
-    const got = await makeFacts(root).facts(wt);
-    assert.deepEqual(got.odd, { available: true, value: ['odd/tasks/one.md'], reason: null });
+  // S1: worktrees stopped receiving issues and ODD documents. Legacy registry
+  // rows still store both, and that data is preserved untouched — it is simply
+  // never read into the public facts payload.
+  test('legacy issue and ODD registry data is never read into the payload', async () => {
+    const root = makeRepo('legacy-association');
+    const wt = addWorktree(root, 'feat/legacy-association');
+    // A row whose association fields THROW when touched: the read path is
+    // gone, so building the facts must never reach either one.
+    const hostile = {
+      branch: 'feat/legacy-association',
+      path: wt,
+      thread: 'warp-popup',
+      createdAt: '2024-01-02T03:04:05.000Z',
+      get issues() {
+        throw new Error('the issues association must not be read');
+      },
+      get odd() {
+        throw new Error('the odd association must not be read');
+      },
+    };
+    const facts = makeFacts(root, { readRegistry: () => ({ ok: true, worktrees: [hostile] }) });
+    const got = await facts.facts(wt);
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
+    // The one fact the registry row legitimately owns still answers from it.
+    assert.deepEqual(got.createdAt, {
+      available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry',
+    });
   });
 
-  test('a registered checkout with no odd document reports an empty list, never unavailable', async () => {
-    const root = makeRepo('odd-none');
-    const wt = addWorktree(root, 'feat/odd-none');
-    writeRow(root, { ...fullRow(wt, 'feat/odd-none'), odd: null });
+  // PRESERVE: the registry is only ever READ here. The legacy association data
+  // stays exactly as stored — no write, no migration, no erasure.
+  test('reading the facts leaves the stored registry row byte-identical', async () => {
+    const root = makeRepo('registry-preserved');
+    const wt = addWorktree(root, 'feat/registry-preserved');
+    writeRow(root, fullRow(wt, 'feat/registry-preserved'));
+    const registryFile = path.join(root, '.git', 'pi-worktrees.json');
+    const before = fs.readFileSync(registryFile);
     const got = await makeFacts(root).facts(wt);
-    assert.deepEqual(got.odd, { available: true, value: [], reason: null });
+    assert.deepEqual(fs.readFileSync(registryFile), before, 'the registry is never rewritten');
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
+    // ...and the legacy data is still there for whoever owns it now.
+    const stored = JSON.parse(fs.readFileSync(registryFile, 'utf8')).worktrees[0];
+    assert.deepEqual(stored.issues, ['#12', '#31']);
+    assert.deepEqual(stored.odd, ['odd/tasks/warp-popup.md']);
+  });
+
+  test('peek() never resurrects an association field from the cache', async () => {
+    const root = makeRepo('peek-no-association');
+    const wt = addWorktree(root, 'feat/peek-no-association');
+    writeRow(root, fullRow(wt, 'feat/peek-no-association'));
+    const facts = makeFacts(root);
+    await facts.facts(wt);
+    const shown = facts.peek(wt);
+    assert.equal('issues' in shown, false);
+    assert.equal('odd' in shown, false);
+    assert.equal(shown.branch.value, 'feat/peek-no-association');
+  });
+
+  // PRESERVE: an unusable path still answers every fact unavailable — and now
+  // that set carries no association field at all.
+  test('an unusable checkout path answers the same facts without any association field', async () => {
+    const root = makeRepo('empty-path');
+    for (const [given, reported] of [['', ''], [undefined, null]]) {
+      const got = await makeFacts(root).facts(given);
+      assert.equal(got.checkout, reported);
+      assert.equal('issues' in got, false);
+      assert.equal('odd' in got, false);
+      for (const field of ['branch', 'createdAt', 'lastActivity', 'changes', 'aheadBehind']) {
+        assert.equal(got[field].available, false, `${field} must be unavailable`);
+        assert.equal(got[field].value, null, `${field} must not carry a value`);
+        assert.equal(got[field].reason, 'checkout path is empty');
+      }
+    }
   });
 });
 

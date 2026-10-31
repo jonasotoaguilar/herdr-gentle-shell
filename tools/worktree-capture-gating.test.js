@@ -75,7 +75,12 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 // Fixture repository with a principal `odd/` directory, a real linked
@@ -243,7 +248,12 @@ describe('worktree odd-capture mode gating', { concurrency: false }, () => {
     }
   });
 
-  test('with the mode enabled, the same event records the document', async () => {
+  // S1: the worktree pipeline records NO association, ever. This used to be
+  // the one case that DID record one, so the case stays — with the opposite
+  // expectation — to keep the flip from silently reverting. The mode gates
+  // worktree tools only; reading an `odd/*.md` file records nothing whether it
+  // is enabled or not.
+  test('with the mode enabled, the same event still records nothing', async () => {
     const { root, target, branch } = makeRepoWithWorktree('enabled');
     const modeLib = require('../lib/worktree-mode.js');
     const modeEnv = scratchModeEnv();
@@ -251,16 +261,18 @@ describe('worktree odd-capture mode gating', { concurrency: false }, () => {
     try {
       modeLib.writeMode(true, process.env);
       const { handlers } = await loadExtension();
+      const before = registryBytes(root);
       const returns = await dispatch(
         handlers, 'tool_call',
         { toolName: 'read', args: { path: path.join(target, 'odd', 'notes.md') } },
         ctxFor(target),
       );
       for (const value of returns) assert.equal(value, undefined);
+      assert.deepEqual(registryBytes(root), before, 'an enabled mode writes no association either');
       assert.equal(
         require('../lib/worktree-registry.js').findByBranch(root, branch).odd,
-        'odd/notes.md',
-        'S8: the captured document is the ONE association, stored as a path string',
+        null,
+        'S1: the ODD capture is removed, so no document is ever associated',
       );
     } finally {
       restoreEnv();
@@ -288,8 +300,8 @@ describe('malformed registry backup', { concurrency: false }, () => {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, '{"not json');
       const { tools } = await loadExtension();
-      const create = tools.get('worktree_upsert');
-      assert.ok(create, 'expected worktree_upsert to be registered');
+      const create = tools.get('worktree_create');
+      assert.ok(create, 'expected worktree_create to be registered');
       const ctx = ctxFor(root);
       const result = await create.execute('call-1', { branch: 'feat/kept', issues: [35] }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `expected success: ${(result.content || []).map((p) => p.text).join('\n')}`);
@@ -330,7 +342,7 @@ describe('malformed registry backup', { concurrency: false }, () => {
       // The valid upsert above must not back anything up either.
       assert.deepEqual(corruptSiblings(root), []);
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_upsert').execute(
+      const result = await tools.get('worktree_create').execute(
         'call-1', { branch: 'feat/fresh', issues: [35] }, undefined, undefined, ctxFor(root),
       );
       assert.equal(result.isError, undefined, `expected success: ${(result.content || []).map((p) => p.text).join('\n')}`);

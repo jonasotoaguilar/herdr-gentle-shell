@@ -1,15 +1,17 @@
 'use strict';
 // T8/S12 model-facing half (test-first): lib/worktree-model-result.js turns
-// the five own worktree tools' raw content text into concise, stable,
+// the four own worktree tools' raw content text into concise, stable,
 // agent-useful text built from the SAME `details` object execute() already
 // returns.
 //
 // Why this exists: the extension's current success text prints one raw line
 // per checkout (`worktree list: <name> <branch> thread=<id> issues=<csv>
 // odd=<csv>`), so a listing with many checkouts and many available ODD
-// documents spends the agent's context on discovery inventory it never
-// reads. The formatter keeps what the agent acts on (outcome, name, branch,
-// path, associations, status, routing ids, warnings) and drops the rest.
+// documents spends the agent's context on data it never acts on. The formatter
+// keeps what the agent acts on (outcome, name, branch, path, kind, status,
+// routing ids, warnings) and drops the rest — including issue numbers and ODD
+// documents, which S1 removed from every worktree surface: a worktree carries
+// neither.
 //
 // Fixtures are synthetic but shaped from the extension's real result
 // objects (textResult/errorResult in extensions/gentle-worktree-tools.ts):
@@ -54,36 +56,12 @@ const THREAD_ID = 'thread-4f9c1d2e8a7b6c5d';
 // Fixtures: one per tool, shaped like the real details objects
 // ---------------------------------------------------------------------------
 
-function upsertResult(overrides) {
-  return {
-    content: [{
-      type: 'text',
-      text: 'created: feat-cards · feat/cards\npath: /repo/feat-cards\nissues: 12,13\nodd: odd/native-tool-output.md',
-    }],
-    details: {
-      path: '/repo/feat-cards',
-      branch: 'feat/cards',
-      issues: [12, 13],
-      odd: 'odd/native-tool-output.md',
-      created: true,
-      hooks: { ok: true, steps: [], warnings: [] },
-      warnings: [],
-      pruned: [],
-      replacedRows: [],
-      symlinks: { created: [], skippedTracked: [] },
-      changesRegistered: false,
-      branchCreated: true,
-    },
-    ...(overrides || {}),
-  };
-}
-
 function listResult(overrides) {
   const worktrees = [
-    { name: 'principal', path: '/repo', branch: 'main', thread: null, issues: [], odd: [], status: 'live', kind: 'principal' },
-    { name: 'feat-cards', path: '/repo/feat-cards', branch: 'feat/cards', thread: THREAD_ID, issues: [12, 13], odd: ['odd/a.md', 'odd/b.md'], status: 'live', kind: 'agent' },
-    { name: 'feat-gone', path: '/repo/feat-gone', branch: 'feat/gone', thread: 'unknown', issues: [], odd: [], status: 'missing', kind: 'agent' },
-    { name: 'stray-x', path: '/repo/stray-x', branch: 'feat/stray', thread: null, issues: [], odd: [], status: 'unregistered', kind: 'unregistered' },
+    { name: 'principal', path: '/repo', branch: 'main', thread: null, issues: [], assignedOdd: null, odd: [], status: 'live', kind: 'principal' },
+    { name: 'feat-cards', path: '/repo/feat-cards', branch: 'feat/cards', thread: THREAD_ID, issues: [12, 13], assignedOdd: 'odd/native-tool-output.md', odd: ['odd/a.md', 'odd/b.md'], status: 'live', kind: 'agent' },
+    { name: 'feat-gone', path: '/repo/feat-gone', branch: 'feat/gone', thread: 'unknown', issues: [], assignedOdd: null, odd: [], status: 'missing', kind: 'agent' },
+    { name: 'stray-x', path: '/repo/stray-x', branch: 'feat/stray', thread: null, issues: [], assignedOdd: null, odd: [], status: 'unregistered', kind: 'unregistered' },
   ];
   return {
     content: [{
@@ -157,7 +135,6 @@ function warpResult(overrides) {
 }
 
 const FIXTURES = {
-  worktree_upsert: upsertResult,
   worktree_list: listResult,
   worktree_close: closeResult,
   worktree_session_open: sessionOpenResult,
@@ -169,16 +146,31 @@ const FIXTURES = {
 // ---------------------------------------------------------------------------
 
 describe('helpful pure API', () => {
-  test('exports the formatter and its five-tool coverage', () => {
+  test('exports the formatter and its four-tool coverage', () => {
     assert.strictEqual(typeof formatWorktreeModelResult, 'function');
     assert.deepStrictEqual(
       [...WORKTREE_MODEL_TOOLS].sort(),
-      ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_upsert', 'worktree_warp'],
+      ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_warp'],
     );
   });
 
+  // S1: the create tool writes its own short ordered text (`created:`, `path:`,
+  // `codegraph:`), so the adapter has no builder for it — and none for the
+  // retired `worktree_upsert` name the create replaced. A build that still
+  // carried that dead builder is what kept the retired name alive.
+  test('the create/upsert family has no builder: its result returns untouched', () => {
+    for (const name of ['worktree_create', 'worktree_upsert']) {
+      assert.ok(!WORKTREE_MODEL_TOOLS.includes(name), `${name} is not a formatted tool`);
+      const result = {
+        content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards\npath: /repo/feat-cards' }],
+        details: { path: '/repo/feat-cards', branch: 'feat/cards', created: true },
+      };
+      assert.strictEqual(formatWorktreeModelResult(name, result), result, `${name} keeps its own text`);
+    }
+  });
+
   test('an unknown tool name returns the result untouched', () => {
-    const result = upsertResult();
+    const result = listResult();
     assert.strictEqual(formatWorktreeModelResult('bash', result), result);
     assert.strictEqual(formatWorktreeModelResult('', result), result);
     assert.strictEqual(formatWorktreeModelResult(undefined, result), result);
@@ -263,7 +255,6 @@ describe('preservation contract', () => {
 
   test('per-tool evidence gaps fall back unchanged', () => {
     const cases = [
-      ['worktree_upsert', { created: true }],
       ['worktree_close', { removed: true }],
       ['worktree_session_open', { notify: true }],
       ['worktree_warp', { kind: 'agent' }],
@@ -276,10 +267,10 @@ describe('preservation contract', () => {
   });
 
   test('a result whose content is not a text array is returned untouched', () => {
-    const noContent = { details: upsertResult().details };
-    assert.strictEqual(formatWorktreeModelResult('worktree_upsert', noContent), noContent);
-    const textless = { content: [{ type: 'text' }, { type: 'image', data: 'x' }], details: upsertResult().details };
-    assert.strictEqual(formatWorktreeModelResult('worktree_upsert', textless), textless);
+    const noContent = { details: listResult().details };
+    assert.strictEqual(formatWorktreeModelResult('worktree_list', noContent), noContent);
+    const textless = { content: [{ type: 'text' }, { type: 'image', data: 'x' }], details: listResult().details };
+    assert.strictEqual(formatWorktreeModelResult('worktree_list', textless), textless);
   });
 });
 
@@ -287,48 +278,15 @@ describe('preservation contract', () => {
 // Per-tool model text
 // ---------------------------------------------------------------------------
 
-describe('worktree_upsert model text', () => {
-  test('created worktree keeps outcome, name, branch, path, associations', () => {
-    assert.deepStrictEqual(linesOf(formatWorktreeModelResult('worktree_upsert', upsertResult())), [
-      'outcome: created',
-      'name: feat-cards',
-      'branch: feat/cards',
-      'path: /repo/feat-cards',
-      'issues: #12, #13',
-      'odd: odd/native-tool-output.md',
-    ]);
-  });
-
-  test('updated and already-existed outcomes are never reported as creates', () => {
-    const updated = upsertResult({
-      details: { ...upsertResult().details, created: false, updated: true, issues: [], odd: null },
-    });
-    assert.deepStrictEqual(linesOf(formatWorktreeModelResult('worktree_upsert', updated)), [
-      'outcome: updated',
-      'name: feat-cards',
-      'branch: feat/cards',
-      'path: /repo/feat-cards',
-      'issues: -',
-      'odd: -',
-    ]);
-    const owned = upsertResult({
-      details: { ...upsertResult().details, created: false, issues: [], odd: null },
-    });
-    assert.strictEqual(linesOf(formatWorktreeModelResult('worktree_upsert', owned))[0], 'outcome: already existed');
-  });
-
-  test('an unknown odd field is omitted instead of asserted absent', () => {
-    const details = { ...upsertResult().details, issues: [] };
-    delete details.odd;
-    const rows = linesOf(formatWorktreeModelResult('worktree_upsert', upsertResult({ details })));
-    assert.ok(!rows.some((row) => row.startsWith('odd:')), 'no odd row when the field is unknown: ' + JSON.stringify(rows));
-    assert.ok(rows.includes('issues: -'), 'a known-empty association still reads -: ' + JSON.stringify(rows));
-  });
-
-  test('a failed hook step stays visible even without a matching warning', () => {
+// S1 removed issue and ODD associations from every worktree surface, so the
+// create tool owns its own text and this adapter formats only the four
+// operational tools. Their warning rows are ONE shared derivation: a failed
+// step the details carry is surfaced, a skipped one is not, and a hook's
+// stdout transcript never enters the model text.
+describe('shared warning rows', () => {
+  test('a failed step stays visible even without a matching warning', () => {
     const details = {
-      ...upsertResult().details,
-      odd: null,
+      ...closeResult().details,
       hooks: {
         ok: false,
         steps: [
@@ -339,22 +297,20 @@ describe('worktree_upsert model text', () => {
       },
       warnings: [],
     };
-    const formatted = formatWorktreeModelResult('worktree_upsert', upsertResult({ details }));
+    const formatted = formatWorktreeModelResult('worktree_close', closeResult({ details }));
     const rows = linesOf(formatted);
     assert.ok(
       rows.includes('warning: copied none; source .env is git-ignored'),
-      'a failed hook step is a warning the agent must see: ' + JSON.stringify(rows),
+      'a failed step is a warning the agent must see: ' + JSON.stringify(rows),
     );
     assert.ok(!rows.some((row) => row.includes('skipped because')), 'a skipped step is not a failure');
     assert.ok(!textOf(formatted).includes('x'.repeat(20)), 'hook stdout is never copied');
   });
 
-  test('failed hooks and prune warnings stay visible, without hook transcripts', () => {
+  test('a warning the details already summarize is printed once, without transcripts', () => {
     const warning = 'creation hooks failed: copy-env exited 1';
     const details = {
-      ...upsertResult().details,
-      odd: null,
-      changesRegistered: true,
+      ...closeResult().details,
       hooks: {
         ok: false,
         steps: [{ name: 'copy-env', status: 'failed', detail: warning, stdout: 'x'.repeat(400) }],
@@ -362,74 +318,60 @@ describe('worktree_upsert model text', () => {
       },
       warnings: [warning, "pruned 1 stale worktree record(s) via 'git worktree prune': /repo/dead; git no longer records the missing checkout"],
     };
-    const formatted = formatWorktreeModelResult('worktree_upsert', upsertResult({ details }));
+    const formatted = formatWorktreeModelResult('worktree_close', closeResult({ details }));
     const rows = linesOf(formatted);
-    assert.ok(rows.includes('changes: registered'), 'the session registration is reported: ' + JSON.stringify(rows));
-    assert.ok(rows.includes(`warning: ${warning}`), 'the failed hook stays visible: ' + JSON.stringify(rows));
+    assert.strictEqual(rows.filter((row) => row === `warning: ${warning}`).length, 1, 'no duplicated warning: ' + JSON.stringify(rows));
     assert.ok(rows.some((row) => row.startsWith('warning: pruned 1 stale worktree record(s)')), 'prune warning kept');
     assert.ok(!textOf(formatted).includes('x'.repeat(50)), 'hook stdout never enters the model text');
   });
 });
 
 describe('worktree_list model text', () => {
-  test('count plus one stable row per checkout, associations last', () => {
+  test('count plus one stable row per checkout, and no association cell', () => {
     // kind and status are separate facts even when they agree: an
     // unregistered checkout is both `kind: unregistered` and
-    // `status: unregistered`, and the row keeps both cells.
+    // `status: unregistered`, and the row keeps both cells. S1 removed the
+    // issue/ODD association column from every worktree display, so a row is
+    // exactly the checkout's identity.
     assert.deepStrictEqual(linesOf(formatWorktreeModelResult('worktree_list', listResult())), [
-      'worktrees: 4 (name · branch · path · kind · status · associations)',
-      'principal · main · /repo · principal · live · issues -',
-      'feat-cards · feat/cards · /repo/feat-cards · agent · live · issues #12, #13',
-      'feat-gone · feat/gone · /repo/feat-gone · agent · missing · issues -',
-      'stray-x · feat/stray · /repo/stray-x · unregistered · unregistered · issues -',
+      'worktrees: 4 (name · branch · path · kind · status)',
+      'principal · main · /repo · principal · live',
+      'feat-cards · feat/cards · /repo/feat-cards · agent · live',
+      'feat-gone · feat/gone · /repo/feat-gone · agent · missing',
+      'stray-x · feat/stray · /repo/stray-x · unregistered · unregistered',
     ]);
   });
 
-  test('thread ids, raw prefixes and available odd documents never reach the model', () => {
+  test('thread ids, raw prefixes and associations never reach the model', () => {
     const text = textOf(formatWorktreeModelResult('worktree_list', listResult()));
     assert.ok(!text.includes(THREAD_ID), 'no thread id: ' + text);
     assert.ok(!text.includes('thread='), 'no thread= key: ' + text);
     assert.ok(!text.includes('odd='), 'no odd= key: ' + text);
     assert.ok(!text.includes('worktree list:'), 'no repeated legacy prefix: ' + text);
-    assert.ok(!text.includes('odd/a.md') && !text.includes('odd/b.md'), 'no discovery inventory: ' + text);
-    assert.ok(!/odd\b/.test(text.replace('odd documents', '')), 'no odd label without an assigned value: ' + text);
+    assert.ok(!/issues/i.test(text), 'no issue label or number anywhere: ' + text);
+    assert.ok(!/odd/i.test(text), 'no ODD label or document anywhere: ' + text);
   });
 
-  test('a known-empty association reads `-`, never the discovered inventory', () => {
-    const original = listResult();
-    original.details.worktrees[1] = { ...original.details.worktrees[1], assignedOdd: null };
-    const rows = linesOf(formatWorktreeModelResult('worktree_list', original));
-    assert.strictEqual(
-      rows[2],
-      'feat-cards · feat/cards · /repo/feat-cards · agent · live · issues #12, #13 · odd -',
-    );
-    assert.ok(
-      !rows[2].includes('a.md') && !rows[2].includes('b.md'),
-      'a stored null is a known empty association, not an invitation to print the first available doc: ' + rows[2],
-    );
-  });
-
-  test('the association wins over the inventory even when the inventory leads with another doc', () => {
-    const original = listResult();
-    original.details.worktrees[1] = {
-      ...original.details.worktrees[1],
-      assignedOdd: 'odd/native-tool-output.md',
-      odd: ['odd/inventory-0.md', 'odd/native-tool-output.md'],
-    };
-    const rows = linesOf(formatWorktreeModelResult('worktree_list', original));
-    assert.ok(rows[2].endsWith('odd odd/native-tool-output.md'), 'the stored assignment is printed: ' + rows[2]);
-    assert.ok(!rows[2].includes('inventory-0'), 'the first inventory item is never promoted: ' + rows[2]);
-  });
-
-  test('an assigned odd association is printed, an unknown one is not', () => {
-    const original = listResult();
-    original.details.worktrees[1] = { ...original.details.worktrees[1], assignedOdd: 'odd/native-tool-output.md' };
-    const rows = linesOf(formatWorktreeModelResult('worktree_list', original));
-    assert.strictEqual(
-      rows[2],
-      'feat-cards · feat/cards · /repo/feat-cards · agent · live · issues #12, #13 · odd odd/native-tool-output.md',
-    );
-    assert.ok(!rows[1].includes('odd'), 'an entry without assignedOdd says nothing about odd: ' + rows[1]);
+  // S1: a worktree carries no issue and no ODD association. The stored legacy
+  // fields the registry still keeps are data preservation, not display: the
+  // listing text must be identical whether the details carry them or not.
+  test('legacy registry associations never change the listing text', () => {
+    const withLegacy = linesOf(formatWorktreeModelResult('worktree_list', listResult()));
+    const stripped = listResult({
+      details: {
+        ...listResult().details,
+        worktrees: listResult().details.worktrees.map((row) => {
+          const { issues, assignedOdd, odd, ...rest } = row;
+          void issues; void assignedOdd; void odd;
+          return rest;
+        }),
+      },
+    });
+    assert.deepStrictEqual(linesOf(formatWorktreeModelResult('worktree_list', stripped)), withLegacy);
+    const text = textOf(formatWorktreeModelResult('worktree_list', listResult()));
+    assert.ok(!text.includes('#12') && !text.includes('native-tool-output'), 'no association value: ' + text);
+    assert.ok(!text.includes('a.md') && !text.includes('b.md'), 'no document inventory: ' + text);
+    assert.ok(!text.includes(' -'), 'no bare association placeholder column: ' + text);
   });
 
   test('a 100-document inventory never enters the text and details stay byte-equivalent', () => {
@@ -464,13 +406,15 @@ describe('worktree_list model text', () => {
     original.details = { worktrees, count: 100, all: false, pruned: [], warnings: [], pruneError: null };
     const rows = linesOf(formatWorktreeModelResult('worktree_list', original));
     assert.strictEqual(rows.length, 101, 'one header plus one row per checkout');
-    assert.strictEqual(rows[0], 'worktrees: 100 (name · branch · path · kind · status · associations)');
+    assert.strictEqual(rows[0], 'worktrees: 100 (name · branch · path · kind · status)');
     for (let index = 0; index < 100; index += 1) {
-      assert.ok(rows[index + 1].startsWith(`feat-${index} · feat/branch-${index} · /repo/wt/feat-${index} · agent · `),
-        `row ${index} keeps its identity: ${rows[index + 1]}`);
-      assert.ok(rows[index + 1].includes(`issues ${index % 2 === 0 ? `#${index}` : '-'}`));
+      const expectedStatus = index === 99 ? 'missing' : 'live';
+      assert.strictEqual(
+        rows[index + 1],
+        `feat-${index} · feat/branch-${index} · /repo/wt/feat-${index} · agent · ${expectedStatus}`,
+        `row ${index} is the checkout's identity alone: ${rows[index + 1]}`,
+      );
     }
-    assert.ok(rows[100].endsWith('missing · issues -'));
   });
 
   test('listing warnings and prune errors stay visible once', () => {
@@ -605,11 +549,11 @@ describe('shared formatting guarantees', () => {
 
   test('every row is one line: newlines and control characters never reshape it', () => {
     const details = {
-      ...upsertResult().details,
+      ...closeResult().details,
       branch: 'feat/evil\nsecond-line\x07bell',
       path: '/repo/evil\r\npath',
     };
-    const formatted = formatWorktreeModelResult('worktree_upsert', upsertResult({ details }));
+    const formatted = formatWorktreeModelResult('worktree_close', closeResult({ details }));
     const text = textOf(formatted);
     assert.ok(!/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text), 'no control characters: ' + JSON.stringify(text));
     assert.strictEqual(linesOf(formatted).filter((row) => row.startsWith('branch:')).length, 1, 'one branch row');

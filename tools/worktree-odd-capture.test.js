@@ -1,22 +1,30 @@
 'use strict';
-// P2-S6 tests (test-first): automatic `odd/` document capture (S5, D7) in
-// extensions/gentle-worktree-tools.ts.
+// S1: the worktree tool pipeline observes ODD writes for ONE purpose — naming
+// the session — and records no association.
+//
+// The extension used to associate the first `odd/` document a worktree touched
+// (plus a bounded re-scan complement) with the worktree's registry row. S1
+// removed the association from every worktree surface: a worktree carries no
+// issue and no ODD document, so the pipeline must not write one — and the
+// registry's stored records stay exactly as they are. What the same wiring DOES
+// keep is the session auto-name derived from the ODD task document being
+// written (`pi.setSessionName`), which is a session property, not an
+// association.
 //
 // Loading pattern mirrors tools/worktree-create.test.js: the TypeScript
-// extension is plain JS under the hood (// @ts-nocheck, no type
-// annotations), so the test copies it to a temporary .mjs path with the
-// package import lines stubbed and import()s it with a fake `pi` object
-// that records tool/command/event registrations and lets the test dispatch
+// extension is plain JS under the hood (// @ts-nocheck, no type annotations),
+// so the test copies it to a temporary .mjs path with the package import lines
+// stubbed and import()s it with a fake `pi` object that records tool/command/
+// event registrations, the session name it is given, and lets the test dispatch
 // tool pipeline events.
 //
 // Every test builds its own isolated fixture repository under os.tmpdir()
-// (real `git init` + one commit), a real linked worktree (`git worktree
-// add -b`), a registry entry for that worktree, and a principal `odd/`
-// directory symlinked into the worktree exactly like the creation hooks do.
-// Only observable behavior is asserted: the registry row's single `odd`
-// association inside the git common dir, and the handler's return value
-// (nothing). The user's real checkouts are never touched; only the fixture
-// dirs tracked in `roots` are removed.
+// (real `git init` + one commit), a real linked worktree (`git worktree add -b`),
+// a registry entry for that worktree, and a principal `odd/` directory
+// symlinked into the worktree exactly like the creation hooks do. Only
+// observable behavior is asserted: the registry file's bytes inside the git
+// common dir, the session name the fake host received, and the handler's
+// return value (nothing). The user's real checkouts are never touched.
 
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -47,6 +55,10 @@ const stubbed = srcText
     TYPE_STUB,
   )
   .replace(
+    'import { defineTool } from "@earendil-pi-works/pi-coding-agent";',
+    'const defineTool = (def) => def;',
+  )
+  .replace(
     'import { defineTool } from "@earendil-works/pi-coding-agent";',
     'const defineTool = (def) => def;',
   );
@@ -72,10 +84,10 @@ function git(cwd, args) {
 
 // Fresh fixture repository with one commit, a principal `odd/` directory
 // holding `docs`, a real linked worktree whose `odd/` is a symlink into the
-// principal checkout (exactly what the creation hooks build), and a
-// registry entry owning that worktree.
+// principal checkout (exactly what the creation hooks build), and a registry
+// entry owning that worktree.
 function makeRepoWithWorktree(tag, { branch = 'feat/odd', docs = ['notes.md'] } = {}) {
-  const root = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-odd-${tag}-`)));
+  const root = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-noassoc-${tag}-`)));
   git(root, ['init']);
   git(root, ['config', 'user.email', 'test@example.com']);
   git(root, ['config', 'user.name', 'Test']);
@@ -109,12 +121,30 @@ function oddOf(root, branch) {
   return require('../lib/worktree-registry.js').findByBranch(root, branch).odd;
 }
 
+function registryBytes(root) {
+  return fs.readFileSync(require('../lib/worktree-registry.js').registryPath(root), 'utf8');
+}
+
+// Hand-write the legacy shape an older version left behind: the row carries
+// the old `odd[]` list and a field this version does not model. Nothing the
+// pipeline does may touch it.
+function seedLegacyRow(root, branch, legacyOdd) {
+  const registryLib = require('../lib/worktree-registry.js');
+  const file = registryLib.registryPath(root);
+  const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+  doc.worktrees = doc.worktrees.map((row) => (row.branch === branch
+    ? { ...row, odd: legacyOdd.slice(), note: 'kept verbatim' }
+    : row));
+  fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+  return fs.readFileSync(file, 'utf8');
+}
+
 const savedEnv = { ...process.env };
 // Isolated mode state per test: missing file means enabled. The ambient
 // user's flag must never decide a fixture's outcome; a test that wants
 // disabled mode writes it into its own dir.
 function scratchModeEnv() {
-  return { GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-mode-'))) };
+  return { GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-noassoc-mode-'))) };
 }
 function setEnv(vars) {
   const env = 'GENTLE_STATUS_STATE_DIR' in vars ? vars : { ...vars, ...scratchModeEnv() };
@@ -130,16 +160,17 @@ function restoreEnv() {
   for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
 }
 
-// Import the stubbed extension copy with the lib override in place. The
-// fake `pi` records tool/command registrations and every `pi.on`
-// subscription so tests can dispatch tool pipeline events.
-async function loadExtension() {
-  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-ext-')));
+// Import the stubbed extension copy with the lib override in place. The fake
+// `pi` records registrations, every `pi.on` subscription, and the session name
+// it is given (the ONE thing the pipeline still writes).
+async function loadExtension({ currentName = '' } = {}) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-noassoc-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
   const tools = new Map();
   const commands = new Map();
   const handlers = new Map(); // event name -> [handler]
+  const session = { name: currentName, names: [] };
   const pi = {
     registerTool: (tool) => { tools.set(tool.name, tool); },
     registerCommand: (name, def) => { commands.set(name, def); },
@@ -148,10 +179,15 @@ async function loadExtension() {
       handlers.get(event).push(handler);
       return () => {};
     },
+    getSessionName: () => session.name,
+    setSessionName: (name) => {
+      session.names.push(name);
+      session.name = name;
+    },
   };
   const factory = (await import(pathToFileURL(copy).href)).default;
   factory(pi);
-  return { tools, commands, handlers };
+  return { tools, commands, handlers, session };
 }
 
 function toolEvent(toolName, filePath) {
@@ -172,8 +208,8 @@ async function dispatch(handlers, eventName, event, ctx) {
   return returns;
 }
 
-describe('worktree odd capture', { concurrency: false }, () => {
-  // Round-3 performance: the capture runs on EVERY tool_call and tool_result.
+describe('worktree pipeline records no association', { concurrency: false }, () => {
+  // Round-3 performance: the hook runs on EVERY tool_call and tool_result.
   // Resolving the repo identity spawns two git children, so the same cwd must
   // not respawn them per event: that was ~35ms of blocked event loop per tool
   // call, and it is what made the agent and the TUI feel slow.
@@ -207,157 +243,106 @@ describe('worktree odd capture', { concurrency: false }, () => {
     }
   });
 
-  test('a read/edit/write of an odd/*.md inside a registered worktree records the FIRST document once', async () => {
-    const { root, target, branch } = makeRepoWithWorktree('capture');
+  test('no event associates a document — worktree, principal, bash or tool_result', async () => {
+    const { root, target, branch } = makeRepoWithWorktree('no-association', { docs: ['notes.md', 'unseen.md'] });
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
+      const before = seedLegacyRow(root, branch, ['odd/tasks/kept-a.md', 'odd/tasks/kept-b.md']);
       const { handlers } = await loadExtension();
-      const ctx = ctxFor(target);
+      const inWorktree = ctxFor(target);
+      const atPrincipal = ctxFor(root);
       for (const [toolName, doc] of [['read', 'notes.md'], ['edit', 'notes.md'], ['write', 'tasks/plan.md']]) {
         const full = path.join(target, 'odd', doc);
         fs.mkdirSync(path.dirname(full), { recursive: true });
         if (!fs.existsSync(full)) fs.writeFileSync(full, `# ${doc}\n`);
-        const returns = await dispatch(handlers, 'tool_call', toolEvent(toolName, full), ctx);
-        for (const value of returns) {
+        for (const value of await dispatch(handlers, 'tool_call', toolEvent(toolName, full), inWorktree)) {
           assert.equal(value, undefined, 'the handler returns nothing and never blocks the pipeline');
         }
       }
-      // S8: ONE document. The capture associates the first document it
-      // observes and never replaces it, because swapping the active document
-      // is an explicit act (the edit select) and S8b forbids losing a stored
-      // association silently.
-      assert.equal(oddOf(root, branch), 'odd/notes.md', 'the first observed document is the association');
-      // A second identical wave changes nothing.
-      await dispatch(handlers, 'tool_call', toolEvent('read', path.join(target, 'odd', 'notes.md')), ctx);
-      await dispatch(handlers, 'tool_call', toolEvent('edit', path.join(target, 'odd', 'notes.md')), ctx);
-      await dispatch(handlers, 'tool_call', toolEvent('write', path.join(target, 'odd', 'tasks/plan.md')), ctx);
-      assert.equal(oddOf(root, branch), 'odd/notes.md', 'a second document never replaces the stored one');
-    } finally {
-      restoreEnv();
-    }
-  });
+      // The re-scan complement, the opaque bash call and the result half are
+      // all part of the same pipeline and must associate nothing either.
+      await dispatch(handlers, 'tool_call', { toolName: 'bash', args: { command: 'ls odd/' } }, inWorktree);
+      await dispatch(handlers, 'tool_result', { toolName: 'read', input: { path: path.join(target, 'odd', 'notes.md') } }, inWorktree);
+      // Neither does the same event seen from the principal checkout.
+      await dispatch(handlers, 'tool_call', toolEvent('read', path.join(root, 'odd', 'notes.md')), atPrincipal);
 
-  test('a call whose context is the principal checkout records nothing', async () => {
-    const { root, target, branch } = makeRepoWithWorktree('principal');
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const { handlers } = await loadExtension();
-      // Same shared file, but the agent context is the principal checkout.
-      const returns = await dispatch(
-        handlers, 'tool_call',
-        toolEvent('read', path.join(root, 'odd', 'notes.md')),
-        ctxFor(root),
+      assert.equal(oddOf(root, branch), 'odd/tasks/kept-a.md', 'reads still resolve the legacy list to one document in memory');
+      assert.equal(
+        registryBytes(root),
+        before,
+        'not one byte of the registry changed: the pipeline wrote no association at all',
       );
-      for (const value of returns) assert.equal(value, undefined);
-      assert.equal(oddOf(root, branch), null, 'the principal checkout associates nothing');
-      assert.ok(!fs.existsSync(path.join(target, 'odd', 'notes.md')) || true);
     } finally {
       restoreEnv();
     }
   });
 
-  test('a non-.md path and a path outside odd/ record nothing', async () => {
-    // No pre-existing docs: the re-scan complement must find nothing, so
-    // only the per-call capture is exercised here.
-    const { root, target, branch } = makeRepoWithWorktree('nonmd', { docs: [] });
+  test('a write of an odd task document still names the session', async () => {
+    const { root, target, branch } = makeRepoWithWorktree('naming');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
-      const { handlers } = await loadExtension();
+      const before = registryBytes(root);
+      const { handlers, session } = await loadExtension({ currentName: '' });
       const ctx = ctxFor(target);
-      const image = path.join(target, 'odd', 'diagram.png');
-      fs.writeFileSync(image, 'fake-png\n');
-      await dispatch(handlers, 'tool_call', toolEvent('read', image), ctx);
-      const outside = path.join(target, 'src', 'app.js');
-      fs.mkdirSync(path.dirname(outside), { recursive: true });
-      fs.writeFileSync(outside, 'console.log(1)\n');
-      await dispatch(handlers, 'tool_call', toolEvent('edit', outside), ctx);
-      await dispatch(handlers, 'tool_call', toolEvent('write', outside), ctx);
-      assert.equal(oddOf(root, branch), null, 'only .md documents inside odd/ are captured');
+      const doc = path.join(target, 'odd', 'tasks', 'session-naming.md');
+      fs.mkdirSync(path.dirname(doc), { recursive: true });
+      fs.writeFileSync(doc, '# Session naming\n\nBody.\n');
+      for (const value of await dispatch(handlers, 'tool_call', toolEvent('write', doc), ctx)) {
+        assert.equal(value, undefined, 'the handler still never blocks the pipeline');
+      }
+      assert.deepEqual(session.names, ['Session naming @ feat/odd'], 'the write names the session after the document');
+      // A repeat is idempotent: the same label is never re-written.
+      await dispatch(handlers, 'tool_call', toolEvent('write', doc), ctx);
+      assert.deepEqual(session.names, ['Session naming @ feat/odd'], 'and never writes the same name twice');
+      // Naming is a session property: it records no association.
+      assert.equal(registryBytes(root), before, 'the registry row is untouched by naming');
+      assert.equal(oddOf(root, branch), null, 'the worktree still carries no document');
     } finally {
       restoreEnv();
     }
   });
 
-  test('a bash command touching odd/ is not parsed (re-scan still finds nothing new)', async () => {
-    const { root, target, branch } = makeRepoWithWorktree('bash');
+  test('a human-chosen session name is never overwritten', async () => {
+    const { target } = makeRepoWithWorktree('naming-human');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
-      const { handlers } = await loadExtension();
-      const returns = await dispatch(
-        handlers, 'tool_call',
-        { toolName: 'bash', args: { command: `cat ${path.join(target, 'odd', 'notes.md')}` } },
-        ctxFor(target),
-      );
-      for (const value of returns) assert.equal(value, undefined);
-      // The re-scan complements the hook: the pre-existing notes.md the
-      // registry never saw is recorded even though the bash argv is opaque.
-      assert.equal(oddOf(root, branch), 'odd/notes.md');
+      const { handlers, session } = await loadExtension({ currentName: 'my own name' });
+      const doc = path.join(target, 'odd', 'tasks', 'other.md');
+      fs.mkdirSync(path.dirname(doc), { recursive: true });
+      fs.writeFileSync(doc, '# Other\n');
+      await dispatch(handlers, 'tool_call', toolEvent('write', doc), ctxFor(target));
+      assert.deepEqual(session.names, [], 'a human name is left alone');
     } finally {
       restoreEnv();
     }
   });
 
-  test('a worktree whose registry cannot be written neither throws nor breaks the pipeline', async () => {
-    const { root, target, branch } = makeRepoWithWorktree('readonly');
-    const registryLib = require('../lib/worktree-registry.js');
-    const commonDir = path.resolve(root, spawnSync('git', ['rev-parse', '--git-common-dir'], { cwd: root, encoding: 'utf8' }).stdout.trim());
+  test('the handler never throws nor leaves a write behind when the registry is unwritable', async () => {
+    const { root, target, branch } = makeRepoWithWorktree('unwritable');
+    const commonDir = path.resolve(root, git(root, ['rev-parse', '--git-common-dir']));
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    const before = registryBytes(root);
     fs.chmodSync(commonDir, 0o555);
     try {
       const { handlers } = await loadExtension();
-      let returns;
       let threw = null;
+      let returns = null;
       try {
-        returns = await dispatch(
-          handlers, 'tool_call',
-          toolEvent('read', path.join(target, 'odd', 'notes.md')),
-          ctxFor(target),
-        );
+        returns = await dispatch(handlers, 'tool_call', toolEvent('read', path.join(target, 'odd', 'notes.md')), ctxFor(target));
       } catch (err) {
         threw = err;
       }
       assert.equal(threw, null, 'the handler never throws');
-      assert.ok(returns, 'expected dispatch returns');
       for (const value of returns) assert.equal(value, undefined, 'the pipeline is never blocked');
-      assert.equal(oddOf(root, branch), null, 'a failed write leaves stored data unchanged');
+      assert.equal(oddOf(root, branch), null, 'stored data is unchanged');
+      assert.equal(
+        fs.existsSync(path.join(commonDir, 'pi-worktrees.lock')),
+        false,
+        'no registry write was even attempted: no lock file is left behind',
+      );
     } finally {
       fs.chmodSync(commonDir, 0o755);
-      restoreEnv();
-    }
-  });
-
-  test('the re-scan records ONE document when nothing is associated yet, and never a second', async () => {
-    const { root, target, branch } = makeRepoWithWorktree('rescan', { docs: ['observed.md', 'unseen.md'] });
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const { handlers } = await loadExtension();
-      await dispatch(
-        handlers, 'tool_call',
-        toolEvent('read', path.join(target, 'odd', 'observed.md')),
-        ctxFor(target),
-      );
-      assert.equal(
-        oddOf(root, branch),
-        'odd/observed.md',
-        'the bounded re-scan complements the per-call capture without adding a second document',
-      );
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('tool_result events capture the same way without duplicating', async () => {
-    const { root, target, branch } = makeRepoWithWorktree('result');
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
-    try {
-      const { handlers } = await loadExtension();
-      const ctx = ctxFor(target);
-      const full = path.join(target, 'odd', 'notes.md');
-      await dispatch(handlers, 'tool_result', { toolName: 'read', input: { path: full } }, ctx);
-      assert.equal(oddOf(root, branch), 'odd/notes.md');
-      await dispatch(handlers, 'tool_result', { toolName: 'read', input: { path: full } }, ctx);
-      assert.equal(oddOf(root, branch), 'odd/notes.md', 'repeat results add nothing');
-    } finally {
+      assert.equal(registryBytes(root), before, 'and the file is exactly as it was');
       restoreEnv();
     }
   });

@@ -88,7 +88,12 @@ function makeRepo(tag) {
   fs.writeFileSync(path.join(dir, 'README.md'), 'hello\n');
   git(dir, ['add', 'README.md']);
   git(dir, ['commit', '-m', 'init']);
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 // Stub `gh` mirroring the create-test fixture style (unused by the list /
@@ -240,19 +245,19 @@ function resultText(result) {
 }
 
 // S12/T8 model-facing text: the listing is one header row plus one ` · `-joined
-// row per checkout; a successful close is ordered label rows. The exact cell
-// contract is pinned by tools/worktree-model-result.test.js; these suites pin
-// which rows exist, in which order, with which identity and warnings.
+// row per checkout; a successful close is ordered label rows. S1 removed issue
+// and ODD associations from every worktree surface, so a row is the checkout's
+// identity and nothing else. The exact cell contract is pinned by
+// tools/worktree-model-result.test.js; these suites pin which rows exist, in
+// which order, with which identity and warnings.
 function listHeader(count) {
-  return `worktrees: ${count} (name · branch · path · kind · status · associations)`;
+  return `worktrees: ${count} (name · branch · path · kind · status)`;
 }
 
-function listRow({ name, branch, path: target, kind, status, issues = [], odd = null }) {
-  const cells = [name, branch, target, kind, status];
-  cells.push(`issues ${issues.length > 0 ? issues.map((number) => `#${number}`).join(', ') : '-'}`);
-  if (odd === null) cells.push('odd -');
-  else if (odd.length > 0) cells.push(`odd ${odd}`);
-  return cells.join(' · ');
+// S1: a listing row is the checkout's identity alone — issue numbers and ODD
+// documents are not part of a worktree and never render.
+function listRow({ name, branch, path: target, kind, status }) {
+  return [name, branch, target, kind, status].join(' · ');
 }
 
 function removedRows({ name, branch, path: target }) {
@@ -413,7 +418,7 @@ describe('worktree_list registration', { concurrency: false }, () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
-      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_upsert', 'worktree_warp']);
+      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp']);
       const listParams = tools.get('worktree_list').parameters;
       assert.deepEqual(Object.keys(listParams.properties), ['all']);
       assert.equal(listParams.properties.all.type, 'boolean');
@@ -784,7 +789,7 @@ describe('worktree_close', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
-      const created = await tools.get('worktree_upsert').execute(
+      const created = await tools.get('worktree_create').execute(
         'call-1', { branch: 'feat/clean-close', issues: [35] }, undefined, undefined, ctx,
       );
       assert.equal(created.isError, undefined, `setup create failed: ${resultText(created)}`);
@@ -2208,83 +2213,93 @@ describe('close pending-changes summary (S61)', { concurrency: false }, () => {
   });
 });
 
-describe('S8b/S12: the close keeps its dropped-association warning (T8)', { concurrency: false }, () => {
-  // The close wrote the "registry kept the first and dropped: …" sentence
-  // into its success LINES and then lost it from `details`, so the
-  // model-facing half and the card (both built from details) never saw it.
-  // The summary warning and the structured `droppedOdd` list now travel in
-  // details BEFORE any presentation runs.
-  test('the dropped document reaches details and the model text', async () => {
-    const root = makeRepo('close-dropped-odd');
+describe('S1: the close publishes no association and destroys none', { concurrency: false }, () => {
+  // S1 removed the issue/ODD association from every worktree surface. The
+  // close used to print "a worktree carries ONE odd document, so the registry
+  // kept the first and dropped: …" for a legacy row the write normalized on
+  // its way through, and to carry the same sentence in details.warnings plus
+  // the discarded names in details.droppedOdd. The registry now writes every
+  // row it does not address back byte for byte, so there is no loss to
+  // report — and no association content may reach the text, the warnings or
+  // the details either.
+  function registryFile(root) {
+    return require('../lib/worktree-registry.js').registryPath(root);
+  }
+
+  // Hand-write a legacy registry: the row being closed carries the old
+  // `odd[]` list, and so does a second row the close never addresses.
+  function writeLegacyRows(root, target, { neighbourOdd = ['odd/tasks/other-a.md', 'odd/tasks/other-b.md'] } = {}) {
+    const doc = JSON.parse(fs.readFileSync(registryFile(root), 'utf8'));
+    doc.worktrees = doc.worktrees.map((row) => (row.path === target
+      ? { ...row, odd: ['odd/kept.md', 'odd/dropped.md'] }
+      : row));
+    doc.worktrees.push({
+      branch: 'feat/neighbour',
+      path: path.join(path.dirname(target), 'neighbour-legacy'),
+      thread: 'thread-neighbour',
+      issues: [7],
+      odd: neighbourOdd.slice(),
+      note: 'kept verbatim',
+    });
+    fs.writeFileSync(registryFile(root), `${JSON.stringify(doc, null, 2)}\n`);
+    return doc.worktrees[doc.worktrees.length - 1];
+  }
+
+  test('no ODD document, warning or droppedOdd reaches the text or details', async () => {
+    const root = makeRepo('close-no-association');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
     const modeEnv = scratchModeEnv();
     setEnv(stdEnv({ herdr, gh, modeEnv }));
     try {
       const target = addRegistered(root, 'feat/legacy', { thread: 'thread-1', issues: [35] });
-      // A row written by an older version still carries the `odd[]` list the
-      // registry migrates on its next write.
-      const registryLib = require('../lib/worktree-registry.js');
-      const file = registryLib.registryPath(root);
-      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-      doc.worktrees = doc.worktrees.map((row) => (row.path === target
-        ? { ...row, odd: ['odd/kept.md', 'odd/dropped.md'] }
-        : row));
-      fs.writeFileSync(file, JSON.stringify(doc, null, 2));
+      writeLegacyRows(root, target);
 
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { branch: 'feat/legacy' }, ctx);
-      const warning = 'a worktree carries ONE odd document, so the registry kept the first and dropped: "odd/dropped.md"';
       assert.equal(result.isError, undefined, resultText(result));
-      assert.deepEqual(result.details.droppedOdd, ['odd/dropped.md'], 'the discarded document is structured metadata');
-      assert.deepEqual(result.details.warnings, [warning], 'the summary warning travels in details');
       assert.deepEqual(resultText(result).split('\n'), [
         'outcome: removed',
         'name: feat-legacy',
         'branch: feat/legacy',
         `path: ${target}`,
         'branch state: kept',
-        `warning: ${warning}`,
-      ], 'the model text keeps the warning the close used to lose');
+      ], 'the close text names the outcome and the checkout, nothing else');
+      assert.deepEqual(result.details, {
+        path: target,
+        branch: 'feat/legacy',
+        removed: true,
+        branchKept: true,
+        thread: 'thread-1',
+      }, 'the details carry the close contract, with no warnings or droppedOdd');
+      assert.doesNotMatch(resultText(result), /odd\/|droppedOdd|ONE odd document/i, 'no association content reaches the agent text');
       assert.equal(fs.existsSync(target), false, 'the checkout is still removed');
       assert.equal(branchExists(root, 'feat/legacy'), true, 'the branch is still kept');
-      assert.equal(registryLib.findByBranch(root, 'feat/legacy'), null, 'the entry is still dropped');
+      assert.equal(require('../lib/worktree-registry.js').findByBranch(root, 'feat/legacy'), null, 'the entry is still dropped');
     } finally {
       restoreEnv();
     }
   });
 
-  test('the warning metadata is additive: every pre-existing close field is unchanged', async () => {
-    const root = makeRepo('close-dropped-additive');
+  test('a row the close never addresses keeps its stored documents byte for byte', async () => {
+    const root = makeRepo('close-neighbour-legacy');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
     const modeEnv = scratchModeEnv();
     setEnv(stdEnv({ herdr, gh, modeEnv }));
     try {
-      const target = addRegistered(root, 'feat/additive', { thread: 'thread-1', issues: [35] });
-      const registryLib = require('../lib/worktree-registry.js');
-      const file = registryLib.registryPath(root);
-      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-      doc.worktrees = doc.worktrees.map((row) => (row.path === target
-        ? { ...row, odd: ['odd/kept.md', 'odd/dropped.md'] }
-        : row));
-      fs.writeFileSync(file, JSON.stringify(doc, null, 2));
-
+      const target = addRegistered(root, 'feat/closes', { thread: 'thread-2' });
+      const neighbour = writeLegacyRows(root, target);
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
-      const result = await callClose(tools, { branch: 'feat/additive' }, ctx);
+      const result = await callClose(tools, { branch: 'feat/closes' }, ctx);
       assert.equal(result.isError, undefined, resultText(result));
-      assert.deepEqual(result.details, {
-        path: target,
-        branch: 'feat/additive',
-        removed: true,
-        branchKept: true,
-        thread: 'thread-1',
-        warnings: ['a worktree carries ONE odd document, so the registry kept the first and dropped: "odd/dropped.md"'],
-        droppedOdd: ['odd/dropped.md'],
-      }, 'the S8b metadata is added beside the untouched close contract');
-      assert.equal(fs.existsSync(target), false, 'the checkout is still removed');
+      const stored = JSON.parse(fs.readFileSync(registryFile(root), 'utf8')).worktrees
+        .find((row) => row.branch === neighbour.branch);
+      assert.deepEqual(stored, neighbour, 'every field of the untouched row survives');
+      assert.equal(JSON.stringify(stored), JSON.stringify(neighbour), 'byte for byte, key order included');
+      assert.doesNotMatch(JSON.stringify(result.details), /other-a\.md|other-b\.md|droppedOdd/, 'and nothing of it is published');
     } finally {
       restoreEnv();
     }

@@ -113,6 +113,133 @@ describe('wrapLabel (S3, S17)', () => {
   });
 });
 
+describe('paneWidths reading share (S3)', () => {
+  test('the issues and ODD readers take the smaller 30% share', () => {
+    for (const width of [80, 120, 200]) {
+      const inner = layout.innerWidth(width);
+      const { left, right, divider } = layout.paneWidths(inner, { listShare: layout.READER_LIST_SHARE });
+      assert.ok(Math.abs(left / (left + right) - 0.3) < 0.02, `${width}: the list takes 30% (${left}/${right})`);
+      assert.ok(Math.abs(right / (left + right) - 0.7) < 0.02, `${width}: the preview takes 70% (${left}/${right})`);
+      assert.equal(left + right + divider, inner, `${width}: the two panes and the divider fill the inner width`);
+    }
+  });
+
+  test('the reader share is smaller than the default the worktree detail keeps', () => {
+    assert.equal(layout.READER_LIST_SHARE, 0.3);
+    const inner = layout.innerWidth(120);
+    const reader = layout.paneWidths(inner, { listShare: layout.READER_LIST_SHARE });
+    const detail = layout.paneWidths(inner);
+    assert.ok(reader.left < detail.left, `the reader list is narrower: ${reader.left} < ${detail.left}`);
+    assert.ok(reader.right > detail.right, `the reader preview is wider: ${reader.right} > ${detail.right}`);
+  });
+
+  test('a narrow reader keeps both panes usable', () => {
+    for (const width of [40, 50, 60]) {
+      const inner = layout.innerWidth(width);
+      const { left, right } = layout.paneWidths(inner, { listShare: layout.READER_LIST_SHARE });
+      assert.ok(left >= 8, `${width}: the list keeps a floor, got ${left}`);
+      assert.ok(right >= 24 || width < 60, `${width}: the reading pane keeps the room it has, got ${right}`);
+      assert.equal(left + right + 3, inner, `${width}: the panes fill the inner width`);
+    }
+  });
+});
+
+describe('scrollWindow (S3)', () => {
+  const ones = (count) => Array.from({ length: count }, () => 1);
+
+  test('a list shorter than the body renders in one window from the top', () => {
+    assert.deepEqual(
+      layout.scrollWindow(ones(3), { budget: 10, index: 0, start: 0 }),
+      { start: 0, end: 3, rows: 3, above: false, below: false },
+    );
+  });
+
+  test('the window keeps the focused row visible when the selection moves past its bottom', () => {
+    const win = layout.scrollWindow(ones(30), { budget: 10, index: 15, start: 0 });
+    assert.ok(win.start <= 15 && 15 < win.end, `the focused row is painted: ${JSON.stringify(win)}`);
+    assert.equal(win.rows, 10, 'the window stays full');
+    assert.equal(win.start, 6, 'the focused row sits at the bottom of a full window');
+    assert.equal(win.above, true);
+    assert.equal(win.below, true);
+  });
+
+  test('a selection above the window pulls the window back up to it', () => {
+    const win = layout.scrollWindow(ones(30), { budget: 10, index: 2, start: 20 });
+    assert.equal(win.start, 2);
+    assert.ok(win.start <= 2 && 2 < win.end);
+  });
+
+  test('wrapped rows spend the real budget, so fewer tall rows fit', () => {
+    const win = layout.scrollWindow([3, 3, 3, 3, 3], { budget: 7, index: 0, start: 0 });
+    assert.deepEqual([win.start, win.end, win.rows], [0, 2, 6], 'two three-row titles fill a seven-row body');
+  });
+
+  test('a window never leaves blank rows while items remain above it', () => {
+    const win = layout.scrollWindow(ones(30), { budget: 10, index: 29, start: 25 });
+    assert.equal(win.end, 30, 'the last item is painted');
+    assert.equal(win.rows, 10, 'the window is full');
+    assert.equal(win.start, 20, 'the window slides back to fill the body');
+    assert.equal(win.above, true);
+    assert.equal(win.below, false);
+  });
+
+  test('an item taller than the whole budget still gets its own window', () => {
+    const win = layout.scrollWindow([1, 20, 1], { budget: 5, index: 1, start: 0 });
+    assert.deepEqual([win.start, win.end], [1, 2]);
+  });
+
+  test('an empty list has one empty window', () => {
+    assert.deepEqual(
+      layout.scrollWindow([], { budget: 8, index: 0, start: 0 }),
+      { start: 0, end: 0, rows: 0, above: false, below: false },
+    );
+  });
+
+  test('walking the selection one row at a time never skips or repeats a row', () => {
+    const costs = [2, 1, 3, 1, 1, 2, 1, 1, 1, 4, 1];
+    let start = 0;
+    const focusedWindow = [];
+    for (let index = 0; index < costs.length; index += 1) {
+      const win = layout.scrollWindow(costs, { budget: 6, index, start });
+      assert.ok(index >= win.start && index < win.end, `index ${index} is painted: ${JSON.stringify(win)}`);
+      start = win.start;
+      focusedWindow.push(win.start);
+    }
+    assert.deepEqual(focusedWindow, [...focusedWindow].sort((a, b) => a - b), 'the window never jumps backwards');
+    const last = layout.scrollWindow(costs, { budget: 6, index: costs.length - 1, start });
+    assert.equal(last.end, costs.length, 'the walk ends with the last row painted');
+  });
+});
+
+describe('shiftWindow (S3)', () => {
+  const ones = (count) => Array.from({ length: count }, () => 1);
+
+  test('one screenful forward starts at the row after the last visible one', () => {
+    assert.equal(layout.shiftWindow(ones(30), { budget: 10, start: 0, step: 1 }), 10);
+  });
+
+  test('one screenful back returns to the previous window start', () => {
+    assert.equal(layout.shiftWindow(ones(30), { budget: 10, start: 10, step: -1 }), 0);
+  });
+
+  test('a forward scroll stops at the last full window instead of half-empty rows', () => {
+    assert.equal(layout.shiftWindow(ones(25), { budget: 10, start: 20, step: 1 }), 15);
+  });
+
+  test('scrolling back from the top stays at the top', () => {
+    assert.equal(layout.shiftWindow(ones(25), { budget: 10, start: 0, step: -1 }), 0);
+  });
+
+  test('wrapped rows move the window by whole screens, never a fixed row count', () => {
+    const costs = Array.from({ length: 20 }, () => 3);
+    assert.equal(layout.shiftWindow(costs, { budget: 7, start: 0, step: 1 }), 2);
+  });
+
+  test('an empty list has one window', () => {
+    assert.equal(layout.shiftWindow([], { budget: 10, start: 0, step: 1 }), 0);
+  });
+});
+
 describe('paginate (S5, D3)', () => {
   test('page count follows the body budget, not a fixed item count', () => {
     const rows = Array.from({ length: 20 }, () => 1);

@@ -24,7 +24,7 @@ const {
   safeText,
 } = require('../lib/worktree-card.js');
 
-const TOOLS = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+const TOOLS = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 const WIDTHS = [30, 60, 100];
 
 // Identity theme: adds no ANSI of its own, so any escape left in a line is
@@ -71,7 +71,7 @@ function assertFrame(lines) {
 
 function callFor(tool) {
   switch (tool) {
-    case 'worktree_upsert': return { branch: 'feat/cards', issues: [12] };
+    case 'worktree_create': return { branch: 'feat/cards' };
     case 'worktree_list': return { all: true };
     case 'worktree_close': return { name: 'feat-cards' };
     case 'worktree_session_open': return { worktree: 'feat-cards' };
@@ -82,10 +82,10 @@ function callFor(tool) {
 
 function resultFor(tool) {
   switch (tool) {
-    case 'worktree_upsert':
+    case 'worktree_create':
       return {
-        content: [{ type: 'text', text: 'worktree create: /repo/../feat-cards' }],
-        details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [12], created: true, warnings: [] },
+        content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards\npath: /repo/../feat-cards\ncodegraph: initialized' }],
+        details: { path: '/repo/../feat-cards', branch: 'feat/cards', registered: 'new', codegraph: { status: 'done', detail: '' }, warnings: [] },
       };
     case 'worktree_list':
       return {
@@ -160,7 +160,7 @@ describe('renderCall geometry', () => {
   }
 
   test('narrow widths truncate, zero width renders nothing', () => {
-    const card = createWorktreeCardRenderer('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
     const narrow = renderLines(
       card.renderCall({ branch: 'feat/a-very-long-branch-name-that-keeps-going', issues: [1] }, THEME, {}),
       10,
@@ -171,7 +171,7 @@ describe('renderCall geometry', () => {
   });
 
   test('ANSI in args is stripped: no raw escape leaks with an identity theme', () => {
-    const card = createWorktreeCardRenderer('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
     const lines = renderLines(
       card.renderCall({ branch: '\x1b[31mfeat/evil\x1b[0m', issues: [1] }, THEME, {}),
       60,
@@ -259,8 +259,8 @@ describe('renderResult geometry and states', () => {
   });
 
   test('warnings travel in the expanded body', () => {
-    const card = createWorktreeCardRenderer('worktree_upsert');
-    const result = resultFor('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
+    const result = resultFor('worktree_create');
     result.details.warnings = ['pruned 1 stale worktree record(s)'];
     const expanded = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 100);
     assert.ok(expanded.join('\n').includes('pruned 1 stale'), 'warning survives expansion');
@@ -281,7 +281,7 @@ describe('renderResult geometry and states', () => {
 
 describe('semantic summaries', () => {
   test('create names the branch', () => {
-    assert.ok(summarizeWorktreeResult('worktree_upsert', resultFor('worktree_upsert')).includes('feat/cards'));
+    assert.ok(summarizeWorktreeResult('worktree_create', resultFor('worktree_create')).includes('feat/cards'));
   });
 
   test('list reports the checkout count', () => {
@@ -309,7 +309,7 @@ describe('semantic summaries', () => {
   });
 
   test('error results summarize as errors without hiding the message', () => {
-    const summary = summarizeWorktreeResult('worktree_upsert', {
+    const summary = summarizeWorktreeResult('worktree_create', {
       content: [{ type: 'text', text: 'invalid branch name "a..b": bad pattern' }],
       details: { branch: 'a..b' },
       isError: true,
@@ -329,18 +329,18 @@ describe('call/result pair coherence', () => {
   // the call drops to the top rule and the result body closes the frame.
   // Two independent full cards stacked is the defect this pins.
   test('call drops its closing rule once the shared row state carries a result', () => {
-    const card = createWorktreeCardRenderer('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
     const state = {};
     const callArgs = { branch: 'feat/cards', issues: [12] };
     const theme = { bold: (s) => s, fg: (_c, s) => s };
     const lone = card.renderCall(callArgs, theme, { state }).render(60);
     assert.ok(lone.some((line) => line.includes('─')), 'awaiting call closes its own frame');
     const loneRows = lone.length;
-    card.renderResult(resultFor('worktree_upsert'), { expanded: false }, theme, { state });
+    card.renderResult(resultFor('worktree_create'), { expanded: false }, theme, { state });
     const paired = card.renderCall(callArgs, theme, { state }).render(60);
     assert.ok(paired.length < loneRows, 'paired call drops to the top rule');
     assert.ok(!paired.some((line) => line.includes('─')), 'paired call leaves the closing rule to the result');
-    const body = card.renderResult(resultFor('worktree_upsert'), { expanded: false }, theme, { state }).render(60);
+    const body = card.renderResult(resultFor('worktree_create'), { expanded: false }, theme, { state }).render(60);
     assert.ok(body.some((line) => line.includes('─')), 'the result closes the shared frame');
   });
 
@@ -409,7 +409,7 @@ describe('extension wiring', () => {
     }
   }
 
-  const WIRED = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+  const WIRED = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 
   test('all five tools expose renderShell self with renderCall/renderResult hooks', async () => {
     const { tools } = await loadWiredExtension();
@@ -428,7 +428,7 @@ describe('extension wiring', () => {
     const { tools } = await loadWiredExtension();
     const theme = { bold: (s) => s, fg: (_c, s) => s };
     const argsFor = {
-      worktree_upsert: { branch: 'feat/cards', issues: [12] },
+      worktree_create: { branch: 'feat/cards' },
       worktree_list: { all: true },
       worktree_close: { name: 'feat-cards' },
       worktree_session_open: { worktree: 'feat-cards' },
@@ -474,7 +474,7 @@ describe('extension wiring', () => {
     });
     try {
       const theme = { bold: (s) => s, fg: (_c, s) => s };
-      const tool = tools.get('worktree_upsert');
+      const tool = tools.get('worktree_create');
       const lines = tool.renderCall({ branch: 'feat/👍👍', issues: [1] }, theme, {}).render(30);
       assert.ok(measured > 0, 'the hook measures through the injected helpers');
       for (const line of lines) {
@@ -516,7 +516,7 @@ describe('outputPad contract', () => {
   const theme = { bold: (s) => s, fg: (_c, s) => s };
 
   test('nonzero outputPad pads both sides and keeps content inside width-2', () => {
-    for (const tool of ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open']) {
+    for (const tool of ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open']) {
       const card = createWorktreeCardRenderer(tool);
       const ctx = { outputPad: 1, state: {} };
       for (const width of [30, 60]) {
@@ -549,7 +549,7 @@ describe('outputPad contract', () => {
 
   for (const width of [0, 1, 2, 3]) {
     test(`width ${width} never exceeds the viewport`, () => {
-      const card = createWorktreeCardRenderer('worktree_upsert');
+      const card = createWorktreeCardRenderer('worktree_create');
       const theme = { bold: (s) => s, fg: (_c, s) => s };
       const sets = [
         card.renderCall({ branch: 'feat/cards' }, theme, {}).render(width),
@@ -583,7 +583,7 @@ describe('outputPad contract', () => {
     if (!real || typeof real.visibleWidth !== 'function' || typeof real.truncateToWidth !== 'function') {
       return;
     }
-    const card = createWorktreeCardRenderer('worktree_upsert', {
+    const card = createWorktreeCardRenderer('worktree_create', {
       visibleWidth: real.visibleWidth,
       truncateToWidth: (text, width, ellipsis) => real.truncateToWidth(text, width, ellipsis),
     });
@@ -635,12 +635,12 @@ describe('lifecycle coherence', () => {
   }
 
   test('call → result → call re-render forms one frame with no stale running line', () => {
-    const card = createWorktreeCardRenderer('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
     const state = {};
-    const args = { branch: 'feat/cards', issues: [12] };
+    const args = { branch: 'feat/cards' };
     const ok = {
-      content: [{ type: 'text', text: 'worktree create: /r/feat-cards' }],
-      details: { path: '/r/feat-cards', branch: 'feat/cards', issues: [12], created: true },
+      content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards\npath: /r/feat-cards\ncodegraph: initialized' }],
+      details: { path: '/r/feat-cards', branch: 'feat/cards', codegraph: { status: 'done', detail: '' } },
     };
     const runningCall = card.renderCall(args, theme, hostCtx(state)).render(60);
     assert.ok(runningCall.length > 0, 'running call draws');
@@ -658,7 +658,7 @@ describe('lifecycle coherence', () => {
     assert.strictEqual(closers(pairedCall), 0, 'paired call leaves the closing rule to the result');
     const combined = [...pairedCall, ...body].map(stripAnsi).join('\n');
     assert.strictEqual(closers([...pairedCall, ...body]), 1, 'one frame, one closing rule across the pair');
-    assert.ok(combined.includes('worktree upsert'), 'header survives on the call side');
+    assert.ok(combined.includes('worktree create'), 'header survives on the call side');
     assert.ok(combined.includes('feat/cards'), 'summary survives on the result side');
   });
 });
@@ -722,7 +722,7 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
 
   test('collapsed bodies are ordered short lines per tool', () => {
     const cases = [
-      ['worktree_upsert', ['created: feat-cards · feat/cards']],
+      ['worktree_create', ['status: created']],
       ['worktree_list', ['listed: 1 checkout']],
       ['worktree_close', ['removed: feat-cards · feat/cards', 'branch kept']],
       ['worktree_session_open', ['opened: feat-cards · abc123']],
@@ -811,7 +811,7 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
   });
 
   test('result rows strip ANSI smuggled through branch names and paths', () => {
-    const card = createWorktreeCardRenderer('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
     const evil = {
       content: [{ type: 'text', text: 'worktree create: /repo/x' }],
       details: { path: '/repo/\x1b[31mx', branch: 'feat/\x1b[31mevil', issues: [] },
@@ -830,7 +830,7 @@ describe('S19: bounded compact per tool plus card parity', () => {
 
   function freshResult(tool) {
     switch (tool) {
-      case 'worktree_upsert':
+      case 'worktree_create':
         return {
           content: [{ type: 'text', text: 'created: feat-cards · feat/cards\npath: /repo/../feat-cards\nissues: 12' }],
           details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [12], created: true },
@@ -852,7 +852,7 @@ describe('S19: bounded compact per tool plus card parity', () => {
 
   test('collapsed bodies are the ordered short lines of the new contract', () => {
     const cases = [
-      ['worktree_upsert', ['created: feat-cards · feat/cards']],
+      ['worktree_create', ['status: created']],
       ['worktree_close', ['removed: feat-cards · feat/cards', 'branch kept']],
       ['worktree_session_open', ['opened: feat-cards · abc123']],
     ];
@@ -874,14 +874,14 @@ describe('S19: bounded compact per tool plus card parity', () => {
   });
 
   test('already-exists create, deleted branch, and resume keep the same ordered shape', () => {
-    const createCard = createWorktreeCardRenderer('worktree_upsert');
+    const createCard = createWorktreeCardRenderer('worktree_create');
     const owned = {
       content: [{ type: 'text', text: 'created: feat-cards · feat/cards · already exists\npath: /repo/../feat-cards' }],
-      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: false },
+      details: { path: '/repo/../feat-cards', branch: 'feat/cards', alreadyExists: true },
     };
     assert.deepStrictEqual(
       bodyRows(renderLines(createCard.renderResult(owned, { expanded: false }, THEME, {}), 60)),
-      ['created: feat-cards · feat/cards · already exists'],
+      ['status: already existed'],
     );
     const closeCard = createWorktreeCardRenderer('worktree_close');
     const dropped = {
@@ -1436,15 +1436,12 @@ describe('S24 float card recipe (T17 RED)', () => {
   });
 });
 
-describe('S2/S6: the listing separates the assigned association from the available inventory', () => {
-  // S25 asked for each listed entry's odd documents; the corrected contract
-  // (S2/S6/T8) is that the registry stores ONE associated document per
-  // checkout and that the checkout's `odd/` inventory is a different fact.
-  // The expanded card therefore never labels an inventory document as the
-  // association and never promotes the first one: `odd:` carries the
-  // assignment the details name (or `-` when the entry is known to have
-  // none), and the inventory is exposed under its own label. The collapsed
-  // card carries neither (S12: compact precision).
+describe('S1: the listing shows no issue or ODD association', () => {
+  // S1 removed issue and ODD associations from every worktree surface: a
+  // worktree carries neither, so the listing card never renders an issue
+  // number, an assigned ODD document or the checkout's `odd/` inventory. The
+  // registry still stores those legacy fields, and the details handed to the
+  // renderer may still carry them — they are data preservation, not display.
   function bodyRows(lines) {
     return lines.map((line) => stripAnsi(line).replace(/^\s*\u258E\s?/, '').replace(/\s+$/, ''))
       .filter((row) => !row.includes('\u2500'));
@@ -1457,13 +1454,13 @@ describe('S2/S6: the listing separates the assigned association from the availab
     };
   }
 
-  test('expanded list prints the assigned document, never the inventory order', () => {
+  test('expanded list prints identity rows only, with no association rows at all', () => {
     const card = createWorktreeCardRenderer('worktree_list');
     const result = listResult([
-      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', assignedOdd: 'odd/x.md', odd: ['odd/x-extra.md', 'odd/x.md'] },
-      { name: 'b-y', path: '/repo/b-y', branch: 'feat/y', assignedOdd: null, odd: ['odd/y-held.md'] },
-      { name: 'c-z', path: '/repo/c-z', branch: 'feat/z', assignedOdd: 'odd/assigned.md', odd: ['odd/assigned.md', 'odd/z-two.md'] },
-      { name: 'principal', path: '/repo', branch: 'main', assignedOdd: null, odd: [] },
+      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', issues: [12, 13], assignedOdd: 'odd/x.md', odd: ['odd/x-extra.md', 'odd/x.md'] },
+      { name: 'b-y', path: '/repo/b-y', branch: 'feat/y', issues: [], assignedOdd: null, odd: ['odd/y-held.md'] },
+      { name: 'c-z', path: '/repo/c-z', branch: 'feat/z', issues: [], assignedOdd: 'odd/assigned.md', odd: ['odd/assigned.md', 'odd/z-two.md'] },
+      { name: 'principal', path: '/repo', branch: 'main', issues: [], assignedOdd: null, odd: [] },
     ], 4);
     for (const width of [60, 100]) {
       const rows = bodyRows(renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width));
@@ -1471,46 +1468,35 @@ describe('S2/S6: the listing separates the assigned association from the availab
         'checkouts: 4',
         'a-x \u00B7 feat/x',
         'path: /repo/a-x',
-        'issues: -',
-        'odd: x',
-        'available odd: x-extra, x',
         'b-y \u00B7 feat/y',
         'path: /repo/b-y',
-        'issues: -',
-        'odd: -',
-        'available odd: y-held',
         'c-z \u00B7 feat/z',
         'path: /repo/c-z',
-        'issues: -',
-        'odd: assigned',
-        'available odd: assigned, z-two',
         'principal \u00B7 main',
         'path: /repo',
-        'issues: -',
-        'odd: -',
-      ], `expanded association rows at ${width}`);
+      ], `expanded listing rows at ${width}`);
     }
     const rows = bodyRows(renderLines(card.renderResult(result, { expanded: true }, THEME, {}), 60));
-    for (const doc of ['x-extra', 'y-held', 'z-two']) {
-      assert.ok(!rows.includes(`odd: ${doc}`), `an inventory document is never labelled as the association: ${doc}`);
+    for (const label of ['issues:', 'odd:', 'available odd:']) {
+      assert.ok(!rows.some((row) => row.startsWith(label)), `no ${label} row: ${JSON.stringify(rows)}`);
     }
+    assert.ok(!rows.some((row) => /#\d|\.md\b/.test(row)), 'no issue number or ODD document leaks: ' + JSON.stringify(rows));
   });
 
-  test('an entry the details do not describe prints no association row at all', () => {
+  test('legacy association fields change nothing about the rendered rows', () => {
     const card = createWorktreeCardRenderer('worktree_list');
-    const rows = bodyRows(renderLines(card.renderResult(listResult([
-      { name: 'd-w', path: '/repo/d-w', branch: 'feat/w', odd: ['odd/w.md'] },
-    ], 1), { expanded: true }, THEME, {}), 60));
-    assert.deepStrictEqual(rows, [
-      'checkouts: 1',
-      'd-w \u00B7 feat/w',
-      'path: /repo/d-w',
-      'issues: -',
-      'available odd: w',
-    ], 'unknown association is omitted, never asserted absent or guessed from the inventory');
+    const withLegacy = listResult([
+      { name: 'd-w', path: '/repo/d-w', branch: 'feat/w', issues: [7], assignedOdd: 'odd/w.md', odd: ['odd/w.md'] },
+    ], 1);
+    const stripped = listResult([{ name: 'd-w', path: '/repo/d-w', branch: 'feat/w' }], 1);
+    assert.deepStrictEqual(
+      bodyRows(renderLines(card.renderResult(withLegacy, { expanded: true }, THEME, {}), 60)),
+      bodyRows(renderLines(card.renderResult(stripped, { expanded: true }, THEME, {}), 60)),
+      'display ignores the preserved legacy association data',
+    );
   });
 
-  test('the collapsed list carries no odd rows, and escapes stay stripped', () => {
+  test('the collapsed list stays the action and the count, and escapes stay stripped', () => {
     const card = createWorktreeCardRenderer('worktree_list');
     const clean = listResult([
       { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', assignedOdd: 'odd/x.md', odd: ['odd/x.md'] },
@@ -1518,17 +1504,16 @@ describe('S2/S6: the listing separates the assigned association from the availab
     assert.deepStrictEqual(
       bodyRows(renderLines(card.renderResult(clean, { expanded: false }, THEME, {}), 60)),
       ['listed: 1 checkout'],
-      'S12: the collapsed card says what happened, not which odd docs exist',
+      'S12: the collapsed card says what happened, not which associations exist',
     );
     const evil = listResult([
-      { name: 'a-x', path: '/repo/a-x', branch: 'feat/x', assignedOdd: '\x1b[31modd/evil.md\x1b[0m', odd: [] },
+      { name: '\x1b[31ma-x\x1b[0m', path: '/repo/a-x', branch: 'feat/x', assignedOdd: '\x1b[31modd/evil.md\x1b[0m', odd: [] },
     ], 1);
     const lines = renderLines(card.renderResult(evil, { expanded: true }, THEME, {}), 60);
     for (const line of lines) assert.ok(!line.includes('\x1b'), 'escape leaked: ' + JSON.stringify(line));
-    assert.ok(
-      bodyRows(lines).includes('odd: evil'),
-      'the cleaned doc still shows: ' + JSON.stringify(bodyRows(lines)),
-    );
+    const rows = bodyRows(lines);
+    assert.ok(rows.includes('a-x \u00B7 feat/x'), 'the cleaned identity still shows: ' + JSON.stringify(rows));
+    assert.ok(!rows.some((row) => row.includes('evil')), 'the ODD association never renders: ' + JSON.stringify(rows));
   });
 });
 
@@ -1572,20 +1557,16 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
   // One row shape per tool, pinned exactly: identities first, then the
   // labels that carry status, path and associations in a stable order.
   const EXPANDED = {
-    worktree_upsert: [
-      'name: feat-cards',
-      'branch: feat/cards',
+    worktree_create: [
       'status: created',
       'path: /repo/../feat-cards',
-      'issues: #12',
-      'odd: -',
+      'registered: new',
+      'codegraph: initialized',
     ],
     worktree_list: [
       'checkouts: 1',
       'feat-cards \u00B7 feat/cards',
       'path: /repo/../feat-cards',
-      'issues: -',
-      'odd: -',
     ],
     worktree_close: [
       'name: feat-cards',
@@ -1608,7 +1589,7 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
   };
 
   const COMPACT = {
-    worktree_upsert: ['created: feat-cards \u00B7 feat/cards'],
+    worktree_create: ['status: created'],
     worktree_list: ['listed: 1 checkout'],
     worktree_close: ['removed: feat-cards \u00B7 feat/cards', 'branch kept'],
     worktree_session_open: ['opened: feat-cards \u00B7 abc123'],
@@ -1633,63 +1614,120 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
     }
   });
 
-  test('compact never reports a create that only updated or already existed', () => {
-    const updated = {
-      content: [{ type: 'text', text: 'updated: feat-cards \u00B7 feat/cards' }],
-      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: false, updated: true },
-    };
-    assert.deepStrictEqual(compactRows('worktree_upsert', updated), ['updated: feat-cards \u00B7 feat/cards']);
-    assert.deepStrictEqual(
-      expandedRows('worktree_upsert', updated).slice(0, 3),
-      ['name: feat-cards', 'branch: feat/cards', 'status: updated'],
-    );
+  test('compact never reports a create that already existed', () => {
+    // S1: the tool only creates, so the one non-create outcome left is the
+    // thread's own checkout already being there — and it must never read as a
+    // fresh create.
     const owned = {
       content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards \u00B7 already exists' }],
-      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: false },
+      details: {
+        path: '/repo/../feat-cards',
+        branch: 'feat/cards',
+        alreadyExists: true,
+        registered: 'unchanged',
+        codegraph: { status: 'present', detail: '' },
+      },
     };
     assert.deepStrictEqual(
-      compactRows('worktree_upsert', owned),
-      ['created: feat-cards \u00B7 feat/cards \u00B7 already exists'],
+      compactRows('worktree_create', owned),
+      ['status: already existed'],
+      'the collapsed card is the status row, and it never reads as a fresh create',
     );
-    assert.ok(
-      expandedRows('worktree_upsert', owned).includes('status: already existed'),
-      'the skipped create says so in the detail: ' + JSON.stringify(expandedRows('worktree_upsert', owned)),
-    );
+    const expanded = expandedRows('worktree_create', owned);
+    assert.deepStrictEqual(expanded, [
+      'status: already existed',
+      'path: /repo/../feat-cards',
+      'registered: unchanged',
+      'codegraph: initialized',
+    ], 'the expanded card reports the real index state and that no row was written');
   });
 
-  test('expanded renders the assigned odd NAME and - for absent associations', () => {
+  test('S8: the collapsed create card is the status row only and the expanded one drops name/branch', () => {
+    // The name is implied by the path and the branch is the tool's input, so
+    // both rows only repeat what the caller already knows. What stays: the
+    // status, the path, the registry write (S7) and the real CodeGraph state.
+    const created = resultFor('worktree_create');
+    assert.deepStrictEqual(compactRows('worktree_create', created), ['status: created']);
+    const expanded = expandedRows('worktree_create', created);
+    assert.deepStrictEqual(expanded, [
+      'status: created',
+      'path: /repo/../feat-cards',
+      'registered: new',
+      'codegraph: initialized',
+    ]);
+    assert.ok(!expanded.some((row) => row.startsWith('name:')), 'no redundant name row');
+    assert.ok(!expanded.some((row) => row.startsWith('branch:')), 'no redundant branch row');
+    // A fresh checkout whose index the hook could not build still says so.
+    const failed = {
+      content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards\npath: /repo/../feat-cards\nregistered: replaced\ncodegraph: not initialized (init failed)' }],
+      details: {
+        path: '/repo/../feat-cards',
+        branch: 'feat/cards',
+        registered: 'replaced',
+        codegraph: { status: 'failed', detail: 'init failed' },
+      },
+    };
+    assert.deepStrictEqual(expandedRows('worktree_create', failed), [
+      'status: created',
+      'path: /repo/../feat-cards',
+      'registered: replaced',
+      'codegraph: not initialized (init failed)',
+    ]);
+  });
+
+  test('a create renders no association rows at all (S1/S6)', () => {
+    // The listing still reads legacy registry data, but a CREATE neither
+    // accepts nor displays an association: even details that still carry the
+    // legacy fields must not reach the card.
     const result = {
       content: [{ type: 'text', text: 'created: feat-cards \u00B7 feat/cards' }],
       details: {
         path: '/repo/../feat-cards',
         branch: 'feat/cards',
         issues: [12, 13],
-        created: true,
         odd: 'odd/2026-02-01-native-tool-output.md',
       },
     };
-    const rows = expandedRows('worktree_upsert', result);
-    assert.ok(rows.includes('issues: #12, #13'), 'issue numbers carry #: ' + JSON.stringify(rows));
-    assert.ok(
-      rows.includes('odd: 2026-02-01-native-tool-output'),
-      'odd renders its NAME, not its path: ' + JSON.stringify(rows),
-    );
-    assert.ok(!rows.some((row) => row.includes('.md')), 'the odd path never renders: ' + JSON.stringify(rows));
-    const bare = {
-      content: [{ type: 'text', text: 'created: feat-cards' }],
-      details: { path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], created: true, odd: null },
+    const rows = expandedRows('worktree_create', result);
+    assert.ok(!rows.some((row) => row.startsWith('issues:')), 'no issue row: ' + JSON.stringify(rows));
+    assert.ok(!rows.some((row) => row.startsWith('odd:')), 'no odd row: ' + JSON.stringify(rows));
+    // S1: the listing shows no association either — the legacy registry data
+    // is preserved in the details and deliberately not displayed anywhere.
+    const listed = {
+      content: [{ type: 'text', text: 'worktree list: feat-cards feat/cards thread=t issues=12' }],
+      details: {
+        worktrees: [{
+          name: 'feat-cards',
+          path: '/repo/../feat-cards',
+          branch: 'feat/cards',
+          issues: [12, 13],
+          assignedOdd: 'odd/2026-02-01-native-tool-output.md',
+          odd: ['odd/2026-02-01-native-tool-output.md'],
+        }],
+        count: 1,
+      },
     };
-    const bareRows = expandedRows('worktree_upsert', bare);
-    assert.ok(
-      bareRows.includes('issues: -') && bareRows.includes('odd: -'),
-      'missing associations read - instead of vanishing: ' + JSON.stringify(bareRows),
-    );
+    const listRows = expandedRows('worktree_list', listed);
+    assert.deepStrictEqual(listRows, [
+      'checkouts: 1',
+      'feat-cards \u00B7 feat/cards',
+      'path: /repo/../feat-cards',
+    ], 'the listing row is the checkout identity, with no association cell: ' + JSON.stringify(listRows));
+    assert.ok(!listRows.some((row) => row.includes('.md')), 'the odd path never renders: ' + JSON.stringify(listRows));
+    const bare = {
+      content: [{ type: 'text', text: 'worktree list: feat-cards feat/cards thread=t issues=' }],
+      details: {
+        worktrees: [{ name: 'feat-cards', path: '/repo/../feat-cards', branch: 'feat/cards', issues: [], assignedOdd: null, odd: [] }],
+        count: 1,
+      },
+    };
+    assert.deepStrictEqual(expandedRows('worktree_list', bare), listRows, 'a known-empty association renders nothing at all');
   });
 
-  test('a large listing expands to one labelled block per entry, no giant odd line', () => {
-    // Screenshot-shaped data: many checkouts, each with its own thread,
-    // issue numbers, ONE associated odd document and the documents its
-    // checkout holds.
+  test('a large listing expands to one labelled block per entry, no association rows', () => {
+    // Screenshot-shaped data: many checkouts, each with its own thread and the
+    // legacy issue/ODD fields the registry still stores. S1 removed those
+    // associations from every worktree surface, so none of it renders.
     function docsFor(index) {
       if (index % 3 === 0) return ['odd/a.md', 'odd/b.md', 'odd/c.md'];
       if (index % 3 === 1) return ['odd/a.md'];
@@ -1730,18 +1768,10 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
         `${entry.name} has exactly one identity row: ${JSON.stringify(rows)}`,
       );
     }
-    assert.strictEqual(rows.filter((row) => row === 'odd: -').length, 4, 'a known-empty association reads odd: -');
-    assert.strictEqual(
-      rows.filter((row) => row === 'odd: a').length,
-      8,
-      'the ASSOCIATED document is the only value the odd row ever carries',
-    );
-    assert.strictEqual(rows.filter((row) => row === 'available odd: a, b, c').length, 4, 'the inventory is labelled separately');
-    assert.strictEqual(rows.filter((row) => row === 'available odd: a').length, 4, 'one inventory row per entry');
+    assert.ok(!rows.some((row) => row.startsWith('issues:')), 'no issue row anywhere: ' + JSON.stringify(rows));
+    assert.ok(!rows.some((row) => row.startsWith('odd:')), 'no ODD row anywhere: ' + JSON.stringify(rows));
     assert.ok(!rows.some((row) => row.includes('.md')), 'no odd path or .md suffix leaks into the card');
-    assert.ok(!rows.some((row) => /^odd: .*,/.test(row)), 'odd documents are never a comma list');
-    assert.ok(rows.includes('issues: #70, #90'), 'issue numbers carry #: ' + JSON.stringify(rows));
-    assert.ok(rows.includes('issues: -'), 'an entry without issues reads -');
+    assert.ok(!rows.some((row) => /#\d/.test(row)), 'no issue number leaks into the card');
     assert.ok(rows.includes('thread: thread-1'), 'a known thread is detail, not noise');
     assert.ok(!rows.includes('thread: unknown'), 'the unknown thread placeholder never renders');
     assert.strictEqual(rows.filter((row) => row === 'status: missing').length, 1, 'the missing status survives');
@@ -1825,7 +1855,7 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
         odd: 'odd/deep/nested/design-doc.md',
       },
     };
-    const card = createWorktreeCardRenderer('worktree_upsert');
+    const card = createWorktreeCardRenderer('worktree_create');
     for (const width of [30, 60, 100]) {
       const lines = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width);
       assertFits(lines, width);

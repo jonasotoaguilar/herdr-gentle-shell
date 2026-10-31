@@ -651,23 +651,21 @@ checkout's repository GitHub issues, implemented in `lib/gh-issues.js`
 the command in `extensions/gentle-worktree-tools.ts`. The interactive pager
 searches the whole active bucket through GitHub, debounces typing, keeps
 query-bound cursors, reuses loaded tabs and explicitly refreshes with `r`.
-It never adds All to the shared three-bucket snapshot's totals. The shared
-40/60 geometry and lossless title wrapping live in `lib/view-layout.js`;
-complete metadata and comments use `lib/issue-preview.js` on both Issues
-and worktree detail. Preview keys and capability-based legends use
-`lib/preview-scroll-keys.js`, not OS guesses or a Pi host fork.
+It never adds All to the shared three-bucket snapshot's totals. The reader
+30/70 geometry and lossless title wrapping live in `lib/view-layout.js`;
+complete metadata and comments use `lib/issue-preview.js`. Preview keys and
+capability-based legends use `lib/preview-scroll-keys.js`, not OS guesses or a
+Pi host fork.
 
 Listing, search, paging and scrolling never write. Issues permits only its
 explicit label, assignee, comment and close actions; it paints saving before
-invoking a callback and locks input until completion. Checkout association
-writes belong to worktree detail, not the read-only ODD/Issues viewers.
-Detail mounts stored associations and cached facts before slow GitHub/Git
-reads, marks unresolved data as loading rather than empty, and blocks saving
-until initialization is verified. Enrichment applies to the mounted instance;
-closed-view outcomes cannot authorize registry writes. The viewers retain
-one-row shortcut legends rather than a duplicate `?` overlay. ODD and Issues
-remain registered with Worktree tools disabled; assignment savers re-read
-the mode before writing. Warp is registered only with Worktree tools enabled. The sidebar and Moshi actions stay inline in
+invoking a callback and locks input until completion. Neither viewer writes a
+worktree association, and no surface assigns issues or ODD documents to a
+worktree any more: a worktree is created and listed, never modified.
+Enrichment applies to the mounted viewer; closed-view outcomes cannot
+authorize registry writes. The viewers retain one-row shortcut legends rather
+than a duplicate `?` overlay. ODD and Issues
+remain registered with Worktree tools disabled. Warp is registered only with Worktree tools enabled. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
@@ -824,7 +822,7 @@ list, not silent.
 
 ## 12. Agent worktree tools (`worktree_*`)
 
-Agent-callable worktrees: `worktree_upsert` / `worktree_list` /
+Agent-callable worktrees: `worktree_create` / `worktree_list` /
 `worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
 listed in the Pi package's `pi.extensions`), plus the `Worktree tools`
 rows of `/herdr-gentle:customize` (`Enabled` / `Disabled`, plus read-only
@@ -838,22 +836,38 @@ design decisions.
 
 ### Ownership rule
 
-The worktree belongs to the THREAD, not to the feature or task: one
-thread maps to one worktree, the same rule as `~/.pi/agent/AGENTS.md`.
-The registry entry records the owning thread (`thread`, resolved from
-`GENTLE_WORKTREE_THREAD` else the Pi session id, failing closed when
-neither exists); `worktree_list` shows which thread owns each checkout;
-`worktree_close` reports the owner instead of refusing, because a
-delivered thread is routinely closed from a later session; and
-`worktree_upsert` from a thread that already owns a live registered
-worktree returns that checkout (`created: false`) instead of creating a
-second. A second thread never adopts another thread's checkout.
+The worktree belongs to the THREAD, not to the feature or task, and a
+thread may own SEVERAL checkouts: a second branch is a second worktree,
+not a replay of the first one. The registry entry records the owning
+thread (`thread`, resolved from `GENTLE_WORKTREE_THREAD` else the Pi
+session id, failing closed when neither exists); `worktree_list` shows
+which thread owns each checkout; `worktree_close` reports the owner
+instead of refusing, because a delivered thread is routinely closed from
+a later session; and `worktree_create` is idempotent on the REQUEST, never
+on the thread: the same branch that already has this thread's checkout
+returns that checkout (`alreadyExists: true`, the text says
+`already exists`), while any other branch is created and registered even
+when the thread already owns another checkout. `already exists` is keyed
+to the requested branch's own worktree; a checkout the thread owns for a
+different branch never answers for it. A second thread never adopts
+another thread's checkout, and a branch already checked out at a live path
+is refused rather than shared.
+
+A worktree carries NO issue or ODD association: `worktree_create` takes the
+branch and nothing else, never verifies or writes an association, and its
+output names the checkout, its path, what the registry write actually did
+(`registered: new | replaced | appended | unchanged`) and the one CodeGraph
+fact of the creation. Legacy `issues`/`odd` fields already in the registry
+are preserved byte for byte by every write that does not address their row,
+and no surface displays them.
 
 ### Registry
 
 `<git-common-dir>/pi-worktrees.json` — inside `.git`, never in a working
 tree, never committed, shared by every checkout of the repository.
-Entries `{branch, path, thread, issues[], odd[], createdAt, updatedAt}`.
+Entries `{branch, path, thread, issues[], odd, createdAt, updatedAt}`
+(`odd` is ONE document or `null`; both association fields are legacy — the
+create tool writes no association and only preserves what is stored).
 Reads tolerate malformed content (reported, never thrown, file left
 untouched, never silently enabling); writes are atomic (temp file plus
 rename) under an exclusive lock file with bounded wait and stale-lock

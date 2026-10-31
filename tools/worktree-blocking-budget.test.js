@@ -103,7 +103,12 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 // A `git` shim on PATH: sleep, then exec the real binary, so every caller
@@ -277,7 +282,7 @@ function resultText(result) {
 }
 
 // ---------------------------------------------------------------------------
-// Create: the `worktree_upsert` tool path (the panel path shares this core).
+// Create: the `worktree_create` tool path (the panel path shares this core).
 // ---------------------------------------------------------------------------
 
 describe('interactive worktree create keeps the host event loop free (S21)', { concurrency: false }, () => {
@@ -288,8 +293,8 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
     setSlowChildEnv({ shimDir, vars: { HERDR_BIN_PATH: herdr.bin } });
     try {
       const { tools } = await loadExtension();
-      const tool = tools.get('worktree_upsert');
-      assert.ok(tool, 'expected worktree_upsert to be registered');
+      const tool = tools.get('worktree_create');
+      assert.ok(tool, 'expected worktree_create to be registered');
       const { ctx } = makeCtx({ repoRoot: root });
       const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-budget');
 
@@ -300,7 +305,7 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
       // The conversion must not change behaviour: same success, same text,
       // same checkout, same registry row as the blocking implementation.
       assert.equal(result.isError, undefined, `create failed: ${resultText(result)}`);
-      assert.equal(resultText(result).split('\n')[0], 'outcome: created');
+      assert.equal(resultText(result).split('\n')[0], 'created: feat-budget \u00B7 feat/budget');
       assert.equal(result.details.path, target);
       assert.equal(git(target, ['rev-parse', '--show-toplevel']), target);
       const row = registryLib.findByBranch(root, 'feat/budget');
@@ -309,7 +314,7 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
       assert.ok(fs.readFileSync(herdr.log, 'utf8').includes('worktree create'), 'the create still ran through herdr');
 
       // The property the user felt.
-      assertLoopStayedFree(stats, 'worktree_upsert create');
+      assertLoopStayedFree(stats, 'worktree_create create');
     } finally {
       process.env.PATH = savedPath;
     }
@@ -317,7 +322,11 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
 });
 
 // ---------------------------------------------------------------------------
-// Delete: the warp selector's Ctrl+D, through the REAL shared close.
+// Delete: the warp selector's Ctrl+D is GONE (S4). The extended list used to
+// run the real shared close from that key; worktrees are no longer modified
+// from the popup, so the key is inert and the blocking budget it needed went
+// with the path. The case stays here as the pin: pressing it must ask nothing,
+// remove nothing, and leave the selector live until `esc`.
 // ---------------------------------------------------------------------------
 
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text), bold: (text) => String(text) };
@@ -422,8 +431,9 @@ function makeWiredCtx({ cwd, FakeSM, sessionFile, sessionDir, calls, mount, conf
   return { ctx, notes, customs, confirms };
 }
 
-// `v` opens the extended list, down moves to the worktree row, Ctrl+D asks
-// for the deletion; later mounts (the selector reopening) press Esc.
+// The first mount is driven by the scripted keys; any later mount (the
+// selector reopening) presses Esc. The safety timer only exists so a key that
+// stops settling fails the test instead of hanging the suite.
 function selectorDriver(keys) {
   const views = [];
   let mounts = 0;
@@ -431,7 +441,7 @@ function selectorDriver(keys) {
     mounts += 1;
     const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('warp selector did not settle')), 600000);
+      const timer = setTimeout(() => reject(new Error('warp selector did not settle')), 30000);
       const done = (value) => { clearTimeout(timer); resolve(value); };
       let view;
       try {
@@ -454,8 +464,8 @@ function selectorDriver(keys) {
   return { mount, views, mounts: () => mounts };
 }
 
-describe('the warp selector delete keeps the host event loop free (S21)', { concurrency: false }, () => {
-  test('Ctrl+D + Yes runs the real close without blocking, and removes exactly that checkout', async () => {
+describe('the warp selector delete path is gone, and Ctrl+D is inert (S4)', { concurrency: false }, () => {
+  test('Ctrl+D asks nothing, removes nothing and never freezes the selector', async () => {
     const root = makeRepo('delete');
     git(root, ['branch', 'main', 'HEAD']);
     const target = addRegisteredWorktree(root, 'feat/del');
@@ -466,7 +476,11 @@ describe('the warp selector delete keeps the host event loop free (S21)', { conc
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x1b[B', '\x04']);
+      const checkoutsBefore = git(root, ['worktree', 'list', '--porcelain']);
+      // `v` opens the extended list, down focuses the worktree row, Ctrl+D is
+      // the old delete binding (now inert), and two `esc` steps back to the
+      // panel and closes it. Only the two `esc` keys ever resolve the mount.
+      const driver = selectorDriver(['v', '\x1b[B', '\x04', '\x1b', '\x1b']);
       const built = makeWiredCtx({
         cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
         mount: driver.mount, confirmImpl: () => true,
@@ -475,21 +489,16 @@ describe('the warp selector delete keeps the host event loop free (S21)', { conc
       const def = commands.get('herdr-gentle:warp');
       assert.ok(def, 'expected the warp command to be registered');
 
-      const probe = startTickProbe();
       await def.handler('', built.ctx);
-      const stats = probe.stop();
 
-      // Behaviour first: the confirmation asked once, the real close ran,
-      // and only the approved checkout is gone.
-      assert.equal(built.confirms.length, 1, 'the delete asked exactly once');
-      assert.match(built.confirms[0][0], /^Delete worktree 'feat-del'\?$/);
-      assert.equal(fs.existsSync(target), false, 'the approved checkout was removed');
-      assert.equal(registryLib.findByPath(root, target), null, 'the registry row was dropped');
-      assert.ok(fs.existsSync(root), 'the principal checkout is untouched');
-      assert.equal(driver.mounts(), 2, 'the selector reopened after the delete');
-
-      // The property the user felt.
-      assertLoopStayedFree(stats, 'warp selector Ctrl+D delete');
+      // The delete surface is gone: no confirmation was ever built, nothing
+      // was closed, and the row is byte-identical to what it was.
+      assert.deepEqual(built.confirms, [], 'Ctrl+D never asks for a deletion');
+      assert.ok(fs.existsSync(target), 'the checkout is untouched');
+      assert.ok(registryLib.findByPath(root, target), 'its registry row is untouched');
+      assert.equal(git(root, ['worktree', 'list', '--porcelain']), checkoutsBefore, 'no checkout disappeared');
+      assert.equal(driver.mounts(), 1, 'the selector never reopened: the panel simply stayed up');
+      assert.deepEqual(built.notes, [], 'and nothing is claimed');
     } finally {
       process.env.PATH = savedPath;
     }
