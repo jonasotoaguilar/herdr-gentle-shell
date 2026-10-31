@@ -1,21 +1,13 @@
 'use strict';
-// T36 (customize-command S46) tests: the optional issues + odd
-// multi-select steps of the create-from-warp flow.
+// Lib unit tests for lib/warp-create-picker.js (pure Node, no subprocess, no
+// prompt): pagination, the reusable multi-select component driven with
+// synthetic keys, the single-select prompt and the inline name input.
 //
-// Lib unit tests (lib/warp-create-picker.js, pure Node, no subprocess,
-// no prompt): the pinned `gh` fetch shape (`gh issue list --state open
-// --json number,title` with the CLI's own paging flags), the skip paths,
-// the number-or-title search filter, the odd listing from the CURRENT
-// checkout, pagination, and the reusable multi-select component driven
-// with synthetic keys.
-//
-// Flow tests (same file, extension harness at the bottom): type -> name
-// -> issues -> odd -> creation registers the selected values; Esc in
-// either new step cancels the whole creation with no state change;
-// confirm-with-none proceeds with empty values; both steps skip cleanly
-// when empty or unavailable; several odd documents survive; the odd list
-// comes from the current checkout; the creation still reuses the existing
-// create path (duplicate refusal byte-identical).
+// S1: the ISSUE and ODD selection plumbing is gone with the association
+// itself — no `gh` fetch shape, no open-issue matcher, no `odd/tasks` listing,
+// no pick-item adapters and no issue/ODD creation steps. The tests that pinned
+// them were removed WITH the code (they asserted the removed contract), and
+// the absence is pinned below so the datasets cannot quietly come back.
 
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -60,173 +52,29 @@ function scratchDir(tag) {
   return track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-pick-${tag}-`)));
 }
 
-describe('gh fetch shape and pagination flags', { concurrency: false }, () => {
-  test('the fetch runs gh issue list over open issues as JSON number/title with a limit', async () => {
-    const seen = [];
-    const spawnImpl = (bin, argv, opts) => {
-      seen.push({ bin, argv, cwd: opts && opts.cwd });
-      return {
-        status: 0,
-        stdout: JSON.stringify([{ number: 12, title: 'Fix the crash' }, { number: 7, title: 'Docs' }]),
-        stderr: '',
-        error: null,
-      };
-    };
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: 'gh', spawnImpl });
-    assert.equal(out.ok, true, `expected ok, got ${JSON.stringify(out)}`);
-    assert.deepEqual(seen.length, 1, 'exactly one gh call');
-    assert.equal(seen[0].bin, 'gh', 'the gh CLI');
-    assert.deepEqual(
-      seen[0].argv,
-      ['issue', 'list', '--state', 'open', '--json', 'number,title', '--limit', '200'],
-      'the verified fetch shape with the CLI paging flag',
-    );
-    assert.equal(seen[0].cwd, '/repo', 'the fetch runs in the current checkout');
-    assert.deepEqual(out.issues, [
-      { number: 12, title: 'Fix the crash' },
-      { number: 7, title: 'Docs' },
-    ]);
-  });
-
-  test('a search string rides the CLI search flag', async () => {
-    const seen = [];
-    const spawnImpl = (bin, argv) => {
-      seen.push(argv);
-      return { status: 0, stdout: '[]', stderr: '', error: null };
-    };
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: 'gh', search: 'crash', spawnImpl });
-    assert.equal(out.ok, true);
-    assert.deepEqual(out.issues, [], 'no open issues is ok with an empty list');
-    assert.deepEqual(
-      seen[0],
-      ['issue', 'list', '--state', 'open', '--json', 'number,title', '--limit', '200', '--search', 'crash'],
-      'the search rides --search behind the same shape',
-    );
-  });
-
-  test('a missing gh binary skips instead of throwing', async () => {
-    const spawnImpl = () => {
-      const err = new Error("spawnSync gh ENOENT");
-      err.code = 'ENOENT';
-      return { status: null, stdout: '', stderr: '', error: err };
-    };
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: '/no/such/gh', spawnImpl });
-    assert.equal(out.ok, false, 'not ok');
-    assert.ok(typeof out.skipped === 'string' && out.skipped.length > 0, 'a skip reason travels along');
-  });
-
-  test('an erroring gh skips instead of throwing', async () => {
-    const spawnImpl = () => ({ status: 1, stdout: '', stderr: 'Not logged in. Run gh auth login.', error: null });
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: 'gh', spawnImpl });
-    assert.equal(out.ok, false, 'an unauthenticated gh is a skip, never a block');
-    assert.ok(typeof out.skipped === 'string' && out.skipped.length > 0);
-  });
-
-  test('unparseable gh output skips instead of throwing', async () => {
-    const spawnImpl = () => ({ status: 0, stdout: 'not json', stderr: '', error: null });
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: 'gh', spawnImpl });
-    assert.equal(out.ok, false);
-    assert.ok(typeof out.skipped === 'string' && out.skipped.length > 0);
-  });
-
-  test('a non-array gh payload skips instead of throwing', async () => {
-    const spawnImpl = () => ({ status: 0, stdout: '{"number":1}', stderr: '', error: null });
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: 'gh', spawnImpl });
-    assert.equal(out.ok, false);
-  });
-
-  test('malformed rows are dropped while good rows survive', async () => {
-    const spawnImpl = () => ({
-      status: 0,
-      stdout: JSON.stringify([
-        { number: 3, title: 'Good' },
-        { number: 'x', title: 'Bad number' },
-        { number: 4 },
-        null,
-        { number: 5, title: 'Also good' },
-      ]),
-      stderr: '',
-      error: null,
-    });
-    const out = await picker.fetchOpenIssues({ cwd: '/repo', ghBin: 'gh', spawnImpl });
-    assert.equal(out.ok, true);
-    assert.deepEqual(out.issues, [
-      { number: 3, title: 'Good' },
-      { number: 5, title: 'Also good' },
-    ]);
-  });
-});
-
-describe('issues search: number or title from the same box', { concurrency: false }, () => {
-  const issues = [
-    { number: 12, title: 'Fix the crash on empty' },
-    { number: 123, title: 'Docs for warp' },
-    { number: 7, title: 'Crash report 12' },
-    { number: 45, title: 'Unrelated chore' },
-  ];
-
-  test('a numeric query matches by number', () => {
-    const found = picker.filterIssueItems(issues, '12').map((i) => i.number).sort((a, b) => a - b);
-    assert.deepEqual(found, [7, 12, 123], '12, 123 by number and 7 by its title containing 12');
-  });
-
-  test('a text query matches as a case-insensitive substring of the title', () => {
-    const found = picker.filterIssueItems(issues, 'CRASH').map((i) => i.number).sort((a, b) => a - b);
-    assert.deepEqual(found, [7, 12]);
-  });
-
-  test('a query that is neither number nor title filters the row out', () => {
-    assert.deepEqual(picker.filterIssueItems(issues, 'zzz'), [], 'nothing matches');
-    assert.deepEqual(
-      picker.filterIssueItems(issues, '99').map((i) => i.number),
-      [],
-      'no number contains 99 and no title mentions it',
-    );
-  });
-
-  test('an empty query returns every row', () => {
-    assert.deepEqual(picker.filterIssueItems(issues, '   ').map((i) => i.number), [12, 123, 7, 45]);
-  });
-});
-
-describe('odd listing comes from the given checkout only', { concurrency: false }, () => {
-  function checkoutWithDocs(tag, names) {
-    const root = scratchDir(tag);
-    fs.mkdirSync(path.join(root, 'odd', 'tasks'), { recursive: true });
-    for (const name of names) fs.writeFileSync(path.join(root, 'odd', 'tasks', name), `# ${name}\n`);
-    return root;
-  }
-
-  test('it lists the top-level odd/tasks/*.md names sorted, with absolute paths', () => {
-    const root = checkoutWithDocs('odd-list', ['b-change.md', 'a-change.md', 'notes.txt', 'README']);
-    fs.mkdirSync(path.join(root, 'odd', 'tasks', 'sub'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'odd', 'tasks', 'sub', 'nested.md'), '# nested\n');
-    const docs = picker.listOddTaskDocs(root);
-    assert.deepEqual(
-      docs.map((d) => d.name),
-      ['a-change.md', 'b-change.md'],
-      'sorted .md files only, no txt, no nested dir, no bare README',
-    );
-    for (const doc of docs) {
-      assert.equal(doc.abs, path.join(root, 'odd', 'tasks', doc.name), 'the absolute path travels along');
-      assert.ok(fs.statSync(doc.abs).isFile(), 'it names a real file');
+// S1: worktrees receive no issue or ODD association, so the module carries no
+// dataset plumbing for them any more. Pinned as an ABSENCE: the names are the
+// removed contract, and a future re-add would reintroduce an association
+// surface the create flow must not have.
+describe('S1: no issue or ODD selection plumbing survives', { concurrency: false }, () => {
+  test('the module exports no issue/ODD fetch, listing, matcher or pick-item adapter', () => {
+    for (const name of [
+      'ghFetchArgv', 'resolveGhBin', 'fetchOpenIssues', 'fetchOpenIssuesAsync',
+      'listOddTaskDocs', 'filterIssueItems', 'filterOddItems', 'issuePickItems', 'oddPickItems',
+      'GH_FETCH_LIMIT_DEFAULT',
+    ]) {
+      assert.equal(Object.prototype.hasOwnProperty.call(picker, name), false, `lib/warp-create-picker.js no longer exports ${name}`);
     }
   });
 
-  test('it lists THAT checkout documents, never another checkout', () => {
-    const current = checkoutWithDocs('odd-current', ['current-change.md']);
-    const other = checkoutWithDocs('odd-other', ['other-change.md']);
-    assert.ok(other.length > 0, 'the other checkout really has its own doc');
-    const docs = picker.listOddTaskDocs(current);
-    assert.deepEqual(docs.map((d) => d.name), ['current-change.md']);
-  });
-
-  test('a missing odd/tasks directory means no documents, never a throw', () => {
-    const root = scratchDir('odd-missing');
-    assert.deepEqual(picker.listOddTaskDocs(root), [], 'no odd/ at all');
-    assert.deepEqual(picker.listOddTaskDocs(path.join(root, 'no-such-checkout')), [], 'no checkout at all');
-    fs.mkdirSync(path.join(root, 'odd'), { recursive: true });
-    assert.deepEqual(picker.listOddTaskDocs(root), [], 'odd/ without tasks/');
+  test('the code runs no `gh` issue query and reads no odd/tasks directory', () => {
+    const code = fs.readFileSync(path.resolve(__dirname, '../lib/warp-create-picker.js'), 'utf8')
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('//'))
+      .join('\n');
+    assert.ok(!code.includes("'issue', 'list'"), 'no gh issue list argv');
+    assert.ok(!code.includes('odd/tasks'), 'no odd/tasks listing');
+    assert.ok(!/fetchOpenIssues|issuePickItems|oddPickItems|listOddTaskDocs|filterIssueItems|filterOddItems/.test(code), 'no association data helper survives');
   });
 });
 
@@ -775,38 +623,6 @@ describe('freeze/cancel/key regression (S52: real matcher + raw fallback)', { co
     assert.equal(view.state.mode, 'list', 'raw DOWN moves from the search into the rows');
   });
 
-  test('the async gh fetch keeps the verified argv shape', async () => {
-    const seen = [];
-    const { EventEmitter } = require('node:events');
-    const spawnFn = (bin, argv, _opts) => {
-      seen.push({ bin, argv });
-      const proc = new EventEmitter();
-      proc.stdout = new EventEmitter();
-      proc.stderr = new EventEmitter();
-      proc.kill = () => {};
-      setImmediate(() => {
-        proc.stdout.emit('data', JSON.stringify([{ number: 5, title: 'Async row' }]));
-        proc.emit('close', 0);
-      });
-      return proc;
-    };
-    const out = await picker.fetchOpenIssuesAsync({ cwd: '/repo', ghBin: 'gh', spawnFn });
-    assert.equal(out.ok, true);
-    assert.deepEqual(out.issues, [{ number: 5, title: 'Async row' }]);
-    assert.deepEqual(
-      seen[0].argv,
-      ['issue', 'list', '--state', 'open', '--json', 'number,title', '--limit', '200'],
-      'same shape as the sync fetch, never a shell string',
-    );
-  });
-
-  test('the async gh fetch aborts on timeout instead of blocking', async () => {
-    const out = await picker.fetchOpenIssuesAsync({
-      cwd: '/repo', ghBin: 'gh', timeoutMs: 20,
-      spawnFn: () => ({ stdout: '', stderr: '', on: () => {}, kill: () => {} }),
-    });
-    assert.equal(out.ok, false, 'a hanging gh becomes a silent skip, never a frozen wizard');
-  });
 });
 
 describe('the inline name input (S52 Back on every field)', { concurrency: false }, () => {
@@ -1283,9 +1099,240 @@ describe('S2: one-row key legends', { concurrency: false }, () => {
       assert.match(listLegend[0], /esc cancel/i, `width ${width}: the cancel key survives`);
       view.handleInput('t');
       const searchLines = view.render(width);
-      const searchLegend = legendRows(searchLines, /filter kept|back to list|Tab back|tab/);
+      const searchLegend = legendRows(searchLines, /filter kept|back to list|Enter\/Esc keep|Tab back|tab/);
       assert.equal(searchLegend.length, 1, `width ${width}: exactly one search legend row, got ${searchLegend.length}`);
       assert.ok(!searchLegend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${searchLegend[0]}`);
+    }
+  });
+});
+
+// S11: every picker footer and header paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme — a shortcut KEY is accent+bold
+// and its description muted, a title is accent+bold, a static label is dim, a
+// live value (the typed query) is accent, a count is muted, and a rule takes
+// the border role. A hostile or absent theme degrades to plain text, and the
+// one-row compaction keeps the key role at every width.
+// This module renders no error text: S1 removed the dataset fetches together
+// with their skip messages, so the palette's error role has no call site here.
+describe('S11: the shared palette', { concurrency: false }, () => {
+  const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91 };
+
+  // A theme that RECORDS which role painted each string and paints every role
+  // with its own SGR code, so a rendered line can be read for the ROLE behind a
+  // token instead of trusting an eyeballed colour.
+  function recordingTheme() {
+    const calls = [];
+    const code = (role) => ROLE_SGR[role] ?? 95;
+    return {
+      calls,
+      fg(role, text) {
+        const value = String(text);
+        calls.push({ role, text: value });
+        return `\x1b[${code(role)}m${value}\x1b[0m`;
+      },
+      bold(text) {
+        const value = String(text);
+        calls.push({ role: 'bold', text: value });
+        return `\x1b[1m${value}\x1b[22m`;
+      },
+      bg(role, text) {
+        calls.push({ role: `bg:${role}`, text: String(text) });
+        return String(text);
+      },
+    };
+  }
+
+  function stripAnsi(text) {
+    return String(text)
+      .replace(/\x1b\[[0-9;]*m/g, '')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b_[^\x07\x1b]*\x07/g, '');
+  }
+
+  // The raw (still painted) line carrying `needle`.
+  function findRaw(lines, needle) {
+    const line = lines.find((entry) => stripAnsi(entry).includes(needle));
+    assert.ok(line !== undefined, `no line contains ${JSON.stringify(needle)}\n${lines.map(stripAnsi).join('\n')}`);
+    return line;
+  }
+
+  const rows = Array.from({ length: 12 }, (_, i) => ({ id: i + 1, label: `row ${i + 1}` }));
+  const narrow = (list, q) => {
+    const query = String(q ?? '').trim().toLowerCase();
+    if (query === '') return list.slice();
+    return list.filter((item) => String(item.label).toLowerCase().includes(query));
+  };
+
+  function openMulti(overrides = {}) {
+    const finished = [];
+    const view = picker.createMultiSelect({
+      title: 'Select rows',
+      items: rows,
+      filterFn: narrow,
+      pageSize: 5,
+      searchPlaceholder: 'type to filter',
+      helpers: null,
+      hostTui: null,
+      theme: null,
+      done: (out) => { finished.push(out); },
+      ...overrides,
+    });
+    return { view, finished };
+  }
+
+  function openSingle(overrides = {}) {
+    const finished = [];
+    const view = picker.createSingleSelect({
+      title: 'Type',
+      items: ['feat', 'fix'],
+      helpers: null,
+      hostTui: null,
+      theme: null,
+      done: (out) => { finished.push(out); },
+      ...overrides,
+    });
+    return { view, finished };
+  }
+
+  function openWrite(overrides = {}) {
+    const finished = [];
+    const view = picker.createTextInput({
+      title: 'Name',
+      placeholder: 'name-change',
+      initial: '',
+      helpers: null,
+      hostTui: null,
+      theme: null,
+      done: (out) => { finished.push(out); },
+      ...overrides,
+    });
+    return { view, finished };
+  }
+
+  test('the multi-select footer paints every key accent+bold and its description muted', () => {
+    const theme = recordingTheme();
+    const { view } = openMulti({ theme });
+    const legend = findRaw(view.render(100), 'Esc cancel');
+    assert.match(legend, /\x1b\[1m\x1b\[96m↑↓\x1b\[0m\x1b\[22m\x1b\[90m move/,
+      'the move key is accent+bold and its words muted');
+    assert.match(legend, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m\x1b\[90m pages/, 'so is the page key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mT\x1b\[0m\x1b\[22m\x1b\[90m search/, 'and the search key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mSpace\x1b\[0m\x1b\[22m\x1b\[90m toggle/, 'and the toggle key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mEnter\x1b\[0m\x1b\[22m\x1b\[90m confirm/, 'and the confirm key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/, 'and the cancel key');
+    assert.match(legend, /\x1b\[34m · \x1b\[0m/, 'the entries are joined by the border role');
+    assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('Enter')),
+      'the key is bolded through the theme, never by a literal escape');
+    assert.ok(theme.calls.some((call) => call.role === 'muted' && call.text === ' confirm'),
+      'the description asks the injected theme for the muted role');
+  });
+
+  test('the search footer paints its keys and its descriptions', () => {
+    const theme = recordingTheme();
+    const { view } = openMulti({ theme });
+    view.handleInput('t');
+    const legend = findRaw(view.render(100), 'back to list');
+    assert.match(legend, /\x1b\[1m\x1b\[96mEnter\/Esc\x1b\[0m\x1b\[22m\x1b\[90m back to list \(filter kept\)/,
+      'the leave-search key is accent+bold with a muted description');
+    assert.match(legend, /\x1b\[1m\x1b\[96mdelete\x1b\[0m\x1b\[22m\x1b\[90m clear/, 'so is the clear key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mTab\x1b\[0m\x1b\[22m\x1b\[90m back/, 'and the back key');
+    assert.match(legend, /\x1b\[90mSearch\x1b\[0m/, 'the field name is words, never a key');
+    assert.match(legend, /\x1b\[90mtype to filter\x1b\[0m/, 'so is the typing hint');
+    assert.ok(!/\x1b\[1m\x1b\[96mSearch/.test(legend), 'no prose token borrows the key role');
+  });
+
+  test('the single-select and write-prompt footers paint keys and descriptions', () => {
+    const single = recordingTheme();
+    const singleLegend = findRaw(openSingle({ theme: single }).view.render(100), 'Esc cancel');
+    assert.match(singleLegend, /\x1b\[1m\x1b\[96mEnter\x1b\[0m\x1b\[22m\x1b\[90m confirm/, 'the confirm key is accent+bold');
+    assert.match(singleLegend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/, 'so is the cancel key');
+    assert.match(singleLegend, /\x1b\[1m\x1b\[96mTab\x1b\[0m\x1b\[22m\x1b\[90m back/, 'and the back key');
+
+    const write = recordingTheme();
+    const writeLegend = findRaw(openWrite({ theme: write }).view.render(100), 'Esc cancel');
+    assert.match(writeLegend, /\x1b\[1m\x1b\[96mEnter\x1b\[0m\x1b\[22m\x1b\[90m confirm/, 'the write prompt names its confirm key');
+    assert.match(writeLegend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/, 'and its cancel key');
+    assert.match(writeLegend, /\x1b\[90mtype to write\x1b\[0m/, 'typing is prose, never a key');
+  });
+
+  test('titles are accent+bold and rules take the border role', () => {
+    const theme = recordingTheme();
+    const opened = [openMulti({ theme }), openSingle({ theme }), openWrite({ theme })];
+    for (const { view } of opened) {
+      const lines = view.render(100);
+      assert.match(lines[0], /^\x1b\[34m─+\x1b\[0m$/, 'the opening rule is the border role');
+      assert.match(lines[lines.length - 1], /^\x1b\[34m─+\x1b\[0m$/, 'the closing rule is the border role');
+      assert.match(lines[1], /^\x1b\[1m\x1b\[96m[^\x1b]+\x1b\[0m\x1b\[22m$/, 'the title is accent+bold');
+    }
+    assert.ok(!theme.calls.some((call) => call.role === 'error'), 'no error role is painted on a healthy render');
+  });
+
+  test('counts are muted, the search label dim and the live query a value', () => {
+    const theme = recordingTheme();
+    const { view } = openMulti({ theme });
+    assert.match(findRaw(view.render(100), 'total'),
+      /^\x1b\[90m12 total · 0 selected · page 1\/3\x1b\[0m$/, 'the counts row is the muted role');
+    const idle = findRaw(view.render(100), 'Search:');
+    assert.match(idle, /\x1b\[2mSearch: \x1b\[0m/, 'the box label is the dim role');
+    assert.match(idle, /\x1b\[90mtype to filter\x1b\[0m/, 'the idle placeholder is muted, never a value');
+    view.handleInput('t');
+    for (const ch of 'ro') view.handleInput(ch);
+    const live = findRaw(view.render(100), 'Search:');
+    assert.match(live, /\x1b\[2mSearch: \x1b\[0m\x1b\[96mro\x1b\[0m/, 'the typed query is the accent value role');
+    for (const ch of 'w zzz') view.handleInput(ch);
+    assert.match(findRaw(view.render(100), '(no matches)'),
+      /\x1b\[90m\(no matches\)\x1b\[0m/, 'the empty-list note is muted, never an error');
+
+    const typed = recordingTheme();
+    const write = openWrite({ theme: typed, initial: 'typed' });
+    assert.match(findRaw(write.view.render(100), 'typed'),
+      /\x1b\[96mtyped\x1b\[0m/, 'the typed name is a live value');
+  });
+
+  test('a hostile theme never breaks a render and keeps every key readable', () => {
+    const hostile = {
+      fg() { throw new Error('no colour support'); },
+      bold() { throw new Error('no bold support'); },
+      bg() { throw new Error('no background support'); },
+    };
+    const { view } = openMulti({ theme: hostile });
+    const lines = view.render(90);
+    const text = lines.map(stripAnsi).join('\n');
+    assert.ok(lines.every((line) => !line.includes('\x1b')), 'a throwing theme paints nothing');
+    assert.ok(text.includes('Select rows'), 'the title still renders');
+    assert.ok(text.includes('12 total'), 'the counts still render');
+    assert.ok(text.includes('type to filter'), 'the placeholder still renders');
+    assert.ok(text.includes('↑↓ move · ←/→ pages · T search · Space toggle · Enter confirm · Tab back · Esc cancel'),
+      'the legend still spells every key');
+    assert.equal(lines.filter((line) => stripAnsi(line).includes('Esc cancel')).length, 1, 'and stays on ONE row');
+  });
+
+  test('one-row compaction keeps the key role at every width', () => {
+    for (const width of [40, 60, 80, 120]) {
+      const theme = recordingTheme();
+      const { view } = openMulti({ theme });
+      const listLegend = findRaw(view.render(width), 'Esc cancel');
+      assert.match(listLegend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/,
+        `width ${width}: the compacted cancel key keeps accent+bold`);
+      assert.ok(!listLegend.includes('…'), `width ${width}: compacted, never ellipsis-clipped`);
+      assert.ok([...stripAnsi(listLegend)].length <= width,
+        `width ${width}: the painted legend still fits the panel`);
+      view.handleInput('t');
+      const searchLegend = findRaw(view.render(width), 'Enter/Esc');
+      assert.match(searchLegend, /\x1b\[1m\x1b\[96mEnter\/Esc\x1b\[0m\x1b\[22m\x1b\[90m (keep|back to list)/,
+        `width ${width}: the compact spelling keeps its key role`);
+      assert.ok([...stripAnsi(searchLegend)].length <= width,
+        `width ${width}: the painted search legend still fits the panel`);
+    }
+    for (const width of [40, 80]) {
+      const single = recordingTheme();
+      const singleLegend = findRaw(openSingle({ theme: single }).view.render(width), 'Esc cancel');
+      assert.match(singleLegend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/, `width ${width}: the single-select cancel key keeps its role`);
+      assert.ok([...stripAnsi(singleLegend)].length <= width, `width ${width}: the painted single-select legend fits`);
+      const write = recordingTheme();
+      const writeLegend = findRaw(openWrite({ theme: write }).view.render(width), 'Esc cancel');
+      assert.match(writeLegend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/, `width ${width}: the write-prompt cancel key keeps its role`);
+      assert.ok([...stripAnsi(writeLegend)].length <= width, `width ${width}: the painted write legend fits`);
     }
   });
 });

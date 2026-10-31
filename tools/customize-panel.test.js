@@ -287,23 +287,27 @@ describe('customize command registration', { concurrency: false }, () => {
     }
   });
 
-  test('the old toggles are gone and the S11 detail reuses the worktree name', async () => {
+  test('the old toggles are gone and the removed worktree command never registers', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const hadSlot = setSlot(undefined);
     try {
       modeLib().writeMode(true, process.env);
       const { commands } = await loadExtension();
-      // S11 reuses the removed toggle's name for the full-screen detail of the
-      // current checkout, so presence alone proves nothing: the old mode verbs
-      // must be refused and the mode file left byte-identical.
-      const detail = commands.get('herdr-gentle:worktree');
-      assert.ok(detail, `the S11 detail command is registered eagerly, got ${JSON.stringify([...commands.keys()])}`);
+      // S1/S5: `/herdr-gentle:worktree` was the mode-toggle command for the
+      // association editor. Worktrees carry no association any more, and the
+      // association editor, the full-screen detail and the delete view were
+      // removed with it (S4), so nothing registers that name.
+      assert.ok(!commands.has('herdr-gentle:worktree'),
+        `the removed command never registers, got ${JSON.stringify([...commands.keys()])}`);
+      // The old mode verbs stay dead: the surviving customize command refuses
+      // them and leaves the mode file byte-identical, so a disabled mode can
+      // never be flipped from a toggle verb.
       const modeBefore = modeBytes();
       const { ctx: detailCtx, notes: detailNotes } = makeCtx();
-      await detail.handler('enabled', detailCtx);
-      assert.deepEqual(detailNotes, [['Unknown option "enabled". Use /herdr-gentle:worktree.', 'error']], 'the removed toggle verbs are refused');
-      assert.equal(modeBytes(), modeBefore, 'the detail command never writes the mode');
+      await customizeDef(commands).handler('enabled', detailCtx);
+      assert.deepEqual(detailNotes, [['Unknown option "enabled". Use /herdr-gentle:customize or /herdr-gentle:customize status.', 'error']], 'the removed toggle verbs are refused');
+      assert.equal(modeBytes(), modeBefore, 'a toggle verb never writes the mode');
       assert.ok(commands.has('herdr-gentle:warp'), 'warp stays registered');
       assert.ok(commands.has('herdr-gentle:customize'), 'customize stays registered');
     } finally {
@@ -1086,7 +1090,10 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
       assert.equal(settled, 'pending');
       const lines = component.render(80);
       assert.ok(lines.length > 0, 'themed render produces rows');
-      for (const role of ['border', 'accent', 'muted']) {
+      // S11: every role the panel names comes from the shared palette — the
+      // frame/divider (border), the title and keys (accent), the descriptions
+      // and counts (muted) and the static labels (dim).
+      for (const role of ['border', 'accent', 'muted', 'dim']) {
         assert.ok(roles.includes(role), `theme.fg paints the ${role} role`);
       }
       for (const line of lines) assert.ok(!line.includes('\x1b'), 'injected theme adds no escapes of its own here');
@@ -1185,7 +1192,7 @@ describe('customize label-only rows with focused preview', { concurrency: false 
 });
 
 describe('worktree registration under an injected state dir (S15)', { concurrency: false }, () => {
-  const WORKTREE_TOOLS = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+  const WORKTREE_TOOLS = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 
   // A sandbox XDG state home plus an injected (new-id) dir. A stored flag
   // means <sandbox>/herdr/plugins/herdr-gentle-agents holds the mode file.
@@ -1294,7 +1301,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
   // stays the whole story: the copy names the session and warp coverage,
   // enabled registers exactly the five tools, disabled registers none, and
   // every disabled-path refusal keeps its exact bytes.
-  const FOUR = ['worktree_close', 'worktree_upsert', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
+  const FOUR = ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
   const REFUSAL =
     'worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them';
   const ENABLED_DETAIL = 'agents can create, list, close, warp between and open sessions in agent worktrees';
@@ -1364,7 +1371,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
       // refusal is the whole observable effect.
       modeLib().writeMode(false, process.env);
       const calls = [
-        ['worktree_upsert', { branch: 'feat/off' }],
+        ['worktree_create', { branch: 'feat/off' }],
         ['worktree_list', {}],
         ['worktree_close', { branch: 'feat/off' }],
         ['worktree_session_open', { worktree: 'feat-off' }],
@@ -1558,6 +1565,215 @@ describe('customize has no performance category (S22)', { concurrency: false }, 
     } finally {
       setSlot(hadSlot);
       restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S11: the customize panel paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme, exactly like the warp panel, the
+// create flow, odd and issues — a shortcut KEY is accent+bold and its
+// description muted, the panel title is accent+bold, a static label is dim, a
+// choice and a live value are accent, a position count is muted and the frame
+// plus its divider are the border role. Focus stays visible through its own
+// marks (▸/→), the legend still owns ONE row at every width, and a hostile
+// theme still renders every row in plain text.
+describe('S11: the shared palette', { concurrency: false }, () => {
+  const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39 };
+
+  function stripAnsi(line) {
+    return String(line).replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\]8;;.*?\x07/g, '');
+  }
+
+  // The real host measures a PAINTED line by its visible columns, so the
+  // palette assertions below install an ANSI-aware helper instead of the
+  // plain codepoint counter the untouched stubs use.
+  const ansiStubTui = {
+    ...stubTui,
+    visibleWidth: (text) => [...stripAnsi(String(text))].length,
+    truncateToWidth: (text, width) => {
+      const chars = [...stripAnsi(String(text))];
+      return chars.length > width ? chars.slice(0, width).join('') : String(text);
+    },
+  };
+
+  // A theme that RECORDS which role painted each string and paints every role
+  // with its own SGR code, so a rendered line can be read for the ROLE behind a
+  // token instead of trusting an eyeballed colour.
+  function recordingTheme() {
+    const calls = [];
+    const code = (role) => ROLE_SGR[role] ?? 95;
+    return {
+      calls,
+      fg(role, text) {
+        const value = String(text);
+        calls.push({ role, text: value });
+        return `\x1b[${code(role)}m${value}\x1b[0m`;
+      },
+      bold(text) {
+        const value = String(text);
+        calls.push({ role: 'bold', text: value });
+        return `\x1b[1m${value}\x1b[22m`;
+      },
+      bg(role, text) {
+        calls.push({ role: `bg:${role}`, text: String(text) });
+        return String(text);
+      },
+    };
+  }
+
+  function findRaw(lines, needle) {
+    const line = lines.find((entry) => stripAnsi(entry).includes(needle));
+    assert.ok(line !== undefined, `no line contains ${JSON.stringify(needle)}\n${lines.map(stripAnsi).join('\n')}`);
+    return line;
+  }
+
+  async function openThemedPanel(theme) {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot({ sidebarRead: 'gentle', moshiRead: 'off' });
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => ansiStubTui);
+      const { ctx, customs } = makeCtx({ customImpl: async () => {} });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(customs.length, 1, 'expected exactly one custom() call');
+      const opened = openComponent(customs[0][0], makeHostTui());
+      const component = customs[0][0](makeHostTui().tui, theme, {}, () => {});
+      assert.equal(opened.done(), 'pending');
+      return { component, cleanup: () => { setSlot(hadSlot); restoreEnv(); } };
+    } catch (err) {
+      setSlot(hadSlot);
+      restoreEnv();
+      throw err;
+    }
+  }
+
+  test('the footer paints every key accent+bold and its description muted', async () => {
+    const theme = recordingTheme();
+    const { component, cleanup } = await openThemedPanel(theme);
+    try {
+      const legend = findRaw(component.render(80), 'Esc close');
+      assert.match(legend, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m\x1b\[90m or Tab panes\x1b\[0m/,
+        'the pane key is accent+bold and its description muted');
+      assert.match(legend, /\x1b\[1m\x1b\[96m↑\/↓\x1b\[0m\x1b\[22m\x1b\[90m or j\/k move\x1b\[0m/,
+        'so is the movement key');
+      assert.match(legend, /\x1b\[1m\x1b\[96mEnter\x1b\[0m\x1b\[22m\x1b\[90m apply\x1b\[0m/,
+        'and the apply key');
+      assert.match(legend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m close\x1b\[0m/,
+        'and the close key');
+      assert.match(legend, /\x1b\[34m · \x1b\[0m/, 'the entries are joined by the border role');
+      assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('Enter')),
+        'the key is bolded through the theme, never by a literal escape');
+      assert.ok(theme.calls.some((call) => call.role === 'muted' && call.text === ' apply'),
+        'the description asks the injected theme for the muted role');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('the title is accent+bold, the section label dim, the choice a value and the count muted', async () => {
+    const theme = recordingTheme();
+    const { component, cleanup } = await openThemedPanel(theme);
+    try {
+      const lines = component.render(80);
+      const top = findRaw(lines, 'Customize · Herdr Gentle Shell');
+      assert.match(top, /\x1b\[1m\x1b\[96mCustomize · Herdr Gentle Shell\x1b\[0m\x1b\[22m/,
+        'the panel title is accent+bold');
+      assert.match(top, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m/, 'the esc hint on that row is a key');
+      const heading = findRaw(lines, 'CATEGORIES');
+      assert.match(heading, /\x1b\[2mCATEGORIES\x1b\[0m/, 'the section label is dim');
+      assert.match(heading, /\x1b\[1m\x1b\[96mHerdr Sidebar\x1b\[0m\x1b\[22m/, 'the section heading is a title');
+      assert.match(heading, /\x1b\[90m1\/2\x1b\[0m/, 'the position count is muted');
+      const row = findRaw(lines, 'Gentle (this extension)');
+      assert.match(row, /\x1b\[96m {2}→ Gentle \(this extension\)\x1b\[0m/, 'a choice is a live value');
+      const preview = findRaw(lines, 'Preview · Gentle');
+      assert.match(preview, /\x1b\[2mPreview\x1b\[0m\x1b\[2m · \x1b\[0m\x1b\[96mGentle \(this extension\)\x1b\[0m/,
+        'the preview label is dim and the focused label it names is a value');
+      const detail = findRaw(lines, 'publishes agent state and SessionChanges');
+      assert.match(detail, /\x1b\[90mpublishes agent state and SessionChanges from Gentle\x1b\[0m/,
+        'the description under the preview is muted');
+      assert.match(lines[0], /^\x1b\[34m╭/, 'the frame is painted with the border role');
+      assert.match(findRaw(lines, 'Herdr Sidebar'), /\x1b\[34m│\x1b\[0m/, 'the pane divider is the border role');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('focus markers survive the palette', async () => {
+    // A theme that paints no background has to keep focus readable through the
+    // ▸ mark, and a theme that does paint one shows the selected band instead.
+    const markerTheme = {
+      fg: (role, text) => `\x1b[${ROLE_SGR[role] ?? 95}m${String(text)}\x1b[0m`,
+      bold: (text) => `\x1b[1m${String(text)}\x1b[22m`,
+    };
+    const bandTheme = recordingTheme();
+    const markers = await openThemedPanel(markerTheme);
+    try {
+      const bands = await openThemedPanel(bandTheme);
+      try {
+        const focusedCategory = findRaw(markers.component.render(80), '▸ Herdr Sidebar');
+        assert.match(focusedCategory, /\x1b\[96m▸ /, 'the focused category keeps its accent ▸ mark');
+        markers.component.handleInput('right');
+        const text = markers.component.render(80).map(stripAnsi).join('\n');
+        assert.ok(text.includes('▸ → Gentle (this extension)'), 'the focused value keeps both ▸ and its → active mark');
+        bandTheme.calls.length = 0;
+        const banded = bands.component.render(80);
+        assert.ok(banded.length > 0, 'the background theme renders the same rows');
+        const bandCalls = bandTheme.calls.filter((call) => call.role === 'bg:selectedBg');
+        assert.ok(bandCalls.length > 0, 'a background theme paints the focused row as a band');
+        assert.ok(bandCalls.some((call) => call.text.includes('Herdr Sidebar')), 'the band carries the focused category');
+      } finally {
+        bands.cleanup();
+      }
+    } finally {
+      markers.cleanup();
+    }
+  });
+
+  test('the painted legend still owns exactly one row at every width', async () => {
+    const theme = recordingTheme();
+    const { component, cleanup } = await openThemedPanel(theme);
+    try {
+      for (const width of [40, 60, 80, 120]) {
+        const lines = component.render(width);
+        for (const line of lines) {
+          assert.equal([...stripAnsi(line)].length, width, `width ${width}: every row stays cell-exact`);
+        }
+        const legend = lines.filter((line) => /Esc close|esc close/.test(stripAnsi(line)));
+        assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+        assert.ok(!stripAnsi(legend[0]).includes('…'), `width ${width}: compacted, never ellipsis-clipped`);
+        assert.match(stripAnsi(legend[0]), /close/, `width ${width}: the close key survives`);
+        assert.match(legend[0], /\x1b\[1m\x1b\[96mEsc\x1b\[0m/, `width ${width}: the surviving close key keeps the key role`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('a hostile theme never breaks the panel and keeps every key readable', async () => {
+    const hostile = {
+      fg() { throw new Error('no colour support'); },
+      bold() { throw new Error('no bold support'); },
+      bg() { throw new Error('no background support'); },
+    };
+    const { component, cleanup } = await openThemedPanel(hostile);
+    try {
+      const lines = component.render(80);
+      for (const line of lines) {
+        assert.equal([...stripAnsi(line)].length, 80, `line is not 80 wide: ${JSON.stringify(line)}`);
+      }
+      const text = lines.map(stripAnsi).join('\n');
+      assert.ok(text.includes('Customize · Herdr Gentle Shell'), 'the title still renders');
+      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close'),
+        'the legend still spells every key');
+      assert.ok(text.includes('Preview · Gentle (this extension)'), 'the preview still renders');
+      assert.ok(text.includes('▸ Herdr Sidebar'), 'focus still renders through its mark');
+      for (const line of lines) assert.ok(!line.includes('\x1b'), 'a hostile theme adds no escapes');
+    } finally {
+      cleanup();
     }
   });
 });

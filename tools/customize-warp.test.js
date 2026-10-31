@@ -365,16 +365,14 @@ describe('herdr-gentle:warp command (S11)', { concurrency: false }, () => {
       modeLib().writeMode(false, process.env);
       const { tools, commands } = await loadExtension();
       assert.ok(!commands.has('herdr-gentle:warp'), `warp is hidden while disabled, got ${JSON.stringify([...commands.keys()])}`);
-      // S11: the registered worktree name is the eager read detail, not the
-      // removed mode toggle — it refuses the old verbs and never rewrites the
-      // mode file, so a disabled mode cannot be flipped from it.
-      const detail = commands.get('herdr-gentle:worktree');
-      assert.ok(detail, `the S11 detail stays registered while disabled, got ${JSON.stringify([...commands.keys()])}`);
+      // S1/S5: the `/herdr-gentle:worktree` mode command is removed with the
+      // association editor it drove, so it can never rewrite the mode file
+      // either — the association editor, the full-screen detail and the delete
+      // view went with it (S4), and the warp popup only warps or creates.
       const modeBefore = fs.readFileSync(modeLib().modePath(process.env), 'utf8');
-      const detailNotes = [];
-      await detail.handler('enabled', { ui: { notify: (message, level) => detailNotes.push([message, level]) } });
-      assert.deepEqual(detailNotes, [['Unknown option "enabled". Use /herdr-gentle:worktree.', 'error']], 'the removed toggle verbs are refused');
-      assert.equal(fs.readFileSync(modeLib().modePath(process.env), 'utf8'), modeBefore, 'the detail command never writes the mode');
+      assert.ok(!commands.has('herdr-gentle:worktree'),
+        `the removed worktree command never registers, got ${JSON.stringify([...commands.keys()])}`);
+      assert.equal(fs.readFileSync(modeLib().modePath(process.env), 'utf8'), modeBefore, 'no command rewrites the mode');
       for (const name of ['herdr-gentle:customize', 'herdr-gentle:odd', 'herdr-gentle:issues']) {
         assert.ok(commands.has(name), `${name} stays registered so reading and re-enabling work`);
       }
@@ -2876,7 +2874,7 @@ describe('worktree_warp agent tool (T40/S49)', { concurrency: false }, () => {
       const on = await loadExtension();
       assert.deepEqual(
         [...on.tools.keys()].sort(),
-        ['worktree_close', 'worktree_upsert', 'worktree_list', 'worktree_session_open', 'worktree_warp'].sort(),
+        ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'].sort(),
         'enabled registers all five tools including the agent warp',
       );
       modeLib().writeMode(false, process.env);

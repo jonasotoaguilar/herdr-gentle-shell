@@ -6896,15 +6896,35 @@ function customizeTruncate(helpers, text, width) {
 const CUSTOMIZE_CARD_PADDING = 4;
 const CUSTOMIZE_NARROW_WIDTH = 60;
 const CUSTOMIZE_MAX_HEIGHT = 24;
-// S2: the key legend is ONE terminal row. `text` is the full token, `short`
-// the compact form used when the full one does not fit, and `priority` the
-// drop order (the lowest goes first, ties drop the later token), so the close
-// key outlives every other hint.
+// S11: ONE palette decides which theme role paints each kind of token — a
+// shortcut key versus its description, a frame title, a static label, a live
+// value, a count, the border. It is the same lib/tui-paint.js the warp panel,
+// the create flow, odd and issues use, so the five surfaces cannot drift
+// apart, and a missing, partial or throwing theme degrades to plain text
+// inside the palette instead of breaking a render.
+//
+// Resolved on FIRST USE, never at load: registering the extension must not
+// depend on the presentation layer being present, so a lib directory without
+// it still registers and executes every other tool (see
+// tools/worktree-model-wiring.test.js).
+let customizePaletteModule = null;
+function customizePalette() {
+  if (customizePaletteModule === null) customizePaletteModule = libRequire("tui-paint.js");
+  return customizePaletteModule;
+}
+// S2: the key legend is ONE terminal row, and S11 decides its colours: `key`
+// is the exact key spelling the token starts with, so the palette paints that
+// prefix with the key role (accent + bold) and the rest as its description.
+// `text` is the full token, `short` the compact form used when the full one
+// does not fit (it keeps the same key prefix wherever it can, so a key never
+// loses its role when the row compacts), and `priority` the drop order (the
+// lowest goes first, ties drop the later token), so the close key outlives
+// every other hint.
 const CUSTOMIZE_FOOTER_KEYS = [
-  { text: "←/→ or Tab panes", short: "←/→ panes", priority: 60 },
-  { text: "↑/↓ or j/k move", short: "↑/↓ move", priority: 70 },
-  { text: "Enter apply", short: "↵ apply", priority: 80 },
-  { text: "Esc close", short: "esc close", priority: 100 },
+  { key: "←/→", text: "←/→ or Tab panes", short: "←/→ panes", priority: 60 },
+  { key: "↑/↓", text: "↑/↓ or j/k move", short: "↑/↓ move", priority: 70 },
+  { key: "Enter", text: "Enter apply", short: "Enter apply", priority: 80 },
+  { key: "Esc", text: "Esc close", short: "Esc close", priority: 100 },
 ];
 
 function customizeStripAnsi(value) {
@@ -6934,72 +6954,84 @@ function customizeFit(helpers, text, width, ellipsis = "…") {
   return chars.length > width ? chars.slice(0, Math.max(0, width - 1)).join("") + ellipsis : clean;
 }
 
-function customizePaint(helpers, theme, role, text, size) {
-  const clipped = customizeFit(helpers, text, Math.max(0, size));
-  const padded = clipped + " ".repeat(Math.max(0, size - customizeMeasure(helpers, clipped)));
-  try {
-    if (theme && typeof theme.fg === "function") return theme.fg(role, padded);
-  } catch {
-    // A hostile theme never breaks the panel.
-  }
-  return padded;
+// S11: paint one token with a palette KIND (title, key, label, value, count,
+// description, border) instead of naming a colour here. An unknown kind is
+// plain text.
+function customizeKind(theme, kind, text) {
+  const palette = customizePalette();
+  const painter = palette[kind];
+  if (typeof painter === "function") return painter(theme, text);
+  const role = palette.ROLES[kind];
+  return typeof role === "string" ? palette.paint(theme, role, text) : String(text);
 }
 
-// S2: a key legend stays on ONE row. The full text is used while it fits;
-// otherwise it compacts to its short tokens and then drops its lowest-priority
-// keys (display order never changes, and no token carries a newline), so it
-// never wraps onto a second row. The caller still paints through
-// customizePaint, which keeps the row cell-exact if a single token is wider
-// than the card.
-function customizeLegend(helpers, entries, width) {
-  const join = (list, field) => list.map((entry) => entry[field]).join(" · ");
-  const fits = (text) => customizeMeasure(helpers, text) <= width;
-  if (fits(join(entries, "text"))) return join(entries, "text");
-  if (fits(join(entries, "short"))) return join(entries, "short");
-  const kept = entries.slice();
-  while (kept.length > 1) {
-    let drop = 0;
-    for (let at = 1; at < kept.length; at += 1) {
-      if (kept[at].priority <= kept[drop].priority) drop = at;
-    }
-    kept.splice(drop, 1);
-    if (fits(join(kept, "short"))) break;
+// One cell of one kind. The line is fitted and padded FIRST and painted only
+// when it survived intact: a truncated line stays unpainted, so a cut never
+// lands inside an escape sequence.
+function customizePaint(helpers, theme, kind, text, size) {
+  const plain = String(text).split("\n")[0] ?? "";
+  const clipped = customizeFit(helpers, plain, Math.max(0, size));
+  const pad = " ".repeat(Math.max(0, size - customizeMeasure(helpers, clipped)));
+  if (clipped === "" || clipped !== plain) return clipped + pad;
+  return customizeKind(theme, kind, clipped) + pad;
+}
+
+// A composed line of kind-tagged segments (`{ kind, text }`), fitted and
+// padded as ONE string and painted only after the fit, for the same reason.
+// A segment without a kind is plain text.
+function customizeCompose(helpers, theme, segments, size) {
+  const plain = segments.map((segment) => segment.text).join("");
+  const clipped = customizeFit(helpers, plain, Math.max(0, size));
+  if (clipped !== plain) {
+    return clipped + " ".repeat(Math.max(0, size - customizeMeasure(helpers, clipped)));
   }
-  return join(kept, "short");
+  const painted = segments.map((segment) => customizeKind(theme, segment.kind, segment.text)).join("");
+  return painted + " ".repeat(Math.max(0, size - customizeMeasure(helpers, clipped)));
+}
+
+// An ALREADY painted row (the palette legend paints itself): pad it to `size`
+// without repainting, measuring visible columns.
+function customizePad(helpers, text, size) {
+  return text + " ".repeat(Math.max(0, size - customizeMeasure(helpers, text)));
+}
+
+// S2: the legend stays on ONE row and S11 decides its colours. The compaction
+// (full tokens, then short tokens, then dropping the lowest-priority entries;
+// display order never changes and no token carries a newline) and the
+// key/description painting live in lib/tui-paint.js, shared with the other
+// readers. A legend still wider than the card — one token wider than the inner
+// width — is truncated UNPAINTED so a cut never lands inside an escape.
+function customizeFooter(helpers, theme, entries, size) {
+  const measure = (text) => customizeMeasure(helpers, text);
+  const palette = customizePalette();
+  const plain = palette.legendRow(null, entries, size, measure);
+  if (measure(plain) > size) return customizeFit(helpers, plain, Math.max(0, size));
+  return palette.legendRow(theme, entries, size, measure);
 }
 
 // Focused-row selection (the palette's renderPaletteSelection pattern):
 // a full-width bar when the injected theme paints backgrounds, else an
-// accent ▸ marker — never a hardcoded escape.
+// accent ▸ marker — never a hardcoded escape, so focus stays readable on a
+// theme that answers neither.
 function customizeSelect(helpers, theme, label, size, focused) {
   const safe = String(label).split("\n")[0] ?? "";
   if (focused && theme && typeof theme.bg === "function") {
     try {
       const row = customizeFit(helpers, `  ${safe}`, Math.max(0, size));
-      return theme.bg("selectedBg", row + " ".repeat(Math.max(0, size - customizeMeasure(helpers, row))));
+      const band = theme.bg("selectedBg", row + " ".repeat(Math.max(0, size - customizeMeasure(helpers, row))));
+      if (typeof band === "string") return band;
     } catch {
       // Fall through to the marker form below.
     }
   }
-  let prefix = "  ";
-  if (focused) {
-    try {
-      prefix = theme && typeof theme.fg === "function" ? theme.fg("accent", "▸ ") : "▸ ";
-    } catch {
-      prefix = "▸ ";
-    }
-  }
-  return prefix + customizeFit(helpers, safe, Math.max(0, size - 2));
+  const prefix = focused ? customizePalette().paint(theme, "accent", "▸ ") : "  ";
+  return prefix + customizeKind(theme, "value", customizeFit(helpers, safe, Math.max(0, size - 2)));
 }
 
 function customizeCard(helpers, theme, lines, width) {
   const innerWidth = Math.max(1, width - CUSTOMIZE_CARD_PADDING);
-  let border = (text) => text;
-  try {
-    if (theme && typeof theme.fg === "function") border = (text) => theme.fg("border", text);
-  } catch {
-    border = (text) => text;
-  }
+  const palette = customizePalette();
+  const border = (text) => palette.paint(theme, "border", text);
   const horizontal = "─".repeat(innerWidth + 2);
   return [
     border(`╭${horizontal}╮`),
@@ -7091,27 +7123,34 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     const listLength = navOnly ? model.length : rightLines.length;
     const start = Math.min(Math.max(0, position - contentHeight + 1), Math.max(0, listLength - contentHeight));
     const navStart = Math.min(Math.max(0, state.cat - contentHeight + 1), Math.max(0, model.length - contentHeight));
-    const paint = (text, size, role = "text") => customizePaint(helpers, theme, role, text, size);
-    let divider = "│";
-    try {
-      divider = theme && typeof theme.fg === "function" ? theme.fg("border", "│") : "│";
-    } catch {
-      divider = "│";
-    }
+    const paint = (text, size, kind) => customizePaint(helpers, theme, kind, text, size);
+    const compose = (segments, size) => customizeCompose(helpers, theme, segments, size);
+    const divider = customizePalette().paint(theme, "border", "│");
     const join = (left, right) => leftWidth
       ? `${left}${" ".repeat(Math.max(0, leftWidth - customizeMeasure(helpers, left)))} ${divider} ${right}`
       : right;
     const lines = [];
-    // Title row doubles as the esc hint: same row, right-aligned.
+    // Title row doubles as the esc hint: same row, right-aligned. S11: the
+    // title is a title token and the esc hint a key one.
     const escGap = Math.max(1, inner - customizeMeasure(helpers, title) - 3);
-    lines.push(paint(`${title}${" ".repeat(escGap)}esc`, inner, "accent"));
+    lines.push(compose([
+      { kind: "title", text: title },
+      { text: " ".repeat(escGap) },
+      { kind: "key", text: "esc" },
+    ], inner));
     if (showHeading) {
+      // S11: the section label is dim, the section heading a title and the
+      // i/N position a muted count.
       const heading = navOnly
-        ? "Categories · choose a category →"
-        : `${category.title} · ${rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty"}`;
+        ? [{ kind: "title", text: "Categories" }, { kind: "label", text: " · choose a category →" }]
+        : [
+          { kind: "title", text: category.title },
+          { kind: "label", text: " · " },
+          { kind: "count", text: rows.length ? `${state.row[state.cat] + 1}/${rows.length}` : "empty" },
+        ];
       lines.push(join(
-        leftWidth ? paint("CATEGORIES", leftWidth, "accent") : "",
-        paint(heading, rightWidth, "accent"),
+        leftWidth ? paint("CATEGORIES", leftWidth, "label") : "",
+        compose(heading, rightWidth),
       ));
     }
     const current = focused();
@@ -7131,34 +7170,42 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
         if (navOnly) {
           cell = customizeSelect(helpers, theme, item.title, rightWidth, start + i === position);
         } else if (item.muted) {
-          cell = paint(`    ${item.label}`, rightWidth, "muted");
+          cell = paint(`    ${item.label}`, rightWidth, "description");
         } else if (item.focused) {
           cell = customizeSelect(helpers, theme, item.label, rightWidth, true);
         } else {
-          cell = paint(`  ${item.label}`, rightWidth, "text");
+          cell = paint(`  ${item.label}`, rightWidth, "value");
         }
         right = cell;
       } else if (!navOnly && rightLines.length === 0) {
-        right = paint("No settings available", rightWidth, "muted");
+        right = paint("No settings available", rightWidth, "description");
       }
       lines.push(join(left, right));
     }
     // Bottom block (gentle-shell style): the FOCUSED choice's label in
     // the title plus its S2 description on the next line — exactly
-    // once. The redundant Active: repeat is gone on purpose.
-    const previewTitle = `Preview · ${current.row ? current.row.label : current.category.title}`;
+    // once. The redundant Active: repeat is gone on purpose. S11: the
+    // `Preview` label is dim, the choice it names a live value and the
+    // description muted.
+    const previewLabel = current.row ? current.row.label : current.category.title;
+    const previewTitle = `Preview · ${previewLabel}`;
     const previewSample = current.row ? current.row.detail : "unavailable";
     if (previewLines === 3) {
       lines.push("");
-      lines.push(paint(previewTitle, inner, "accent"));
-      lines.push(paint(previewSample, inner, "muted"));
+      lines.push(compose([
+        { kind: "label", text: "Preview" },
+        { kind: "label", text: " · " },
+        { kind: "value", text: previewLabel },
+      ], inner));
+      lines.push(paint(previewSample, inner, "description"));
     } else if (previewLines === 1) {
-      lines.push(paint(previewTitle, inner, "muted"));
+      lines.push(paint(previewTitle, inner, "description"));
     }
     // S15/S30: the footer names every shortcut; no `?` help and no
-    // benchmark disclosure widget.
+    // benchmark disclosure widget. S11: the legend paints itself through
+    // the shared palette (keys accent+bold, descriptions muted).
     if (showHeading) {
-      lines.push(paint(customizeLegend(helpers, CUSTOMIZE_FOOTER_KEYS, inner), inner, "muted"));
+      lines.push(customizePad(helpers, customizeFooter(helpers, theme, CUSTOMIZE_FOOTER_KEYS, inner), inner));
     }
     return customizeCard(helpers, theme, lines.slice(0, Math.max(0, height - 2)), w);
   }

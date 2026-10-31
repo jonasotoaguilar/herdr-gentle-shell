@@ -497,10 +497,6 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const sessionFile = sessionFileIn();
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
       const { commands, mod } = await loadExtension();
-      // S6: the create panel consults NO issue or odd source, so these two
-      // stubs throw if the creation ever asks for one.
-      mod.setWarpCreateIssuesFetcher(async () => { throw new Error('the create panel must not list issues'); });
-      mod.setWarpCreateOddLister(() => { throw new Error('the create panel must not list odd documents'); });
       let mounts = 0;
       built.ctx.ui.custom = async (factory, options) => {
         mounts += 1;
@@ -546,348 +542,6 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       assert.equal(created.odd, null, 'S6: a created row carries no odd association');
       assert.equal(built.switches.length, 1, 'the session warped into the new worktree');
       assert.deepEqual(built.notes, [], 'creation then warp is silent on success');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('the extended-list delete flow stays reachable and still guarded', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete');
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      // `v` opens the extended list; Ctrl+D on the principal is guarded;
-      // down + Ctrl+D targets the agent worktree.
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      const closeCtxs = [];
-      mod.setWarpCloseRunner(async (params, closeCtx) => {
-        closeCalls.push(params);
-        closeCtxs.push(closeCtx);
-        return { isError: false, text: 'removed: feat-del \u00b7 feat/del', details: {} };
-      });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'the principal row is never deletable');
-      assert.equal(built.confirms[0][0], `Delete worktree 'feat-del'?`);
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch.`,
-        'a clean row with no commits of its own raises no false warning');
-      assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once for the approved row');
-      assert.equal(closeCtxs[0].hasUI, false, 'the confirmed delete shows no second dialog');
-      assert.deepEqual(built.notes, [['removed: feat-del \u00b7 feat/del', 'info']], 'the success text is unchanged');
-      assert.equal(driver.mounts(), 2, 'the selector reopened after the delete');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a refused deletion changes nothing and reopens the selector', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-cancel');
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => false,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      const registryFile = registryLib.registryPath(root);
-      const before = fs.readFileSync(registryFile);
-      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1);
-      assert.deepEqual(closeCalls, [], 'a refusal removes nothing');
-      assert.deepEqual(built.notes, [], 'a refusal notifies nothing');
-      assert.deepEqual(fs.readFileSync(registryFile), before, 'a refusal writes no registry entry');
-      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'a refusal leaves every checkout live');
-      assert.ok(fs.existsSync(target), 'the refused checkout still exists');
-      assert.equal(driver.mounts(), 2, 'the selector reopened');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a dirty target names its pending changes and the approval carries force for exactly that row', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-dirty');
-      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
-      git(root, ['add', 'a.txt']);
-      git(root, ['commit', '-m', 'seed']);
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1);
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Pending changes: 1 file, +1/-0.`,
-        'the dirty row names its pending changes and nothing else');
-      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes carries force for that row');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a dirty row with commits of its own discloses BOTH the pending changes and the commits ahead of main', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-dirty-ahead');
-      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
-      git(root, ['add', 'a.txt']);
-      git(root, ['commit', '-m', 'seed']);
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      // Two commits that `main` does not have, plus one pending change.
-      git(target, ['commit', '--allow-empty', '-m', 'ahead one']);
-      git(target, ['commit', '--allow-empty', '-m', 'ahead two']);
-      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'the warning never replaces the confirmation');
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Pending changes: 1 file, +1/-0. Commits ahead of main: 2.`,
-        'both the pending changes and the commits ahead of main are named');
-      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes carries force for that row');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a HEAD that only has commits ahead of main warns about them too', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-ahead-only');
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      git(target, ['commit', '--allow-empty', '-m', 'ahead one']);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Commits ahead of main: 1.`,
-        'a clean checkout ahead of main warns without claiming pending changes');
-      assert.deepEqual(closeCalls, [{ path: target }], 'a clean row is closed without force');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('missing ahead-of-main evidence is reported as unknown, never as zero and never as safe', async () => {
-    setEnv(warpStateEnv());
-    try {
-      // No `main` branch: the ahead-of-main comparison cannot be answered.
-      const root = makeRepo('wired-delete-no-main');
-      const target = addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => false,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'unknown evidence still asks');
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch. Commits ahead of main: unknown (base branch not found: main).`,
-        'the unreadable comparison is named, not silently dropped');
-      assert.ok(!/Commits ahead of main: 0/.test(built.confirms[0][1]), 'unknown is never reported as zero');
-      assert.deepEqual(closeCalls, [], 'a refusal deletes nothing');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('YOLO active still asks before deleting a clean row and a refusal deletes nothing', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-yolo');
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      // The row is provably clean and YOLO is ON: the keypress alone must
-      // still never delete, so the refusal below removes nothing.
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => false,
-      });
-      answerYolo('ON');
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'YOLO never waives a keyboard delete');
-      assert.equal(built.confirms[0][0], `Delete worktree 'feat-del'?`);
-      assert.deepEqual(closeCalls, [], 'the refusal under YOLO removed nothing');
-      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'no checkout disappeared');
-      assert.equal(driver.mounts(), 2, 'the selector reopened');
-    } finally {
-      restoreEnv();
-      resetYolo();
-    }
-  });
-
-  test('YOLO active still asks before deleting a clean row and the Yes deletes exactly once', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-yolo-yes');
-      addMainBranch(root);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      answerYolo('ON');
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      const closeCtxs = [];
-      mod.setWarpCloseRunner(async (params, closeCtx) => {
-        closeCalls.push(params);
-        closeCtxs.push(closeCtx);
-        return { isError: false, text: 'removed', details: {} };
-      });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'exactly one confirmation under YOLO');
-      assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once, without force');
-      assert.equal(closeCtxs[0].hasUI, false, 'the explicit Yes is the only dialog');
-      assert.deepEqual(built.notes, [['removed', 'info']], 'the success text is unchanged');
-    } finally {
-      restoreEnv();
-      resetYolo();
-    }
-  });
-
-  test('YOLO never waives the deletion confirmation of a dirty row', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-yolo-dirty');
-      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
-      git(root, ['add', 'a.txt']);
-      git(root, ['commit', '-m', 'seed']);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      answerYolo('ON');
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'a dirty row is confirmed even under YOLO');
-      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes still carries force for that row');
-    } finally {
-      restoreEnv();
-      resetYolo();
-    }
-  });
-
-  test('a host without a confirm dialog deletes nothing', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-noui');
-      addMainBranch(root);
-      addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      delete built.ctx.ui.confirm;
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      const beforeList = git(root, ['worktree', 'list', '--porcelain']);
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 0, 'no dialog could be asked');
-      assert.deepEqual(closeCalls, [], 'no confirmation means no delete');
-      assert.equal(git(root, ['worktree', 'list', '--porcelain']), beforeList, 'no checkout disappeared');
-      assert.deepEqual(built.notes, [['warp: the host UI cannot confirm worktree deletion here; nothing was deleted.', 'error']],
-        'the refusal is stated once');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('the ordinary delete failure text is unchanged and nothing is removed silently', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-fail');
-      addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const refusal = 'cannot close the worktree at /somewhere: dirty checkout';
-      mod.setWarpCloseRunner(async () => ({ isError: true, text: refusal, details: {} }));
-      await warpDef(commands).handler('', built.ctx);
-      assert.deepEqual(built.notes, [[refusal, 'error']], 'the close refusal is reported verbatim');
-      assert.equal(driver.mounts(), 2, 'the selector reopened after the failure');
     } finally {
       restoreEnv();
     }
@@ -1088,347 +742,7 @@ function wiredCtx(root, driver, extra = {}) {
   });
 }
 
-// The editing panel's fixture world: issues in the SOURCE (recency) order,
-// odd documents in modification order, and previews that never spawn `gh`.
-const SOURCE_ISSUES = [
-  { number: 7, title: 'newest update' },
-  { number: 2, title: 'middle update' },
-  { number: 9, title: 'oldest update' },
-];
-const SOURCE_ODD = [
-  { name: 'w1-a', path: '/fixtures/odd/w1-a.md' },
-  { name: 'w1-b', path: '/fixtures/odd/w1-b.md' },
-];
-
-function panelSources(mod) {
-  mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: SOURCE_ISSUES.map((row) => ({ ...row })) }));
-  mod.setWarpCreateOddLister(() => SOURCE_ODD.map((doc) => ({ ...doc })));
-  // Both seams are optional while the wiring is incomplete (RED), so a
-  // missing setter never makes a suite reach for a live `gh`.
-  if (typeof mod.setWarpCreateIssuePreviewReader === 'function') {
-    mod.setWarpCreateIssuePreviewReader((number) => ({
-      ok: true,
-      issue: { number, title: `Issue ${number}`, state: 'open', author: 'ana', body: `body ${number}` },
-      comments: [],
-    }));
-  }
-  if (typeof mod.setWarpCreateOddPreviewReader === 'function') {
-    mod.setWarpCreateOddPreviewReader((doc) => ({ ok: true, text: `# ${doc.name}\n\nspecs` }));
-  }
-}
-
-const ghIssues = require('../lib/gh-issues.js');
-
-// The worktree detail lists the checkout's OPEN issues and previews them
-// through the shared gh client; this stub answers both, and answers 404 for a
-// number it does not know, so no test ever spawns the binary.
-function stubDetailGh(openNumbers = [2, 7]) {
-  const calls = [];
-  // The same cursor-paged connection the production prime reads: the detail's
-  // open-issue snapshot arrives through it, never through a live binary.
-  const graphqlSnapshot = () => JSON.stringify({
-    data: {
-      repository: {
-        issues: {
-          totalCount: openNumbers.length,
-          pageInfo: { hasNextPage: false, endCursor: null },
-          nodes: openNumbers.map((number) => ({
-            number,
-            title: `issue title ${number}`,
-            state: 'OPEN',
-            stateReason: '',
-            author: { login: 'octo' },
-            labels: { nodes: [] },
-            createdAt: '2024-01-01T00:00:00Z',
-            updatedAt: '2024-01-02T00:00:00Z',
-            url: `https://example.test/issues/${number}`,
-            comments: { totalCount: 0 },
-            reactionGroups: [],
-          })),
-        },
-      },
-    },
-  });
-  ghIssues.setGhRunner(async (bin, argv) => {
-    calls.push(argv.slice());
-    if (argv[0] === 'api' && argv[1] === 'graphql') return { status: 0, stdout: graphqlSnapshot(), stderr: '' };
-    if (argv[0] === 'api' && argv[1] === 'user') return { status: 0, stdout: '{"login":"octo"}', stderr: '' };
-    if (argv[0] === 'repo' && argv[1] === 'view') return { status: 0, stdout: '{"nameWithOwner":"octo/repo"}', stderr: '' };
-    if (argv[0] === 'issue' && argv[1] === 'list') {
-      const rows = openNumbers.map((number) => ({
-        number,
-        title: `issue title ${number}`,
-        state: 'open',
-        author: { login: 'octo' },
-        labels: [],
-        createdAt: '2024-01-01T00:00:00Z',
-        updatedAt: '2024-01-02T00:00:00Z',
-      }));
-      return { status: 0, stdout: JSON.stringify(rows), stderr: '' };
-    }
-    if (argv[0] === 'issue' && argv[1] === 'view') {
-      const number = Number(argv[2]);
-      if (!openNumbers.includes(number)) {
-        return { status: 1, stdout: '', stderr: `GraphQL: Could not resolve to an Issue with the number of ${number}. (repository.issue)` };
-      }
-      return {
-        status: 0,
-        stdout: JSON.stringify({ number, title: `issue title ${number}`, state: 'open', body: `body ${number}`, comments: [] }),
-        stderr: '',
-      };
-    }
-    return { status: 0, stdout: '{}', stderr: '' };
-  });
-  return calls;
-}
-
-// An odd document inside the checkout the detail reads.
-function writeOddDoc(target, name) {
-  const file = path.join(target, 'odd', 'tasks', `${name}.md`);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `# ${name}\n\nspecs\n`);
-  return file;
-}
-
-// Drive the registry's write seam: the count and the patch are what prove
-// "both fields, exactly one write". The extension requires the same module
-// object, so a local wrapper observes every save without touching git.
-function watchRegistryWrites() {
-  const original = registryLib.updateWorktree;
-  const writes = [];
-  registryLib.updateWorktree = (repoRoot, key, patch, opts) => {
-    writes.push({ key, patch });
-    return original(repoRoot, key, patch, opts);
-  };
-  return {
-    writes,
-    restore: () => { registryLib.updateWorktree = original; },
-  };
-}
-
-// The panel's `e` on the first listed worktree row: creation is no longer a
-// row (S6), so the first row is already the focused checkout.
-const EDIT_KEYS = ['e'];
-
-describe('T12: `e` opens the worktree detail (S7, S13)', { concurrency: false }, () => {
-  test('e mounts the full-screen detail with the checkout real branch, path and stored assignment', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-open');
-      const target = addRegisteredWorktree(root, 'feat/real-target');
-      writeOddDoc(target, 'w1-a');
-      writeOddDoc(target, 'w1-b');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      let rendered = '';
-      let oddRendered = '';
-      const driver = multiDriver([['e'], (view) => {
-        rendered = clean(view.render(120).join('\n'));
-        view.handleInput('tab');
-        oddRendered = clean(view.render(120).join('\n'));
-        view.handleInput('\x1b');
-      }, ['\x1b']]);
-      const built = wiredCtx(root, driver);
-      const { commands } = await loadExtension();
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(driver.mounts(), 3, 'the selector, the detail, then the selector again');
-      // S7: full screen, never the old centred create/edit popup.
-      assert.deepEqual(built.customs[1], {
-        overlay: true,
-        overlayOptions: { anchor: 'center', width: '100%', maxHeight: '100%', margin: 0 },
-      });
-      assert.ok(rendered.includes(target), `the detail names the checkout path\n${rendered}`);
-      assert.match(rendered, /feat-real-target/, 'the checkout name');
-      assert.match(rendered, /branch feat\/real-target/, 'the REAL branch, read from git');
-      assert.match(rendered, /\[x\] #2 issue title 2/, 'the stored issue arrives pre-selected');
-      assert.match(rendered, /\[ \] #7 issue title 7/, 'the unassigned issue arrives unchecked');
-      // Round-3 S6 adds #number to the complete title; order and marks still
-      // come from visible list cells, never a private row shape.
-      const issueRows = rendered.split('\n').filter((row) => /\[[x ]\]/.test(row));
-      assert.deepEqual(
-        issueRows.map((row) => row.match(/\[[x ]\] (#\d+ issue title \d+)/)[1]),
-        ['#2 issue title 2', '#7 issue title 7'],
-        'the left list shows the exact titles in source order',
-      );
-      assert.ok(
-        issueRows.every((row) => /\[[x ]\] #\d+ /.test(row.split('│')[1] || '')),
-        'S6: each list title carries its #number',
-      );
-      assert.match(rendered, /issues: #2\b/, 'the header carries assigned ids, not a count');
-      assert.match(oddRendered, /● w1-a/, 'the stored odd document is the active one (one, never a list)');
-      assert.match(oddRendered, /○ w1-b/, 'and the other document is offered but not selected');
-      assert.deepEqual(built.notes, [], 'Esc is silent');
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-
-  test('esc writes nothing: the registry keeps its row byte for byte and the selector reopens', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-esc');
-      const target = addRegisteredWorktree(root, 'feat/esc-target');
-      writeOddDoc(target, 'w1-a');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      const registryFile = registryLib.registryPath(root);
-      const before = fs.readFileSync(registryFile, 'utf8');
-      const watcher = watchRegistryWrites();
-      try {
-        const driver = multiDriver([EDIT_KEYS, (view) => view.handleInput('\x1b'), ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 3, 'the selector reopened after the cancel');
-        assert.deepEqual(watcher.writes, [], 'Esc performed no registry write');
-        const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-        assert.deepEqual(row.issues, [2], 'the assigned issues are untouched');
-        assert.equal(row.odd, 'w1-a', 'the assigned odd document is untouched');
-        assert.equal(fs.readFileSync(registryFile, 'utf8'), before, 'the registry file is byte for byte unchanged');
-        assert.deepEqual(built.notes, [], 'a cancel notifies nothing');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-
-  test('ctrl+s writes BOTH fields exactly once, and the selector reopens with the fresh values', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-save');
-      const target = addRegisteredWorktree(root, 'feat/save-target');
-      writeOddDoc(target, 'w1-a');
-      writeOddDoc(target, 'w1-b');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      const watcher = watchRegistryWrites();
-      try {
-        const driver = multiDriver([
-          EDIT_KEYS,
-          (view) => {
-            // ODD tab: filter down to the second document and select it.
-            view.handleInput('tab');
-            view.handleInput('T');
-            for (const char of 'w1-b') view.handleInput(char);
-            view.handleInput('\r');
-            view.handleInput(' ');
-            // Issues tab: filter to #7 and assign it.
-            view.handleInput('tab');
-            view.handleInput('T');
-            view.handleInput('7');
-            view.handleInput('\r');
-            view.handleInput(' ');
-            view.handleInput('\x13');
-            view.handleInput('\x1b');
-          },
-          ['\x1b'],
-        ]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(watcher.writes.length, 1, 'exactly ONE registry write carries both fields');
-        assert.equal(watcher.writes[0].key, target, 'the write targets the edited checkout');
-        assert.deepEqual(
-          Object.keys(watcher.writes[0].patch).sort(),
-          ['issues', 'odd'],
-          'the single patch carries both assignment fields',
-        );
-        const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-        assert.deepEqual(row.issues, [2, 7], 'the selected issues were saved');
-        // S8a: the ODD control is a SELECT, so choosing the second document
-        // REPLACES the stored one instead of adding to it.
-        assert.equal(row.odd, 'odd/tasks/w1-b.md', 'the chosen odd document replaced the stored one, never joined it');
-        assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
-        const reopened = await waitForFactsFooter(driver.views[2]);
-        assert.match(reopened, /issues: #2, #7/, `the reopened selector shows the saved issue identities\n${reopened}`);
-        assert.match(reopened, /odd: w1-b/, 'the saved document appears by name');
-        assert.deepEqual(built.notes, [], 'a successful save is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-
-  test('a refusing registry surfaces its error in the detail and changes nothing stored', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-refuse');
-      const target = addRegisteredWorktree(root, 'feat/refuse-target');
-      writeOddDoc(target, 'w1-a');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      const original = registryLib.updateWorktree;
-      registryLib.updateWorktree = () => ({ ok: false, error: 'registry is read-only' });
-      try {
-        let rendered = '';
-        const driver = multiDriver([EDIT_KEYS, async (view) => {
-          view.handleInput('T');
-          view.handleInput('7');
-          view.handleInput('\r');
-          view.handleInput(' ');
-          view.handleInput('\x13');
-          await tick();
-          rendered = clean(view.render(120).join('\n'));
-          view.handleInput('\x1b');
-        }, ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.match(rendered, /save failed: registry is read-only/, 'the refusing registry surfaces its own error');
-        assert.deepEqual(built.notes, [], 'the failure is shown in the surface, not announced');
-      } finally {
-        registryLib.updateWorktree = original;
-      }
-      const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-      assert.deepEqual(row.issues, [2], 'the refused write changed nothing');
-      assert.equal(row.odd, 'w1-a', 'the refused write changed nothing');
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-});
-
-describe('T12: the popup and its panes keep the SOURCE order (S15)', { concurrency: false }, () => {
-  test('the Issues tab lists assigned first, then descending number, and only open issues', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-order');
-      const target = addRegisteredWorktree(root, 'feat/order-target');
-      writeOddDoc(target, 'w1-a');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: null }).ok, true);
-      stubDetailGh([2, 7, 9]);
-      let rendered = '';
-      const driver = multiDriver([EDIT_KEYS, (view) => {
-        rendered = clean(view.render(160).join('\n'));
-        view.handleInput('\x1b');
-      }, ['\x1b']]);
-      const built = wiredCtx(root, driver);
-      const { commands } = await loadExtension();
-      await warpDef(commands).handler('', built.ctx);
-      const issueRows = rendered.split('\n').filter((row) => /\[[x ]\]/.test(row));
-      assert.deepEqual(
-        issueRows.map((row) => row.match(/\[[x ]\] (#\d+ issue title \d+)/)[1]),
-        ['#2 issue title 2', '#9 issue title 9', '#7 issue title 7'],
-        `assigned first, then descending number, open only\n${rendered}`,
-      );
-      assert.ok(
-        issueRows.every((row) => /\[[x ]\] #\d+ /.test(row.split('│')[1] || '')),
-        'S6: each list title carries its #number',
-      );
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-
+describe('T12: the popup rows keep the activity order (S15)', { concurrency: false }, () => {
   test('the popup rows are ordered by last activity (commit time), oldest last', async () => {
     setEnv(warpStateEnv());
     try {
@@ -1551,6 +865,91 @@ function missingSessionFile(tag) {
   return path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-warp-${tag}-`))), 'missing.jsonl');
 }
 
+// ---------------------------------------------------------------------------
+// S1/S4: the warp popup reaches NO worktree modification any more. The old
+// `e` opened the full-screen worktree detail and deleted issues/ODD
+// associations there; `ctrl+d` (panel and extended list) opened the delete
+// confirmation. Both views were removed with the association, so every one of
+// those keys is inert and mutates nothing.
+describe('S1/S4: the warp popup cannot edit or delete a worktree', { concurrency: false }, () => {
+  test('`e` opens no detail, asks nothing, writes nothing and leaves the popup in place', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-edit-key');
+      const target = addRegisteredWorktree(root, 'feat/edit-target');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [5], odd: 'w1-a' }).ok, true);
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['e', '\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(driver.mounts(), 1, 'only the popup mounted: `e` opened no detail');
+        assert.deepEqual(built.confirms, [], 'no dialog was raised');
+        assert.deepEqual(watcher.kinds(), [], 'no creation and no registry write');
+        assert.deepEqual(createdState(root), before, 'the checkout and the registry are untouched');
+        assert.deepEqual(built.notes, [], 'an inert key is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('`ctrl+d` in the panel and in the extended list deletes nothing', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-delete-key');
+      const target = addRegisteredWorktree(root, 'feat/del-target');
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        // `v` enters the extended list, where Ctrl+D used to resolve a delete.
+        const driver = multiDriver([['v', '\x04', 'ctrl+d', '\x1b', '\x04', 'ctrl+d', '\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+        assert.deepEqual(built.confirms, [], 'no deletion confirmation was asked');
+        assert.deepEqual(watcher.kinds(), [], 'nothing was removed and nothing was written');
+        assert.deepEqual(createdState(root), before, 'the checkout is still there');
+        assert.ok(fs.existsSync(target), 'the checkout directory still exists on disk');
+        assert.deepEqual(built.notes, [], 'an inert key is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S1: opening and leaving the popup preserves a legacy stored association byte for byte', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('legacy-association');
+      const target = addRegisteredWorktree(root, 'feat/legacy');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [5, 6], odd: 'w1-a' }).ok, true);
+      const stored = registryLib.readRegistry(root).worktrees.find((row) => row.path === target);
+      assert.deepEqual(stored.issues, [5, 6], 'the fixture really stores an association');
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+        assert.deepEqual(watcher.kinds(), [], 'the popup wrote nothing');
+        const after = registryLib.readRegistry(root).worktrees.find((row) => row.path === target);
+        assert.deepEqual(after, stored, 'the legacy association is preserved, never migrated or dropped');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
 describe('T16: the panels write nothing until the user confirms (S17)', { concurrency: false }, () => {
   test('opening the creating panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
     setEnv(warpStateEnv());
@@ -1566,8 +965,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           view.handleInput('\x1b'); // cancel
         }]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(driver.mounts(), 2, 'the popup then the create panel mounted');
         assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) created nothing and wrote nothing');
@@ -1579,43 +977,6 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         watcher.restore();
       }
     } finally {
-      restoreEnv();
-    }
-  });
-
-  test('opening the worktree detail performs no registry write and no checkout creation, and Esc creates no state', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('no-write-open-edit');
-      const target = addRegisteredWorktree(root, 'feat/real-target');
-      writeOddDoc(target, 'w1-a');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      const before = createdState(root);
-      const registryFile = registryLib.registryPath(root);
-      const registryBytes = fs.readFileSync(registryFile, 'utf8');
-      const watcher = watchMutations();
-      try {
-        const driver = multiDriver([EDIT_KEYS, (view) => {
-          view.render(160);
-          assert.equal(watcher.events.length, 0, 'drawing the detail mutated nothing');
-          view.handleInput('\x1b'); // cancel
-        }, ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 3, 'the popup, the detail, then the popup again');
-        assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) wrote nothing');
-        assert.equal(watcher.writes().length, 0, 'zero registry writes');
-        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
-        assert.deepEqual(createdState(root), before, 'no created state');
-        assert.equal(fs.readFileSync(registryFile, 'utf8'), registryBytes, 'the registry file is byte for byte unchanged');
-        assert.deepEqual(built.notes, [], 'a cancel is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      ghIssues.setGhRunner(null);
       restoreEnv();
     }
   });
@@ -1669,108 +1030,6 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('inside the worktree detail navigating, filtering and selecting each add no mutation', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('no-write-edit-keys');
-      const target = addRegisteredWorktree(root, 'feat/real-target');
-      writeOddDoc(target, 'w1-a');
-      writeOddDoc(target, 'w1-b');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      const before = createdState(root);
-      const watcher = watchMutations();
-      try {
-        const driver = multiDriver([EDIT_KEYS, (view) => {
-          const step = stepRecorder(view, watcher);
-          step('navigate the issue rows', (v) => v.handleInput('down'));
-          assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
-          step('filter the issues', (v) => {
-            v.handleInput('T');
-            for (const char of '7') v.handleInput(char);
-            v.handleInput('\r');
-          });
-          assert.deepEqual(view.state.issues, [2], 'filtering selects nothing');
-          step('assign the filtered issue', (v) => v.handleInput(' '));
-          assert.deepEqual(view.state.issues, [2, 7], 'exactly the toggled issue was added');
-          step('switch to the ODD tab', (v) => v.handleInput('tab'));
-          step('filter the documents', (v) => {
-            v.handleInput('T');
-            for (const char of 'w1-b') v.handleInput(char);
-            v.handleInput('\r');
-          });
-          step('select that document', (v) => v.handleInput(' '));
-          assert.match(String(view.state.odd), /w1-b/, 'the chosen document REPLACED the active one');
-          assert.equal(Array.isArray(view.state.odd), false, 'never a list');
-          step('scroll the preview', (v) => v.handleInput('ctrl+j'));
-          step('cancel the detail', (v) => v.handleInput('\x1b'));
-          assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 8, 'every scripted interaction was measured');
-        }, ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
-        assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
-        assert.deepEqual(createdState(root), before, 'the assignments and every created state are untouched');
-        assert.deepEqual(built.notes, [], 'a cancel is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-
-  test('confirming the edit is the FIRST mutation: exactly one registry write and no creation', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('first-mutation-edit');
-      const target = addRegisteredWorktree(root, 'feat/save-target');
-      writeOddDoc(target, 'w1-a');
-      writeOddDoc(target, 'w1-b');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: 'w1-a' }).ok, true);
-      stubDetailGh([2, 7]);
-      const watcher = watchMutations();
-      try {
-        let confirmedAt = 0;
-        const driver = multiDriver([EDIT_KEYS, (view) => {
-          view.handleInput('tab');
-          view.handleInput('T');
-          for (const char of 'w1-b') view.handleInput(char);
-          view.handleInput('\r');
-          view.handleInput(' '); // choose the second odd document (replaces)
-          view.handleInput('tab');
-          view.handleInput('T');
-          view.handleInput('7');
-          view.handleInput('\r');
-          view.handleInput(' '); // assign #7
-          assert.deepEqual(watcher.kinds(), [], 'every selection before the confirm wrote nothing');
-          confirmedAt = watcher.events.length;
-          view.handleInput('\x13'); // the explicit confirm
-          view.handleInput('\x1b');
-        }, ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
-        assert.deepEqual(watcher.kinds(), ['registry-write'], 'confirming is the first and only mutation');
-        assert.equal(watcher.writes().length, 1, 'editing performs exactly ONE registry write');
-        assert.equal(watcher.creations().length, 0, 'editing creates no checkout');
-        assert.equal(watcher.writes()[0].name, 'updateWorktree', 'the write goes through the registry entry point');
-        assert.equal(watcher.writes()[0].key, target, 'and targets the edited checkout');
-        assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
-        assert.deepEqual(built.notes, [], 'a successful save is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      ghIssues.setGhRunner(null);
-      restoreEnv();
-    }
-  });
-
   test('confirming the creation is the FIRST mutation, and the checkout creation precedes the one registry write', async () => {
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'first-mutation-thread' }));
     try {
@@ -1792,8 +1051,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           view.handleInput('enter'); // the explicit confirm key
         }]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
         assert.deepEqual(watcher.kinds(), ['checkout-create', 'registry-write'], 'one creation then one write, in that order');
@@ -1840,8 +1098,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           calls: [],
           mount: driver.mount,
         });
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
         assert.deepEqual(watcher.kinds(), [], 'a refused preflight mutates nothing');

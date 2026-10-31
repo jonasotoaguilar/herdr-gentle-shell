@@ -17,19 +17,21 @@
 // worktree is left out (S4c, reconciled in L2) and never when everything
 // fits; the legend is exactly ONE row (S2); S5 rows are the checkout NAMES
 // alone (the branch lives in a data line, never repeated on the row); a data
-// line carries branch, the associated issue IDS and ODD NAMES (never counts;
-// a readable empty association is `-`), the change size as LINE
-// COUNTS (`changes +A −D`, S16), `↑N ↓M` and both ages, omits a measured zero
-// for the change size and for each of `↑`/`↓`, and says `unavailable` — never
-// `0` — for a fact it cannot read, while an unreadable AGE is the brief `—`
-// and never the caller's prose reason (S15: the reason stays in the data);
-// the facts are read for the current and the
+// line carries branch, the change size as LINE COUNTS (`changes +A −D`, S16),
+// `↑N ↓M` and both ages, omits a measured zero for the change size and for
+// each of `↑`/`↓`, and says `unavailable` — never `0` — for a fact it cannot
+// read, while an unreadable AGE is the brief `—` and never the caller's prose
+// reason (S15: the reason stays in the data). S1/S4: a worktree carries no
+// issue or ODD association any more and the panel keeps no edit or delete
+// view, so the line names neither association (a legacy registry value never
+// reaches it), `e` and `ctrl+d` are NOT bindings and no legend advertises
+// them; the facts are read for the current and the
 // focused checkout, at most once each, and render() performs no I/O; `c`
-// opens the create flow instead of owning a list row (S6) while `e`, `v`,
+// opens the create flow instead of owning a list row (S6) while `v`,
 // `enter`, `r` and `esc` keep their meanings; `esc` steps back one level from
 // the list; while the search is active `delete` clears the whole query and
-// `backspace` edits one character, and the delete legend names the real
-// `ctrl+d` binding (S4/S12); no key outside the documented map changes state.
+// `backspace` edits one character (S4/S12); no key outside the documented map
+// changes state.
 //
 // The panel frame is pinned: 7 fixed rows (top rule, current name, current
 // data, separator, focused data, legend, bottom rule) plus up to five
@@ -58,6 +60,35 @@ const helpers = {
 
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text) };
 
+// S11: a theme that RECORDS which role painted each string and paints every
+// role with its own SGR code, so a rendered line can be read for the ROLE
+// behind a token instead of trusting an eyeballed colour. A role the map does
+// not name still gets its own code, so an unexpected role shows up instead of
+// passing silently.
+const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39 };
+
+function recordingTheme() {
+  const calls = [];
+  const code = (role) => ROLE_SGR[role] ?? 95;
+  return {
+    calls,
+    fg(role, text) {
+      const value = String(text);
+      calls.push({ role, text: value });
+      return `\x1b[${code(role)}m${value}\x1b[0m`;
+    },
+    bold(text) {
+      const value = String(text);
+      calls.push({ role: 'bold', text: value });
+      return `\x1b[1m${value}\x1b[22m`;
+    },
+    bg(role, text) {
+      calls.push({ role: `bg:${role}`, text: String(text) });
+      return String(text);
+    },
+  };
+}
+
 const WIDTH = 80;
 const WIDE = 200;
 const HEIGHT = 20;
@@ -74,10 +105,13 @@ const CHECKOUTS = [
   { name: 'fix-beta', path: '/w/fix-beta', branch: 'fix/beta' },
 ];
 
-const DEFAULT_FACTS = { branch: 'feat/alpha', issues: [12], odd: ['w1-a'], changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
+const DEFAULT_FACTS = { branch: 'feat/alpha', changes: { added: 2, deleted: 1 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
+// S1: a LEGACY registry association still travels in the facts payload (the
+// stored data is preserved), and the line must never print it.
+const LEGACY_FACTS = { ...DEFAULT_FACTS, issues: [12], assignedOdd: 'odd/tasks/w1-a.md', odd: ['w1-a', 'w2-b'] };
 // The same facts rendered, so an assertion names the behaviour, not the
 // formatter's punctuation.
-const DEFAULT_LINE = 'branch feat/alpha · issues: #12 · odd: w1-a · changes +2 −1 · ↑1 · created 28d ago · modified —';
+const DEFAULT_LINE = 'branch feat/alpha · changes +2 −1 · ↑1 · created 28d ago · modified —';
 // S15: the two ages are the facts that carry a prose reason when they are
 // unreadable, so a compact preview line names them with a dash instead of
 // repeating that explanation. The reason itself stays in the data.
@@ -107,9 +141,8 @@ function makeView(options = {}) {
       toggles.push(path);
       return options.onToggle(path);
     } : undefined,
-    canDelete: options.canDelete,
     helpers,
-    theme: plainTheme,
+    theme: options.theme === undefined ? plainTheme : options.theme,
     now: options.now === undefined ? NOW : options.now,
     rowsAvailable: () => (options.rows === undefined ? HEIGHT : options.rows),
     requestRender: () => { paints.push(true); },
@@ -180,7 +213,7 @@ describe('bottom panel layout (S3, S4)', () => {
     assert.equal(rows[5], '  feat-alpha');
     assert.equal(rows[6], '  fix-beta');
     assert.equal(rows[7], DEFAULT_LINE, 'the focused worktree\'s data line follows the list');
-    assert.equal(rows[8], '↑↓ move · enter choose · c create · e edit · r reload · esc close', 'one legend row, with no `v all` while nothing is hidden');
+    assert.equal(rows[8], '↑↓ move · enter choose · c create · r reload · esc close', 'one legend row, with no `v all` while nothing is hidden and no retired edit key');
     assert.match(lines[9], /^╰─+╯$/, 'the frame is closed');
     assert.equal(lines.length, 10, 'the frame fills its computed height exactly');
   });
@@ -270,7 +303,7 @@ describe('bottom panel layout (S3, S4)', () => {
 
 describe('current worktree data line (S4a)', () => {
   const CURRENT_FACTS = {
-    branch: 'feat/odd-viewer', issues: [3], odd: [], changes: { added: 0, deleted: 0 }, ahead: 0, behind: 2, createdAt: ago(2 * 86400_000), lastActivity: ago(3600_000),
+    branch: 'feat/odd-viewer', changes: { added: 0, deleted: 0 }, ahead: 0, behind: 2, createdAt: ago(2 * 86400_000), lastActivity: ago(3600_000),
   };
 
   test('the line under the current name reports that worktree\'s own facts', async () => {
@@ -278,7 +311,7 @@ describe('current worktree data line (S4a)', () => {
       facts: (path) => (path === CURRENT.path ? CURRENT_FACTS : { ...CURRENT_FACTS, branch: 'main' }),
     });
     const frame = panel(view, WIDE);
-    assert.equal(frame.currentData, 'branch feat/odd-viewer · issues: #3 · odd: - · ↓2 · created 2d ago · modified 1h ago');
+    assert.equal(frame.currentData, 'branch feat/odd-viewer · ↓2 · created 2d ago · modified 1h ago');
     assert.ok(frame.focusData.startsWith('branch main'), 'the focused line keeps its own worktree');
   });
 
@@ -287,17 +320,17 @@ describe('current worktree data line (S4a)', () => {
     const frame = panel(view, WIDE);
     assert.equal(
       frame.currentData,
-      `branch unavailable · issues: unavailable · odd: unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`,
+      `branch unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`,
     );
     assert.ok(!frame.currentData.includes(' 0'), 'a failed read never claims a number');
   });
 });
 
 describe('focused checkout facts (S4d, S9)', () => {
-  const BASE = { branch: 'main', issues: [7], odd: ['w9-x'], changes: { added: 12, deleted: 3 }, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
-  const FULL = 'branch main · issues: #7 · odd: w9-x · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
+  const BASE = { branch: 'main', changes: { added: 12, deleted: 3 }, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
+  const FULL = 'branch main · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
 
-  test('the focused checkout reports branch, issues, odd, the change-size line counts, ahead/behind and created-at', async () => {
+  test('the focused checkout reports branch, the change-size line counts, ahead/behind and created-at', async () => {
     const { view } = await opened({ facts: () => BASE });
     const frame = panel(view, WIDE);
     assert.equal(frame.worktrees[0], '▸ main · use the local project', 'the principal is focused first');
@@ -307,22 +340,21 @@ describe('focused checkout facts (S4d, S9)', () => {
   test('every fact that cannot be read renders unavailable, never zero', async () => {
     const { view } = await opened({ facts: () => null });
     const frame = panel(view, WIDE);
-    assert.equal(frame.focusData, `branch unavailable · issues: unavailable · odd: unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`);
+    assert.equal(frame.focusData, `branch unavailable · changes unavailable · ↑unavailable ↓unavailable · ${NO_AGES}`);
   });
 
-  test('more associations widen the line with their ids and names instead of a count', async () => {
-    const { view } = await opened({ facts: () => ({ ...BASE, issues: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], odd: ['a', 'b', 'c'] }) });
+  test('S1: a legacy association in the facts is never rendered, not even as a count', async () => {
+    const { view } = await opened({ facts: () => ({ ...BASE, issues: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], assignedOdd: 'odd/tasks/w9-x.md', odd: ['w9-x', 'w9-y'] }) });
     const frame = panel(view, WIDE);
-    assert.ok(frame.focusData.includes('issues: #1, #2, #3, #4, #5, #6, #7, #8, #9, #10'), `every id renders: ${frame.focusData}`);
-    assert.ok(frame.focusData.includes('odd: a, b, c'), `every name renders: ${frame.focusData}`);
-    assert.ok(!/issues 10|odd 3/.test(frame.focusData), `no association count survives: ${frame.focusData}`);
+    assert.equal(frame.focusData, FULL, `the line carries no association: ${frame.focusData}`);
+    for (const word of ['issues', 'w9-x', 'w9-y', '#1', '#10']) {
+      assert.ok(!frame.lines.join('\n').includes(word), `no association reaches the frame (${word})`);
+    }
   });
 
   test('each single unavailable fact is reported on its own while the others survive', async () => {
     const cases = [
       ['branch', 'branch unavailable'],
-      ['issues', 'issues: unavailable'],
-      ['odd', 'odd: unavailable'],
       ['changes', 'changes unavailable'],
       ['ahead', '↑unavailable'],
       ['behind', '↓unavailable'],
@@ -338,16 +370,16 @@ describe('focused checkout facts (S4d, S9)', () => {
     }
   });
 
-  test('a measured zero is omitted for the change size and both arrows, while an empty association is `-`', async () => {
+  test('a measured zero is omitted for the change size and both arrows', async () => {
     const { view } = await opened({ facts: () => ({ ...BASE, changes: { added: 0, deleted: 0 }, ahead: 0, behind: 0, issues: [], odd: [] }) });
-    assert.equal(panel(view, WIDE).focusData, 'branch main · issues: - · odd: - · created 1mo ago · modified 1d ago');
+    assert.equal(panel(view, WIDE).focusData, 'branch main · created 1mo ago · modified 1d ago');
   });
 
   test('a one-sided ahead shows only ↑N, and a one-sided behind only ↓M', async () => {
     const aheadOnly = await opened({ facts: () => ({ ...BASE, behind: 0 }) });
-    assert.equal(panel(aheadOnly.view, WIDE).focusData, 'branch main · issues: #7 · odd: w9-x · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(aheadOnly.view, WIDE).focusData, 'branch main · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
     const behindOnly = await opened({ facts: () => ({ ...BASE, ahead: 0 }) });
-    assert.equal(panel(behindOnly.view, WIDE).focusData, 'branch main · issues: #7 · odd: w9-x · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(behindOnly.view, WIDE).focusData, 'branch main · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
   });
 
   test('the change size is the tracked and untracked LINE counts, never a file count', async () => {
@@ -490,7 +522,7 @@ describe('S15: compact facts rows never print the raw reason', () => {
   });
 });
 
-describe('the create and edit keys (S6, S13)', () => {
+describe('the create key and the retired edit key (S1, S4, S6)', () => {
   test('c opens the create flow and no list row offers creation', async () => {
     const { view, results } = await opened();
     const frame = panel(view, WIDE);
@@ -508,12 +540,15 @@ describe('the create and edit keys (S6, S13)', () => {
     assert.deepEqual(results, []);
   });
 
-  test('e on the focused checkout completes with an edit request and is inert elsewhere', async () => {
+  test('S4: `e` is not a binding any more — no edit request, no legend token, nothing edited', async () => {
     const { view, results } = await opened();
     const frame = panel(view, WIDE);
-    assert.match(frame.legend, /e edit/, 'the legend names the edit key');
+    assert.ok(!frame.legend.includes('e edit'), `the legend names no edit key: ${frame.legend}`);
+    for (const width of [40, 80, 120]) {
+      assert.ok(!panel(view, width).legend.includes('e edit'), `width ${width}: no edit token at any width`);
+    }
     view.handleInput('e');
-    assert.deepEqual(results, [{ edit: '/w/herdr' }], 'the focused row is the one edited');
+    assert.deepEqual(results, [], 'e resolves nothing on a focused checkout row');
 
     const empty = await opened({ checkouts: [CURRENT], current: { name: CURRENT.name, path: CURRENT.path } });
     empty.view.handleInput('e');
@@ -527,7 +562,7 @@ describe('the create and edit keys (S6, S13)', () => {
     for (let i = 0; i < 5; i += 1) offered.view.handleInput('down');
     assert.match(panel(offered.view).viewAll || '', /^▸ view all worktrees$/, 'the offer row is focused');
     offered.view.handleInput('e');
-    assert.deepEqual(offered.results, [], 'e on the offer row is inert');
+    assert.deepEqual(offered.results, [], 'e on the offer row is inert too');
 
     const listed = await opened();
     listed.view.handleInput('v');
@@ -704,7 +739,7 @@ describe('S9: no redundant help overlay', () => {
 
   test('the legends name every shortcut and never advertise ? help', async () => {
     const { view } = await opened();
-    assert.equal(panel(view, WIDE).legend, '↑↓ move · enter choose · c create · e edit · r reload · esc close');
+    assert.equal(panel(view, WIDE).legend, '↑↓ move · enter choose · c create · r reload · esc close');
     assert.ok(!panel(view, WIDE).legend.includes('?'), 'no generic help hint in the panel legend');
 
     // S4c: the offer row and its key appear together, only when a worktree
@@ -795,7 +830,7 @@ describe('S1: render performs no I/O and enrichment keeps the selection', () => 
 
 // S12/S4: Delete clears the WHOLE query only while the search field is
 // active, Backspace still removes one character, and neither of them ever
-// signals a worktree deletion — that stays ctrl+d on an eligible row.
+// signals anything else — S4 removed the worktree deletion binding entirely.
 describe('S12: Delete clears the search, Backspace edits it', () => {
   const filterRow = (view, width = WIDTH) => screen(view, width).rows[1];
 
@@ -831,15 +866,14 @@ describe('S12: Delete clears the search, Backspace edits it', () => {
     assert.equal(view.state.filter, 'alp');
   });
 
-  test('Delete with the search closed changes nothing and deletes no worktree', async () => {
-    const { view, results } = await opened({ canDelete: (path) => path === '/w/feat-alpha' });
+  test('Delete with the search closed changes nothing', async () => {
+    const { view, results } = await opened();
     view.handleInput('down');
-    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'an eligible row is focused');
+    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'a row is focused');
     const before = JSON.parse(JSON.stringify(view.state));
     view.handleInput('\x1b[3~');
-    assert.deepEqual(results, [], 'Delete is not a deletion binding');
+    assert.deepEqual(results, [], 'Delete is not a binding');
     assert.deepEqual(view.state, before, 'and it changes no state');
-    assert.match(panel(view, WIDE).legend, /ctrl\+d delete/, 'the legend keeps naming the real delete key');
   });
 
   test('the footer advertises Delete clear on one row only while the search is active', async () => {
@@ -987,140 +1021,191 @@ describe('S2: one-row key legends', () => {
   });
 });
 
-// S24: the panel deletes through the SAME marker the extended list already
-// resolves, and the caller keeps owning confirmation and the close. Who may be
-// deleted is the caller's one predicate — the view never invents a second
-// rule, so the principal, the current checkout and every unregistered row stay
-// protected exactly as the extended list protects them.
-describe('S24: Ctrl+D on a deletable panel row', () => {
-  const DELETABLE = '/w/feat-alpha';
-  const registered = (path) => path === DELETABLE;
-
-  test('Ctrl+D on a deletable row resolves { delete: path } exactly once', async () => {
-    const { view, results } = await opened({ canDelete: registered });
-    view.handleInput('down');
-    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'the deletable row is focused');
-    view.handleInput('\x04');
-    assert.deepEqual(results, [{ delete: DELETABLE }], 'the panel resolves the marker with its path');
-    view.handleInput('\x04');
-    view.handleInput('enter');
-    assert.deepEqual(results, [{ delete: DELETABLE }], 'the component resolves once');
-  });
-
-  test('the installed matcher spelling of ctrl+d is the same key', async () => {
-    const { view, results } = await opened({ canDelete: registered });
-    view.handleInput('down');
-    view.handleInput('ctrl+d');
-    assert.deepEqual(results, [{ delete: DELETABLE }]);
-  });
-
-  test('the principal, the current checkout and the offer row resolve nothing', async () => {
-    const asked = [];
-    const canDelete = (path) => {
-      asked.push(path);
-      return path === DELETABLE;
-    };
-    const many = [
-      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
-      { name: 'main', path: '/w/herdr', branch: 'main', isPrincipal: true },
-      ...Array.from({ length: 7 }, (_, index) => ({ name: `wt-${index + 1}`, path: `/w/wt-${index + 1}`, branch: `feat/wt-${index + 1}` })),
-    ];
-    const { view, results } = await opened({ checkouts: many, current: { name: 'cur', path: '/w/cur' }, canDelete, rows: 14 });
-    const frame = panel(view);
-    assert.ok(!frame.worktrees.some((row) => row.includes('cur')), 'the current worktree is the header, never a row');
-    assert.ok(!asked.includes('/w/cur'), 'the current checkout is never even offered to the delete rule');
-    assert.match(frame.worktrees[0], /^▸ main /, 'the principal is focused first');
-    const before = JSON.parse(JSON.stringify(view.state));
-    view.handleInput('\x04');
-    assert.deepEqual(results, [], 'Ctrl+D on the principal is inert');
-    assert.deepEqual(view.state, before, 'and it changes no state');
-    for (let i = 0; i < 5; i += 1) view.handleInput('down');
-    assert.match(panel(view).viewAll || '', /^▸ view all worktrees$/, 'the offer row is focused');
-    view.handleInput('\x04');
-    assert.deepEqual(results, [], 'Ctrl+D on the offer row is inert');
-  });
-
-  test('without the deletability option the panel is unchanged and Ctrl+D is inert', async () => {
+// S4: the panel keeps NO delete view and no edit view. Ctrl+C/D-style
+// keyboard deletion is gone with lib/warp-delete-confirm.js, so `ctrl+d` (in
+// every spelling a host might deliver) resolves nothing, changes no state and
+// is never advertised, on any row and at any width.
+describe('S4: no delete binding in the panel or the extended list', () => {
+  test('ctrl+d resolves nothing from a checkout row, in either raw or named spelling', async () => {
     const { view, results } = await opened();
     view.handleInput('down');
+    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'a checkout row is focused');
     const before = JSON.parse(JSON.stringify(view.state));
-    assert.equal(panel(view).legend, '↑↓ move · enter choose · c create · e edit · r reload · esc close');
     view.handleInput('\x04');
-    assert.deepEqual(results, [], 'no capability, no delete');
-    assert.deepEqual(view.state, before);
+    view.handleInput('ctrl+d');
+    assert.deepEqual(results, [], 'no delete marker is ever produced');
+    assert.deepEqual(view.state, before, 'and nothing changes');
   });
 
-  test('the delete token names the ACTUAL ctrl+d binding where it fits and drops before esc', async () => {
-    for (const width of [40, 60, 80, 120]) {
-      const { view } = await opened({ canDelete: registered });
-      view.handleInput('down');
-      const frame = panel(view, width);
-      assert.equal(frame.height, 10, `width ${width}: the legend still owns no extra row`);
-      assert.equal(helpers.visibleWidth(frame.lines[frame.lines.length - 2]), width, `width ${width}: the legend row is cell-exact`);
-      assert.ok(!frame.legend.includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${frame.legend}`);
-      assert.match(frame.legend, /esc close/, `width ${width}: the close key outlives the delete key: ${frame.legend}`);
-      assert.ok(!/\bdel delete\b|(^|· )del( ·|$)/.test(frame.legend), `width ${width}: the legend never claims a bare del key: ${frame.legend}`);
-      assert.equal(/ctrl\+d/.test(frame.legend), width >= 60, `width ${width}: the real binding is named where it fits: ${frame.legend}`);
-    }
-    const wide = await opened({ canDelete: registered });
-    wide.view.handleInput('down');
-    assert.equal(
-      panel(wide.view, 120).legend,
-      '↑↓ move · enter choose · c create · e edit · ctrl+d delete · r reload · esc close',
-      'the full legend names the real ctrl+d binding between edit and reload',
-    );
-  });
-
-  test('a row the rule refuses leaves the legend without the delete token', async () => {
-    const { view, results } = await opened({ canDelete: registered });
-    assert.match(panel(view).worktrees[0], /^▸ main /, 'the principal is focused first');
-    assert.ok(!/ctrl\+d/.test(panel(view).legend), `nothing to delete, so nothing is advertised: ${panel(view).legend}`);
+  test('ctrl+d in the extended list resolves nothing either', async () => {
+    const { view, results } = await opened();
+    view.handleInput('v');
     view.handleInput('down');
-    assert.match(panel(view, WIDE).legend, /ctrl\+d delete/, 'moving onto a deletable row names the real key');
+    const before = { listCursor: view.state.listCursor, filter: view.state.filter, view: view.state.view };
     view.handleInput('\x04');
-    assert.deepEqual(results, [{ delete: DELETABLE }]);
+    view.handleInput('ctrl+d');
+    assert.deepEqual(results, [], 'the list speaks no delete marker');
+    assert.deepEqual({ listCursor: view.state.listCursor, filter: view.state.filter, view: view.state.view }, before);
+  });
+
+  test('no legend ever advertises a delete key, at any width', async () => {
+    for (const width of [40, 60, 80, 120]) {
+      const { view } = await opened();
+      for (let row = 0; row < panel(view, width).worktrees.length; row += 1) {
+        const legend = panel(view, width).legend;
+        assert.ok(!/ctrl\+d|delete/i.test(legend), `width ${width} row ${row}: no delete token: ${legend}`);
+        view.handleInput('down');
+      }
+      view.handleInput('v');
+      const { lines } = screen(view, width);
+      assert.ok(!/ctrl\+d|delete/i.test(lines[lines.length - 2]), `width ${width}: the list legend names no delete key`);
+    }
+  });
+
+  test('the panel legend is the same at every width and every focus', async () => {
+    for (const width of [40, 60, 80, 120]) {
+      const { view } = await opened();
+      const first = panel(view, width).legend;
+      view.handleInput('down');
+      assert.equal(panel(view, width).legend, first, `width ${width}: moving the focus adds no capability token`);
+      assert.equal(helpers.visibleWidth(panel(view, width).lines[8]), width, `width ${width}: the legend row is cell-exact`);
+    }
   });
 });
 
 // ---------------------------------------------------------------------------
-// ui-consistency-round3 T6 S2: the warp's association facts are the ASSIGNED
-// identities — issue ids with `#`, the ODD document's name — never a count,
-// and an absent association is `-` while an unreadable read stays
-// `unavailable` (the two are different truths and never share a symbol).
+// S1: worktrees no longer receive issues or ODD. The stored registry data is
+// preserved (the facts payload still carries it), and no association — id,
+// name, path or count — may reach the panel's line.
 // ---------------------------------------------------------------------------
-describe('round 3 S2: associations render as ids and names, not counts', () => {
+describe('S1: no issue or ODD association is rendered', () => {
   const line = (facts) => formatFactsLine(facts, { now: NOW });
-  const BASE = { branch: 'feat/x', changes: { added: 1, deleted: 0 }, ahead: 1, createdAt: '2026-02-01' };
+  const BASE = { branch: 'feat/x', changes: { added: 1, deleted: 0 }, ahead: 1, behind: 0, createdAt: '2026-02-01' };
 
-  test('issue ids carry `#` and the ODD is its document name', () => {
-    const facts = line({ ...BASE, issues: [76, 77], odd: ['alpha'] });
-    assert.ok(facts.includes('issues: #76, #77'), facts);
-    assert.ok(facts.includes('odd: alpha'), facts);
-    assert.ok(!facts.includes('issues 2') && !facts.includes('odd 1'), `no counts: ${facts}`);
+  test('the rendered line carries no association, even when the facts do', () => {
+    const facts = line({ ...BASE, issues: [76, 77], assignedOdd: 'odd/tasks/alpha.md', odd: ['alpha', 'beta'] });
+    assert.equal(facts, 'branch feat/x · changes +1 −0 · ↑1 · created 28d ago · modified —');
+    for (const word of ['issues', 'odd', 'alpha', 'beta', '#76']) {
+      assert.ok(!facts.includes(word), `no association in the line (${word}): ${facts}`);
+    }
   });
 
-  test('a stored odd path renders as its document name', () => {
-    assert.ok(line({ ...BASE, issues: [], odd: ['odd/tasks/w1-a.md'] }).includes('odd: w1-a'));
-    assert.ok(line({ ...BASE, issues: [], odd: 'odd/tasks/w1-a.md' }).includes('odd: w1-a'), 'a bare string is accepted');
+  test('an empty or unreadable association is simply absent, never `-` or `unavailable`', () => {
+    const empty = line({ ...BASE, issues: [], odd: [] });
+    const unreadable = line({ ...BASE, issues: null, odd: 'unavailable' });
+    assert.equal(empty, unreadable, 'both read as "no association" because the line has no such fact');
+    assert.ok(!empty.includes('-') || empty.includes('modified —'), `no association placeholder: ${empty}`);
+    assert.ok(!/issues: unavailable|odd: unavailable/.test(unreadable), unreadable);
   });
 
-  test('a readable empty association is `-`, never 0', () => {
-    const facts = line({ ...BASE, issues: [], odd: [] });
-    assert.ok(facts.includes('issues: -'), facts);
-    assert.ok(facts.includes('odd: -'), facts);
-    assert.ok(!/issues: 0|odd: 0/.test(facts), `no zero for an empty association: ${facts}`);
-  });
-
-  test('an unreadable association keeps `unavailable` instead of pretending to be empty', () => {
-    const facts = line({ ...BASE, issues: null, odd: 'unavailable' });
-    assert.ok(facts.includes('issues: unavailable'), facts);
-    assert.ok(facts.includes('odd: unavailable'), facts);
-  });
-
-  test('the panel forces the wide line so the names are never truncated away', async () => {
-    const { view } = await opened({ facts: () => ({ ...BASE, issues: [76, 77], odd: ['alpha'] }) });
+  test('the panel and the extended list never print an association', async () => {
+    const { view } = await opened({ facts: () => LEGACY_FACTS });
     const frame = panel(view, WIDE);
-    assert.ok(frame.focusData.includes('issues: #76, #77 · odd: alpha'), frame.focusData);
-    assert.ok(!frame.focusData.includes(' 2 '), 'a count never stands in for the association');
+    assert.equal(frame.focusData, DEFAULT_LINE, 'the focused line is association-free');
+    assert.equal(frame.currentData, DEFAULT_LINE, 'so is the current worktree line');
+    view.handleInput('v');
+    const listed = screen(view, WIDE).lines.join('\n');
+    assert.ok(!listed.includes('issues'), 'the extended list names no issue association');
+    assert.ok(!/w1-a|w2-b|#12/.test(listed), 'and no ODD document or issue id either');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S11: every footer and header token paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme — a shortcut KEY is accent+bold,
+// its description muted, the frame title accent+bold, values accent and
+// counts/labels muted or dim — while the focus cue stays monochrome (`▸`), so
+// a theme that answers nothing still reads as a frame.
+describe('S11: the shared palette', () => {
+  test('the panel legend paints every key accent+bold and its description muted', async () => {
+    const theme = recordingTheme();
+    const { view } = await opened({ theme });
+    const legend = view.render(WIDE).at(-2);
+    assert.match(legend, /\x1b\[1m\x1b\[96m↑↓\x1b\[0m\x1b\[22m\x1b\[90m move/, 'the movement key is accent+bold, its description muted');
+    assert.match(legend, /\x1b\[1m\x1b\[96menter\x1b\[0m\x1b\[22m\x1b\[90m choose/, 'the confirm key keeps its own role');
+    assert.match(legend, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m\x1b\[90m close/, 'so does esc, with its words muted');
+    assert.match(legend, /\x1b\[34m · \x1b\[0m/, 'the entries are joined by the border role');
+    assert.ok(theme.calls.some((call) => call.role === 'accent' && call.text === '↑↓'),
+      'the accent role is requested from the injected theme');
+    assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('↑↓')),
+      'the key is bolded through the theme, never by a literal escape');
+    assert.ok(theme.calls.some((call) => call.role === 'muted' && call.text === ' move'),
+      'the description asks the injected theme for the muted role');
+  });
+
+  test('the extended list and the active-search legend use the same key/description palette', async () => {
+    const theme = recordingTheme();
+    const { view } = await opened({ theme });
+    view.handleInput('v');
+    const browse = view.render(WIDE).at(-2);
+    assert.match(browse, /\x1b\[1m\x1b\[96mpgUp\/pgDn\x1b\[0m\x1b\[22m\x1b\[90m page/, 'a compound key is ONE key run');
+    assert.match(browse, /\x1b\[1m\x1b\[96menter\x1b\[0m\x1b\[22m\x1b\[90m warp/, 'and its description is muted');
+    assert.match(browse, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m\x1b\[90m back/, 'the back key is a key');
+    view.handleInput('T');
+    const search = view.render(WIDE).at(-2);
+    assert.match(search, /\x1b\[1m\x1b\[96mbackspace\x1b\[0m\x1b\[22m\x1b\[90m del char/, 'the search legend paints its keys too');
+    assert.match(search, /\x1b\[1m\x1b\[96mdelete\x1b\[0m\x1b\[22m\x1b\[90m clear/, 'delete keeps the key role');
+    assert.match(search, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m\x1b\[90m keep filter/, 'so does esc keep filter');
+  });
+
+  test('a compacted legend keeps the key roles instead of falling back to plain descriptions', async () => {
+    const theme = recordingTheme();
+    const { view } = await opened({ theme });
+    const legend = view.render(40).at(-2);
+    assert.match(legend, /\x1b\[1m\x1b\[96m↑↓\x1b\[0m\x1b\[22m/, 'the compact form still paints the movement key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m\x1b\[90m close/, 'esc keeps its key and its description');
+    assert.equal(helpers.visibleWidth(legend), 40, 'the compacted row is still cell-exact');
+  });
+
+  test('the header palette: title accent+bold, values accent, facts muted and the close key a key', async () => {
+    const theme = recordingTheme();
+    const { view } = await opened({ theme });
+    const lines = view.render(WIDE);
+    assert.match(lines[0], /\x1b\[1m\x1b\[96mWarp\x1b\[0m\x1b\[22m/, 'the frame title is accent+bold');
+    assert.match(lines[0], /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m/, 'the close hint in the header is painted as a key');
+    assert.match(lines[0], /\x1b\[34m╭─\x1b\[0m/, 'the frame rule keeps the border role');
+    assert.match(lines[1], /\x1b\[96mfeat-odd-viewer/, 'the current worktree name is a value (accent, not bold)');
+    assert.ok(!/\x1b\[1m\x1b\[96mfeat-odd-viewer/.test(lines[1]), 'a value is never emphasized like a key');
+    assert.match(lines[2], /\x1b\[90mbranch feat\/alpha/, 'the facts line is muted');
+    assert.match(lines.at(-3), /\x1b\[90mbranch feat\/alpha/, 'so is the focused worktree line');
+  });
+
+  test('the list page row paints its label dim, the page value accent and the total muted', async () => {
+    const theme = recordingTheme();
+    const { view } = await opened({ theme, rows: 20 });
+    view.handleInput('v');
+    const pageRow = view.render(WIDE).at(-3);
+    assert.match(pageRow, /\x1b\[2mpage \x1b\[0m/, 'the `page` label is dim');
+    assert.match(pageRow, /\x1b\[96m1\/1\x1b\[0m/, 'the page number is a value');
+    assert.match(pageRow, /\x1b\[90m · 4 worktrees\x1b\[0m/, 'the worktree count is muted');
+  });
+
+  test('the search row paints its static label dim and the live query accent', async () => {
+    const theme = recordingTheme();
+    const { view } = await opened({ theme });
+    view.handleInput('v');
+    const idle = view.render(WIDE)[1];
+    assert.match(idle, /\x1b\[2mfilter: \x1b\[0m\x1b\[90mtype to search/, 'the idle hint is dim/muted, never accent');
+    view.handleInput('a');
+    view.handleInput('l');
+    const live = view.render(WIDE)[1];
+    assert.match(live, /\x1b\[2mfilter: \x1b\[0m/, 'the label stays dim while typing');
+    assert.match(live, /\x1b\[96mal/, 'the typed query is painted accent');
+  });
+
+  test('a hostile theme never breaks the frame and keeps the keys and the focus mark readable', async () => {
+    const hostile = {
+      fg() { throw new Error('no colour support'); },
+      bold() { throw new Error('no bold support'); },
+      bg() { throw new Error('no background support'); },
+    };
+    const { view } = await opened({ theme: hostile });
+    const { lines, rows } = screen(view, WIDE);
+    assert.match(lines[0], /^╭─ Warp ─+ esc ─╮$/, 'the title line still renders without colour');
+    assert.match(rows[rows.length - 2], /↑↓ move · enter choose · c create · r reload · esc close/,
+      'the legend still spells every key and its words');
+    assert.equal(rows[4], '▸ main · use the local project', 'the focus marker survives monochrome');
+    view.handleInput('v');
+    assert.match(screen(view, WIDE).rows.at(-2), /pgUp\/pgDn page/, 'the list legend survives too');
   });
 });
