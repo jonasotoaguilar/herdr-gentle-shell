@@ -2,39 +2,55 @@
 
 Full-screen two-pane overlay over the current checkout's odd documents:
 the left pane lists every `odd/tasks/*.md` file, the right pane renders
-the selected document as styled markdown. The viewer is read-only about the
-checkout's worktree association: it never marks, toggles or saves which
-document belongs to a worktree — that association lives in the worktree
-detail (S10b). `Esc` closes.
+the selected document as styled markdown. Worktrees carry no ODD association
+any more (S1), so the viewer has nothing to mark, toggle or save: no surface
+assigns a document to a worktree. `Esc` closes.
 
 ## What it shows
 
 The list reads exactly `odd/tasks/*.md` (non-recursive, `*.md` only) in the
 checkout the session runs in — inside a worktree that is that worktree,
-never the principal — sorted by name. Each row shows the document NAME
-only: the `.md` extension stripped, no path. The title stays short, just
-the viewer and the document count (`✎ Odd · 4 documents`).
+never the principal — in modification order, most recently modified
+first (S12). That sequence is the loader's own order
+(`lib/odd-docs.js` sorts by modification time), so the viewer never re-sorts
+it; `s` alternates it with a case-insensitive alphabetical order by
+document name and the footer names the order that is active. Each row shows
+the document NAME only: the `.md` extension stripped, no path. The title
+stays short, just the viewer and the document count (`✎ Odd · 4
+documents`).
 
-Below the title the fixed search row carries the live query and list-page
-indicator (`› Search · page 1/4`), including one-page and empty lists. The
-selected document's reading position sits at the right edge when space allows;
-it yields before the list-page indicator on narrow terminals. The `T` hint
-belongs only in the footer. The header never repeats checkout/branch identity
-or the focused name already marked in the list.
+Below the title the fixed search row carries the live query (`› Search`),
+including empty and one-document lists; the page indicator is gone with the
+pager (S3). The selected document's reading position sits at the right edge
+when space allows. The `T` hint belongs only in the footer. The header never
+repeats checkout/branch identity or the focused name already marked in the
+list. The viewer name and the count are separate palette tokens in the header
+- title accent+bold, count muted — not one painted run.
 
-All fullscreen readers use the shared 40% list / 60% preview allocation, subject
-to minimum widths on small terminals. Names wrap at spaces and hyphens, keeping
-all characters; a segment is split only if it cannot fit the entire text width.
-Page capacity is not a fixed document count: the viewer reserves four chrome
-rows (frame top, Search, footer, frame bottom), then packs whole names according
-to their wrapped row cost into the remaining height. A taller name therefore
-reduces the number of entries on that page.
+The issues and ODD readers use the smaller 30% list / 70% reading allocation,
+subject to minimum widths on small terminals. Names wrap at spaces and
+hyphens, keeping all characters; a
+segment is split only if it cannot fit the entire text width.
+
+The list is ONE continuous window, never a pager: the viewer reserves four
+chrome rows (frame top, Search, footer, frame bottom) and paints the documents
+whose wrapped rows fit the remaining height. `←`/`→` (also `[`/`]`) move that
+window a screenful, and the focused document always stays inside it, so the
+window follows the selection instead of snapping to a page. A taller name
+simply reduces how many entries the window holds, and the window is kept full at
+the end of the list rather than trailing blank rows.
+
+Changing the order keeps the reader on the same document: the focused
+document is re-found in the new sequence, its reading position is untouched,
+and the window re-anchors on its new place, so the focused row is painted even
+when its alphabetical position is far from the recent one. The name filter
+composes with both orders — it narrows the list, and the matching rows are
+shown in the active order.
 
 Rows carry no association mark and the status row carries no assigned or
-unsaved fact: the viewer never claims which document belongs to the
-checkout's worktree (S10b). Reading, filtering, the external open and
-scrolling all work; the checkout↔document association lives in the
-worktree detail.
+unsaved fact: no surface claims which document belongs to a checkout any more
+(S1), so there is nothing here to show. Reading, filtering, the external open
+and scrolling all work.
 
 The right pane reads the selected document from disk and renders its full
 content as styled markdown rather than raw text: `##`/`###` section
@@ -49,8 +65,10 @@ document.
 
 | Key | Effect |
 | --- | --- |
-| `↑` / `↓`, `j` / `k` | Move the selection |
-| `ctrl+shift+j/k` when negotiated; `Shift+J/K` fallback; PageDown/PageUp always | Scroll the document down/up one page |
+| `↑` / `↓`, `j` / `k` | Move the selection; the list window follows it |
+| `←` / `→`, `[` / `]` | Scroll the list one screenful (no pages: the window just moves); the footer token reads `←/→ list` |
+| `s` | Toggle the list order: modification order, most recent first (the default) ↔ alphabetical by name, case-insensitive |
+| `ctrl+shift+j/k` when negotiated; `Shift+J/K` fallback; PageDown/PageUp always | Scroll the document down/up one page (the footer names this target once, as `ctrl+shift+j/k doc` or `shift+j/k doc`) |
 | `ctrl+d` / `ctrl+u` | Scroll down/up half a page |
 | mouse wheel | Scroll the document up/down, never the selection |
 | `home` / `end` | Jump to the top / bottom of the document |
@@ -64,15 +82,51 @@ Ctrl+Shift+J/K only when the host confirms the extended keyboard protocol;
 otherwise it names Shift+J/K. It never guesses from the OS. Bare LF/CR and
 legacy Ctrl+J/K are not preview-scroll aliases.
 
+The footer spends ONE token per scroll target instead of repeating every
+alias: `ctrl+shift+j/k doc` (or `shift+j/k doc` when the extended protocol is
+not confirmed) for the document pane and `←/→ list` for the list. The
+alternates — `Shift+J/K`, PageDown/PageUp, `ctrl+d`/`ctrl+u`, `home`/`end` —
+keep working exactly as documented above; they are described here instead of
+spending footer cells.
+
+The `s` hint rides the same ONE footer row and names the order that is active
+(`s sort: recent` / `s sort: name`), keeping the key/description palette split
+the rest of the legend uses. On a narrow terminal the row compacts to its short
+tokens (`s`, `T`, `r`, …) instead of wrapping onto a second row; the labelled
+scroll tokens survive that compaction, and `s` is the first entry dropped at
+the narrowest width.
+
 The document pane scrolls independently of the list. Each hint is named
 once: the footer names `T`, and while searching that same footer switches to
 the actions available in the search input.
 
+## Palette
+
+Every token paints through the injected theme with a role that says what it is
+(S11), so the header, the search row and the footer read as ONE palette and the
+view hardcodes no colour:
+
+| Token | Role |
+| --- | --- |
+| frame title (`✎ Odd`) | `accent` + bold |
+| the document count (`4 documents`) and status words | `muted` |
+| the `·` separator and the `›` prompt / idle `Search` label | `dim` |
+| the live search value and its caret | `accent` |
+| shortcut KEY in the footer (`↑↓`, `←/→`, `ctrl+shift+j/k`, `s`, `T`, `esc`, …) | `accent` + bold |
+| a key's description (`select`, `list`, `doc`, `sort: recent`, `search`, …) | `muted` |
+| frame rules and pane divider | `border` |
+| the document title (the markdown heading) | its heading role + bold |
+
+A key is therefore distinguishable from the words beside it by BOTH colour and
+weight, and focus never depends on colour: the focused document keeps its `▸`
+mark, so a monochrome terminal shows the same information. A missing, partial or
+throwing theme degrades to plain text rather than breaking a frame.
+
 ## The association is not here
 
-The checkout↔document association lives in the worktree detail, not in this
-viewer (S10b): the viewer never marks, toggles or saves it, so nothing here
-writes. The documents are still only read.
+Worktrees receive no ODD document any more (S1), so no surface marks, toggles
+or saves an association: nothing here writes. The documents are still only
+read.
 
 ## States
 

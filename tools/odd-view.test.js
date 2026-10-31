@@ -45,6 +45,33 @@ const cellWidth = (line) => (realTui && typeof realTui.visibleWidth === 'functio
 
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text) };
 
+// S11: a theme that RECORDS which role it was asked to paint each string with
+// and paints every role with its own SGR code, so a rendered line can be read
+// for the ROLE behind a token instead of trusting an eyeballed colour.
+const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
+
+function recordingTheme() {
+  const calls = [];
+  const code = (role) => ROLE_SGR[role] ?? 95;
+  return {
+    calls,
+    fg(role, text) {
+      const value = String(text);
+      calls.push({ role, text: value });
+      return `\x1b[${code(role)}m${value}\x1b[0m`;
+    },
+    bold(text) {
+      const value = String(text);
+      calls.push({ role: 'bold', text: value });
+      return `\x1b[1m${value}\x1b[22m`;
+    },
+    bg(role, text) {
+      calls.push({ role: `bg:${role}`, text: String(text) });
+      return String(text);
+    },
+  };
+}
+
 function doc(name) {
   return { name, file: `${name}.md`, path: `/checkout/odd/tasks/${name}.md` };
 }
@@ -214,7 +241,7 @@ describe('createOddView read-only association (S10b)', () => {
     assert.ok(!body.includes('unsaved'), 'no unsaved indicator exists');
     assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
     assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
-    assert.match(body, /shift\+j\/k( scroll)?/, 'the reading keys stay in the legend, naming a usable pair');
+    assert.match(body, /shift\+j\/k doc/, 'the reading keys stay in the legend, naming a usable pair and its target (S14)');
     assert.match(body, /esc close/, 'the close key stays in the legend');
   });
 
@@ -862,7 +889,8 @@ describe('S13: the odd frame repeats nothing', () => {
     view.handleInput('J');
     const lines = strip(view.render(80).join('\n')).split('\n');
     assert.equal(lines.length, 20, 'the frame still fills every row');
-    assert.match(lines[1], /› Search · page 1\/1/, 'the page marker rides the search row');
+    assert.match(lines[1], /› Search/, 'the search widget rides the search row');
+    assert.ok(!/page/i.test(lines[1]), 'the page marker is gone with the pager (S3)');
     assert.match(lines[1], / \d+-\d+\/\d+/, 'the reading position keeps the right edge');
     assert.equal(lines.length - 3, 20 - 3, 'the panes keep the rows the status row used to take');
   });
@@ -924,51 +952,53 @@ describe('createOddView feedback round (S1,S3,S4,S5,D3)', () => {
     assert.equal(view.state.index, 0, 'no scroll key moved the list selection');
   });
 
-  test('S5: a long document list paginates by the body budget, and ←/→ page it', async () => {
+  test('S3: a long document list scrolls by the body budget, and ←/→ move the window', async () => {
     const docs = Array.from({ length: 14 }, (_, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
     const { view } = build({ docs, rows: 12 });
     await tick();
     let lines = view.render(80);
     // rows 12 -> top rule + search row + footer + bottom rule = 8 body rows
-    const firstPage = leftRows(lines).filter((row) => row.trim() !== '');
-    assert.equal(firstPage.length, 8, 'every body row carries a document, no fixed page size');
-    assert.match(searchRowOf(lines), /1\/2/, 'the page position rides the search row');
-    assert.match(firstPage[0], /document-01/);
+    const firstWindow = leftRows(lines).filter((row) => row.trim() !== '');
+    assert.equal(firstWindow.length, 8, 'every body row carries a document, no fixed page size');
+    assert.match(firstWindow[0], /document-01/);
+    assert.ok(!/page/i.test(searchRowOf(lines)), 'no page marker is printed');
 
     view.handleInput('right');
     lines = view.render(80);
-    const secondPage = leftRows(lines).filter((row) => row.trim() !== '');
-    assert.equal(secondPage.length, 6, 'the last page carries the remaining documents');
-    assert.match(secondPage[0], /document-09/, 'the second page starts where the first ended');
-    assert.match(searchRowOf(lines), /2\/2/, 'the page position follows');
-    assert.equal(view.state.index, 8, 'the selection moves to the first document of the new page');
+    const secondWindow = leftRows(lines).filter((row) => row.trim() !== '');
+    assert.equal(secondWindow.length, 8, 'the last window is kept full instead of half empty');
+    assert.match(secondWindow[0], /document-07/, '→ starts the next screen after the last painted document');
+    assert.equal(view.state.index, 6, 'the selection follows into the new screen');
 
     view.handleInput('left');
-    assert.equal(view.state.index, 0, '← returns to the first document of the previous page');
+    assert.equal(view.state.listStart, 0, '← returns to the first document of the previous screen');
+    assert.match(leftRows(view.render(80)).join(' '), /document-01/, 'the first screen paints again');
     view.handleInput('right');
     view.handleInput('right');
-    assert.equal(view.state.index, 8, '→ never pages past the last page');
+    assert.equal(view.state.listStart, 6, '→ stops at the last full window');
     view.handleInput('left');
     view.handleInput('left');
-    assert.equal(view.state.index, 0, '← never pages before the first page');
+    assert.equal(view.state.listStart, 0, '← never scrolls before the first document');
   });
 
-  test('S5: ↓ walks every document across page boundaries, skipping none', async () => {
+  test('S3: ↓ walks every document across window boundaries, skipping none', async () => {
     const docs = Array.from({ length: 14 }, (_, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
     const { view } = build({ docs, rows: 12 });
     await tick();
     const seen = [];
-    const pages = [];
+    const windows = [];
     for (let step = 0; step < docs.length; step += 1) {
       const rendered = view.render(80);
       const rows = leftRows(rendered);
       const focused = rows.find((row) => row.includes('▸')) || '';
       seen.push((focused.match(/document-\d+/) || [''])[0]);
-      pages.push((searchRowOf(rendered).match(/(\d+)\/2/) || [])[1]);
+      windows.push(view.state.listStart);
       view.handleInput('down');
     }
     assert.deepEqual(seen, docs.map((entry) => entry.name.replace(/\.md$/, '')), 'every document is reachable in order');
-    assert.deepEqual([...new Set(pages)], ['1', '2'], 'the page followed the selection across the boundary');
+    assert.equal(windows[0], 0, 'the first document starts the walk at the top of the list');
+    assert.equal(windows.at(-1), 6, 'the last document ends the walk in the last full window');
+    assert.deepEqual(windows, [...windows].sort((a, b) => a - b), 'the continuous window never jumps backwards');
   });
 
   test('S3: a long document name wraps over the rows it needs instead of truncating', async () => {
@@ -986,10 +1016,14 @@ describe('createOddView feedback round (S1,S3,S4,S5,D3)', () => {
   test('S4: T is named by the footer only, never above it', async () => {
     const { view } = build();
     await tick();
-    const lines = view.render(120);
+    // S12 added one legend token, so the FULL spelling needs the wider row;
+    // S14 replaced the page/half aliases with the ONE labelled document token,
+    // so the compact tier now starts below 120.
+    const lines = view.render(160);
     assert.equal(searchRowOf(lines).includes('(T)'), false, 'the search row names no key');
     assert.ok(!searchRowOf(lines).includes('T to edit'), 'leaving the box never re-adds the parenthetical key');
     assert.match(footerOf(lines), /T search/, 'the footer names the search key');
+    assert.match(footerOf(view.render(80)), /(^|· )T( ·|$)/, 'the compact legend still names the search key');
     view.handleInput('T');
     view.handleInput('a');
     const typing = view.render(80);
@@ -1041,7 +1075,8 @@ describe('createOddView feedback round (S1,S3,S4,S5,D3)', () => {
 describe('createOddView round-3 geometry, capacity and page marker (S5,S8,S14,S17)', () => {
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
   const inner = (width) => layout.innerWidth(width);
-  const panes = (width) => layout.paneWidths(inner(width));
+  // S3: the ODD reader asks view-layout for the smaller 30% list share.
+  const panes = (width) => layout.paneWidths(inner(width), { listShare: layout.READER_LIST_SHARE });
   const searchRowOf = (lines) => strip(lines[1]);
   const listCells = (lines) => lines.slice(2, -2).map((line) => strip(line).split('│')[1] || '');
   const filled = (lines) => listCells(lines).filter((row) => row.trim() !== '');
@@ -1062,7 +1097,7 @@ describe('createOddView round-3 geometry, capacity and page marker (S5,S8,S14,S1
   const manyShort = (count) => Array.from({ length: count }, (_unused, at) => doc(`doc-${String(at + 1).padStart(2, '0')}`));
   const manyLong = (count) => Array.from({ length: count }, (_unused, at) => doc(`long-wrapped-document-name-number-${String(at + 1).padStart(2, '0')}`));
 
-  test('S5: the two panes take the shared 40/60 geometry at 200 and 80 columns', async () => {
+  test('S3: the two panes take the smaller 30/70 reader geometry at 200 and 80 columns', async () => {
     const { view } = build({ docs: [doc('alpha'), doc('beta')] });
     await tick();
     for (const width of [200, 80]) {
@@ -1092,14 +1127,14 @@ describe('createOddView round-3 geometry, capacity and page marker (S5,S8,S14,S1
     await tick();
     const first = view.render(200);
     assert.equal(listCells(first).length, 16, 'the body keeps every row the fixed chrome leaves');
-    assert.equal(filled(first).length, 16, '16 one-row names fill the page at 200 columns');
-    assert.match(searchRowOf(first), /page 1\/2/, '30 names in a 16-row body are two pages');
+    assert.equal(filled(first).length, 16, '16 one-row names fill the window at 200 columns');
+    assert.ok(!/page/i.test(searchRowOf(first)), 'no page marker is printed (S3)');
     assert.match(filled(first)[0], /doc-01/);
     view.handleInput('right');
     const second = view.render(200);
-    assert.equal(filled(second).length, 14, 'the last page carries exactly the remaining names');
-    assert.match(searchRowOf(second), /page 2\/2/);
-    assert.match(filled(second)[0], /doc-17/, 'no name is skipped between pages');
+    assert.equal(filled(second).length, 16, 'the next window is kept full');
+    assert.match(filled(second)[0], /doc-15/, 'the next window starts after the last painted name');
+    assert.equal(view.state.listStart, 14, 'a forward scroll stops at the last full window');
   });
 
   test('S8: taller wrapped names spend more of the same body budget', async () => {
@@ -1108,51 +1143,51 @@ describe('createOddView round-3 geometry, capacity and page marker (S5,S8,S14,S1
     await tick();
     const lines = view.render(64);
     const cost = layout.rowCost(helpers, docs[0].name, panes(64).left, { first: '▸ ' });
-    assert.equal(cost, 2, 'each name needs two rows at this width');
+    assert.ok(cost >= 2, `each name wraps over several rows at this width, got ${cost}`);
     assert.equal(listCells(lines).length, 16, 'the body row budget does not depend on the wrap');
-    assert.equal(filled(lines).length, 16, 'a full page of wrapped names spends every body row');
-    assert.equal(filled(lines).length / cost, 8, 'the page carries 8 two-row names, not a fixed 20');
-    assert.match(searchRowOf(lines), /page 1\/2/);
+    assert.equal(filled(lines).length, Math.floor(16 / cost) * cost, 'a full window of wrapped names spends every body row');
+    assert.equal(filled(lines).length / cost, Math.floor(16 / cost), 'the window carries whole names, never a fixed 20');
+    assert.ok(!/page/i.test(searchRowOf(lines)), 'no page marker is printed (S3)');
   });
 
-  test('S8: walking every page covers each label once, mixed one-row and two-row names included', async () => {
+  test('S8: walking the window covers each label once, mixed one-row and two-row names included', async () => {
     const docs = Array.from({ length: 18 }, (_unused, at) => (at % 2 === 0
       ? doc(`short-name-${String(at + 1).padStart(2, '0')}`)
       : doc(`long-wrapped-document-name-number-${String(at + 1).padStart(2, '0')}`)));
     const { view } = build({ docs, rows: 20 });
     await tick();
-    const pageMarker = () => (searchRowOf(view.render(64)).match(/page (\d+)\/(\d+)/) || []);
-    const walked = [];
-    for (let guard = 0; guard < 20; guard += 1) {
-      const before = pageMarker();
-      assert.ok(before[1], `page ${guard + 1}: the marker is always on the search row`);
+    const walked = new Set();
+    for (let guard = 0; guard < 40; guard += 1) {
       const rows = filled(view.render(64));
-      assert.ok(rows.length <= 16, `page ${before[1]}: never more rows than the body holds`);
-      walked.push(...rows.join(' ').match(/name-(?:number-)?\d\d/g).map((token) => token.replace(/^name-(?:number-)?/, '')));
+      assert.ok(rows.length <= 16, `window ${guard + 1}: never more rows than the body holds`);
+      // Rows of one wrapped name are concatenated, so a name broken across rows
+      // is still read whole.
+      for (const token of rows.map((row) => row.trim()).join('').match(/name-(?:number-)?\d\d/g) || []) {
+        walked.add(token.replace(/^name-(?:number-)?/, ''));
+      }
+      const before = view.state.listStart;
       view.handleInput('right');
-      if (pageMarker()[1] === before[1]) break;
+      if (view.state.listStart === before) break;
     }
     assert.deepEqual(
-      walked,
+      [...walked].sort(),
       Array.from({ length: 18 }, (_unused, at) => String(at + 1).padStart(2, '0')),
-      'every document appears once, in order, across the page transitions',
+      'every document is reachable by scrolling the one window',
     );
-    assert.equal(pageMarker()[2], String(pageMarker()[1]), 'the walk ends on the last page');
   });
 
-  test('S8: resizing re-pages around the selection and keeps it visible', async () => {
+  test('S8: resizing re-windows around the selection and keeps it visible', async () => {
     const { view } = build({ docs: manyLong(40), rows: 20 });
     await tick();
     for (let step = 0; step < 20; step += 1) view.handleInput('down');
     assert.equal(view.state.index, 20);
     const wide = view.render(200);
-    assert.match(searchRowOf(wide), /page 2\/3/, 'one-row names at 200 columns page by 16');
-    assert.match(strip(filled(wide).find((row) => row.includes('▸'))), /number-21/, 'the selection is on the wide page');
+    assert.ok(!/page/i.test(searchRowOf(wide)), 'one-row names at 200 columns print no page marker');
+    assert.match(strip(filled(wide).find((row) => row.includes('▸'))), /number-21/, 'the selection is in the wide window');
     const narrow = view.render(64);
-    assert.match(searchRowOf(narrow), /page 3\/5/, 'two-row names at 64 columns page by 8');
     const focused = filled(narrow).find((row) => row.includes('▸'));
-    assert.ok(focused, 'the selection stays on the rendered page after the resize');
-    assert.match(strip(focused), /long-wrapped-document-/, 'the focused name starts on the focused row');
+    assert.ok(focused, 'the selection stays in the window after the resize');
+    assert.match(strip(focused), /▸ long-wrapped-/, 'the focused name starts on the focused row');
     assert.ok(filled(narrow).join(' ').replace(/\s+/g, '').includes('name-number-21'), 'the focused document renders');
   });
 
@@ -1164,36 +1199,39 @@ describe('createOddView round-3 geometry, capacity and page marker (S5,S8,S14,S1
     view.handleInput('2');
     view.handleInput('enter');
     const lines = view.render(80);
-    assert.match(searchRowOf(lines), /› 2 · page 1\/2/, 'the narrowed list re-pages truthfully');
-    assert.match(strip(filled(lines).find((row) => row.includes('▸'))), /doc-02/, 'the selection restarts on the visible page');
+    assert.match(searchRowOf(lines), /› 2/, 'the narrowed list keeps its query on the search row');
+    assert.ok(!/page/i.test(searchRowOf(lines)), 'no page marker is printed (S3)');
+    assert.equal(view.state.listStart, 0, 'the narrowed list starts at its own top');
+    assert.match(strip(filled(lines).find((row) => row.includes('▸'))), /doc-02/, 'the selection restarts in the visible window');
   });
 
-  test('S14: the page marker sits next to Search on one-page lists and empty states too', async () => {
+  test('S3: no page marker renders beside Search in any state', async () => {
     const single = build({ docs: [doc('alpha'), doc('beta')] });
     await tick();
-    assert.match(searchRowOf(single.view.render(120)), /› Search · page 1\/1/, 'a one-page list still reports its page');
+    assert.match(searchRowOf(single.view.render(120)), /› Search/, 'the widget keeps the row');
+    assert.ok(!/page/i.test(searchRowOf(single.view.render(120))), 'a short list prints no marker');
     const empty = build({ docs: [] });
     await tick();
-    assert.match(searchRowOf(empty.view.render(120)), /› Search · page 1\/1/, 'the empty list says 1/1 instead of hiding the marker');
+    assert.ok(!/page/i.test(searchRowOf(empty.view.render(120))), 'the empty list prints no marker');
     const noMatch = build({ docs: [doc('alpha'), doc('beta')] });
     await tick();
     noMatch.view.handleInput('T');
     noMatch.view.handleInput('z');
-    assert.match(searchRowOf(noMatch.view.render(120)), /› z█ · page 1\/1/, 'a no-match query keeps the marker truthful');
+    assert.match(searchRowOf(noMatch.view.render(120)), /› z█/, 'the query is still displayed');
+    assert.ok(!/page/i.test(searchRowOf(noMatch.view.render(120))), 'a no-match query prints no marker');
     const narrow = build({ docs: [doc('alpha'), doc('beta')], rows: 12 });
     await tick();
-    assert.match(searchRowOf(narrow.view.render(24)), /page 1\/1/, 'even the narrowest frame keeps the page marker');
+    assert.ok(!/page/i.test(searchRowOf(narrow.view.render(24))), 'even the narrowest frame prints no marker');
   });
 
-  test('S14: the page marker renders once, in the chrome, never in the list content', async () => {
+  test('S3: the frame carries no page marker at all, and the window moves instead', async () => {
     const docs = Array.from({ length: 14 }, (_unused, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
     const { view } = build({ docs, rows: 12 });
     await tick();
-    const body = strip(view.render(80).join('\n'));
-    assert.equal((body.match(/page \d+\/\d+/g) || []).length, 1, 'the marker renders once in the whole frame');
-    assert.match(searchRowOf(view.render(80)), /page 1\/2/);
+    assert.ok(!/page \d+\/\d+/.test(strip(view.render(80).join('\n'))), 'nothing in the frame claims a page');
+    assert.match(filled(view.render(80))[0], /document-01/);
     view.handleInput('right');
-    assert.match(searchRowOf(view.render(80)), /page 2\/2/, 'the same cell follows the page');
+    assert.match(filled(view.render(80))[0], /document-07/, 'the window moved instead');
     assert.ok(!listCells(view.render(80)).some((row) => /page \d/.test(row)), 'the list content carries no page marker');
   });
 
@@ -1276,11 +1314,11 @@ describe('createOddView preview scroll bindings (S1)', () => {
     return { view, paints };
   }
 
-  test('the footer names ctrl+shift+j/k only when the host confirms the extended protocol', async () => {
+  test('the footer names ctrl+shift+j/k doc only when the host confirms the extended protocol', async () => {
     const confirmed = build({ helpers: host({ kitty: true }) });
     await tick();
     const extendedFooter = footerOf(confirmed.view.render(120));
-    assert.match(extendedFooter, /ctrl\+shift\+j\/k/, `the confirmed pair is named: ${extendedFooter}`);
+    assert.match(extendedFooter, /ctrl\+shift\+j\/k doc/, `the confirmed pair is named with its target: ${extendedFooter}`);
     assert.ok(!extendedFooter.includes('ctrl+j/k'), 'the removed binding is never printed');
 
     const cases = [
@@ -1293,18 +1331,27 @@ describe('createOddView preview scroll bindings (S1)', () => {
       const { view } = build({ helpers });
       await tick();
       const footer = footerOf(view.render(120));
-      assert.match(footer, /(^|· )shift\+j\/k/, `${label}: the printable fallback is named: ${footer}`);
+      assert.match(footer, /(^|· )shift\+j\/k doc/, `${label}: the printable fallback is named with its target: ${footer}`);
       assert.ok(!footer.includes('ctrl+shift'), `${label}: no fabricated extended support: ${footer}`);
       assert.ok(!footer.includes('ctrl+j/k'), `${label}: the removed binding is never printed: ${footer}`);
     }
   });
 
-  test('PgUp/PgDn are named as the always-available pair in both tiers', async () => {
+  test('PgUp/PgDn still page although S14 drops their generic token', async () => {
+    // S14 supersedes the earlier legend: «alguna key generidad como el page o
+    // half estan demas». The pair leaves the row because the labelled document
+    // token already names what it moves — the BINDINGS are untouched.
     for (const kitty of [true, false]) {
       const { view } = build({ helpers: host({ kitty }) });
       await tick();
       const footer = footerOf(view.render(120));
-      assert.match(footer, /(PgUp\/PgDn|PgUp\/Dn)/, `kitty ${kitty}: the page keys are named: ${footer}`);
+      assert.ok(!/(PgUp|PgDn|PgUp\/Dn)/.test(footer), `kitty ${kitty}: no generic page token: ${footer}`);
+      view.render(80);
+      view.handleInput('\x1b[6~');
+      const paged = view.state.scroll;
+      assert.ok(paged > 1, `kitty ${kitty}: PageDown still pages the preview`);
+      view.handleInput('\x1b[5~');
+      assert.equal(view.state.scroll, 0, `kitty ${kitty}: PageUp still pages back`);
     }
   });
 
@@ -1398,12 +1445,555 @@ describe('createOddView preview scroll bindings (S1)', () => {
   test('the mouse wheel and the frame geometry are untouched by the binding change', async () => {
     const { view } = build({ helpers: host({ kitty: true }) });
     await tick();
-    const geometry = layout.paneWidths(layout.innerWidth(120));
+    const geometry = layout.paneWidths(layout.innerWidth(120), { listShare: layout.READER_LIST_SHARE });
     const lines = view.render(120);
-    assert.equal(layout.paneWidths(layout.innerWidth(120)).left, geometry.left, 'the 40/60 rule still owns the panes');
+    assert.equal(
+      layout.paneWidths(layout.innerWidth(120), { listShare: layout.READER_LIST_SHARE }).left,
+      geometry.left,
+      'the 30/70 reader rule owns the panes',
+    );
     assert.equal([...strip(lines[2])].indexOf('│', 2), 3 + geometry.left, 'the divider still sits at the shared column');
     view.handleMouse({ type: 'wheel', wheelDelta: 2 });
     assert.equal(view.state.scroll, 2, 'the wheel still scrolls the preview');
     assert.equal(view.state.index, 0, 'the wheel never moves the selection');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S14: «alguna key generidad como el page o half estan demas (nose para que
+// es)» — the ODD footer names each scroll TARGET once, exactly like the issues
+// reader: the document pane's page, half-page and printable hints collapse into
+// the ONE labelled token the terminal can deliver, the list keeps its own
+// labelled token so the two can never be read as the same binding, and every
+// binding still answers in the handler even after its hint leaves the row.
+// ---------------------------------------------------------------------------
+describe('createOddView footer scroll targets (S14)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const footerOf = (lines) => strip(lines[lines.length - 2]);
+  const tokensOf = (footer) => footer.split('·').map((token) => token.trim()).filter((token) => token !== '');
+  const body200 = longDoc(200);
+  // The generic tokens the user reported as noise: a page pair and a half-page
+  // pair nobody could place, next to a bare unlabelled `scroll`.
+  const GENERIC = /(pgup|pgdn|half|ctrl\+d\/u)/i;
+
+  // A host whose matcher is the payload table these tests drive, so every
+  // binding assertion states what the terminal reported.
+  function host(kitty) {
+    return {
+      isKittyProtocolActive: () => kitty,
+      matchesKey: (data, name) => data === name,
+      parseKey: (data) => data,
+      isKeyRelease: () => false,
+    };
+  }
+
+  function build({ kitty = true, theme = plainTheme, rows = 20, docs = [doc('alpha'), doc('beta')] } = {}) {
+    return createOddView({
+      docs,
+      loadDoc: () => ({ ok: true, text: body200 }),
+      helpers: host(kitty),
+      theme,
+      rowsAvailable: () => rows,
+      requestRender: () => {},
+      done: () => {},
+    });
+  }
+
+  test('the generic page and half tokens leave the footer in both tiers', async () => {
+    for (const kitty of [true, false]) {
+      const view = build({ kitty });
+      await tick();
+      for (const width of [80, 120]) {
+        const footer = footerOf(view.render(width));
+        assert.ok(!GENERIC.test(footer), `kitty ${kitty}/${width}: no generic page or half token: ${footer}`);
+        assert.ok(!/\bscroll\b/.test(footer), `kitty ${kitty}/${width}: no bare unlabelled scroll token: ${footer}`);
+      }
+    }
+  });
+
+  test('the document pane is named once, by the pair this terminal delivers', async () => {
+    const extended = build({ kitty: true });
+    const printable = build({ kitty: false });
+    await tick();
+    const extendedFooter = footerOf(extended.render(120));
+    const printableFooter = footerOf(printable.render(120));
+    assert.match(extendedFooter, /ctrl\+shift\+j\/k doc/, `the confirmed pair is named with its target: ${extendedFooter}`);
+    assert.match(printableFooter, /shift\+j\/k doc/, `the fallback pair is named with its target: ${printableFooter}`);
+    for (const [label, footer] of [['extended', extendedFooter], ['fallback', printableFooter]]) {
+      const docTokens = tokensOf(footer).filter((token) => /(^|\s)doc$/.test(token));
+      assert.equal(docTokens.length, 1, `${label}: exactly one labelled document token: ${footer}`);
+    }
+  });
+
+  test('the list token is labelled, so it never reads as the document scroll', async () => {
+    const view = build();
+    await tick();
+    const footer = footerOf(view.render(120));
+    assert.match(footer, /←\/→ list/, `the list scroll key names its target: ${footer}`);
+    assert.ok(!footer.includes('←/→ scroll'), 'the ambiguous unlabelled reading is gone');
+    assert.match(footer, /s sort: recent/, 'the sort token stays beside the two labelled scroll hints');
+  });
+
+  test('every document scroll binding still answers with its hint gone', async () => {
+    const view = build({ kitty: true });
+    await tick();
+    view.render(80);
+    view.handleInput('\x1b[6~');
+    const paged = view.state.scroll;
+    assert.ok(paged > 1, 'PgDn still pages the document');
+    view.handleInput('\x1b[5~');
+    assert.equal(view.state.scroll, 0, 'PgUp still pages back');
+    view.handleInput('J');
+    assert.equal(view.state.scroll, paged, 'J pages exactly what PgDn pages');
+    view.handleInput('K');
+    assert.equal(view.state.scroll, 0, 'K pages back');
+    view.handleInput('\x04');
+    const half = view.state.scroll;
+    assert.ok(half > 0 && half < paged, `ctrl+d keeps the half-page step: ${half} of ${paged}`);
+    view.handleInput('\x15');
+    assert.equal(view.state.scroll, 0, 'ctrl+u returns half a page up');
+    view.handleInput('\x1b[106;6u');
+    assert.equal(view.state.scroll, paged, 'ctrl+shift+j pages the document');
+    view.handleInput('\x1b[107;6u');
+    assert.equal(view.state.scroll, 0, 'ctrl+shift+k pages back');
+    view.handleInput('end');
+    assert.ok(view.state.scroll > 0, 'end still jumps to the bottom');
+    view.handleInput('home');
+    assert.equal(view.state.scroll, 0, 'home still returns to the top');
+    assert.equal(view.state.index, 0, 'no document scroll key ever moved the list');
+  });
+
+  test('the list scroll keys keep working under their new label', async () => {
+    const names = Array.from({ length: 30 }, (_unused, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
+    const view = build({ docs: names, rows: 12 });
+    await tick();
+    const firstCells = (lines) => lines.slice(2, -2).map((line) => strip(line).split('│')[1] || '').filter((cell) => cell.trim() !== '');
+    const first = () => firstCells(view.render(80))[0];
+    assert.match(first(), /document-01/, 'the window starts at the first document');
+    view.handleInput(']');
+    assert.match(first(), /document-09/, '] moves the window a screen forward');
+    view.handleInput('[');
+    assert.match(first(), /document-01/, '[ moves it back');
+    view.handleInput('right');
+    assert.match(first(), /document-09/, '→ scrolls the list like ]');
+    view.handleInput('left');
+    assert.match(first(), /document-01/, '← scrolls the list like [');
+  });
+
+  test('the one-row legend keeps the key/description roles at every width', async () => {
+    for (const width of [40, 60, 80, 120]) {
+      const view = build({ theme: recordingTheme() });
+      await tick();
+      const lines = view.render(width);
+      const legend = lines.map(strip).filter((line) => /esc close|o open/.test(line));
+      assert.equal(legend.length, 1, `${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /esc close/, `${width}: the close key survives`);
+      for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `${width}: rows stay ${width} wide`);
+    }
+    const view = build({ theme: recordingTheme(), kitty: true });
+    await tick();
+    const footer = view.render(160).at(-2);
+    assert.match(footer, /\x1b\[1m\x1b\[96mctrl\+shift\+j\/k\x1b\[0m\x1b\[22m\x1b\[90m doc/,
+      'the document hint paints its key accent+bold and its target muted');
+    assert.match(footer, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m\x1b\[90m list/,
+      'the list hint splits its key and target the same way');
+  });
+});
+
+// S3 (T3): the ODD reader drops the page marker and becomes a continuous list.
+// The left pane is the smaller 30% share, ←/→ scroll the list a screenful at a
+// time, and the focused document always stays inside the painted window — the
+// filter keeps working over the whole list and no document is skipped.
+describe('createOddView continuous list scrolling instead of pages (S3)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const readerPanes = (width) => layout.paneWidths(layout.innerWidth(width), { listShare: layout.READER_LIST_SHARE });
+  const searchRowOf = (lines) => strip(lines[1]);
+  const footerOf = (lines) => strip(lines[lines.length - 2]);
+  const listCells = (lines) => lines.slice(2, -2).map((line) => strip(line).split('│')[1] || '');
+  const filled = (lines) => listCells(lines).filter((row) => row.trim() !== '');
+  const names = (count) => Array.from({ length: count }, (_unused, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
+
+  function build({ docs = names(2), rows = 20 } = {}) {
+    const view = createOddView({
+      docs,
+      loadDoc: () => ({ ok: true, text: 'body\n' }),
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => rows,
+      requestRender: () => {},
+      done: () => {},
+    });
+    return view;
+  }
+
+  test('the left pane takes the smaller 30/70 share', async () => {
+    const view = build({ docs: [doc('alpha'), doc('beta')] });
+    await tick();
+    for (const width of [80, 120, 200]) {
+      const lines = view.render(width);
+      const expected = readerPanes(width).left;
+      assert.equal([...strip(lines[2])].indexOf('│', 2), 3 + expected, `${width}: the list is ${expected} cells`);
+      assert.ok(expected < layout.paneWidths(layout.innerWidth(width)).left, `${width}: narrower than the old 40% list`);
+      for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `${width}: the frame fills the terminal`);
+    }
+  });
+
+  test('no page marker renders on the search row in any state', async () => {
+    const many = build({ docs: names(30), rows: 12 });
+    await tick();
+    assert.ok(!/page/i.test(searchRowOf(many.render(80))), 'a long list prints no page marker');
+    const single = build({ docs: [doc('alpha')] });
+    await tick();
+    assert.ok(!/page/i.test(searchRowOf(single.render(120))), 'a one-document list prints no marker');
+    const empty = build({ docs: [] });
+    await tick();
+    assert.ok(!/page/i.test(searchRowOf(empty.render(120))), 'the empty state prints no marker');
+    const narrow = build({ docs: names(30), rows: 12 });
+    await tick();
+    assert.ok(!/page/i.test(searchRowOf(narrow.render(24))), 'the narrowest frame prints no marker');
+  });
+
+  test('the footer names no page key', async () => {
+    const view = build({ docs: names(30), rows: 12 });
+    await tick();
+    const footer = footerOf(view.render(200));
+    assert.ok(!/page/i.test(footer), `the legend drops the page hint: ${footer}`);
+    assert.match(footer, /←\/→ list/, 'the list scroll key is still named, with its target (S14)');
+    assert.match(footer, /(ctrl\+shift\+j\/k|shift\+j\/k) doc/, 'the document scroll is named once with its target');
+  });
+
+  test('a long list scrolls continuously: one screen at a time', async () => {
+    const view = build({ docs: names(30), rows: 12 });
+    await tick();
+    // 12 rows leave 8 body rows, so the first window paints documents 1..8.
+    const first = filled(view.render(80));
+    assert.equal(first.length, 8, 'every body row carries a document');
+    assert.match(first[0], /document-01/);
+    assert.ok(!first.join(' ').includes('document-09'), 'the rest of the list is below the window');
+    view.handleInput('right');
+    const second = filled(view.render(80));
+    assert.match(second[0], /document-09/, '→ starts the next screen after the last painted document');
+    assert.ok(!second.join(' ').includes('document-01'), 'the previous screen scrolled away');
+    view.handleInput('left');
+    assert.match(filled(view.render(80))[0], /document-01/, '← scrolls back to the first screen');
+    view.handleInput('left');
+    assert.match(filled(view.render(80))[0], /document-01/, '← never scrolls before the first document');
+  });
+
+  test('the selection walks past the window edge and the list follows it', async () => {
+    const view = build({ docs: names(20), rows: 12 });
+    await tick();
+    for (let step = 0; step < 8; step += 1) view.handleInput('down');
+    assert.equal(view.state.index, 8, 'the ninth document is focused');
+    const rows = filled(view.render(80));
+    assert.ok(!rows.join(' ').includes('document-01'), 'the window scrolled past the first document');
+    assert.ok(rows.some((row) => /▸ document-09/.test(row)), 'the focused document is painted at the window edge');
+  });
+
+  test('every document stays reachable in order across the window moves', async () => {
+    const docs = names(18);
+    const view = build({ docs, rows: 12 });
+    await tick();
+    const seen = [];
+    for (let step = 0; step < docs.length; step += 1) {
+      const rows = filled(view.render(80));
+      const focused = rows.find((row) => row.includes('▸')) || '';
+      seen.push((focused.match(/document-\d+/) || [''])[0]);
+      view.handleInput('down');
+    }
+    assert.deepEqual(seen, docs.map((entry) => entry.name), 'every document is focused once, in order');
+  });
+
+  test('the filter still narrows the whole list and keeps the focused document visible', async () => {
+    const view = build({ docs: names(30), rows: 12 });
+    await tick();
+    for (let step = 0; step < 19; step += 1) view.handleInput('down');
+    view.handleInput('T');
+    view.handleInput('2');
+    view.handleInput('enter');
+    const rows = filled(view.render(80));
+    assert.match(searchRowOf(view.render(80)), /› 2/, 'the query is kept on the search row');
+    assert.match(rows.find((row) => row.includes('▸')) || '', /document-02/, 'the selection restarts on a visible document');
+    assert.ok(rows.length > 0, 'the narrowed list paints its rows');
+  });
+
+  test('the preview scroll position still rides the right edge of the search row', async () => {
+    const view = createOddView({
+      docs: [doc('alpha')],
+      loadDoc: () => ({ ok: true, text: longDoc(200) }),
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => 20,
+      requestRender: () => {},
+      done: () => {},
+    });
+    await tick();
+    view.handleInput('J');
+    const row = searchRowOf(view.render(80));
+    assert.match(row, /› Search/, 'the search widget owns the left of the row');
+    assert.match(row, / \d+-\d+\/\d+/, 'the reading position keeps the right edge');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S11: every footer token paints through the injected theme with a role that
+// distinguishes a shortcut KEY from its description, and the header paints its
+// title accent+bold, its separator dim and its count muted.
+describe('odd view palette (S11)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  function paletteView(theme, docs = [doc('alpha'), doc('beta')]) {
+    return createOddView({
+      docs,
+      loadDoc: (entry) => ({ ok: true, text: `# ${entry.name}\n\n## Specs\nS1. first rule\n` }),
+      helpers,
+      theme,
+      rowsAvailable: () => 20,
+      requestRender: () => {},
+      done: () => {},
+    });
+  }
+
+  test('the footer paints every shortcut key accent+bold and its description muted', async () => {
+    const theme = recordingTheme();
+    const view = paletteView(theme);
+    await tick();
+    const footer = view.render(160).at(-2);
+    assert.match(footer, /\x1b\[1m\x1b\[96m↑↓\x1b\[0m\x1b\[22m/, 'the key token is painted accent+bold');
+    assert.match(footer, /\x1b\[90m select/, 'its description is painted muted');
+    assert.match(footer, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m/, 'the list scroll key is a key run');
+    assert.match(footer, /\x1b\[1m\x1b\[96mT\x1b\[0m\x1b\[22m/, 'a single-letter key is painted the same way');
+    assert.ok(theme.calls.some((call) => call.role === 'accent' && call.text === '↑↓'),
+      'the accent role comes from the injected theme');
+    assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('↑↓')),
+      'the key is bolded through the theme, never by a literal escape');
+    assert.ok(theme.calls.some((call) => call.role === 'muted' && call.text.includes('select')),
+      'the description asks the injected theme for the muted role');
+  });
+
+  test('the search legend uses the same key/description split', async () => {
+    const theme = recordingTheme();
+    const view = paletteView(theme);
+    await tick();
+    view.handleInput('T');
+    const footer = view.render(160).at(-2);
+    assert.match(footer, /\x1b\[1m\x1b\[96mtype\x1b\[0m\x1b\[22m\x1b\[90m to filter/,
+      'the typing hint paints its key accent+bold and its description muted');
+    assert.match(footer, /\x1b\[1m\x1b\[96mbksp\x1b\[0m\x1b\[22m/, 'backspace keeps the same pair');
+  });
+
+  test('the header paints the title accent+bold, its separator dim and the count muted', async () => {
+    const theme = recordingTheme();
+    const view = paletteView(theme);
+    await tick();
+    const lines = view.render(120);
+    assert.match(lines[0], /\x1b\[1m\x1b\[96m✎ Odd\x1b\[0m\x1b\[22m/, 'the frame title is accent+bold');
+    assert.match(lines[0], /\x1b\[2m · \x1b\[0m/, 'the separator is the dim label role');
+    assert.match(lines[0], /\x1b\[90m2 documents\x1b\[0m/, 'the document count is muted, never accent');
+    // The right-pane document title is the markdown heading, painted through the
+    // injected theme with its own heading role plus bold — never a hardcoded SGR.
+    assert.ok(theme.calls.some((call) => call.role === 'mdHeading'),
+      'the document title keeps its own heading role');
+    const titleCall = theme.calls.find((call) => call.role === 'mdHeading');
+    assert.match(titleCall.text, /^\x1b\[1m/, 'the document title is bolded through the theme');
+  });
+
+  test('a hostile theme never breaks the frame and keeps the keys and focus readable', async () => {
+    const hostile = {
+      fg() { throw new Error('no colour support'); },
+      bold() { throw new Error('no bold support'); },
+      bg() { throw new Error('no background support'); },
+    };
+    const view = paletteView(hostile);
+    await tick();
+    // 160 keeps the full-spelling legend tier (S12 added one token).
+    const body = strip(view.render(160).join('\n'));
+    assert.match(body, /✎ Odd · 2 documents/, 'the header still renders without colour');
+    assert.match(body, /↑↓ select/, 'the footer still names the key and its description');
+    assert.match(body, /▸ alpha/, 'the focused document keeps its mark, so focus survives monochrome');
+    assert.match(body, /› Search/, 'the search widget still renders');
+  });
+
+  test('the search row paints its label dim and its live value accent', async () => {
+    const theme = recordingTheme();
+    const view = paletteView(theme);
+    await tick();
+    const idle = view.render(120)[1];
+    assert.match(idle, /\x1b\[2m› \x1b\[0m\x1b\[2mSearch/, 'the idle search widget is dim, never accent');
+    view.handleInput('T');
+    for (const char of 'alp') view.handleInput(char);
+    const live = view.render(120)[1];
+    assert.match(live, /\x1b\[2m› \x1b\[0m/, 'the prompt keeps the dim label role while typing');
+    assert.match(live, /\x1b\[96malp/, 'the live query value is painted accent');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S12: the list shows the most recently modified document first — the order
+// lib/odd-docs.js already returns — and ONE shortcut alternates it with a
+// case-insensitive alphabetical order. The focused document survives the
+// toggle, the visible window re-anchors on it, the name filter composes with
+// both orders, and the ONE footer legend names the key and the active order.
+describe('createOddView list order (S12)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const listCells = (lines) => lines.slice(2, -2).map((line) => strip(line).split('│')[1] || '');
+  const filled = (lines) => listCells(lines).filter((cell) => cell.trim() !== '');
+  const rowName = (cell) => cell.trim().replace(/^▸\s*/, '');
+  const namesOf = (lines) => filled(lines).map(rowName);
+  const focusedName = (lines) => {
+    const cell = filled(lines).find((entry) => entry.includes('▸'));
+    return cell === undefined ? null : rowName(cell);
+  };
+  const footerOf = (lines) => strip(lines[lines.length - 2]);
+  const searchRowOf = (lines) => strip(lines[1]);
+
+  // The loader's own order: most recently modified first, never alphabetical.
+  const RECENT = [doc('mike'), doc('alpha'), doc('Zulu'), doc('bravo')];
+
+  function build({ docs = RECENT, rows = 20, theme = plainTheme, reloadDocs } = {}) {
+    const paints = [];
+    const view = createOddView({
+      docs,
+      loadDoc: (entry) => ({ ok: true, text: `# ${entry.name}\n\nbody of ${entry.name}\n` }),
+      reloadDocs,
+      helpers,
+      theme,
+      rowsAvailable: () => rows,
+      requestRender: () => { paints.push(true); },
+      done: () => {},
+    });
+    return { view, paints };
+  }
+
+  test('the list defaults to the loader order, newest modified first', async () => {
+    const { view } = build();
+    await tick();
+    const lines = view.render(80);
+    assert.deepEqual(namesOf(lines), ['mike', 'alpha', 'Zulu', 'bravo'], 'the loader order is kept, never re-sorted');
+    assert.equal(focusedName(lines), 'mike', 'the first (most recent) document is focused');
+    assert.match(footerOf(view.render(160)), /s sort: recent/, 'the footer names the order key and the active order');
+  });
+
+  test('s alternates between newest-first and case-insensitive alphabetical order', async () => {
+    const { view, paints } = build();
+    await tick();
+    const before = paints.length;
+    view.handleInput('s');
+    assert.ok(paints.length > before, 'the toggle requests a repaint');
+    let lines = view.render(80);
+    assert.deepEqual(namesOf(lines), ['alpha', 'bravo', 'mike', 'Zulu'], 'alphabetical and case-insensitive');
+    assert.equal(focusedName(lines), 'mike', 'the focused document rides the toggle');
+    assert.match(footerOf(view.render(160)), /s sort: name/, 'the footer names the alphabetical order once it is active');
+    view.handleInput('s');
+    lines = view.render(80);
+    assert.deepEqual(namesOf(lines), ['mike', 'alpha', 'Zulu', 'bravo'], 'the second toggle returns the loader order');
+    assert.equal(focusedName(lines), 'mike');
+    assert.match(footerOf(view.render(160)), /s sort: recent/);
+  });
+
+  test('the focused document stays focused across the toggle, in both directions', async () => {
+    const { view } = build();
+    await tick();
+    view.handleInput('down');
+    assert.equal(focusedName(view.render(80)), 'alpha', 'alpha is focused in the loader order');
+    view.handleInput('s');
+    let lines = view.render(80);
+    assert.equal(focusedName(lines), 'alpha', 'the same document is focused in the alphabetical order');
+    assert.equal(view.state.index, 0, 'its new position is the focused index');
+    assert.match(strip(lines.join('\n')), /body of alpha/, 'the reading pane still shows the same document');
+    view.handleInput('s');
+    lines = view.render(80);
+    assert.equal(focusedName(lines), 'alpha', 'and again on the way back');
+    assert.equal(view.state.index, 1, 'back in its loader position');
+  });
+
+  test('a toggle re-anchors the visible window on the focused document', async () => {
+    // The loader order is the reverse of the alphabetical one.
+    const docs = Array.from({ length: 20 }, (_unused, at) => doc(`item-${String(20 - at).padStart(2, '0')}`));
+    const { view } = build({ docs, rows: 12 });
+    await tick();
+    let lines = view.render(80);
+    assert.equal(namesOf(lines)[0], 'item-20', 'the most recent document starts the window');
+    assert.equal(focusedName(lines), 'item-20');
+    view.handleInput('s');
+    lines = view.render(80);
+    assert.equal(focusedName(lines), 'item-20', 'the focused document stays focused');
+    assert.equal(namesOf(lines).at(-1), 'item-20', 'the window moved to its alphabetical position at the end of the list');
+    assert.ok(!namesOf(lines).includes('item-01'), 'the window no longer starts at the top of the list');
+    assert.equal(filled(lines).length, 8, 'the window is kept full');
+    view.handleInput('s');
+    lines = view.render(80);
+    assert.equal(namesOf(lines)[0], 'item-20', 'the window returns to the top with the loader order');
+    assert.equal(focusedName(lines), 'item-20');
+  });
+
+  test('the order toggle composes with the name filter', async () => {
+    const { view } = build({ docs: [doc('maple'), doc('alpha'), doc('bravo'), doc('cherry')] });
+    await tick();
+    view.handleInput('T');
+    view.handleInput('a');
+    view.handleInput('enter');
+    let lines = view.render(80);
+    assert.match(searchRowOf(lines), /› a( |$)/m, 'the query stays on the search row');
+    assert.deepEqual(namesOf(lines), ['maple', 'alpha', 'bravo'], 'the filter keeps the loader order of its matches');
+    view.handleInput('s');
+    lines = view.render(80);
+    assert.deepEqual(namesOf(lines), ['alpha', 'bravo', 'maple'], 'the filtered matches sort alphabetically');
+    assert.match(searchRowOf(lines), /› a( |$)/m, 'the toggle keeps the filter');
+    assert.equal(focusedName(lines), 'maple', 'the focused match stays focused');
+    view.handleInput('s');
+    assert.deepEqual(namesOf(view.render(80)), ['maple', 'alpha', 'bravo'], 'and back to the loader order of the matches');
+  });
+
+  test('s types into the open filter box instead of toggling the order', async () => {
+    const { view } = build({ docs: [doc('maple'), doc('alpha'), doc('bravo')] });
+    await tick();
+    view.handleInput('T');
+    view.handleInput('s');
+    assert.match(searchRowOf(view.render(80)), /› s█/, 'the letter goes into the query');
+    view.handleInput('\x7f');
+    view.handleInput('enter');
+    assert.deepEqual(namesOf(view.render(80)), ['maple', 'alpha', 'bravo'], 'the order never toggled while typing');
+    assert.match(footerOf(view.render(160)), /s sort: recent/);
+  });
+
+  test('a reload keeps the chosen order', async () => {
+    let current = [doc('mike'), doc('alpha'), doc('Zulu')];
+    const { view } = build({ docs: current, reloadDocs: () => ({ ok: true, docs: current }) });
+    await tick();
+    view.handleInput('s');
+    current = [doc('mike'), doc('alpha'), doc('Zulu'), doc('bravo')];
+    view.handleInput('r');
+    await tick();
+    assert.deepEqual(namesOf(view.render(80)), ['alpha', 'bravo', 'mike', 'Zulu'], 'the reloaded list keeps the alphabetical order');
+    assert.match(strip(view.render(80).join('\n')), /4 documents/);
+  });
+
+  test('the footer names the sort key with the key/description roles, on ONE row', async () => {
+    const { view } = build({ theme: recordingTheme() });
+    await tick();
+    let footer = view.render(160).at(-1 - 1);
+    assert.match(footer, /\x1b\[1m\x1b\[96ms\x1b\[0m\x1b\[22m\x1b\[90m sort: recent/, 'the key is accent+bold, its description muted');
+    view.handleInput('s');
+    footer = view.render(160).at(-2);
+    assert.match(footer, /\x1b\[1m\x1b\[96ms\x1b\[0m\x1b\[22m\x1b\[90m sort: name/, 'the description names the new order');
+
+    const plain = build();
+    await tick();
+    for (const width of [40, 60, 80, 120]) {
+      const lines = plain.view.render(width);
+      const legend = lines.map(strip).filter((line) => /esc close|o open/.test(line));
+      assert.equal(legend.length, 1, `${width}: the legend owns exactly one row`);
+      assert.ok(!legend[0].includes('…'), `${width}: compacted, never ellipsis-clipped`);
+      // S14: the labelled document token is four cells longer than the bare
+      // pair it replaced, so at the narrowest width the sort key is the entry
+      // the one-row budget drops first. From 60 up both spellings survive: the
+      // compact `s` while the row still compacts, the full one once it fits.
+      if (width >= 60 && width < 120) assert.match(legend[0], /(^|· )s( ·|$)/, `${width}: the sort key survives the compaction`);
+      if (width >= 120) assert.match(legend[0], /s sort: recent/, `${width}: the full spelling names the sort key and the order`);
+      assert.equal(lines.length, 20, `${width}: the frame still fills the rows`);
+      for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `${width}: rows stay ${width} wide`);
+    }
   });
 });

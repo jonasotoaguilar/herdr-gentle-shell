@@ -319,7 +319,7 @@ describe('/herdr-gentle:odd read-only association (S10b)', () => {
     assert.ok(!body.includes('unsaved'), 'no unsaved claim exists');
     assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
     assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
-    assert.match(body, /shift\+j\/k scroll/, 'the reading legend names the effective fallback');
+    assert.match(body, /(ctrl\+shift\+j\/k|shift\+j\/k) doc/, 'the reading legend names the effective fallback and the target it scrolls (S14)');
     assert.match(body, /› Search /, 'the search row names the filter alone, with no key above (S4)');
     assert.ok(!/› Search \(T\)/.test(body), 'the search row never carries the (T) key hint (S4)');
     assert.match(body, /T search/, 'the filter key lives in the footer instead (S4)');
@@ -458,14 +458,13 @@ describe('/herdr-gentle:odd external open (K3)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S29: `/herdr-gentle:odd` stays registered while the worktree mode is off or
-// malformed; only the worktree association is disabled. This file covers the
-// extension seam (mode read plus refuse-to-save); the view-side hiding of the
-// association marks, hints and keys is asserted in tools/odd-view.test.js.
+// S1: the odd reader associates nothing with the checkout. The command hands
+// the view NO `assigned`, NO `saveAssignment` and NO `assignmentEnabled` — the
+// association was removed from the product, not merely gated — so opening the
+// reader performs zero registry writes in every worktree-mode state.
 // ---------------------------------------------------------------------------
-describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
+describe('/herdr-gentle:odd never reads or writes an association (S1)', () => {
   const modeLib = require('../lib/worktree-mode.js');
-  const S29_REFUSAL = 'worktree tools are disabled; enable them in /herdr-gentle:customize to assign issues or odd documents';
 
   function modeDir() {
     return track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-mode-')));
@@ -503,6 +502,12 @@ describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
     return { holder, restore: () => { lib.createOddView = original; } };
   }
 
+  function assertNoAssociationOptions(options) {
+    for (const key of ['assigned', 'assignedOdd', 'saveAssignment', 'assignmentEnabled']) {
+      assert.equal(key in options, false, `the view is handed no ${key}: ${JSON.stringify(Object.keys(options))}`);
+    }
+  }
+
   async function openOdd(root) {
     const { commands, mod } = await loadExtension();
     mod.setOddTuiLoader(async () => stubTui);
@@ -517,76 +522,46 @@ describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
     return commands;
   }
 
-  test('mode off: the command exists, assignmentEnabled is false and the callback refuses with zero writes', async () => {
+  async function openWithRegistry(tag, seed) {
+    const root = makeRepo({ docs: { 'a.md': '# a\n\n## Specs\nS1. one rule\n' }, tag });
+    const file = oddRegistryFile(root);
+    if (seed) fs.writeFileSync(file, `${JSON.stringify(seed(root), null, 2)}\n`);
+    const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    const capture = captureOddView();
+    try {
+      const commands = await openOdd(root);
+      assert.ok(commands.has('herdr-gentle:odd'), 'the command stays registered');
+      assert.ok(capture.holder.options, 'the view was constructed');
+      assertNoAssociationOptions(capture.holder.options);
+    } finally {
+      capture.restore();
+    }
+    const after = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    assert.equal(after, before, 'reading writes nothing to the registry');
+  }
+
+  const seeded = (root) => ({
+    version: 1,
+    worktrees: [{ branch: git(root, ['branch', '--show-current']).trim(), path: root, thread: 'test-thread', issues: [], odd: 'odd/tasks/a.md' }],
+  });
+
+  test('mode off: no association option and no registry write', async () => {
     await withModeDir(async () => {
       modeLib.writeMode(false, process.env);
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n\n## Specs\nS1. one rule\n' }, tag: 'odd-s29-off' });
-        const file = oddRegistryFile(root);
-        const commands = await openOdd(root);
-        assert.ok(commands.has('herdr-gentle:odd'), 'the command stays registered while the mode is off');
-        assert.ok(capture.holder.options, 'the view was constructed');
-        assert.equal(capture.holder.options.assignmentEnabled, false, 'the disabled mode travels to the view');
-        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the refusal is honest and exact');
-        assert.equal(fs.existsSync(file), false, 'a refused save writes no registry');
-      } finally {
-        capture.restore();
-      }
+      await openWithRegistry('odd-s1-off', seeded);
     });
   });
 
-  test('malformed mode: assignmentEnabled is false and the callback refuses', async () => {
+  test('malformed mode: no association option and no registry write', async () => {
     await withModeDir(async () => {
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-malformed' });
-        const file = oddRegistryFile(root);
-        const commands = await openOdd(root);
-        assert.ok(commands.has('herdr-gentle:odd'));
-        assert.equal(capture.holder.options.assignmentEnabled, false, 'a malformed mode never enables assignment');
-        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL });
-        assert.equal(fs.existsSync(file), false, 'a malformed mode never writes');
-      } finally {
-        capture.restore();
-      }
+      await openWithRegistry('odd-s1-malformed', seeded);
     }, { malformed: true });
   });
 
-  test('mode switched off after opening: the callback re-reads and refuses', async () => {
+  test('mode enabled and then switched off: still no association option and no write', async () => {
     await withModeDir(async () => {
       modeLib.writeMode(true, process.env);
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-switched' });
-        const file = oddRegistryFile(root);
-        await openOdd(root);
-        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode opened normally');
-        modeLib.writeMode(false, process.env);
-        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the callback re-reads the mode, not the snapshot');
-        assert.equal(fs.existsSync(file), false, 'the registry is untouched');
-      } finally {
-        capture.restore();
-      }
-    });
-  });
-
-  test('enabled mode: assignmentEnabled stays true (regression)', async () => {
-    await withModeDir(async () => {
-      // Explicit, not inferred: a missing file also means enabled, but the
-      // test names the enabled state it exercises.
-      modeLib.writeMode(true, process.env);
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-on' });
-        await openOdd(root);
-        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode passes true');
-      } finally {
-        capture.restore();
-      }
+      await openWithRegistry('odd-s1-on', seeded);
     });
   });
 });
