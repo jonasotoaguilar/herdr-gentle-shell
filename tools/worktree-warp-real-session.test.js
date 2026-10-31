@@ -105,7 +105,12 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 function addWorktree(root, branch) {
@@ -152,6 +157,10 @@ async function loadExtension() {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
+  // The copy lives outside the package, so the module-load-time libRequire
+  // calls (the shared palette) must resolve through the override, exactly as
+  // the in-repo extension does.
+  process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
   const tools = new Map();
   const commands = new Map();
   const pi = {

@@ -131,26 +131,50 @@ function perfTraceView(view, component, hostTui) {
 
 // The herdr binary honors the documented HERDR_BIN_PATH override (tests),
 // else `herdr` on PATH — the same convention lib/gentle-diagnostics.js uses.
-// Under the test harness (GENTLE_WORKTREE_LIB_DIR set by the test loaders)
-// with no explicit binary injected, fail closed instead of spawning live
-// herdr: lib/worktree-git.js resolveHerdrBinary is the single authority.
+//
+// lib/worktree-git.js `resolveHerdrBinary` is the SINGLE authority and its
+// answer is propagated verbatim, including its refusal: under the test harness
+// (GENTLE_WORKTREE_LIB_DIR, set only by the test loaders) a value that may be
+// the live binary is refused unless the CURRENT test opted in with
+// GENTLE_WORKTREE_ALLOW_LIVE_HERDR=1. A `catch {}` around that call used to
+// swallow the refusal and then re-apply an inherited HERDR_BIN_PATH here, which
+// handed a test process exactly the live binary the authority had just refused
+// (a real Herdr workspace, created from a test). No fallback in this file may
+// re-decide the binary: the only remaining branch is for a lib that is missing
+// entirely, and it fails closed under the harness.
 function herdrBinary() {
+  let git = null;
   try {
-    const git = libRequire("worktree-git.js");
-    if (git && typeof git.resolveHerdrBinary === "function") {
-      return git.resolveHerdrBinary(process.env);
-    }
+    git = libRequire("worktree-git.js");
   } catch {
-    // Fall through to the inline check below; a missing helper never
-    // silently reaches a live binary from a test process.
+    git = null;
+  }
+  if (git && typeof git.resolveHerdrBinary === "function") {
+    return git.resolveHerdrBinary(process.env);
+  }
+  const harness = process.env.GENTLE_WORKTREE_LIB_DIR;
+  if (typeof harness === "string" && harness.length > 0) {
+    throw new Error(
+      "refusing to run live herdr from a test harness: herdr binary cannot be resolved "
+      + "(lib/worktree-git.js is unavailable, so no binary is injected)",
+    );
   }
   const bin = process.env.HERDR_BIN_PATH;
   if (typeof bin === "string" && bin.length > 0) return bin;
-  const harness = process.env.GENTLE_WORKTREE_LIB_DIR;
-  if (typeof harness === "string" && harness.length > 0) {
-    throw new Error('herdr binary is not injected: set HERDR_BIN_PATH in tests (refusing to run live herdr)');
-  }
   return "herdr";
+}
+
+// The texts the authority (and the missing-lib branch above) use to refuse.
+// Matching on text keeps the boundary between lib and extension small: a
+// refusal is a resolved STATE, not an error class shared across it.
+const HERDR_REFUSAL_PATTERN = /refusing to run live herdr|herdr binary is not injected/;
+
+function isHerdrRefusal(err) {
+  return !!(
+    err
+    && typeof err.message === "string"
+    && HERDR_REFUSAL_PATTERN.test(err.message)
+  );
 }
 
 function toolCwd(ctx) {
