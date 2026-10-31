@@ -371,15 +371,20 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 
 ### Agent worktrees
 
-An agent thread owns one checkout, created with `worktree_upsert` (branch
-plus at least one verified GitHub issue — success answers `worktree
-create: <path>`), inspected with `worktree_list`, and removed with
-`worktree_close` (the branch is kept). Creation copies untracked env
-files, installs dependencies by detected lockfile, symlinks the shared
-`odd/` / `.agents/` / `.claude/` dirs, and runs `codegraph init` when
-available. Full contract — registry, hooks, mode gate, `odd/` capture,
-and limitations — lives in
-[docs/worktree-tools.md](docs/worktree-tools.md).
+An agent thread may own several checkouts, each created with
+`worktree_create` (the branch is the whole input — success answers
+`created: <slug> · <branch>`, its path, `registered: new|replaced|appended|unchanged`
+for what the registry write did, and whether CodeGraph was initialized),
+inspected with `worktree_list`, and removed with `worktree_close` (the branch
+is kept). Idempotency is keyed to the requested
+branch: the same branch returns its own checkout as `already exists`, while
+any other branch is created even when the thread already owns one. Creation
+copies untracked env files, installs dependencies by detected lockfile,
+symlinks the shared `odd/` / `.agents/` / `.claude/` dirs, and runs
+`codegraph init` when available; an already existing checkout only has its
+index state READ (never re-initialized). A worktree carries no issue or ODD
+association. Full contract — registry, hooks, mode gate, and limitations —
+lives in [docs/worktree-tools.md](docs/worktree-tools.md).
 
 ## Key Features You Should Know About
 
@@ -458,12 +463,13 @@ and limitations — lives in
   publications never appear and still depend on chat delivery, and
   absence-driven completion records `completed` without latching an error.
 - TTL-bounded tokens: stale panes fall back to native `idle`.
-- Agent worktrees (`worktree_upsert` / `worktree_list` / `worktree_close`,
-  plus the `Worktree tools` rows of `/herdr-gentle:customize`): one checkout per
-  thread at the flattened worktree path, issue-associated and verified
-  through `gh`, with creation hooks (untracked env copies, lockfile-detected
-  installs, shared-dir symlinks, `codegraph init`) and automatic `odd/`
-  capture. See [docs/worktree-tools.md](docs/worktree-tools.md).
+- Agent worktrees (`worktree_create` / `worktree_list` / `worktree_close`,
+  plus the `Worktree tools` rows of `/herdr-gentle:customize`): one or more
+  checkouts per thread at the flattened worktree path, created from the branch
+  alone — no issue or ODD association — with creation hooks (untracked env
+  copies, lockfile-detected installs, shared-dir symlinks, `codegraph init`,
+  whose outcome the create result reports). See
+  [docs/worktree-tools.md](docs/worktree-tools.md).
 
 ## Documentation
 
