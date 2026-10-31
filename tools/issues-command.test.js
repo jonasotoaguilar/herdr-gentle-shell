@@ -238,22 +238,18 @@ function graphqlSnapshotOf(argv, rows) {
   });
 }
 
-// The cursor-paged SEARCH snapshot the fresh viewer reads through
-// `getIssuePage` (S5/D1): every edge carries its own opaque cursor, so a
-// caller resumes after the last row it actually showed.
-function graphqlSearchPage(argv, rows) {
-  const field = (name) => {
-    for (let index = 0; index < argv.length - 1; index += 1) {
-      if (argv[index] === '-F' && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
-    }
-    return null;
-  };
-  const first = Number(field('first'));
-  const after = field('cursor');
-  const start = after === null ? 0 : Number(String(after).replace('row-', '')) + 1;
-  const page = rows.slice(start, start + (Number.isFinite(first) ? first : rows.length));
-  const hasNextPage = start + page.length < rows.length;
-  const node = (row) => ({
+// The `-F name=value` / `-f name=value` field a graphql call carried.
+function graphqlField(argv, name, flag = '-F') {
+  for (let index = 0; index < argv.length - 1; index += 1) {
+    if (argv[index] === flag && argv[index + 1].startsWith(`${name}=`)) return argv[index + 1].slice(name.length + 1);
+  }
+  return null;
+}
+
+// One issue node, in the shape both GraphQL page queries ask for. Test rows are
+// synthesized, so these are exactly the fields `normalizeIssue` reads.
+function graphqlIssueNode(row) {
+  return {
     number: row.number,
     title: row.title,
     state: String(row.state || 'OPEN').toUpperCase(),
@@ -265,16 +261,66 @@ function graphqlSearchPage(argv, rows) {
     labels: { nodes: [] },
     comments: { totalCount: 0 },
     reactionGroups: [],
-  });
+  };
+}
+
+// The cursor-paged SEARCH snapshot the fresh viewer reads through
+// `getIssuePage` (S5/D1): every edge carries its own opaque cursor, so a
+// caller resumes after the last row it actually showed.
+function graphqlSearchPage(argv, rows) {
+  const first = Number(graphqlField(argv, 'first'));
+  const after = graphqlField(argv, 'cursor');
+  const start = after === null ? 0 : Number(String(after).replace('row-', '')) + 1;
+  const page = rows.slice(start, start + (Number.isFinite(first) ? first : rows.length));
+  const hasNextPage = start + page.length < rows.length;
   return JSON.stringify({
     data: {
       search: {
         issueCount: rows.length,
         pageInfo: { hasNextPage, endCursor: hasNextPage ? `row-${start + page.length - 1}` : null },
-        edges: page.map((row, at) => ({ cursor: `row-${start + at}`, node: node(row) })),
+        edges: page.map((row, at) => ({ cursor: `row-${start + at}`, node: graphqlIssueNode(row) })),
       },
     },
   });
+}
+
+// The cursor-paged CONNECTION snapshot the unfiltered `All` bucket reads
+// (T2/S2): `totalCount` is the server's exact count, `pageInfo` says whether
+// the walk continues, and EVERY edge carries its own cursor, so the reader
+// resumes after the last row it showed with no 1000-match search ceiling.
+function graphqlConnectionPage(argv, rows) {
+  const first = Number(graphqlField(argv, 'first'));
+  const after = graphqlField(argv, 'cursor');
+  const start = after === null ? 0 : Number(String(after).replace('conn-', '')) + 1;
+  const page = rows.slice(start, start + (Number.isFinite(first) ? first : rows.length));
+  const hasNextPage = start + page.length < rows.length;
+  return JSON.stringify({
+    data: {
+      repository: {
+        issues: {
+          totalCount: rows.length,
+          pageInfo: { hasNextPage, endCursor: hasNextPage ? `conn-${start + page.length - 1}` : null },
+          edges: page.map((row, at) => ({ cursor: `conn-${start + at}`, node: graphqlIssueNode(row) })),
+        },
+      },
+    },
+  });
+}
+
+// Every call that read the repository issue CONNECTION — the `All` bucket's
+// source. A search call is not one of them: only the connection query carries a
+// `states: [...]` literal and per-edge cursors, which is what makes the 1000
+// match ceiling inapplicable.
+function connectionReads(calls) {
+  return calls
+    .filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql')
+    .map((call) => ({
+      query: graphqlField(call.argv, 'query', '-f') || '',
+      first: graphqlField(call.argv, 'first'),
+      cursor: graphqlField(call.argv, 'cursor'),
+      argv: call.argv,
+    }))
+    .filter((read) => read.query.includes('issues(states: [') && read.query.includes('edges { cursor node'));
 }
 
 // The exact source query each fresh GraphQL search page asked for, with the
@@ -303,7 +349,11 @@ function searchQueries(calls) {
 // triage-level or unknown role removes the label/assignee editors (S16).
 // `WRITE` is the default because the label test creates a label, which needs
 // `canCreateLabels` and therefore write access.
-function makeIssuesRunner({ failComment = false, role = 'WRITE' } = {}) {
+//
+// `connectionRows` is what the unfiltered `All` bucket's issue CONNECTION
+// answers with (T2/S2); it defaults to the same fixture rows, so a test only
+// passes it to model a repository large enough to cross the search cap.
+function makeIssuesRunner({ failComment = false, role = 'WRITE', connectionRows = null } = {}) {
   const calls = [];
   const ok = (stdout) => ({ status: 0, stdout, stderr: '', error: null });
   const rows = JSON.parse(fixture('gh-issue-list.json'));
@@ -337,6 +387,9 @@ function makeIssuesRunner({ failComment = false, role = 'WRITE' } = {}) {
         } } }));
       }
       if (query.includes('type: ISSUE')) return ok(graphqlSearchPage(argv, rows));
+      // T2/S2: the unfiltered `All` bucket asks the repository's issue
+      // CONNECTION (edges with per-edge cursors), never the capped search.
+      if (query.includes('edges { cursor node')) return ok(graphqlConnectionPage(argv, connectionRows || rows));
       return ok(graphqlSnapshotOf(argv, rows));
     }
     if (argv[0] === 'api') return ok(fixture('gh-api-user.json'));
@@ -401,6 +454,37 @@ async function openIssues(root, { runner } = {}) {
   const { component, done } = openComponent(factory, host);
   await tick();
   return { component, notes, customs, commands, done };
+}
+
+// The options the command mounts the real view with, over the real injected
+// `gh`, while every client call the extension makes stays real and injectable.
+// `calls` is the injected runner's own call log; `connectionRows` (T2/S2) is
+// what the unfiltered `All` bucket's issue connection answers with.
+async function capturedIssuesOptions(root, options = {}) {
+  const injected = options.runner
+    ? { runner: options.runner, calls: options.calls || [] }
+    : makeIssuesRunner(options);
+  const capture = captureIssuesView();
+  try {
+    const { commands, mod, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(injected.runner);
+    const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+    await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const { ctx } = makeCtx({ cwd: root });
+    // The host calls the factory; the captured options live on it.
+    ctx.ui.custom = async (factory) => {
+      factory(makeHostTui(24).tui, {}, {}, () => {});
+      return null;
+    };
+    await commands.get('herdr-gentle:issues').handler('', ctx);
+    await tick();
+    assert.ok(capture.holder.options, 'the command mounts the view');
+    return { options: capture.holder.options, calls: injected.calls, restore: capture.restore };
+  } catch (err) {
+    capture.restore();
+    throw err;
+  }
 }
 
 describe('/herdr-gentle:issues gate (S3)', () => {
@@ -497,14 +581,15 @@ describe('/herdr-gentle:issues overlay', () => {
     assert.deepEqual(listSearches, [], 'the viewer reads fresh pages, never the cached buckets');
     // S5/D1: the source asks gh for last-update ordering with the EXACT bucket
     // query; Involved excludes the viewer's own issues so the two buckets are
-    // disjoint at the source, before any client filter.
+    // disjoint at the source, before any client filter. T2/S2: `All` is the
+    // fourth tab's repository CONNECTION, which takes no search text at all.
     assert.deepEqual(searchQueries(calls), [
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-      'sort:updated-desc',
     ],
-      'the mount reads every tab once with its own exact query');
+      'the mount reads every scoped tab once with its own exact query');
+    assert.equal(connectionReads(calls).length, 1, 'the All tab is read once through the issue connection');
     const body = clean(component.render(110).join('\n'));
     assert.match(body, /My issues/, 'first page tab');
     assert.match(body, /Assigned/, 'second page tab');
@@ -861,8 +946,8 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-      'sort:updated-desc',
-    ], 'one fresh page per tab at open');
+    ], 'one fresh page per scoped tab at open');
+    assert.equal(connectionReads(calls).length, 1, 'the All tab opened through the repository connection');
   });
 
   test('the removed state key is inert and a reload re-reads the current page', async () => {
@@ -876,8 +961,9 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-      'sort:updated-desc',
-    ], 'the mount read every bucket once');
+    ], 'the mount read every scoped bucket once');
+    const connectionsAtMount = connectionReads(calls).length;
+    assert.equal(connectionsAtMount, 1, 'and the All bucket once, through the connection');
     const before = clean(component.render(110).join('\n'));
     component.handleInput('f');
     await tick();
@@ -887,20 +973,21 @@ describe('/herdr-gentle:issues first paint and open-only reads', () => {
     await tick();
     assert.deepEqual(reads().slice(primed.length), ['author:@me sort:updated-desc'],
       'a reload re-reads the current page fresh');
+    assert.equal(connectionReads(calls).length, connectionsAtMount,
+      'the reload left the All connection page alone');
     assert.equal(calls.some((call) => call.argv.includes('--state')), false,
       'the list API is never asked for any state');
   });
 });
 
 // ---------------------------------------------------------------------------
-// S29: `/herdr-gentle:issues` stays registered while the worktree mode is off
-// or malformed; only the worktree association is disabled. The extension
-// re-reads the mode inside the save callback, so a panel opened while enabled
-// still refuses once the mode is switched off.
+// S1: the issues reader associates nothing with the checkout. The command hands
+// the view NO `assigned`, NO `saveAssignment` and NO `assignmentEnabled` — the
+// association was removed from the product, not merely gated — so opening the
+// reader performs zero registry writes in every worktree-mode state.
 // ---------------------------------------------------------------------------
-describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
+describe('/herdr-gentle:issues never reads or writes an association (S1)', () => {
   const modeLib = require('../lib/worktree-mode.js');
-  const S29_REFUSAL = 'worktree tools are disabled; enable them in /herdr-gentle:customize to assign issues or odd documents';
 
   function modeDir() {
     return track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-mode-')));
@@ -919,81 +1006,59 @@ describe('/herdr-gentle:issues assignment mode gate (S29)', () => {
     }
   }
 
-  test('mode off: the command exists, assignmentEnabled is false and the save callback refuses with zero writes', async () => {
+  function assertNoAssociationOptions(options) {
+    for (const key of ['assigned', 'assignedOdd', 'saveAssignment', 'assignmentEnabled']) {
+      assert.equal(key in options, false, `the view is handed no ${key}: ${JSON.stringify(Object.keys(options))}`);
+    }
+  }
+
+  async function openWithStoredIssues(tag) {
+    const root = makeRepo({ tag });
+    const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
+    const before = readRaw(file);
+    const { runner } = makeIssuesRunner();
+    const capture = captureIssuesView();
+    try {
+      const { commands } = await openIssues(root, { runner });
+      assert.ok(commands.has('herdr-gentle:issues'), 'the command stays registered');
+      assert.ok(capture.holder.options, 'the view was constructed');
+      assertNoAssociationOptions(capture.holder.options);
+    } finally {
+      capture.restore();
+    }
+    assert.equal(readRaw(file), before, 'reading writes nothing to the registry');
+  }
+
+  test('mode off: no association option and no registry write', async () => {
     await withModeDir(async () => {
       modeLib.writeMode(false, process.env);
-      const capture = captureIssuesView();
-      try {
-        const root = makeRepo({ tag: 'issues-s29-off' });
-        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
-        const before = readRaw(file);
-        const { runner } = makeIssuesRunner();
-        const { commands } = await openIssues(root, { runner });
-        assert.ok(commands.has('herdr-gentle:issues'), 'the command stays registered while the mode is off');
-        assert.ok(capture.holder.options, 'the view was constructed');
-        assert.equal(capture.holder.options.assignmentEnabled, false, 'the disabled mode travels to the view');
-        const result = await capture.holder.options.saveAssignment([76]);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the refusal is honest and exact');
-        assert.equal(readRaw(file), before, 'a refused save leaves the registry bytes unchanged');
-      } finally {
-        capture.restore();
-      }
+      await openWithStoredIssues('issues-s1-off');
     });
   });
 
-  test('malformed mode: the command exists, assignmentEnabled is false and the callback refuses', async () => {
+  test('malformed mode: no association option and no registry write', async () => {
     await withModeDir(async () => {
-      const capture = captureIssuesView();
-      try {
-        const root = makeRepo({ tag: 'issues-s29-malformed' });
-        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
-        const before = readRaw(file);
-        const { runner } = makeIssuesRunner();
-        const { commands } = await openIssues(root, { runner });
-        assert.ok(commands.has('herdr-gentle:issues'), 'the command stays registered with a malformed mode');
-        assert.equal(capture.holder.options.assignmentEnabled, false, 'a malformed mode never enables assignment');
-        const result = await capture.holder.options.saveAssignment([76]);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL });
-        assert.equal(readRaw(file), before, 'a malformed mode never writes');
-      } finally {
-        capture.restore();
-      }
+      await openWithStoredIssues('issues-s1-malformed');
     }, { malformed: true });
   });
 
-  test('mode switched off after opening: the callback re-reads and refuses', async () => {
+  test('mode enabled and then switched off: still no association option and no write', async () => {
     await withModeDir(async () => {
       modeLib.writeMode(true, process.env);
+      const root = makeRepo({ tag: 'issues-s1-on' });
+      const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
+      const before = readRaw(file);
+      const { runner } = makeIssuesRunner();
       const capture = captureIssuesView();
       try {
-        const root = makeRepo({ tag: 'issues-s29-switched' });
-        const file = writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
-        const before = readRaw(file);
-        const { runner } = makeIssuesRunner();
         await openIssues(root, { runner });
-        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode opened normally');
+        assertNoAssociationOptions(capture.holder.options);
         modeLib.writeMode(false, process.env);
-        const result = await capture.holder.options.saveAssignment([76]);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the callback re-reads the mode, not the snapshot');
-        assert.equal(readRaw(file), before, 'the registry is untouched');
+        assertNoAssociationOptions(capture.holder.options);
       } finally {
         capture.restore();
       }
-    });
-  });
-
-  test('enabled mode: assignmentEnabled stays true (regression)', async () => {
-    await withModeDir(async () => {
-      const capture = captureIssuesView();
-      try {
-        const root = makeRepo({ tag: 'issues-s29-on' });
-        writeRegistry(root, [{ branch: branchOf(root), path: root, thread: 't', issues: [76], odd: null }]);
-        const { runner } = makeIssuesRunner();
-        await openIssues(root, { runner });
-        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode passes true');
-      } finally {
-        capture.restore();
-      }
+      assert.equal(readRaw(file), before, 'neither state writes the registry');
     });
   });
 });
@@ -1084,13 +1149,14 @@ describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => 
     const { component } = await openIssues(root, { runner });
     await tick();
     // Round 3: the mount reads ALL FOUR tabs once — a tab that was never
-    // visited showed `(0)` for issues the repository does have.
+    // visited showed `(0)` for issues the repository does have. T2/S2: the
+    // fourth tab is the repository connection, never a search.
     assert.deepEqual(searchQueries(calls), [
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-      'sort:updated-desc',
-    ], 'every tab is read once at open, each with its own exact query');
+    ], 'every scoped tab is read once at open, each with its own exact query');
+    assert.equal(connectionReads(calls).length, 1, 'and the All tab through the issue connection');
     component.handleInput('tab');
     await tick();
     component.handleInput('tab');
@@ -1101,8 +1167,8 @@ describe('/herdr-gentle:issues page fetch parallelism and state honesty', () => 
       'author:@me sort:updated-desc',
       'assignee:@me sort:updated-desc',
       'involves:@me -author:@me sort:updated-desc',
-      'sort:updated-desc',
     ], 'switching tabs reads nothing again');
+    assert.equal(connectionReads(calls).length, 1, 'switching to All reads nothing again either');
   });
 
   test('no page read ever uses the list API or widens to all states', async () => {
@@ -1269,34 +1335,9 @@ describe('/herdr-gentle:issues mounted page seam (S5,D1)', () => {
 // query rides the page seam instead of filtering the loaded page.
 // ---------------------------------------------------------------------------
 describe('/herdr-gentle:issues All bucket and server search query (S15,S9)', () => {
-  // The options the command mounts the view with, over the real injected gh.
-  async function capturedOptions(root) {
-    const base = makeIssuesRunner();
-    const capture = captureIssuesView();
-    try {
-      const { commands, mod, sessionStarts } = await loadExtension();
-      ghIssues.setGhRunner(base.runner);
-      const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
-      await fireSessionStart(sessionStarts, gateCtx(scratch, []));
-      mod.setIssuesTuiLoader(async () => stubTui);
-      const { ctx } = makeCtx({ cwd: root });
-      // The host calls the factory; the captured options live on it.
-      ctx.ui.custom = async (factory) => {
-        factory(makeHostTui(24).tui, {}, {}, () => {});
-        return null;
-      };
-      await commands.get('herdr-gentle:issues').handler('', ctx);
-      assert.ok(capture.holder.options, 'the command mounts the view');
-      return { options: capture.holder.options, calls: base.calls, restore: capture.restore };
-    } catch (err) {
-      capture.restore();
-      throw err;
-    }
-  }
-
   test('the mounted view carries the fourth All bucket after the three disjoint ones', async () => {
     const root = makeRepo({ tag: 'issues-buckets' });
-    const run = await capturedOptions(root);
+    const run = await capturedIssuesOptions(root);
     try {
       assert.deepEqual(run.options.pages.map((page) => page.id), ['mine', 'assigned', 'involved', 'all'],
         'All is the last interactive bucket');
@@ -1306,17 +1347,31 @@ describe('/herdr-gentle:issues All bucket and server search query (S15,S9)', () 
     }
   });
 
-  test('the All bucket reads every open issue of the repository through the search seam', async () => {
+  test('the All bucket reads every open issue through the repository connection, not the capped search', async () => {
     const root = makeRepo({ tag: 'issues-all' });
-    const run = await capturedOptions(root);
+    const run = await capturedIssuesOptions(root);
     try {
       const before = run.calls.length;
       const asked = await run.options.loadIssuePage({ bucketId: 'all', cursor: null, limit: 5 });
       assert.equal(asked.ok, true, 'the real client answered the All page');
-      assert.deepEqual(searchQueries(run.calls.slice(before)), ['sort:updated-desc'],
-        'the All search is the whole open repository: the client adds repo/is:issue/is:open, and no bucket query narrows it');
+      const reads = connectionReads(run.calls.slice(before));
+      assert.equal(reads.length, 1, 'one connection read answered the All bucket');
+      assert.deepEqual(searchQueries(run.calls.slice(before)), [], 'the All bucket never used the search API');
+      assert.equal(reads[0].cursor, null, 'a head read starts the connection at its first row');
+      assert.equal(reads[0].first, '5', 'the caller limit bounds the connection page');
+      assert.match(reads[0].query, /issues\(states: \[OPEN\], first: \$first, after: \$cursor/,
+        'only open issues are requested, and the connection cursor is explicit');
+      assert.match(reads[0].query, /orderBy: \{field: UPDATED_AT, direction: DESC\}/,
+        'the ordering belongs to the query, so no search text has to carry it');
+      assert.match(reads[0].query, /totalCount/, 'the exact total comes from the connection');
+      assert.ok(!reads[0].query.includes('search('), 'never the 1000-match search API');
+      assert.ok(!reads[0].argv.some((entry) => entry.startsWith('search=')),
+        'no search text reaches the connection');
+      assert.ok(!reads[0].argv.some((entry) => entry.includes('sort:updated-desc')),
+        'the builtin ordering is never forwarded as search text');
       const rows = JSON.parse(fixture('gh-issue-list.json')).length;
       assert.equal(asked.total, rows, 'the whole open set is the bucket total, never a deduplicated slice');
+      for (const issue of asked.issues) assert.equal(typeof issue.cursor, 'string', 'every row keeps its own cursor');
       assert.equal(asked.issues.length, Math.min(5, rows), 'the caller limit bounds the page');
     } finally {
       run.restore();
@@ -1325,7 +1380,7 @@ describe('/herdr-gentle:issues All bucket and server search query (S15,S9)', () 
 
   test('a reader query is appended to the scoped bucket search, and an absent one leaves it byte for byte', async () => {
     const root = makeRepo({ tag: 'issues-query' });
-    const run = await capturedOptions(root);
+    const run = await capturedIssuesOptions(root);
     try {
       const before = run.calls.length;
       const asked = await run.options.loadIssuePage({
@@ -1352,19 +1407,31 @@ describe('/herdr-gentle:issues All bucket and server search query (S15,S9)', () 
 
   test('a search that exceeds the GitHub cap is reported, never presented as the whole dataset', async () => {
     const root = makeRepo({ tag: 'issues-cap' });
-    const run = await capturedOptions(root);
+    const run = await capturedIssuesOptions(root);
     const original = ghIssues.getIssuePage;
+    const realConnection = ghIssues.getIssueConnectionPage;
     const capped = {
       ok: false,
       error: 'GitHub issue search exceeds 1000 matches; narrow the filter',
       truncated: true,
     };
+    let connectionCalls = 0;
+    ghIssues.getIssueConnectionPage = (...args) => {
+      connectionCalls += 1;
+      return realConnection(...args);
+    };
     ghIssues.getIssuePage = () => capped;
     try {
+      const connectionCallsBefore = connectionCalls;
       const asked = await run.options.loadIssuePage({ bucketId: 'all', cursor: null, limit: 10, query: 'is:open' });
       assert.deepEqual(asked, capped, 'the client error passes through unchanged: no rows, no invented total');
+      assert.equal(connectionCalls, connectionCallsBefore,
+        'a typed All query stays on the search API: the connection takes no search text');
+      const involved = await run.options.loadIssuePage({ bucketId: 'involved', cursor: null, limit: 10 });
+      assert.deepEqual(involved, capped, 'Involved is a capped search too, and says so');
     } finally {
       ghIssues.getIssuePage = original;
+      ghIssues.getIssueConnectionPage = realConnection;
       run.restore();
     }
   });
@@ -1381,10 +1448,165 @@ describe('/herdr-gentle:issues All bucket and server search query (S15,S9)', () 
     component.handleInput('tab');
     await tick();
     assert.equal(component.state.page, 3, 'All is the fourth tab');
-    assert.deepEqual(searchQueries(calls).slice(-1), ['sort:updated-desc'], 'All read the whole open set');
+    const reads = connectionReads(calls);
+    assert.equal(reads.length, 1, 'All read the whole open set once, through the connection');
+    assert.equal(reads[0].cursor, null, 'from the head of the connection');
     assert.match(frame(), new RegExp(`All \\(${rows}\\)`), 'the All tab names the whole open count');
     const snapshots = calls.filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql'
       && call.argv.some((entry) => entry.includes('issues(states: OPEN')));
     assert.deepEqual(snapshots, [], 'the interactive reader never re-primes the session snapshot');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T2 (S2): the unfiltered `All` bucket reads the repository's own issue
+// CONNECTION — cursor-paged to its end with an exact `totalCount` — while a
+// TYPED search and the three scoped buckets stay on the search API, whose
+// 1000-match cap is reported instead of being shown as a complete list. The
+// connection is a fresh read, never the session's cached open snapshot.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues All connection paging (T2,S2)', () => {
+  function syntheticIssues(count, from = 1) {
+    return Array.from({ length: count }, (_, at) => {
+      const number = from + at;
+      return {
+        number,
+        title: `synthetic issue ${number}`,
+        state: 'OPEN',
+        createdAt: '2026-02-01T00:00:00Z',
+        updatedAt: '2026-02-01T00:00:00Z',
+        url: `https://github.com/o/r/issues/${number}`,
+      };
+    });
+  }
+
+  test('more than 1000 open issues page to the end through the All bucket', async () => {
+    const root = makeRepo({ tag: 'issues-all-1200' });
+    const total = 1200;
+    const run = await capturedIssuesOptions(root, { connectionRows: syntheticIssues(total) });
+    try {
+      const before = run.calls.length;
+      const seen = [];
+      let cursor = null;
+      let pages = 0;
+      for (;;) {
+        const page = await run.options.loadIssuePage({ bucketId: 'all', cursor, limit: 100 });
+        assert.equal(page.ok, true, `page ${pages + 1} loaded: ${page.error || ''}`);
+        assert.equal(page.total, total, 'every page reports the exact server total');
+        assert.ok(page.issues.length > 0, 'a page never comes back empty mid-walk');
+        // Continue after the LAST row this page actually showed.
+        cursor = page.issues[page.issues.length - 1].cursor;
+        seen.push(...page.issues.map((issue) => issue.number));
+        pages += 1;
+        if (page.hasNextPage !== true) break;
+        assert.ok(pages <= 12, 'the walk ends: 1200 rows at 100 per page is 12 pages');
+      }
+      assert.equal(pages, 12, 'exactly the pages the 1200 rows need');
+      assert.deepEqual(seen, syntheticIssues(total).map((row) => row.number),
+        'every open issue arrives once, in order, crossing the 1000-match search boundary');
+      const reads = connectionReads(run.calls.slice(before));
+      assert.equal(reads.length, 12, 'every page was a connection read');
+      assert.equal(reads[0].cursor, null, 'the walk started at the head');
+      assert.equal(reads[1].cursor, 'conn-99', 'each continuation resumes after the last row shown');
+      assert.deepEqual(searchQueries(run.calls.slice(before)), [], 'no page read the capped search');
+    } finally {
+      run.restore();
+    }
+  });
+
+  test('a typed All query stays on the search API with the bucket ordering', async () => {
+    const root = makeRepo({ tag: 'issues-all-typed' });
+    const run = await capturedIssuesOptions(root);
+    const realConnection = ghIssues.getIssueConnectionPage;
+    let connectionCalls = 0;
+    ghIssues.getIssueConnectionPage = (...args) => {
+      connectionCalls += 1;
+      return realConnection(...args);
+    };
+    try {
+      const mounted = connectionCalls;
+      const before = run.calls.length;
+      const typed = await run.options.loadIssuePage({ bucketId: 'all', cursor: 'row-2', limit: 4, query: '  label:bug  ' });
+      assert.equal(typed.ok, true, 'the typed All search answered');
+      assert.deepEqual(searchQueries(run.calls.slice(before)), ['sort:updated-desc label:bug'],
+        'a typed query keeps the bucket ordering and rides the search API');
+      assert.equal(connectionCalls, mounted, 'a typed query never reaches the connection, which takes no search text');
+    } finally {
+      ghIssues.getIssueConnectionPage = realConnection;
+      run.restore();
+    }
+  });
+
+  test('the All connection is a fresh read, separate from the cached open snapshot', async () => {
+    const root = makeRepo({ tag: 'issues-all-fresh' });
+    const total = 1200;
+    const { runner, calls } = makeIssuesRunner({ connectionRows: syntheticIssues(total) });
+    // The gate runs in the REAL checkout so the session's open-issue snapshot
+    // is primed beside the viewer, which is the pair this test keeps apart.
+    const { commands, mod, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(runner);
+    await fireSessionStart(sessionStarts, gateCtx(root, []));
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const { ctx } = makeCtx({ cwd: root });
+    let factory = null;
+    ctx.ui.custom = async (captured) => { factory = captured; return null; };
+    await commands.get('herdr-gentle:issues').handler('', ctx);
+    assert.ok(factory, 'the overlay opens');
+    const { component } = openComponent(factory, makeHostTui(24));
+    await tick();
+    const frame = () => clean(component.render(110).join('\n'));
+    // The session snapshot holds the ONE fixture open issue; the All tab shows
+    // the connection's exact count, so no cached bucket answered that tab. A
+    // page from a longer walk is a lower bound (`N+`), never a claimed total.
+    assert.ok(frame().includes(`All (${total}+)`), 'the All count is the connection count, as a lower bound of the page read');
+    const snapshotReads = calls.filter((call) => {
+      const query = graphqlField(call.argv, 'query', '-f') || '';
+      return query.includes('issues(states: OPEN') && !query.includes('edges');
+    });
+    assert.ok(snapshotReads.length >= 1, 'the session snapshot is primed separately for assignment evidence');
+    const cacheLists = calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'list');
+    for (const call of cacheLists) {
+      assert.equal(call.argv[call.argv.indexOf('--state') + 1], 'all',
+        `the snapshot's own margin is the only list read: ${call.argv.join(' ')}`);
+      assert.ok(!/@me/.test(call.argv.join(' ')),
+        `no cached bucket answers a viewer page: ${call.argv.join(' ')}`);
+    }
+    const mounted = connectionReads(calls).length;
+    assert.ok(mounted >= 1, 'the mount read the All bucket through the connection');
+    component.handleInput('tab');
+    await tick();
+    component.handleInput('tab');
+    await tick();
+    component.handleInput('tab');
+    await tick();
+    assert.equal(component.state.page, 3, 'the All tab is active');
+    assert.equal(connectionReads(calls).length, mounted, 'switching to All reuses the page it already read');
+    component.handleInput('r');
+    await tick();
+    assert.equal(connectionReads(calls).length, mounted + 1, '`r` refreshes All through the connection, not a cache');
+    assert.ok(frame().includes(`All (${total}+)`), 'the refreshed count is still the connection count');
+  });
+
+  test('a client without the connection reader fails loudly instead of falling back to the capped search', async () => {
+    const root = makeRepo({ tag: 'issues-all-no-reader' });
+    const run = await capturedIssuesOptions(root);
+    const realConnection = ghIssues.getIssueConnectionPage;
+    const realPage = ghIssues.getIssuePage;
+    let searchCalls = 0;
+    ghIssues.getIssueConnectionPage = undefined;
+    ghIssues.getIssuePage = (...args) => {
+      searchCalls += 1;
+      return realPage(...args);
+    };
+    try {
+      const asked = await run.options.loadIssuePage({ bucketId: 'all', cursor: null, limit: 5 });
+      assert.equal(asked.ok, false, 'the All read fails instead of silently capping the list');
+      assert.match(asked.error, /no unfiltered issue connection reader/);
+      assert.equal(searchCalls, 0, 'a capped search never stands in for the complete connection');
+    } finally {
+      ghIssues.getIssueConnectionPage = realConnection;
+      ghIssues.getIssuePage = realPage;
+      run.restore();
+    }
   });
 });

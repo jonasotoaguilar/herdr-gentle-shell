@@ -8,6 +8,21 @@ values. The view must advance after the last **displayed** issue, not the final
 unused fetched row. Search sets above GitHub's 1000-match limit fail explicitly;
 they are never presented as complete. Existing full-snapshot reads are unchanged.
 
+`getIssueConnectionPage({state, after, first}, opts)` reads the UNFILTERED `All`
+bucket from the repository's own issue connection (`repository.issues`) instead of
+the search API, which caps a result set at 1000 matches. Ordering is
+`UPDATED_AT DESC` in the query, `total` is the connection's exact `totalCount`,
+and every row carries its own `cursor`, so the reader continues after the last
+displayed row with no match ceiling. It returns the same page shape as
+`getIssuePage` (`{ok, issues, total, hasNextPage}`), so a bucket can switch source
+without changing its reader. `state` is explicit — `open` (default), `closed` or
+`all` — and a `closed` read asks for CLOSED, never widened back to open. It takes
+NO search text: a non-blank `query` is refused rather than silently listed
+unfiltered, and typed searches stay on `getIssuePage` above. A failed or invalid
+page is a failure, never a short page a caller could read as the end of the list;
+`totalCount` is the server's count at request time, so a cursor walk is not a
+snapshot and concurrent updates can shift what it sees.
+
 `listAssignableUsers(opts)` traverses the repository's actual assignable-user
 connection. It returns `{ok, users:[{login,name}]}`, deduplicates logins and rejects
 non-advancing or malformed pages. It does not approximate collaborators from

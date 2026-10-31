@@ -3,9 +3,9 @@
 Full-screen four-tab overlay over the current checkout's repository
 GitHub issues: the left pane lists the issues, the right pane shows the
 selected issue in full (labels, state, author, dates, reactions, separated
-comments) with its own scroll. The viewer is read-only about the checkout's
-worktree association: it never marks, toggles or saves which issue belongs
-to a worktree — that association lives in the worktree detail (S10b).
+comments) with its own scroll. Worktrees carry no issue association any more
+(S1), so the viewer has nothing to mark, toggle or save: no surface assigns an
+issue to a worktree.
 `Esc` closes.
 
 ## What it shows
@@ -13,29 +13,46 @@ to a worktree — that association lives in the worktree detail (S10b).
 The list shows the repository's issues fetched through `gh` (`author:@me`
 for My issues, `assignee:@me` for Assigned, and `involves:@me -author:@me`
 for Involved). The fourth tab, All, lists every open issue in the repository,
-not just those involving you; it does not deduplicate against the other tabs. The frame reads top to bottom: the concise header, then the
+not just those involving you; it does not deduplicate against the other tabs.
+The scoped tabs and any typed search read GitHub's search API, while the
+unfiltered All tab reads the repository's own issue connection, which is the
+only source GitHub will page past 1000 matches — so a large repository can be
+browsed to its end (see [Limits](#limits)). The frame reads top to bottom: the concise header, then the
 dedicated search/filter row (`› Search (T)`, showing the live query while
 typing and the kept query after leaving), then the bucket tabs with their
 counts, then a notice row (errors and copy notices only, blank when there is
-nothing to say), and finally the list. `page n/m` is fixed beside Search,
-even for empty or single-page results, and never consumes a list row.
+nothing to say), and finally the list. The search row carries the widget alone:
+the `page n/m` indicator left with the pager (S3).
 An issue authored by you is excluded from Involved; Assigned may overlap
-My issues or Involved, and All may overlap every scoped tab. The list and
-preview use the shared 40/60 split and titles wrap in full.
+My issues or Involved, and All may overlap every scoped tab. The issues and
+ODD readers use the smaller 30% list / 70% reading allocation, and titles wrap
+in full.
+
+The list is ONE continuous window, never a pager: `]`/`[` scroll it a
+screenful and the focused issue always stays inside the painted window, so
+scrolling past its edge slides the list instead of jumping to a page. `tab`,
+`shift+tab` and `←`/`→` all switch buckets — the arrows are the tab key, they do
+not scroll the list (S10) — and a bucket keeps its own window and focused row, so
+returning to it restores the reader's place. Scrolling
+to the bottom of the rows loaded so far reads the NEXT cursor page and appends
+it below them, so a large bucket keeps going while opening still costs exactly
+one page per bucket.
 
 Typing sends a debounced GitHub search over the complete active bucket,
-not just the loaded page: title words and qualifiers such as `label:bug`
-work before every page is fetched. A settled query resets its page cursor;
-a stale response cannot overwrite a newer query. Opening the viewer reads
-all four tabs once, so switching between them never fetches again and no tab
-can show a false `0` for issues the repository does have; a tab whose read is
-still in flight shows `–` instead. Already loaded tabs reuse their rows and
-position immediately. `r` explicitly refreshes the current page, while
-successful writes invalidate affected cached pages.
+not just the loaded rows: title words and qualifiers such as `label:bug`
+work before every page is fetched, and an appended page repeats the same query.
+A typed query is a search on every tab, All included; clearing it returns the
+All tab to its unfiltered connection read. A settled query reads from the head of its own result set; a stale response
+cannot overwrite a newer query. Opening the viewer reads all four tabs once, so
+switching between them never fetches again and no tab can show a false `0` for
+issues the repository does have; a tab whose read is still in flight shows `–`
+instead. Already loaded tabs reuse their rows and position immediately. `r`
+explicitly refreshes the active list from the head, while successful writes
+invalidate the affected lists.
 
 Only open issues are listed (S10a): the state toggle is gone, no other state
 is ever requested, and a page that arrives carrying a closed row counts only
-its open rows — a closed issue never inflates a tab count or page marker.
+its open rows — a closed issue never inflates a tab count.
 Each row shows the issue number and title. While a page is being fetched
 the view says `loading issues…` instead of claiming an empty list.
 Closing the focused issue removes it from the list at once, because the list
@@ -45,15 +62,14 @@ The right pane shows the selected issue: number and title, state, labels,
 author, created and updated time, `👍` reactions, comment count, the body,
 then each comment separated by its author and time. The body and the
 comments render as complete plain wrapped text, never as styled markdown or
-silently capped snippets. This is the same formatter as worktree detail,
-including assignees, projects and linked-PR count. Moving
-the selection resets the scroll to the top of that issue.
+silently capped snippets. This is the shared issue formatter
+(`lib/issue-preview.js`), including assignees, projects and linked-PR count.
+Moving the selection resets the scroll to the top of that issue.
 
 Rows carry no association mark and the notice row carries no
-assignment hint: the viewer never claims which issue belongs to the
-checkout's worktree (S10b). Reading, search, labels, comments, closing and
-opening in the browser all work as before; the checkout↔issue association
-lives in the worktree detail.
+assignment hint: no surface claims which issue belongs to a checkout any more
+(S1), so there is nothing here to show. Reading, search, labels, comments,
+closing and opening in the browser all work as before.
 
 The frame header stays short and carries only the surface (`◈ Issues`): the
 active bucket is named and marked by its own tab, and the header repeats
@@ -65,16 +81,38 @@ the tab, and while the search box holds the keyboard the footer names that
 interaction's keys (`type to filter · bksp edit · enter/esc keep`) instead of
 repeating them beside the query or naming the list keys.
 
+## Palette
+
+Every token paints through the injected theme with a role that says what it is
+(S11), so the header, the search row, the tabs and the footer read as ONE
+palette and no view hardcodes a colour:
+
+| Token | Role |
+| --- | --- |
+| frame title (`◈ Issues`), active tab label, right-pane issue title | `accent` + bold |
+| shortcut KEY in the footer (`↑↓`, `tab/←→`, `esc`, …) | `accent` + bold |
+| a key's description (`move`, `bucket`, `close`, …) | `muted` |
+| tab counts and status words (`(12)`, `loading…`) | `muted` |
+| static labels — the `›` prompt and the idle `Search` | `dim` |
+| the live search value and its caret | `accent` |
+| frame rules and pane divider | `border` |
+
+A key is therefore distinguishable from the words beside it by BOTH colour and
+weight, and focus never depends on colour at all: the focused row keeps its `▸`
+mark and the active tab its `▸` too, so a monochrome terminal shows the same
+information. A missing, partial or throwing theme degrades to plain text rather
+than breaking a frame.
+
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `↑`/`↓`, `j`/`k` | move the selection in the list |
-| `tab`, `shift+tab` | next / previous bucket (My issues, Assigned, Involved, All) |
-| `ctrl+shift+j/k` when negotiated; `Shift+J/K` fallback; `PgDn`/`PgUp` always | page the issue preview |
+| `↑`/`↓`, `j`/`k` | move the selection in the list; the window follows it |
+| `tab`, `shift+tab`, `←` / `→` | next / previous bucket (My issues, Assigned, Involved, All) |
+| `ctrl+shift+j/k` when negotiated; `Shift+J/K` fallback; `PgDn`/`PgUp` always | page the issue preview (the footer names this target once, as `ctrl+shift+j/k doc` or `shift+j/k doc`) |
 | `ctrl+d`/`ctrl+u` | half-page the preview |
-| `home`/`end` | first / last issue in the current page |
-| `←` / `→`, `[` / `]` | previous / next list page; `page n/m` stays beside Search |
+| `home`/`end` | first / last loaded issue (the last one asks for the next page) |
+| `]` / `[` | scroll the list one screenful (no pages: the window just moves, and reaching its end reads the next page); the footer token reads `]/[ list` |
 | `T` (also `/`) | open the search row directly below the header; typing searches the complete active bucket through GitHub; `Enter`/`Esc` leave the row keeping the filter, which stays visible in it |
 | `L` | open the label editor (S3) |
 | `n` | create a new label inside the label editor |
@@ -82,13 +120,20 @@ repeating them beside the query or naming the list keys.
 | `c` | open the comment input (S7) |
 | `x` / `X` | close the focused issue (S4/S10a), after the host's own confirm; it leaves the open list at once |
 | `o` | open the issue in the browser (S5) |
-| `r` | reload the current page from `gh` |
+| `r` | reload the active list from the head |
 | `esc`/`ctrl+c`/`q` | close |
 
 There is no `?` key-help overlay: the footer shortcut legend is the only
 key reference, and every shortcut it names stays on screen. It is also the
 legend of the interaction in progress — the search keys while the search box
 is open, the list keys otherwise — on ONE row.
+
+The legend spends ONE token per scroll target rather than repeating every
+alias: `ctrl+shift+j/k doc` (or `shift+j/k doc` when the host does not confirm
+the extended protocol) for the preview and `]/[ list` for the list, so the two
+targets stay distinguishable at a glance. The alternates — `Shift+J/K`,
+`PgDn`/`PgUp`, `ctrl+d`/`ctrl+u`, `home`/`end` — keep working exactly as
+documented above; they are described here instead of spending footer cells.
 
 Reserved keys this view must not steal: `ctrl+c`, `ctrl+u`, `ctrl+d`, `alt+*` shortcuts registered elsewhere.
 
@@ -157,8 +202,8 @@ on a nonempty comment draft asks before discarding.
   while the pages are in flight. A slow answer can never overwrite a
   newer one: the viewer keeps only the answer to its latest request, and a
   closed view paints nothing.
-- **Read-only association (S10b):** the view never marks, toggles or saves
-  which issue belongs to the checkout's worktree. A malformed or unreadable
+- **No worktree association (S1):** worktrees receive no issues any more, so
+  the view has nothing to mark, toggle or save. A malformed or unreadable
   worktree registry therefore changes nothing here: the command opens and
   stays fully usable.
 - **`gh` unavailable:** the command stays registered and stays in the
@@ -169,9 +214,17 @@ on a nonempty comment draft asks before discarding.
 
 ## Limits
 
-GitHub search cannot enumerate more than 1000 matches. The server path names
-that limit and asks you to narrow the filter instead of silently treating a
-partial result as complete. A bounded eager source may show `N+` as a lower
-bound; the page marker names only the page position. Scope is the current checkout only — the
+GitHub's **search** API cannot enumerate more than 1000 matches, and that is
+what the three scoped tabs and every typed search use. When a search reaches
+that cap the client fails the read and the view names the limit, asking you to
+narrow the filter instead of silently treating a partial result as complete.
+The unfiltered **All** tab is not a search: it reads the repository's own issue
+connection, cursor-paged to its end with the exact `totalCount`, so open issues
+past 1000 remain reachable there — a single read is still bounded by the
+viewport-derived page size, and further pages arrive as you scroll. A count
+taken from a page whose walk has not finished is shown as a lower bound
+(`N+`). That `totalCount` is the server's count at request time, so a walk is
+not a snapshot: issues updated while you page can shift what the next page
+returns. Scope is the current checkout only — the
 session's cwd resolved to its Git root. The issue body and the comments
 show as plain wrapped text (no markdown styling).

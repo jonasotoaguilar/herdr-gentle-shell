@@ -1,28 +1,31 @@
 'use strict';
-// worktree-ui-redesign S10/S5/S7c/S7d wiring tests: lib/issues-cache.js as the
-// extension actually uses it — one complete OPEN snapshot at session start for
-// assignment proof, fresh server pages for the viewer, and per-worktree
-// assignment verification that drops an issue only on PROOF and never purges
-// what it cannot prove.
+// worktree-ui-redesign S10/S5 wiring tests: lib/issues-cache.js as the
+// extension actually uses it — one complete OPEN snapshot at session start and
+// fresh server pages for the `/herdr-gentle:issues` reader.
+//
+// S1 removed the worktree issue/ODD association together with the worktree
+// detail that verified it, so nothing reconciles a stored assignment any more.
+// What survives is the issue cache itself, and every assertion below drives it
+// through the PUBLIC `/herdr-gentle:issues` command: the interactive reader for
+// the fresh per-tab pages (the fourth `All` tab included), and the same
+// command's non-interactive fallback for the session cache it serves.
 //
 // Observable contract under test (the argv that reaches the injected `gh`
-// runner, the registry bytes on disk, and the text the mounted surfaces
-// render):
+// runner, the registry bytes on disk, and the text the public command reports):
 // - session start lists the open set with ONE bounded fetch and never works
 //   from a truncated or sampled page;
 // - each `/herdr-gentle:issues` mount reads ONE fresh search page per bucket,
 //   bounded by the reader's row budget, and never re-primes the snapshot;
-// - the assignment margin is a SEPARATE bounded `--state all` read that starts
-//   only after the overlay mounted, is settled before the command returns, and
-//   never becomes a second source for the list on screen;
-// - a closure the shared refresh reports is merged, so the worktree that still
-//   carried the issue loses it — persisted in the registry — and the detail's
-//   Issues tab no longer lists it;
-// - an issue that gh answers 404 for is dropped on proof, while an
-//   authentication/network failure preserves the stored assignment byte for
-//   byte and is reported instead of silently kept or silently removed;
-// - two repositories never share one cache: a number open in one repository is
-//   not "proven open" for the other.
+// - the margin is a SEPARATE bounded `--state all` read that starts only after
+//   the overlay mounted, is settled before the command returns, and never
+//   becomes a second source for the list on screen;
+// - a closure the shared margin reports leaves the cached open set the command
+//   serves, while a failed read preserves the rows it could not prove changed;
+// - the whole open set is reachable — no 500-row snapshot cap, and `All` lists
+//   every open issue, not the union of the scoped tabs;
+// - two repositories never share one cache: the cached open set, its merge
+//   counters and its margins belong to the repository that read them, so the
+//   fallback never answers for another repository.
 
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -206,13 +209,23 @@ function fakeGitHub({ nameWithOwner = 'octo/repo', issues = new Map() } = {}) {
     }
     if (argv[0] === 'api' && argv[1] === 'user') return json({ login: 'octo' });
     if (argv[0] === 'api' && argv[1] === 'graphql') {
-      // Two GraphQL shapes reach gh: the assignment snapshot connection and
-      // the viewer's `search` page. They are told apart by their variables.
+      // Three GraphQL shapes reach gh: the open snapshot connection, the
+      // viewer's `search` page, and the `All` bucket's unfiltered issue
+      // connection. They are told apart by their variables and their state
+      // literal (the connection spells it `[OPEN]`, the snapshot `OPEN`).
       if (graphqlVariable(argv, 'search') !== null) return json(graphqlSearchPage(model, argv));
+      const query = argv.filter((entry) => entry.startsWith('query=')).join('');
+      if (query.includes('issues(states: [')) return json(graphqlConnectionPage(model, argv));
       return json(graphqlOpenPage(model, argv));
     }
     if (argv[0] === 'repo' && argv[1] === 'view') return json({ nameWithOwner: model.nameWithOwner });
     if (argv[0] === 'issue' && argv[1] === 'list') {
+      // A listing-only transport failure: `gh api user` and `gh repo view`
+      // still answer, so the command's gate opens and only the issue reads
+      // fail — exactly the shape a flaky network gives a live session.
+      if (model.listFailure === true) {
+        return { status: null, stdout: '', stderr: '', error: 'spawn gh ENOENT: gh CLI is not available' };
+      }
       const at = (flag) => argv[argv.indexOf(flag) + 1];
       const state = at('--state');
       const search = typeof at('--search') === 'string' ? at('--search') : '';
@@ -312,6 +325,34 @@ function graphqlSearchPage(model, argv) {
   };
 }
 
+// T2: the `All` bucket's UNFILTERED read — `repository.issues` with a literal
+// state, an exact totalCount and one cursor per edge. The search API is capped
+// at 1000 matches, so this connection is what keeps a large repository paging.
+function graphqlConnectionPage(model, argv) {
+  const first = Number(graphqlVariable(argv, 'first'));
+  const cursor = graphqlVariable(argv, 'cursor');
+  const rows = [...model.issues.entries()]
+    .filter(([, record]) => record.state === 'open')
+    .sort((left, right) => {
+      const byTime = Date.parse(right[1].updatedAt) - Date.parse(left[1].updatedAt);
+      return byTime !== 0 ? byTime : right[0] - left[0];
+    });
+  const offset = cursor === null ? 0 : Number(String(cursor).replace('connection-', '')) || 0;
+  const page = rows.slice(offset, offset + (Number.isFinite(first) ? first : rows.length));
+  const hasNextPage = offset + page.length < rows.length;
+  return {
+    data: {
+      repository: {
+        issues: {
+          totalCount: rows.length,
+          pageInfo: { hasNextPage, endCursor: hasNextPage ? `connection-${offset + page.length}` : null },
+          edges: page.map(([number, record]) => ({ cursor: `row-${number}`, node: searchNode(number, record) })),
+        },
+      },
+    },
+  };
+}
+
 // The exact connection shape `listAllOpenIssues` pages through:
 // `repository.issues(states: OPEN, first:, after:)` with totalCount and
 // pageInfo. `model.snapshot` simulates the ways a page can lie.
@@ -370,6 +411,18 @@ function searchQueries(calls) {
   return searchPages(calls).map((argv) => String(graphqlVariable(argv, 'search')));
 }
 
+// The `All` bucket's unfiltered issue connection: no search text, and the
+// bracketed state literal the snapshot query never uses.
+function connectionPages(calls) {
+  return calls.filter((argv) => argv[0] === 'api' && argv[1] === 'graphql'
+    && graphqlVariable(argv, 'search') === null
+    && argv.some((entry) => entry.includes('issues(states: [')));
+}
+
+function connectionLimits(calls) {
+  return connectionPages(calls).map((argv) => Number(graphqlVariable(argv, 'first')));
+}
+
 // The viewer mounts first and paints after its cached pages settle, so its
 // frame is rendered again once the load has landed.
 async function viewerFrame(opened) {
@@ -421,14 +474,46 @@ function sessions(handlers, ctx) {
   return (handlers.get('session_start') || []).map((handler) => handler({}, ctx));
 }
 
+// The SAME public command on a host without an interactive overlay: this is
+// the one path that serves the session's cached open set (and its margin) to a
+// reader, and it reports through `notify`. Nothing below reaches an internal
+// cache API; every assertion reads what the command told the reader.
+function makePlainCtx(cwd) {
+  const notes = [];
+  const ctx = {
+    cwd,
+    sessionManager: { getSessionId: () => 'thread-1' },
+    ui: { notify: (message, level) => notes.push([message, level]) },
+  };
+  return { ctx, notes, text: () => notes.map(([message]) => message).join('\n') };
+}
+
+async function openIssuesPlain(commands, ctx) {
+  await commands.get('herdr-gentle:issues').handler('', ctx);
+}
+
+// The fallback's one line: `issues: <n> issue(s) across <p> pages (the viewer
+// needs an interactive session)` — or the failure the read reported.
+function fallbackTotal(notes) {
+  for (const [message] of notes) {
+    const match = /^issues: (\d+) issue\(s\) across (\d+) pages/.exec(String(message));
+    if (match) return { total: Number(match[1]), pages: Number(match[2]) };
+  }
+  return null;
+}
+
 describe('S10: the complete open snapshot at session start', { concurrency: false }, () => {
-  test('250 open issues take three cursor pages, and the detail lists the whole set', async () => {
+  test('250 open issues take three cursor pages, and /issues serves the whole set', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('prime');
-      const target = addRegisteredWorktree(root, 'feat/prime', { issues: [7] });
       const model = fakeGitHub();
       for (let number = 1; number <= 250; number += 1) model.set(number, 'open');
+      // `My issues` owns the whole set, so the total the command serves is
+      // exactly the primed open set: no bucket can hide part of it.
+      model.buckets.mine = new Set(Array.from({ length: 250 }, (_, at) => at + 1));
+      model.buckets.assigned = new Set();
+      model.buckets.involved = new Set();
       ghIssues.setGhRunner(model.runner);
       const { commands, handlers } = await loadExtension();
 
@@ -437,9 +522,9 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
 
       const pages = snapshotPages(model.calls);
       assert.equal(pages.length, 3, `250 rows are three 100-row cursor pages: ${pages.length}`);
-      // Startup pays for the assignment snapshot alone: the viewer's buckets
-      // arrive one fresh search page at a time (S5/D1), so no bucket listing
-      // and no `gh issue list` read happens here.
+      // Startup pays for the open snapshot alone: the viewer's buckets arrive
+      // one fresh search page at a time (S5/D1), so no bucket listing and no
+      // `gh issue list` read happens here.
       assert.equal(opensOf(model.calls, 'open').length, 0, 'no bucket listing at startup');
       assert.equal(searchPages(model.calls).length, 0, 'no viewer page before the viewer mounts');
       for (const argv of pages) {
@@ -449,9 +534,12 @@ describe('S10: the complete open snapshot at session start', { concurrency: fals
       assert.ok(!pages[0].some((entry) => entry.startsWith('cursor=')), 'the first page starts the connection');
       assert.ok(pages[1].some((entry) => entry.startsWith('cursor=')), 'the next page carries the cursor');
 
-      const opened = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
-      assert.match(opened.text(), /Issues \(250\)/, 'the detail inherits the complete primed set');
+      // The public command on a non-interactive host serves that primed set.
+      const opened = makePlainCtx(root);
+      await openIssuesPlain(commands, opened.ctx);
+      assert.deepEqual(fallbackTotal(opened.notes), { total: 250, pages: 3 },
+        `the whole primed set is served: ${JSON.stringify(opened.notes)}`);
+      assert.equal(snapshotPages(model.calls).length, 3, 'the command never re-primes the snapshot');
     } finally {
       restoreEnv();
     }
@@ -502,14 +590,18 @@ describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: f
       // the whole set.
       // Every tab is read ONCE at open (round 3): a tab nobody visited used to
       // sit at a false `(0)`, and each switch then refetched its own page.
-      assert.equal(searchPages(after).length, 4, `one fresh page per tab: ${JSON.stringify(after)}`);
-      assert.deepEqual(searchLimits(after), [18, 18, 18, 18], 'each bounded by the row budget');
+      assert.equal(searchPages(after).length, 3, `one fresh page per scoped tab: ${JSON.stringify(after)}`);
+      assert.deepEqual(searchLimits(after), [18, 18, 18], 'each bounded by the row budget');
       assert.deepEqual(searchQueries(after), [
         'repo:octo/repo is:issue is:open author:@me sort:updated-desc',
         'repo:octo/repo is:issue is:open assignee:@me sort:updated-desc',
         'repo:octo/repo is:issue is:open involves:@me -author:@me sort:updated-desc',
-        'repo:octo/repo is:issue is:open sort:updated-desc',
       ], 'each page carries its own bucket\'s S2 search, never the snapshot connection');
+      // T2: the fourth `All` tab reads the repository's issue CONNECTION — the
+      // search API refuses to page past 1000 matches — bounded by the same row
+      // budget and never carrying search text.
+      assert.equal(connectionPages(after).length, 1, 'the All tab reads the unfiltered connection');
+      assert.deepEqual(connectionLimits(after), [18], 'bounded by the row budget too');
       for (const argv of searchPages(after)) {
         assert.ok(!argv.some((entry) => entry.startsWith('cursor=')), 'the first page starts the connection');
         assert.ok(!argv.some((entry) => entry.startsWith('owner=')), 'the search seam replaces the snapshot connection');
@@ -567,9 +659,9 @@ describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: f
         'repo:octo/repo is:issue is:open author:@me sort:updated-desc',
         'repo:octo/repo is:issue is:open assignee:@me sort:updated-desc',
         'repo:octo/repo is:issue is:open involves:@me -author:@me sort:updated-desc',
-        'repo:octo/repo is:issue is:open sort:updated-desc',
       ], 'the margin never replaces or adds to the viewer\'s page source');
-      assert.equal(searchPages(after).length, 4, 'exactly one fresh page per tab');
+      assert.equal(searchPages(after).length, 3, 'exactly one fresh search page per scoped tab');
+      assert.equal(connectionPages(after).length, 1, 'plus the All tab\'s own connection page');
       assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
       // The first frame is the truthful loading state: mounting never waits for
       // a network read, and the margin in particular starts after it.
@@ -581,109 +673,163 @@ describe('S5/S10: the fresh bounded page read on /issues open', { concurrency: f
   });
 });
 
-describe('S7c/S7d: closure evidence reaches the worktree assignment', () => {
-  test('a merged closure drops the issue, persists it, and leaves it off the list', { concurrency: false }, async () => {
+describe('S7c: a closure the margin reports leaves the cached open set', { concurrency: false }, () => {
+  test('the closed issue is merged out, and the command serves the rest', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('closure');
-      const target = addRegisteredWorktree(root, 'feat/closure', { issues: [7, 8] });
       const model = fakeGitHub();
+      // Only `Assigned` matches the two issues, so the served total is exactly
+      // that bucket: a stale row would be visible in it.
+      model.buckets.mine = new Set();
+      model.buckets.assigned = new Set([7, 8]);
+      model.buckets.involved = new Set();
       model.set(7, 'open', '2024-01-02T00:00:00Z');
       model.set(8, 'open', '2024-01-03T00:00:00Z');
       ghIssues.setGhRunner(model.runner);
       const { commands, handlers } = await loadExtension();
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
 
-      // #8 closes with a NEWER timestamp, so the margin reports it as closed.
+      // The first open seeds the cached buckets with both open issues.
+      const first = makePlainCtx(root);
+      await openIssuesPlain(commands, first.ctx);
+      assert.deepEqual(fallbackTotal(first.notes), { total: 2, pages: 3 },
+        `both open issues are served: ${JSON.stringify(first.notes)}`);
+
+      // #8 closes with a NEWER timestamp, so the margin reports it as closed
+      // and the next open must stop serving it.
       model.set(8, 'closed', '2024-02-01T00:00:00Z');
-      const issuesOpen = makeCtx(root);
-      await commands.get('herdr-gentle:issues').handler('', issuesOpen.ctx);
+      const before = model.calls.length;
+      const second = makePlainCtx(root);
+      await openIssuesPlain(commands, second.ctx);
+      const after = model.calls.slice(before);
 
-      const opened = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
-
-      const row = registryLib.findByPath(root, target);
-      assert.deepEqual(row.issues, [7], 'the closed issue is dropped from the stored assignment');
-      assert.ok(opened.notes.some(([message]) => /dropped issue assignment\(s\) #8/.test(message)),
-        `the removal is reported, never silent: ${JSON.stringify(opened.notes)}`);
-      assert.match(opened.text(), /Issues \(1\)/, 'only the open issue is listed');
-      assert.doesNotMatch(opened.text(), /#8\b/, 'a closed issue never appears as a choice');
+      assert.deepEqual(fallbackTotal(second.notes), { total: 1, pages: 3 },
+        `the closed issue left the served set: ${JSON.stringify(second.notes)}`);
+      assert.equal(opensOf(after, 'all').length, 1, 'the closure arrived through the separate margin read');
+      assert.equal(snapshotPages(after).length, 0, 'and the snapshot was never re-primed');
     } finally {
       restoreEnv();
     }
   });
 });
 
-describe('S7d: proof, not assumption', { concurrency: false }, () => {
-  test('a 404 drops the assignment while a network failure preserves it byte for byte', async () => {
+describe('S7d: an unprovable read never purges the served set', { concurrency: false }, () => {
+  test('a failing listing keeps the cached rows the command serves', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('proof');
-      const target = addRegisteredWorktree(root, 'feat/proof', { issues: [7, 999] });
       const model = fakeGitHub();
+      model.buckets.mine = new Set([7, 8]);
+      model.buckets.assigned = new Set();
+      model.buckets.involved = new Set();
       model.set(7, 'open');
+      model.set(8, 'open');
       ghIssues.setGhRunner(model.runner);
       const { commands, handlers } = await loadExtension();
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
 
-      // 999 is not in the repository at all: gh answers 404 for it.
-      const deleted = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', deleted.ctx);
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [7], 'the deleted issue is dropped on proof');
-      assert.ok(deleted.notes.some(([message]) => /dropped issue assignment\(s\) #999/.test(message)),
-        `the 404 removal is reported: ${JSON.stringify(deleted.notes)}`);
+      const first = makePlainCtx(root);
+      await openIssuesPlain(commands, first.ctx);
+      assert.deepEqual(fallbackTotal(first.notes), { total: 2, pages: 3 },
+        `both open issues are served: ${JSON.stringify(first.notes)}`);
 
-      // Now an unverifiable number (an auth failure) must never be removed.
-      const row = registryLib.findByPath(root, target);
-      assert.equal(registryLib.updateWorktree(root, row.path, { issues: [7, 4242] }).ok, true);
-      const registryFile = registryLib.registryPath(root);
-      const before = fs.readFileSync(registryFile);
-      model.mode = 'auth';
-      const unverified = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', unverified.ctx);
-      assert.deepEqual(fs.readFileSync(registryFile), before, 'a failed verification writes nothing');
-      assert.ok(unverified.notes.some(([message]) => /could not verify issue assignment\(s\) #4242/.test(message)),
-        `the failure is reported: ${JSON.stringify(unverified.notes)}`);
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [7, 4242], 'nothing was purged');
+      // The margin and every bucket read now fail. Nothing proves either issue
+      // changed, so neither may leave the served set.
+      model.listFailure = true;
+      const before = model.calls.length;
+      const second = makePlainCtx(root);
+      await openIssuesPlain(commands, second.ctx);
+      const after = model.calls.slice(before);
 
-      // Saving from the detail may never remove a number the surface could not
-      // list: it was never on screen for the reader to untick.
-      const saving = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', saving.ctx);
-      saving.mounted.component.handleInput('ctrl+s');
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [7, 4242],
-        'an unverifiable assignment survives a save');
+      assert.equal(opensOf(after, 'all').length, 1, 'the margin was attempted, not skipped');
+      assert.deepEqual(fallbackTotal(second.notes), { total: 2, pages: 3 },
+        `a failed read purges nothing: ${JSON.stringify(second.notes)}`);
+      assert.equal(second.notes.length, 1, 'the served total is the one line the reader gets');
+      assert.equal(snapshotPages(after).length, 0, 'a failed merge never re-primes the snapshot');
     } finally {
       restoreEnv();
     }
   });
+});
 
-  test('one repository never answers for another', async () => {
+// The cached-fallback isolation proof the removed worktree-detail surface used
+// to carry, restored on the surface that survives: the public command's
+// non-interactive path, which is the ONE reader of the session's cached rows.
+// A single extension instance answers both repositories, so a cache keyed by
+// anything other than the repository's canonical identity would serve one
+// repository's rows — and one repository's merge counters — for the other.
+describe('S10: the cached open set belongs to one repository', { concurrency: false }, () => {
+  test('the cached fallback never answers for another repository', async () => {
     setEnv(stdEnv());
     try {
       const rootA = makeRepo('iso-a');
-      const targetA = addRegisteredWorktree(rootA, 'feat/iso-a', { issues: [7] });
       const modelA = fakeGitHub({ nameWithOwner: 'octo/a' });
-      modelA.set(7, 'open');
-      ghIssues.setGhRunner(modelA.runner);
-      let loaded = await loadExtension();      await Promise.all(sessions(loaded.handlers, makeCtx(rootA).ctx));
+      // `Assigned` owns A's single open issue, so 1 is exactly A's own count:
+      // sharing B's three rows would show up in it.
+      modelA.buckets.mine = new Set();
+      modelA.buckets.assigned = new Set([7]);
+      modelA.buckets.involved = new Set();
+      modelA.set(7, 'open', '2024-01-02T00:00:00Z');
 
       const rootB = makeRepo('iso-b');
-      const targetB = addRegisteredWorktree(rootB, 'feat/iso-b', { issues: [7] });
       const modelB = fakeGitHub({ nameWithOwner: 'octo/b' });
-      modelB.set(11, 'open');
-      // ONE extension instance answers both repositories, so a cache keyed by
-      // anything other than the repository's canonical identity would leak A's
-      // proof into B.
-      modelA.byCwd = new Map([[rootA, modelA], [targetA, modelA], [rootB, modelB], [targetB, modelB]]);
+      modelB.buckets.mine = new Set([11, 12, 13]);
+      modelB.buckets.assigned = new Set();
+      modelB.buckets.involved = new Set();
+      for (const number of [11, 12, 13]) modelB.set(number, 'open', `2024-02-0${number - 10}T00:00:00Z`);
 
-      const openedB = makeCtx(targetB);
-      await loaded.commands.get('herdr-gentle:worktree').handler('', openedB.ctx);
-      assert.deepEqual(registryLib.findByPath(rootB, targetB).issues, [], 'B never inherits A\'s proof');
-      assert.ok(openedB.notes.some(([message]) => /dropped issue assignment\(s\) #7/.test(message)),
-        `B verifies against B: ${JSON.stringify(openedB.notes)}`);
-      assert.deepEqual(registryLib.findByPath(rootA, targetA).issues, [7], 'A is untouched');
+      // One runner, routed by checkout: every read is attributed to the
+      // repository whose cwd asked for it, so a leaked cache is visible on
+      // both sides — the wrong rows and the wrong read count.
+      const router = fakeGitHub({ nameWithOwner: 'octo/router' });
+      router.byCwd = new Map([[rootA, modelA], [rootB, modelB]]);
+      ghIssues.setGhRunner(router.runner);
+      const { commands, handlers } = await loadExtension();
+
+      await Promise.all(sessions(handlers, makeCtx(rootA).ctx));
+      await Promise.all(sessions(handlers, makeCtx(rootB).ctx));
+      assert.equal(snapshotPages(modelA.calls).length, 1, 'A primes its own open set once');
+      assert.equal(snapshotPages(modelB.calls).length, 1, 'B primes its own open set once');
+
+      const openedA = makePlainCtx(rootA);
+      await openIssuesPlain(commands, openedA.ctx);
+      assert.deepEqual(fallbackTotal(openedA.notes), { total: 1, pages: 3 },
+        `A serves its own single issue: ${JSON.stringify(openedA.notes)}`);
+
+      const openedB = makePlainCtx(rootB);
+      await openIssuesPlain(commands, openedB.ctx);
+      assert.deepEqual(fallbackTotal(openedB.notes), { total: 3, pages: 3 },
+        `B serves its own three issues, never A's row: ${JSON.stringify(openedB.notes)}`);
+
+      // A serves its own set again: B's three rows never entered A's cached
+      // buckets, and A's margin was read from A's checkout alone.
+      const reopenedA = makePlainCtx(rootA);
+      await openIssuesPlain(commands, reopenedA.ctx);
+      assert.deepEqual(fallbackTotal(reopenedA.notes), { total: 1, pages: 3 },
+        `B never answers for A: ${JSON.stringify(reopenedA.notes)}`);
+
+      // The merge counters belong to the repository whose margin produced
+      // them: #11 closes in B only, so B's next open loses exactly one row
+      // while A's count is unchanged.
+      modelB.set(11, 'closed', '2024-03-01T00:00:00Z');
+      const closedB = makePlainCtx(rootB);
+      await openIssuesPlain(commands, closedB.ctx);
+      assert.deepEqual(fallbackTotal(closedB.notes), { total: 2, pages: 3 },
+        `B's closure counts against B: ${JSON.stringify(closedB.notes)}`);
+
+      const finalA = makePlainCtx(rootA);
+      await openIssuesPlain(commands, finalA.ctx);
+      assert.deepEqual(fallbackTotal(finalA.notes), { total: 1, pages: 3 },
+        `A never inherits B's closure: ${JSON.stringify(finalA.notes)}`);
+
+      // Three opens of A are three margins read in A, B's two opens are two
+      // read in B: no repository ever paid for (or answered from) the other's
+      // reads, and neither snapshot was re-primed.
+      assert.equal(opensOf(modelA.calls, 'all').length, 3, 'A margins only ever ran in A');
+      assert.equal(opensOf(modelB.calls, 'all').length, 2, 'B margins only ever ran in B');
+      assert.equal(snapshotPages(modelA.calls).length, 1, 'A never re-primed, and never primed B');
+      assert.equal(snapshotPages(modelB.calls).length, 1, 'B never re-primed, and never primed A');
     } finally {
       restoreEnv();
     }
@@ -691,37 +837,43 @@ describe('S7d: proof, not assumption', { concurrency: false }, () => {
 });
 
 describe('S10: every open issue, no snapshot cap', { concurrency: false }, () => {
-  test('more than 600 open issues prime completely and keep a low-numbered assignment', async () => {
+  test('more than 600 open issues prime completely and the command serves them all', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('big');
-      const target = addRegisteredWorktree(root, 'feat/big', { issues: [1] });
       const model = fakeGitHub();
-      // #1 is the OLDEST of 620 open issues, so only the cursor walk reaches it.
+      // #1 is the OLDEST of 620 open issues, so only the cursor walk reaches it,
+      // and `My issues` owns them all: the served total is the whole set.
       for (let number = 1; number <= 620; number += 1) model.set(number, 'open');
+      model.buckets.mine = new Set(Array.from({ length: 620 }, (_, at) => at + 1));
+      model.buckets.assigned = new Set();
+      model.buckets.involved = new Set();
       ghIssues.setGhRunner(model.runner);
       const { commands, handlers } = await loadExtension();
 
       await Promise.all(sessions(handlers, makeCtx(root).ctx));
       assert.equal(snapshotPages(model.calls).length, 7, '620 rows are seven 100-row cursor pages');
 
-      const opened = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
-      assert.match(opened.text(), /Issues \(620\)/, 'the whole open set is primed, never capped at 500');
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [1], 'the low-numbered assignment stays');
-      assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
-        `nothing was dropped: ${JSON.stringify(opened.notes)}`);
+      const opened = makePlainCtx(root);
+      await openIssuesPlain(commands, opened.ctx);
+      assert.deepEqual(fallbackTotal(opened.notes), { total: 620, pages: 3 },
+        `the whole open set is served, never capped at 500: ${JSON.stringify(opened.notes)}`);
+      assert.equal(snapshotPages(model.calls).length, 7, 'serving it never re-primes the snapshot');
     } finally {
       restoreEnv();
     }
   });
 
+  const INCOMPLETE = {
+    short: /the snapshot is incomplete/,
+    'stuck-cursor': /repeated the cursor/,
+    errors: /API rate limit exceeded/,
+  };
   for (const snapshot of ['short', 'stuck-cursor', 'errors']) {
-    test(`a snapshot page that cannot prove completeness (${snapshot}) fails and never tombstones`, async () => {
+    test(`a snapshot page that cannot prove completeness (${snapshot}) fails and serves no total`, async () => {
       setEnv(stdEnv());
       try {
         const root = makeRepo(`page-${snapshot}`);
-        const target = addRegisteredWorktree(root, `feat/page-${snapshot}`, { issues: [1] });
         const model = fakeGitHub();
         for (let number = 1; number <= 600; number += 1) model.set(number, 'open');
         // `short`: the terminal page drops a row while reporting the real
@@ -739,15 +891,15 @@ describe('S10: every open issue, no snapshot cap', { concurrency: false }, () =>
         const before = fs.readFileSync(registryFile);
         await Promise.all(sessions(handlers, makeCtx(root).ctx));
         assert.deepEqual(fs.readFileSync(registryFile), before, 'a failed snapshot writes nothing');
-        assert.deepEqual(registryLib.findByPath(root, target).issues, [1], 'no fetch-only absence removes a stored issue');
 
-        const opened = makeCtx(target);
-        await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
-        assert.ok(opened.notes.some(([message]) => /cannot list open issues/.test(message)),
-          `the incomplete snapshot is reported, never passed off as complete: ${JSON.stringify(opened.notes)}`);
-        assert.deepEqual(registryLib.findByPath(root, target).issues, [1], '#1 is verified on its own and kept');
-        assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
-          `nothing was dropped: ${JSON.stringify(opened.notes)}`);
+        // The public command retries the prime and reports the failure instead
+        // of a number: an incomplete snapshot is never passed off as complete.
+        const opened = makePlainCtx(root);
+        await openIssuesPlain(commands, opened.ctx);
+        assert.equal(fallbackTotal(opened.notes), null, 'no total is reported for an unproven set');
+        assert.match(opened.text(), INCOMPLETE[snapshot],
+          `the incomplete snapshot is named: ${JSON.stringify(opened.notes)}`);
+        assert.deepEqual(fs.readFileSync(registryFile), before, 'the retried prime writes nothing either');
       } finally {
         restoreEnv();
       }
@@ -790,8 +942,9 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       const after = model.calls.slice(before);
 
       assert.equal(snapshotPages(after).length, 0, 'the snapshot is never re-primed');
-      assert.equal(searchPages(after).length, 4, 'each tab is read fresh once at open');
-      assert.deepEqual(searchLimits(after), [18, 18, 18, 18], 'the request is the row budget, never a fixed count');
+      assert.equal(searchPages(after).length, 3, 'each scoped tab is read fresh once at open');
+      assert.deepEqual(searchLimits(after), [18, 18, 18], 'the request is the row budget, never a fixed count');
+      assert.equal(connectionPages(after).length, 1, 'and the All tab reads its connection page once');
       assert.match(firstFrame, /My issues \(45\+\)/, 'the tab names the server total');
 
       // A second open reads the same first page again: fresh rows every time,
@@ -802,14 +955,15 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       const secondFrame = await viewerFrame(second);
       const again = model.calls.slice(beforeSecond);
       assert.equal(snapshotPages(again).length, 0, 'never a second snapshot');
-      assert.equal(searchPages(again).length, 4, 'a reopen is a fresh page per tab, not a cache hit');
+      assert.equal(searchPages(again).length, 3, 'a reopen is a fresh search page per scoped tab, not a cache hit');
+      assert.equal(connectionPages(again).length, 1, 'and a fresh connection page for All');
       assert.match(secondFrame, /My issues \(45\+\)/);
     } finally {
       restoreEnv();
     }
   });
 
-  test('the fourth All tab lists the whole open set through the search seam, never a cached bundle', async () => {
+  test('the fourth All tab lists the whole open set through the issue connection, never a cached bundle', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('viewer-all');
@@ -836,9 +990,10 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       assert.match(frame, /All \(5\)/, 'All counts every open issue, not the other tabs\' rows');
       assert.match(frame, /issue title 4/, 'an issue outside every scoped bucket lists here');
       assert.match(frame, /issue title 5/, 'and so does the last one');
-      assert.deepEqual(searchQueries(after).slice(-1), ['repo:octo/repo is:issue is:open sort:updated-desc'],
-        'the All page is the plain open-repository search');
-      assert.equal(snapshotPages(after).length, 0, 'the All tab never re-primes the assignment snapshot');
+      assert.equal(connectionPages(after).length, 1, 'All reads the unfiltered issue connection');
+      assert.ok(!searchQueries(after).some((query) => query.endsWith('is:open sort:updated-desc')),
+        'All is not a fourth search page');
+      assert.equal(snapshotPages(after).length, 0, 'the All tab never re-primes the open snapshot');
       assert.deepEqual(opensOf(after, 'open'), [], 'the All tab never reads the legacy list cache');
     } finally {
       restoreEnv();
@@ -930,38 +1085,6 @@ describe('S5: the viewer reads each page fresh from its bucket', { concurrency: 
       await commands.get('herdr-gentle:issues').handler('', opened.ctx);
       assert.match(await viewerFrame(opened), /failed to load issues: .*exceeded the requested issue page size/,
         'the overdelivered page is reported, never rendered as a page');
-    } finally {
-      restoreEnv();
-    }
-  });
-});
-
-describe('S7d: a repository-level 404 proves nothing', { concurrency: false }, () => {
-  test('the stored assignment keeps its bytes and is reported unverifiable', async () => {
-    setEnv(stdEnv());
-    try {
-      const root = makeRepo('repo404');
-      const target = addRegisteredWorktree(root, 'feat/repo404', { issues: [999] });
-      const model = fakeGitHub();
-      model.set(7, 'open');
-      ghIssues.setGhRunner(model.runner);
-      const { commands, handlers } = await loadExtension();
-      await Promise.all(sessions(handlers, makeCtx(root).ctx));
-
-      const registryFile = registryLib.registryPath(root);
-      const before = fs.readFileSync(registryFile);
-      // Private or inaccessible repository: every issue view answers the
-      // generic `HTTP 404: Not Found`, which names no issue.
-      model.mode = 'repo404';
-      const opened = makeCtx(target);
-      await commands.get('herdr-gentle:worktree').handler('', opened.ctx);
-
-      assert.deepEqual(fs.readFileSync(registryFile), before, 'a generic 404 writes nothing');
-      assert.deepEqual(registryLib.findByPath(root, target).issues, [999], 'the assignment is preserved');
-      assert.ok(opened.notes.some(([message]) => /could not verify issue assignment\(s\) #999/.test(message)),
-        `the failure is reported: ${JSON.stringify(opened.notes)}`);
-      assert.ok(!opened.notes.some(([message]) => /dropped issue assignment/.test(message)),
-        'a 404 for the repository never drops the issue');
     } finally {
       restoreEnv();
     }
