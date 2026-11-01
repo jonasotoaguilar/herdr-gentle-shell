@@ -75,6 +75,8 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -303,7 +305,7 @@ describe('malformed registry backup', { concurrency: false }, () => {
       const create = tools.get('worktree_create');
       assert.ok(create, 'expected worktree_create to be registered');
       const ctx = ctxFor(root);
-      const result = await create.execute('call-1', { branch: 'feat/kept', issues: [35] }, undefined, undefined, ctx);
+      const result = await create.execute('call-1', { branch: 'feat/kept', issues: [35], changes: 'none' }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `expected success: ${(result.content || []).map((p) => p.text).join('\n')}`);
       track(result.details.path);
       // The entry is written …
@@ -343,7 +345,7 @@ describe('malformed registry backup', { concurrency: false }, () => {
       assert.deepEqual(corruptSiblings(root), []);
       const { tools } = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'call-1', { branch: 'feat/fresh', issues: [35] }, undefined, undefined, ctxFor(root),
+        'call-1', { branch: 'feat/fresh', issues: [35], changes: 'none' }, undefined, undefined, ctxFor(root),
       );
       assert.equal(result.isError, undefined, `expected success: ${(result.content || []).map((p) => p.text).join('\n')}`);
       track(result.details.path);

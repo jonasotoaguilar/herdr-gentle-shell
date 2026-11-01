@@ -14,6 +14,57 @@ The list shows the repository's issues fetched through `gh` (`author:@me`
 for My issues, `assignee:@me` for Assigned, and `involves:@me -author:@me`
 for Involved). The fourth tab, All, lists every open issue in the repository,
 not just those involving you; it does not deduplicate against the other tabs.
+
+Every tab reads the checkout's OWN repository, never the base `gh` resolves. A
+fork checkout normally configures `origin` (the fork) and `upstream` (the
+original), and for exactly that layout `gh repo view` answers the original —
+which used to list the original's issues in all four tabs. The repository in
+scope is therefore an unambiguous NON-BASE remote: branch `pushRemote`,
+`remote.pushDefault`, `origin` or the tracking remote when one of them is not
+named like a base, otherwise the only non-base remote. A branch that merely
+TRACKS `upstream` (the usual fork clone that never names the origin) therefore
+still reads `myfork`, not the original; two or more non-base remotes with no
+such attach point is AMBIGUOUS and fails closed instead of guessing a fork or
+silently reading the base. The selected remote is read from git and handed to
+every repo-scoped `gh` call as a HOST-QUALIFIED `GH_REPO` — `<host>/<owner>/<repo>`,
+the form `gh` accepts — and the detail, labels, assignable users, search and the
+`o` browser opener follow the same identity, so the same `owner/name` on two
+servers can never be confused. A scope is used only when that remote PROVES it
+names a GitHub repository — the server `gh` will actually talk to and a valid
+`owner/name`. `github.com` is accepted on the remote's own host; any other
+server (GitHub Enterprise Server, `*.ghe.com`) requires `GH_HOST` to name it,
+because the search and connection reads go through `gh api`/GraphQL, which use
+the default host — an enterprise remote without `GH_HOST` fails closed instead
+of reading the same `owner/name` on github.com. With `GH_HOST` set, the remote
+must name that EXACT same server — a mismatch (the same `owner/name` on another
+server) is refused. A
+local/`file://` remote, a remote on another host, an unreadable URL, a
+malformed or percent-encoded identifier, or a git resolution error (git
+missing, unreadable configuration) fails the read AND the write closed: no `gh`
+command runs, the refusal names the remote (never the URL, which can carry
+credentials), and another remote is never substituted — so an issue action can
+never be sent to a different repository. The `o` opener refuses the same way. Before the list loads, the resolved scope
+is revalidated against the checkout's live git configuration; a config read
+that fails for any reason other than "not a git repository" (a corrupt or
+unreadable configuration) fails closed for reads AND writes, while a directory
+that is not a Git repository keeps `gh`'s own resolution. Once the list is
+loaded the repository identity is PINNED, host included: every page, detail,
+label and assignee read, and every action, uses exactly the repository the rows
+came from. If the checkout's remote moves while the reader is open — including
+a move to another server under the SAME `owner/name` — the list keeps the loaded
+repository (reads stay on it), the comment, close/reopen, label and assignee
+actions REFUSE with a message to reopen, and `o` always opens the issue it was
+read from on the server it was read from, never the one the checkout happens to
+resolve to now. A `GH_HOST` that no longer selects the pinned server fails every
+bound read and action closed instead of being redirected, and an ambient
+`GH_REPO` — present at open or appearing later — never overrides the pin.
+Reopening resolves the checkout again. A checkout with a single remote has
+nothing to disambiguate: the identity bound is the repository `gh` itself
+resolves for it, host-qualified, so its opener gains an explicit
+`-R <host>/<owner>/<repo>` and reads carry that one identity instead of
+re-resolving. An explicit `GH_REPO` in the environment is the pin when the
+reader opens (host-qualified the same way), and it never changes under an open
+reader.
 The scoped tabs and any typed search read GitHub's search API, while the
 unfiltered All tab reads the repository's own issue connection, which is the
 only source GitHub will page past 1000 matches — so a large repository can be
@@ -60,11 +111,18 @@ only ever shows open issues.
 
 The right pane shows the selected issue: number and title, state, labels,
 author, created and updated time, `👍` reactions, comment count, the body,
-then each comment separated by its author and time. The body and the
-comments render as complete plain wrapped text, never as styled markdown or
-silently capped snippets. This is the shared issue formatter
-(`lib/issue-preview.js`), including assignees, projects and linked-PR count.
-Moving the selection resets the scroll to the top of that issue.
+then each comment separated by its author and time. The body and every comment
+render as complete styled markdown through `lib/odd-markdown.js` — the same
+renderer the ODD document pane uses — so headings, list and task rows, quotes,
+fenced code and inline code/bold take their theme roles instead of showing raw
+syntax. A single newline inside a paragraph joins that paragraph (github-flavored
+markdown), long lines and long words wrap instead of being cut, and a control or
+escape sequence in a body is removed before rendering, so text from someone
+else's tracker can neither repaint the pane nor move the cursor. The rows around
+the body stay the shared issue formatter (`lib/issue-preview.js`), including
+assignees, projects and linked-PR count, so the two surfaces cannot drift; only
+the free text is markdown, and a `#` in a title or a `-` in a label list is
+still literal. Moving the selection resets the scroll to the top of that issue.
 
 Rows carry no association mark and the notice row carries no
 assignment hint: no surface claims which issue belongs to a checkout any more
@@ -85,23 +143,37 @@ repeating them beside the query or naming the list keys.
 
 Every token paints through the injected theme with a role that says what it is
 (S11), so the header, the search row, the tabs and the footer read as ONE
-palette and no view hardcodes a colour:
+palette and no view hardcodes a colour. S13 splits the levels the way the
+reference does: a TITLE takes `customMessageLabel`, the role the Pi Agents view
+paints its own frame title with, a BUTTON (a shortcut key) the primary `accent`, ordinary text the normal `text` role and the
+focused row its own background band.
 
 | Token | Role |
 | --- | --- |
-| frame title (`◈ Issues`), active tab label, right-pane issue title | `accent` + bold |
-| shortcut KEY in the footer (`↑↓`, `tab/←→`, `esc`, …) | `accent` + bold |
+| frame title (`◈ Issues`) and the active tab label | `customMessageLabel` + bold (the Pi Agents view title role) |
+| the right-pane issue title (the shared preview formatter, `lib/issue-preview.js`) | the same shared title role + bold |
+| shortcut KEY in the footer (`↑↓`, `tab/←→`, `esc`, …) | `accent` (primary) + bold |
 | a key's description (`move`, `bucket`, `close`, …) | `muted` |
 | tab counts and status words (`(12)`, `loading…`) | `muted` |
 | static labels — the `›` prompt and the idle `Search` | `dim` |
-| the live search value and its caret | `accent` |
+| the live search value and its caret | `text` |
+| the issue's state (`[open]`), its `muted` notes and the `dim` end marker | `accent` / `muted` / `dim` |
+| the comment rule (`─ ana · 2d ago ─`) | `border` |
 | frame rules and pane divider | `border` |
 
-A key is therefore distinguishable from the words beside it by BOTH colour and
-weight, and focus never depends on colour at all: the focused row keeps its `▸`
-mark and the active tab its `▸` too, so a monochrome terminal shows the same
-information. A missing, partial or throwing theme degrades to plain text rather
-than breaking a frame.
+No frame title, tab or reading-pane title is painted with the accent a
+shortcut key owns, so a heading never reads as a control: the preview formatter
+asks the shared table for its title role (`ROLES.title` in `lib/tui-paint.js`)
+instead of writing a role name of its own, so a change to that table moves the
+frame, the tabs and the reading pane together. Everything else in the preview
+keeps the role it had — the state, its notes, the comment rule and the end
+marker — and labels, assignees, counters and the body stay the caller's plain
+text. A key is distinguishable from the words
+beside it by BOTH colour and weight, and focus never depends on colour at all:
+the focused row keeps its `▸` mark (and its `selectedBg` band where the theme
+paints backgrounds) and the active tab its `▸` too, so a monochrome terminal
+shows the same information. A missing, partial or throwing theme degrades to
+plain text rather than breaking a frame.
 
 ## Keys
 
@@ -225,6 +297,8 @@ viewport-derived page size, and further pages arrive as you scroll. A count
 taken from a page whose walk has not finished is shown as a lower bound
 (`N+`). That `totalCount` is the server's count at request time, so a walk is
 not a snapshot: issues updated while you page can shift what the next page
-returns. Scope is the current checkout only — the
-session's cwd resolved to its Git root. The issue body and the comments
-show as plain wrapped text (no markdown styling).
+returns. Scope is the current checkout only — the session's cwd resolved to its
+Git root — and, inside that checkout, the remote it pushes to (its fork) rather
+than the upstream `gh` resolves as a base; see above. The issue body and the
+comments render as styled markdown (headings, lists, code and inline formatting),
+never as raw syntax and never as capped snippets.

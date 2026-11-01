@@ -55,21 +55,44 @@ the reader could observe before a repaint.
 Every hint lives on **one** footer row and nowhere else. The row has two
 tiers and then drops its lowest-priority hint:
 
-- full tier, e.g. `↑↓ select · ←/→ list · ctrl+shift+j/k doc · T search ·
-  r reload · o open · esc close` — one labelled token per scroll target, so
-  the generic `PgUp/PgDn` and `ctrl+d/u half` hints no longer occupy cells
-  (those bindings stay live and are documented in the key tables);
-- short tier (`↑↓`, `←/→`, `ctrl+shift+j/k`, …) when the full tier does not
-  fit;
-- pruning, by priority, when even the short tier does not fit, so
-  `esc close` outlives every other hint.
+- full tier, e.g. `↑↓ select · ctrl+shift+j/k doc · s sort: recent ·
+  T search · r reload · o open · esc close` (`shift+j/k doc` when the extended
+  protocol is not confirmed) — the document pane is the ONE scroll target
+  with a labelled token, so the generic `PgUp/PgDn` and `ctrl+d/u half` hints
+  no longer occupy cells (those bindings stay live and are documented in the
+  key tables);
+- short tier, e.g. `↑↓ · ctrl+shift+j/k doc · s · T · r · o open · esc close`
+  when the full tier does not fit: the document token keeps its ` doc`
+  target, `s`, `T` and `r` compact to the bare key, and `o open`/`esc close`
+  keep their words;
+- pruning, by priority, when even the short tier does not fit: the lowest
+  priority actions go first (`o open`, then the reload hint, then `T` and `s`),
+  and `esc close` outlives every other hint.
+
+The ODD reader's list scroll pair is in neither tier: `←`/`→` (and `[`/`]`)
+still move the list one screenful, but they are movement rather than an action
+that needs naming, so they cost no footer cells. The reload token names what
+the key just did — `r reload` before the first press, `r reloaded` after a
+successful re-list that re-reads the open document, and `r failed` (full
+`r reload failed` where the row holds it) when the re-read could not happen —
+so a reload that changes no row is never silent. That token ranks just above
+`o open`, so the legend spends that hint's cells on the answer: at the reported
+~60-column width both outcomes are painted instead of the idle `r` being
+replaced by nothing, and `esc close` is never the entry given up.
 
 The keys read as keys: every shortcut token is painted with the theme's
 `accent` role and emphasised with its `bold`, while its description is
 `muted` (and a static label `dim`) — the role table lives once in
 `lib/tui-paint.js`, so the two readers cannot drift into two palettes, and a
 host theme that is absent or throws degrades to plain text instead of
-breaking the row. In a monochrome terminal the roles collapse, and `bold`
+breaking the row. The same table keeps a TITLE off the accent (S13): a frame
+title, a section heading, the active tab and the Issues reading-pane title (the
+shared preview formatter asks the table for `ROLES.title` instead of writing a
+role of its own) are painted with the shared title role (`ROLES.title` in
+`lib/tui-paint.js`, `customMessageLabel` — the role the Pi Agents view paints its
+own frame title with), ordinary
+text with the normal `text` role, and a selected row is told apart by its own
+`selectedBg` band. In a monochrome terminal the roles collapse, and `bold`
 alone still separates a key from the words next to it.
 
 The scroll hint is the shared legend, so it names `ctrl+shift+j/k` only when
@@ -118,6 +141,31 @@ The retired detail's third rule — a verbose reason handed in for `modified`
 renders as `modified —`, never as the explanation sentence — went with the
 facts that needed it: neither reader renders a computed date or an invented
 value.
+
+## The Issues preview is styled markdown (S12)
+
+«em issues, la preview igual hagamoslo como un md estilizado». The preview's free
+text — the issue body and every comment body — now renders through the same
+`lib/odd-markdown.js` renderer the ODD document pane uses, reached through the
+shared formatter's own `wrap` seam. Headings keep their mark, bullets and task
+rows get their boxes, fenced code is indented and dim, inline code and bold take
+their roles, and a single newline inside a paragraph joins it (github-flavored
+markdown) instead of adding a separator row per source line.
+
+The boundary is deliberate: only the two kinds of free text are handed to the
+renderer, by identity. Every metadata row stays the shared formatter's own
+(`lib/issue-preview.js`, S16), so a `#` in a title or a `-` in a label list is
+still literal and the two surfaces still cannot show different fields. The
+render is memoized on the exact source and pane width (S23), so a repaint at an
+unchanged width re-renders no body and no comment. Because those strings come
+from someone else's tracker, the renderer now strips ANSI/OSC sequences and the
+remaining C0 controls from its source before parsing — the ODD documents, which
+share that path, gain the same guard — and folds tabs to spaces so the wrap
+budget matches what the terminal draws.
+
+Scroll, paging, list keys and the legend are untouched: the markdown rows are
+just rows in the same document, so `ctrl+shift+j/k doc`, the half-page pair and
+the clamped scroll behave exactly as before.
 
 ## Refresh (S10)
 

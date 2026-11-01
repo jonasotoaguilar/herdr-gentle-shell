@@ -4,14 +4,21 @@ Every view has one compact shortcut row. Search has its own interaction-scoped
 legend; keys are not repeated above and below the same control.
 
 In every footer and panel header a shortcut's KEY stands apart from the words
-beside it: the key carries the theme's accent role plus bold, its description
-the muted role, static labels are dim, live values (a derived branch or path, a
-typed name, a search query, the page number) are accent and counts are muted.
-One shared palette (`lib/tui-paint.js`) decides those roles for the warp panel,
-the create flow, odd, issues and the customize panel, so the five surfaces
-cannot drift apart. A theme that answers no colour (or throws) still renders
-every key and row: plain text is the fallback, and focus stays readable through
-its `▸` mark.
+beside it: the key is a BUTTON and carries the theme's primary accent role plus
+bold, its description the muted role, static labels are dim and counts are
+muted. A TITLE — a frame title, a section heading, the active tab — takes the
+`customMessageLabel` title role the Pi Agents view paints its own frame title
+with, and ordinary
+text (a derived branch or path, a typed name, a search query, a page number)
+takes the normal `text` role, so a heading never reads as a control and the
+accent stays with the buttons. In the reference, which names its roles
+separately, a primary button is `solid`/`solid_foreground`; pi's theme has no
+`solid`, so its documented primary — `accent` — is what every button here uses. A selected row is told apart from that ordinary text by its own
+`selectedBg` band. One shared palette (`lib/tui-paint.js`) decides those roles
+for the warp panel, the create flow, odd, issues and the customize panel, so the
+five surfaces cannot drift apart. A theme that answers no colour (or throws)
+still renders every key and row: plain text is the fallback, and focus stays
+readable through its `▸` mark.
 
 ## Warp
 
@@ -63,7 +70,7 @@ only; there is no `f` state toggle or reopen path.
 | Navigate | `↑`/`↓`, `j`/`k` | `↑`/`↓`, `j`/`k` |
 | Search | `T`, `/` | `T`, `/` |
 | Reload | `r` | `r` |
-| Open externally | `o` (editor) | `o` (browser) |
+| Open externally | `o` (editor; the terminal is released until it exits) | `o` (browser) |
 | Switch bucket | — | `tab`, `shift+tab` |
 | Page active list | `←`/`→` | `←`/`→` |
 | Edit labels (when permitted) | — | `l`, `L` |
@@ -81,7 +88,19 @@ before discarding. These actions do not assign a worktree, and Copy is removed.
 In an active search, Delete clears the whole query and Backspace removes one
 character; only that search footer advertises clearing. Lists page by viewport
 rows and wrapped titles, not a fixed item count. Issues page changes and `r` read
-fresh data; `r` also refreshes the focused detail.
+fresh data; `r` also refreshes the focused detail. In Odd the list scroll pair is
+movement, not a documented action, so it carries no footer token (the keys still
+work), and `r` names its outcome in the footer: `r reload` before the first
+press, `r reloaded` after a re-list that also re-reads the open document, and
+`r failed` (full `r reload failed` where the row holds it) when the re-read could
+not happen and the current list stays. The reload token outranks the `o open`
+hint, so the ~60-column row gives that hint up rather than dropping the answer.
+
+In Odd, `o` releases the terminal for the editor's whole lifetime instead of
+sharing it: Pi paints nothing and reads no key while `$VISUAL`/`$EDITOR` runs,
+so Escape stays with nvim and the reader is still open behind it when the editor
+exits. Pi's own suspend plus a repaint re-arms the view afterwards — see
+[Opening in an editor](odd-viewer.md#opening-in-an-editor).
 
 ## Preview scrolling
 
@@ -100,7 +119,11 @@ Escape closes. The panel offers four categories — sidebar, moshi, worktree and
 reset — and no performance switch of any kind. Its title, section label,
 choices, position count and footer paint through the same shared palette, so
 the `esc` hint and the footer keys read apart from the words beside them here
-too.
+too: the panel title and the section heading take `customMessageLabel`, the role
+the Pi Agents view paints its own frame title with, the keys keep the
+primary accent, an unselected choice is ordinary text
+and the focused row is told apart by its own `selectedBg` band — the panel never
+paints every row in the accent.
 
 The performance trace is not a panel option: it is switched on by exporting
 `GENTLE_PERF_TRACE=1` before starting Pi. See

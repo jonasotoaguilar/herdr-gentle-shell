@@ -88,6 +88,8 @@ function makeRepo(tag) {
   fs.writeFileSync(path.join(dir, 'README.md'), 'hello\n');
   git(dir, ['add', 'README.md']);
   git(dir, ['commit', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -247,17 +249,27 @@ function resultText(result) {
 // S12/T8 model-facing text: the listing is one header row plus one ` · `-joined
 // row per checkout; a successful close is ordered label rows. S1 removed issue
 // and ODD associations from every worktree surface, so a row is the checkout's
-// identity and nothing else. The exact cell contract is pinned by
-// tools/worktree-model-result.test.js; these suites pin which rows exist, in
-// which order, with which identity and warnings.
+// identity and nothing else. S6 then made the row minimal: being listed IS the
+// existence proof, so `live`/`exists` is never a cell, and a kind the row
+// already states (`principal` repeats the name, `agent` means "registered",
+// `unregistered` repeats the state) is not one either — only the informative
+// `missing`/`unregistered` state rides a trailing cell. The exact cell contract
+// is pinned by tools/worktree-model-result.test.js; these suites pin which rows
+// exist, in which order, with which identity and warnings.
 function listHeader(count) {
-  return `worktrees: ${count} (name · branch · path · kind · status)`;
+  return `worktrees: ${count} (name · branch · path)`;
 }
 
 // S1: a listing row is the checkout's identity alone — issue numbers and ODD
-// documents are not part of a worktree and never render.
+// documents are not part of a worktree and never render. S6: the identity is
+// `name · branch · path` plus at most one trailing state cell.
 function listRow({ name, branch, path: target, kind, status }) {
-  return [name, branch, target, kind, status].join(' · ');
+  const state = status === undefined || status === 'live' || status === 'exists' ? '' : status;
+  const kindCell = kind === undefined || kind === 'agent' || kind === 'live' || kind === 'exists'
+    || kind === name || kind === state
+    ? ''
+    : kind;
+  return [name, branch, target, kindCell, state].filter((cell) => cell.length > 0).join(' · ');
 }
 
 function removedRows({ name, branch, path: target }) {
@@ -790,7 +802,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
       const created = await tools.get('worktree_create').execute(
-        'call-1', { branch: 'feat/clean-close', issues: [35] }, undefined, undefined, ctx,
+        'call-1', { branch: 'feat/clean-close', issues: [35], changes: 'none' }, undefined, undefined, ctx,
       );
       assert.equal(created.isError, undefined, `setup create failed: ${resultText(created)}`);
       const target = created.details.path;

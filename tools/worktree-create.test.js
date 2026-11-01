@@ -91,6 +91,9 @@ function makeRepo(tag) {
   git(real, ['config', 'user.email', 'test@example.com']);
   git(real, ['config', 'user.name', 'Test']);
   git(real, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: new worktrees are born from LOCAL main, so every fixture that creates
+  // one needs that branch to exist (the create refuses without it).
+  git(real, ['branch', 'main', 'HEAD']);
   return real;
 }
 
@@ -175,6 +178,18 @@ function listWorktreePaths(root) {
     .map((line) => line.slice('worktree '.length));
 }
 
+// One snapshot of everything a create may write: branches, live checkouts and
+// registry rows. A refusal must leave all three identical.
+function createdState(root) {
+  const registry = require('../lib/worktree-registry.js');
+  const read = registry.readRegistry(root);
+  return {
+    branches: git(root, ['branch', '--format=%(refname:short)']).split('\n').filter(Boolean).sort(),
+    checkouts: listWorktreePaths(root).sort(),
+    rows: (read.ok ? read.worktrees : []).map((row) => `${row.branch} ${row.path}`).sort(),
+  };
+}
+
 function expectedTarget(root, slug) {
   return path.join(path.dirname(root), `${path.basename(root)}-worktrees`, slug);
 }
@@ -207,7 +222,7 @@ function assertCreatedText(text, details, expected) {
 // overwritten) or `appended` (a live checkout at another path kept the branch,
 // so the new row was recorded alongside it) — and `unchanged` for the
 // idempotent call that returns the checkout this thread already owns.
-function createdRows({ alreadyExists = false, name, branch, path: target, registered = 'new', codegraph = 'initialized', changes = false }) {
+function createdRows({ alreadyExists = false, name, branch, path: target, registered = 'new', codegraph = 'initialized', changes = false, copied = null }) {
   const rows = [
     alreadyExists ? `created: ${name} \u00B7 ${branch} \u00B7 already exists` : `created: ${name} \u00B7 ${branch}`,
     `path: ${target}`,
@@ -215,6 +230,7 @@ function createdRows({ alreadyExists = false, name, branch, path: target, regist
     `codegraph: ${codegraph}`,
   ];
   if (changes) rows.push('changes: already registered for this session');
+  if (copied !== null) rows.push(`copied: ${copied}`);
   return rows;
 }
 
@@ -288,18 +304,27 @@ function makeCtx({ repoRoot, thread = 'thread-1', hasUI = false, confirm = true 
 async function callCreate(tools, params, ctx) {
   const tool = tools.get('worktree_create');
   assert.ok(tool, 'expected worktree_create to be registered');
-  return tool.execute('call-1', params, undefined, undefined, ctx);
+  // S4: `changes` is mandatory, so a creation test that cares about something
+  // else states the no-copy selection explicitly instead of omitting it.
+  const sent = params && params.changes !== undefined ? params : { ...(params || {}), changes: 'none' };
+  return tool.execute('call-1', sent, undefined, undefined, ctx);
 }
 
 describe('worktree_create', { concurrency: false }, () => {
-  test('registers exactly one tool with only the branch parameter', async () => {
+  // S3/S4: two declared parameters and no more — the branch, and the pending
+  // changes selection the caller must send. `optional` is the plain-node Type
+  // double's mark for Optional(), so its absence is what makes the field
+  // mandatory: the runtime validates the declaration before execute runs.
+  test('registers exactly one tool with the branch and the required changes parameters', async () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
       assert.deepEqual([...tools.keys()], ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp']);
       const params = tools.get('worktree_create').parameters;
-      assert.deepEqual(Object.keys(params.properties).sort(), ['branch']);
+      assert.deepEqual(Object.keys(params.properties).sort(), ['branch', 'changes']);
       assert.equal(params.properties.branch.type, 'string');
+      assert.ok(params.properties.changes, 'the changes selection is declared');
+      assert.notEqual(params.properties.changes.optional, true, 'changes is mandatory, not optional');
     } finally {
       restoreEnv();
     }
@@ -1354,6 +1379,176 @@ describe('I3: non-directory occupant at the target', { concurrency: false }, () 
   });
 });
 
+describe('S2: a new worktree is born from local main', { concurrency: false }, () => {
+  function stdMainEnv(herdr) {
+    const modeEnv = scratchModeEnv();
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GENTLE_WORKTREE_THREAD: undefined,
+    };
+  }
+
+  // The invoking checkout sits on a feature branch with its own commit, and
+  // local `main` is one commit behind it. "Worktrees always start from main"
+  // means the new branch carries main's commit and NOT the invoking
+  // checkout's, and the base the backend receives is main's commit.
+  test('the base is the tip of local main, never the invoking checkout HEAD', async () => {
+    const root = makeRepo('main-base');
+    fs.writeFileSync(path.join(root, 'main.txt'), 'main\n');
+    git(root, ['add', 'main.txt']);
+    git(root, ['commit', '-m', 'on main']);
+    git(root, ['branch', '-f', 'main']);
+    git(root, ['checkout', '-b', 'feat/session']);
+    fs.writeFileSync(path.join(root, 'session.txt'), 'session\n');
+    git(root, ['add', 'session.txt']);
+    git(root, ['commit', '-m', 'session work']);
+    const mainSha = git(root, ['rev-parse', 'main']);
+    const sessionSha = git(root, ['rev-parse', 'HEAD']);
+    assert.notEqual(mainSha, sessionSha, 'the fixture distinguishes main from the invoking HEAD');
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-main' });
+      const target = expectedTarget(root, 'feat-from-main');
+      const result = await callCreate(tools, { branch: 'feat/from-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
+      assert.equal(git(target, ['rev-parse', 'HEAD']), mainSha, 'the checkout starts at local main');
+      assert.equal(git(target, ['log', '-1', '--format=%s']), 'on main', 'main\'s commit is the base');
+      assert.equal(fs.existsSync(path.join(target, 'session.txt')), false, 'the invoking checkout\'s work is not a base');
+      const [line] = shimArgv(herdr.log);
+      assert.ok(line.includes(`--base ${mainSha}`), `the backend receives main\'s commit: ${line}`);
+      assert.deepEqual(result.details.base, { source: 'main', ref: 'main', commit: mainSha }, 'the base is reported, not inferred');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // No local `main` (a plain `git init` repository, or one that renamed its
+  // trunk): the create still works and the base it used is reported honestly
+  // instead of being claimed as `main`.
+  // S2: local `main` is the ONLY base of a new branch. A repository without it
+  // refuses BEFORE anything is written — no branch, no checkout, no registry
+  // row, no backend call, no prune — and says exactly what to do, instead of
+  // silently seeding the new branch from whatever the invoking checkout has
+  // checked out.
+  test('a repository without local main refuses to create a new branch, mutating nothing', async () => {
+    const root = makeRepo('main-missing');
+    git(root, ['branch', '-m', 'main', 'trunk']); // no branch named main, only a trunk
+    fs.writeFileSync(path.join(root, 'head.txt'), 'head\n');
+    git(root, ['add', 'head.txt']);
+    git(root, ['commit', '-m', 'only commit']);
+    const before = createdState(root);
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-main-missing' });
+      const target = expectedTarget(root, 'feat-no-main');
+      const result = await callCreate(tools, { branch: 'feat/no-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, true, 'a missing local main is a refusal, not a silent fallback');
+      const text = resultText(result);
+      assert.match(text, /main/, `the refusal names the missing base: ${text}`);
+      assert.match(text, /nothing was created/, `the refusal states that nothing was written: ${text}`);
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.equal(fs.existsSync(target), false, 'the target path was never created');
+      assert.deepEqual(shimArgv(herdr.log), [], 'no backend ran');
+      assert.equal('base' in result.details, false, 'no base is reported: nothing was created');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE (S9): the idempotent replay is a READ — it returns the checkout
+  // this session already owns — so it must keep answering even where a NEW
+  // branch could not be created (no local main). The base requirement only
+  // guards creation, never the "already exists" answer.
+  test('a repeat call for an owned checkout still answers already exists without local main', async () => {
+    const root = makeRepo('main-missing-repeat');
+    fs.writeFileSync(path.join(root, 'a.txt'), 'a\n');
+    git(root, ['add', 'a.txt']);
+    git(root, ['commit', '-m', 'work']);
+    git(root, ['branch', '-f', 'main', 'HEAD']);
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-repeat' });
+      const first = await callCreate(tools, { branch: 'feat/repeat-no-main' }, ctx);
+      assert.equal(first.isError, undefined, `expected success: ${resultText(first)}`);
+      git(root, ['branch', '-m', 'main', 'trunk']); // local main disappears afterwards
+      const second = await callCreate(tools, { branch: 'feat/repeat-no-main', changes: 'all' }, ctx);
+      assert.equal(second.isError, undefined, `a replay never needs a base: ${resultText(second)}`);
+      assert.equal(second.details.alreadyExists, true, 'the owned checkout is returned, not created');
+      assert.equal('base' in second.details, false, 'nothing was created, so no base is reported');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE (S20): adoption needs no base, so it keeps working in a
+  // repository that has no local `main` at all — the requirement above applies
+  // only to a branch that would be CREATED.
+  test('an adopted branch needs no local main and still checks out its own commit', async () => {
+    const root = makeRepo('adopt-no-main');
+    git(root, ['branch', '-m', 'main', 'trunk']);
+    git(root, ['checkout', '-b', 'feat/adopt-no-main']);
+    fs.writeFileSync(path.join(root, 'branch.txt'), 'branch\n');
+    git(root, ['add', 'branch.txt']);
+    git(root, ['commit', '-m', 'branch work']);
+    const branchSha = git(root, ['rev-parse', 'feat/adopt-no-main']);
+    git(root, ['checkout', 'trunk']); // the branch must not be checked out live
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-adopt-no-main' });
+      const target = expectedTarget(root, 'feat-adopt-no-main');
+      const result = await callCreate(tools, { branch: 'feat/adopt-no-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, undefined, `adoption needs no base: ${resultText(result)}`);
+      assert.equal(result.details.branchCreated, false, 'the existing branch was adopted');
+      assert.equal(git(target, ['rev-parse', 'HEAD']), branchSha, 'the adopted branch keeps its own commit');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE: adoption is untouched by the base change. An existing branch is
+  // checked out as-is (no `-b`, no base), so its own commit — not main's — is
+  // what the new checkout carries.
+  test('an adopted branch still carries its own commit, not main', async () => {
+    const root = makeRepo('main-adopt');
+    fs.writeFileSync(path.join(root, 'main.txt'), 'main\n');
+    git(root, ['add', 'main.txt']);
+    git(root, ['commit', '-m', 'on main']);
+    git(root, ['branch', '-f', 'main']);
+    git(root, ['checkout', '-b', 'feat/adopted-main']);
+    fs.writeFileSync(path.join(root, 'branch.txt'), 'branch\n');
+    git(root, ['add', 'branch.txt']);
+    git(root, ['commit', '-m', 'branch work']);
+    const branchSha = git(root, ['rev-parse', 'feat/adopted-main']);
+    git(root, ['checkout', 'master']);
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-adopt-main' });
+      const target = expectedTarget(root, 'feat-adopted-main');
+      const result = await callCreate(tools, { branch: 'feat/adopted-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, undefined, `expected adoption success, got: ${resultText(result)}`);
+      assert.equal(result.details.branchCreated, false, 'the existing branch was adopted');
+      assert.equal(git(target, ['rev-parse', 'HEAD']), branchSha, 'the adopted branch keeps its own commit');
+      assert.equal(git(root, ['rev-parse', 'refs/heads/feat/adopted-main']), branchSha, 'the branch ref is never rewritten');
+      assert.equal(fs.existsSync(path.join(target, 'branch.txt')), true, 'the branch\'s work is in the checkout');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
 describe('H3: relative git listing paths never resolve against the process cwd', { concurrency: false }, () => {
   test('isPathInAnyCheckout gives the same verdict from a decoy cwd', async () => {
     const root = makeRepo('decoy-cwd');
@@ -2144,7 +2339,7 @@ describe('S1: a create publishes no association and destroys none', { concurrenc
       const neighbour = writeLegacyNeighbour(root);
       const tools = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/fresh' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-fresh' }).ctx,
+        'c1', { branch: 'feat/fresh', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-fresh' }).ctx,
       );
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
@@ -2686,7 +2881,7 @@ describe('S50/T41 + S3/L4: create registers the checkout and links git-ignored p
       const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-command' });
       const target = expectedTarget(root, 'feat-s3-command');
       const result = await mod.executeWorktreeCreate(
-        { branch: 'feat/s3-command' },
+        { branch: 'feat/s3-command', changes: 'none' },
         ctx,
         { gitOnly: true, principalLayout: true },
       );
@@ -2751,6 +2946,9 @@ describe('S50/T41 + S3/L4: create registers the checkout and links git-ignored p
     fs.writeFileSync(path.join(root, '.agents', 'extra.json'), '{"ignored":true}\n');
     git(root, ['add', '-f', '.agents/config.json']);
     git(root, ['commit', '-m', 'track agents config']);
+    // S2: the checkout is born from LOCAL main, so the tracked entry has to be
+    // part of main's tree to arrive with it.
+    git(root, ['branch', '-f', 'main', 'HEAD']);
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
@@ -2886,6 +3084,9 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
     fs.writeFileSync(path.join(root, 'package-lock.json'), '{}\n');
     git(root, ['add', 'package-lock.json']);
     git(root, ['commit', '-m', 'add npm marker']);
+    // S2: the fresh checkout is born from LOCAL main, so the npm marker must be
+    // in main's tree for the hooks to see it.
+    git(root, ['branch', '-f', 'main', 'HEAD']);
     // Slow FAKE npm on PATH (bounded ~200ms, no network, no live managers).
     const binDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-npmslow-')));
     fs.writeFileSync(path.join(binDir, 'npm'), '#!/bin/sh\nsleep 0.2\nexit 0\n', { mode: 0o755 });
@@ -2909,7 +3110,7 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
       const timer = setInterval(() => { beats += 1; }, 10);
       let result;
       try {
-        const pending = mod.executeWorktreeCreate({ branch: 'feat/gitonly-async' }, ctx, { gitOnly: true, principalLayout: true });
+        const pending = mod.executeWorktreeCreate({ branch: 'feat/gitonly-async', changes: 'none' }, ctx, { gitOnly: true, principalLayout: true });
         await new Promise((resolve) => setTimeout(resolve, 100));
         assert.ok(beats > 0, `heartbeat advanced while gitOnly hooks pending (beats=${beats})`);
         result = await pending;

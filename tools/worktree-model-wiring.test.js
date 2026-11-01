@@ -126,7 +126,7 @@ test('worktree_create keeps its own ordered text: the adapter never rewrites it'
     details: { branch: 'feat/demo', path: '/repo/demo', codegraph: { status: 'done', detail: '' } },
   };
   mod.produced.set('worktree_create', raw);
-  const result = await tools.get('worktree_create').execute('call-7', { branch: 'feat/demo' }, undefined, undefined, { cwd: '/repo' });
+  const result = await tools.get('worktree_create').execute('call-7', { branch: 'feat/demo', changes: 'none' }, undefined, undefined, { cwd: '/repo' });
   assert.strictEqual(result, raw, 'the extension text reaches the model unchanged');
   assert.ok(!WORKTREE_MODEL_TOOLS.includes('worktree_create'), 'and the adapter has no create builder to drift from');
   assert.ok(!WORKTREE_MODEL_TOOLS.includes('worktree_upsert'), 'and none for the retired upsert name either');

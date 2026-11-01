@@ -553,3 +553,344 @@ describe('warp create preflight on real sessions (allocated-but-missing guard)',
     assert.equal(mod.warpForkSourceUsable(headerless), false, 'entries without a session header never fork');
   });
 });
+
+// ---------------------------------------------------------------------------
+// The host seam (S14) and the full warp lifecycle, driven through the REAL
+// installed host:
+//
+//  * `ExtensionRunner` — the class the host uses to build the contexts an
+//    extension receives — proves what a TOOL context carries (no session
+//    control) and what a COMMAND context carries (`waitForIdle` +
+//    `switchSession`), which is why the agent-facing warp is a queued command
+//    rather than a tool-side `switchSession`.
+//  * A real `AgentSession` + the real agent loop (a scripted stream stands in
+//    for the provider) + the real `DefaultResourceLoader` loading THIS
+//    extension + the real `AgentSessionRuntime` performing the switch on real
+//    session files: the agent calls `worktree_warp`, the tool queues the
+//    command, the run settles, the command switches, and the switched-to
+//    session continues the work in the new checkout.
+//
+// Nothing live is touched: no credentials, no network, no daemon, no host
+// configuration (`PI_CONFIG_DIR` and the agent dir are scratch, settings are
+// in memory, and the only model is the scripted one).
+// ---------------------------------------------------------------------------
+function releaseRootFor(sessionManagerPath) {
+  const marker = `${path.sep}dist${path.sep}core${path.sep}session-manager.js`;
+  if (typeof sessionManagerPath !== 'string' || !sessionManagerPath.endsWith(marker)) return null;
+  return sessionManagerPath.slice(0, -marker.length);
+}
+
+function contentTextOf(message) {
+  try {
+    if (!message) return '';
+    if (typeof message.content === 'string') return message.content;
+    if (Array.isArray(message.content)) {
+      return message.content.map((part) => (part && typeof part.text === 'string' ? part.text : '')).join('\n');
+    }
+    return '';
+  } catch {
+    return '';
+  }
+}
+
+describe('warp handoff on the real host (S14)', { skip: !SM_PATH, concurrency: false }, () => {
+  let releaseRoot = null;
+  let host = null;
+  let piAi = null;
+  let savedEnv = null;
+
+  before(async () => {
+    releaseRoot = releaseRootFor(SM_PATH);
+    assert.ok(releaseRoot, `cannot derive the release root from ${SM_PATH}`);
+    host = await import(pathToFileURL(path.join(releaseRoot, 'dist', 'index.js')).href);
+    piAi = await import(pathToFileURL(path.join(releaseRoot, '..', 'pi-ai', 'dist', 'index.js')).href);
+    assert.equal(typeof host.ExtensionRunner, 'function', 'the installed host exposes ExtensionRunner');
+    assert.equal(typeof host.createAgentSessionServices, 'function', 'the installed host exposes its SDK factories');
+    assert.equal(typeof host.createAgentSessionRuntime, 'function', 'the installed host exposes its session runtime');
+    assert.equal(typeof piAi.createAssistantMessageEventStream, 'function', 'the installed pi-ai builds message streams');
+  });
+
+  // The mode file and the lib override are process state: every test restores
+  // them so the suites that follow see the environment they expect.
+  function withExtensionEnv(run) {
+    savedEnv = { ...process.env };
+    const stateDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-state-')));
+    process.env.GENTLE_STATUS_STATE_DIR = stateDir;
+    process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
+    delete process.env.GENTLE_WORKTREE_THREAD;
+    // The extension probes `gh` and `herdr` on session_start. Those probes must
+    // never leave this machine: a `gh` that only fails fast (and a `herdr` that
+    // does not exist) keeps the harness offline and deterministic while the
+    // REAL git stays reachable further down PATH.
+    const binDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-bin-')));
+    for (const name of ['gh', 'herdr', 'herdr-gentle-shell']) {
+      const file = path.join(binDir, name);
+      fs.writeFileSync(file, '#!/bin/sh\nexit 1\n');
+      fs.chmodSync(file, 0o755);
+    }
+    process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH}`;
+    require('../lib/worktree-mode.js').writeMode(true, process.env);
+    return Promise.resolve(run()).finally(() => {
+      for (const key of Object.keys(process.env)) {
+        if (!(key in savedEnv)) delete process.env[key];
+      }
+      for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
+    });
+  }
+
+  test('the host gives a tool context no session control and a command context both', async () => {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-ctx-')));
+    const runner = new host.ExtensionRunner(
+      [],
+      host.createExtensionRuntime(),
+      dir,
+      { getSessionId: () => 'session-1' },
+      {},
+    );
+    const toolCtx = runner.createToolContext('call-1', undefined);
+    assert.equal(typeof toolCtx.switchSession, 'undefined', 'a tool context cannot switch sessions');
+    assert.equal(typeof toolCtx.waitForIdle, 'undefined', 'a tool context cannot wait for idle');
+    assert.equal(typeof toolCtx.abort, 'function', 'a tool context keeps only the plain extension context');
+    const commandCtx = runner.createCommandContext();
+    assert.equal(typeof commandCtx.switchSession, 'function', 'a command context owns the switch');
+    assert.equal(typeof commandCtx.waitForIdle, 'function', 'a command context owns the idle wait');
+  });
+
+  test('the agent warp queues the command, which switches a real session and continues there', async () => {
+    await withExtensionEnv(async () => {
+      const cfgDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-cfg-')));
+      process.env.PI_CONFIG_DIR = cfgDir;
+      const root = makeRepo('host-e2e');
+      const target = addWorktree(root, 'feat/agent-move');
+      const sessionDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-sessions-')));
+      const agentDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-agent-')));
+
+      // The extension under test, loaded by the REAL loader from a stubbed copy
+      // (the two package imports are the only thing replaced).
+      const extDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-real-host-ext-')));
+      const extensionPath = path.join(extDir, 'gentle-worktree-tools.mjs');
+      fs.writeFileSync(extensionPath, stubbed);
+
+      const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+      const assistantMessage = (content, stopReason) => ({
+        role: 'assistant', content, api: 'scripted', provider: 'scripted', model: 'scripted',
+        usage, stopReason, timestamp: Date.now(),
+      });
+      const streamOf = (message) => {
+        const stream = piAi.createAssistantMessageEventStream();
+        stream.push({ type: 'start', partial: message });
+        stream.push({ type: 'done', message });
+        return stream;
+      };
+
+      const log = [];
+      const record = (what, extra) => { log.push({ what, ...(extra || {}) }); };
+      // One scripted provider for every session this test creates: the FIRST
+      // user prompt asks for the warp tool, the turn after the tool result
+      // answers in the checkout being left, and the continuation message
+      // answers in the new checkout.
+      const scriptedStream = (model, context) => {
+        const messages = Array.isArray(context?.messages) ? context.messages : [];
+        const last = messages[messages.length - 1];
+        const text = contentTextOf(last);
+        record('llm', { role: last?.role, text });
+        if (last && last.role === 'toolResult') {
+          return streamOf(assistantMessage([{ type: 'text', text: 'settling in the source checkout' }], 'stop'));
+        }
+        if (/Continue the task from here/.test(text)) {
+          return streamOf(assistantMessage([{ type: 'text', text: 'continued in the new checkout' }], 'stop'));
+        }
+        return streamOf(assistantMessage([
+          { type: 'toolCall', id: 'call-warp-1', name: 'worktree_warp', arguments: { name: 'feat-agent-move' } },
+        ], 'toolUse'));
+      };
+      const model = { provider: 'scripted', id: 'scripted', api: 'scripted', name: 'Scripted', input: ['text'], output: ['text'], contextWindow: 200000, maxTokens: 4096 };
+      // The model runtime is staged: auth is a constant and `streamSimple` is
+      // the scripted provider. Nothing reaches a network.
+      const modelRuntime = {
+        streamSimple: (mm, context, options) => scriptedStream(mm, context, options),
+        getAuth: async () => ({ auth: { apiKey: 'scripted' }, env: {} }),
+        hasConfiguredAuth: () => true,
+        checkAuth: async () => ({ type: 'api_key' }),
+        isUsingOAuth: () => false,
+        getModel: () => model,
+        getPhysicalModel: () => model,
+        getAvailableSnapshot: () => [model],
+        resolveModel: async (selected) => ({ model: selected, thinkingLevel: 'off' }),
+        refresh: async () => {},
+        getError: () => null,
+        registerProvider() {}, unregisterProvider() {}, registerNativeProvider() {},
+        registerVirtualModel() {}, unregisterVirtualModel() {},
+      };
+      const settingsManager = host.SettingsManager.inMemory({
+        compaction: { enabled: false },
+        retry: { enabled: false },
+      });
+      const services = await host.createAgentSessionServices({
+        cwd: root,
+        agentDir,
+        settingsManager,
+        modelRuntime,
+        resourceLoaderOptions: {
+          cwd: root,
+          agentDir,
+          settingsManager,
+          additionalExtensionPaths: [extensionPath],
+          noSkills: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          noContextFiles: true,
+        },
+      });
+      const loadErrors = services.resourceLoader.getExtensions().errors;
+      assert.deepEqual(loadErrors, [], `the real loader loaded the extension: ${JSON.stringify(loadErrors)}`);
+
+      const sessionManager = host.SessionManager.create(root, sessionDir);
+      const sourceFile = sessionManager.getSessionFile();
+      const switches = [];
+      let session = null;
+      const createRuntime = async (options) => {
+        const created = await host.createAgentSessionFromServices({
+          services: { ...services, cwd: options.cwd },
+          sessionManager: options.sessionManager,
+          model,
+          ...(options.sessionStartEvent ? { sessionStartEvent: options.sessionStartEvent } : {}),
+        });
+        session = created.session;
+        if (options.sessionStartEvent) record('session-start', { reason: options.sessionStartEvent.reason });
+        return { ...created, services: { ...services, cwd: options.cwd }, diagnostics: [] };
+      };
+      const runtimeHost = await host.createAgentSessionRuntime(createRuntime, {
+        cwd: root, agentDir, sessionManager,
+      });
+      session = runtimeHost.session;
+      const rebind = async () => {
+        session = runtimeHost.session;
+        await session.bindExtensions({
+          mode: 'print',
+          uiContext: {
+            notify: (message, level) => record('notify', { message: String(message), level }),
+            setStatus: () => {},
+            select: async () => undefined,
+            confirm: async () => false,
+            input: async () => undefined,
+            custom: async () => undefined,
+            setWidget: () => {},
+            setFooter: () => {},
+            setHeader: () => {},
+            setTitle: () => {},
+            getEditorText: () => '',
+            setEditorText: () => {},
+            pasteToEditor: () => {},
+            onTerminalInput: () => () => {},
+            setWorkingMessage: () => {},
+            setWorkingVisible: () => {},
+            setHiddenThinkingLabel: () => {},
+            addAutocompleteProvider: () => {},
+            setEditorComponent: () => {},
+            getEditorComponent: () => undefined,
+            get theme() { return { fg: (_c, s) => s, bold: (s) => s, dim: (s) => s }; },
+            getAllThemes: () => [],
+            getTheme: () => undefined,
+            setTheme: () => ({ success: false, error: 'no theme' }),
+            getToolsExpanded: () => false,
+            setToolsExpanded: () => {},
+          },
+          commandContextActions: {
+            waitForIdle: () => session.waitForIdle(),
+            newSession: async (options) => runtimeHost.newSession(options),
+            fork: async (entryId, options) => ({ cancelled: (await runtimeHost.fork(entryId, options)).cancelled }),
+            navigateTree: async () => ({ cancelled: false }),
+            switchSession: async (sessionPath, options) => {
+              // The host's own wiring (interactive/rpc/print modes all do
+              // exactly this): the command context's switch IS the runtime's.
+              switches.push(sessionPath);
+              const sourceNow = fs.readFileSync(sourceFile, 'utf8');
+              record('switch', {
+                path: sessionPath,
+                sourceHasToolResult: sourceNow.includes('handoff queued'),
+                sourceHasSettlingTurn: sourceNow.includes('settling in the source checkout'),
+              });
+              return runtimeHost.switchSession(sessionPath, options);
+            },
+            reload: async () => {},
+          },
+          onError: (error) => record('extension-error', { error: String(error && error.error) }),
+        });
+      };
+      runtimeHost.setRebindSession(rebind);
+      await rebind();
+
+      // The handoff is ASYNCHRONOUS by contract: `pi.sendUserMessage` returns
+      // void and the queued command switches only after the run settles, so the
+      // assertions wait (bounded) for the move to land instead of assuming the
+      // prompt's own resolution already covers it.
+      const waitForMove = async (timeoutMs = 5000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (switches.length > 0 && runtimeHost.cwd === target) return true;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        return false;
+      };
+      try {
+        await session.prompt('move this session to feat-agent-move');
+        assert.equal(await waitForMove(), true, `the queued command moved the session: ${JSON.stringify(log)}`);
+        // The continuation turn runs after the switch: give it the same bounded
+        // chance to finish before reading the files.
+        const continuationDeadline = Date.now() + 5000;
+        while (Date.now() < continuationDeadline && runtimeHost.session.isIdle !== true) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      } finally {
+        const destinationFile = runtimeHost.session.sessionFile;
+        assert.equal(runtimeHost.session.isIdle, true, 'the run settled');
+        assert.equal(switches.length, 1, `exactly one switch happened: ${JSON.stringify(log)}`);
+        assert.equal(runtimeHost.cwd, target, 'the session now runs in the target checkout');
+        assert.equal(runtimeHost.session.sessionManager.getCwd(), target, 'the session manager agrees on the cwd');
+        assert.notEqual(destinationFile, sourceFile, 'the session file changed');
+        assert.equal(fs.existsSync(destinationFile), true, 'the destination session file exists');
+
+        const sourceEntries = readSessionLines(sourceFile);
+        const destinationEntries = readSessionLines(destinationFile);
+        const sourceToolResult = sourceEntries.find((entry) => entry.type === 'message'
+          && entry.message && entry.message.role === 'toolResult');
+        const toolText = contentTextOf(sourceToolResult && sourceToolResult.message);
+        assert.ok(toolText.includes('handoff queued'), `the tool reported a queued handoff: ${toolText}`);
+        assert.ok(!toolText.includes('moved:'), 'the tool never claimed the switch');
+        assert.ok(sourceEntries.some((entry) => contentTextOf(entry.message).includes('settling in the source checkout')),
+          'the source session keeps its own turn');
+        assert.ok(!sourceEntries.some((entry) => contentTextOf(entry.message).includes('continued in the new checkout')),
+          'the continuation turn happened in the destination, not the source');
+
+        const switchRecord = log.find((entry) => entry.what === 'switch');
+        assert.equal(switchRecord.sourceHasToolResult, true, 'the tool result was already persisted when the switch began');
+        assert.equal(switchRecord.sourceHasSettlingTurn, true, 'the whole turn was persisted when the switch began');
+
+        const destinationWarp = destinationEntries.find((entry) => entry.type === 'custom_message'
+          && entry.customType === 'worktree-warp');
+        assert.ok(destinationWarp, 'the switched-to session carries the warp card: ' + JSON.stringify(log));
+        assert.match(contentTextOf(destinationWarp), /Continue the task from here/, 'the card tells the agent to continue');
+        assert.ok(destinationEntries.some((entry) => contentTextOf(entry.message).includes('continued in the new checkout')),
+          'the continuation turn ran in the destination');
+        const continuation = log.filter((entry) => entry.what === 'llm' && /Continue the task from here/.test(entry.text));
+        assert.equal(continuation.length, 1, `exactly one continuation turn: ${JSON.stringify(log)}`);
+        const switchIndex = log.findIndex((entry) => entry.what === 'switch');
+        const continuationIndex = log.findIndex((entry) => entry.what === 'llm' && /Continue the task from here/.test(entry.text));
+        assert.ok(switchIndex !== -1 && continuationIndex > switchIndex, 'the continuation starts only after the switch');
+        assert.deepEqual(log.filter((entry) => entry.what === 'extension-error'), [], 'the host reported no extension error');
+        // The startup `gh` gate notifies too (the stubbed `gh` fails), so this
+        // pins what the MOVE reports: no error-level notice and nothing about a
+        // warp failure.
+        const moveNotices = log.filter((entry) => entry.what === 'notify'
+          && (entry.level === 'error' || /warp/i.test(entry.message)));
+        assert.deepEqual(moveNotices, [], 'the move reported no failure to the user');
+        // The destination is a real fork of the source: the header names the
+        // parent session file the host wrote.
+        const destinationHeader = JSON.parse(fs.readFileSync(destinationFile, 'utf8').split('\n')[0]);
+        assert.equal(destinationHeader.parentSession, sourceFile, 'the destination is a fork of the source session');
+        await runtimeHost.dispose();
+      }
+    });
+  });
+});

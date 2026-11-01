@@ -108,7 +108,7 @@ function resetYolo() {
   yoloResponder = null;
 }
 
-async function loadExtension() {
+async function loadExtension({ sendUserMessage } = {}) {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
@@ -119,6 +119,7 @@ async function loadExtension() {
     registerCommand: (name, def) => { commands.set(name, def); },
     registerMessageRenderer: () => {},
     on: () => () => {},
+    ...(sendUserMessage ? { sendUserMessage } : {}),
     events: {
       emit: (channel, payload) => {
         if (typeof yoloResponder === 'function') yoloResponder(channel, payload);
@@ -189,7 +190,7 @@ describe('/herdr-gentle:warp outside a Git checkout (S11)', { concurrency: false
     });
     try {
       const outside = plainDir('tool-outside');
-      const { tools } = await loadExtension();
+      const { tools } = await loadExtension({ sendUserMessage: () => { throw new Error('must not dispatch outside a repository'); } });
       const tool = tools.get('worktree_warp');
       assert.ok(tool, 'expected worktree_warp to be registered');
       const switched = [];
@@ -471,6 +472,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('wired-create-open');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
@@ -479,25 +481,37 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: driver.mount });
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.customs.length, 2, 'the selector then the create panel mounted');
+      // S7: `esc` on the create panel cancels the CREATION and hands the
+      // selector back, so the flow mounts the selector, the create panel, then
+      // the selector again — closing that one is what ends it.
+      assert.equal(built.customs.length, 3, 'the selector, the create panel, then the selector again');
       assert.equal(built.customs[1].overlay, true, 'the create panel is an overlay too');
+      assert.equal(built.customs[2].overlay, true, 'the returned selector is the same bottom overlay');
       assert.ok(!built.notes.some(([message]) => /nothing was created/.test(message)), 'no create failure');
     } finally {
       restoreEnv();
     }
   });
 
-  test("the panel payload reaches the existing creation path: the branch is created, registered and warped into", async () => {
+  // S7: creation is CREATION. The panel payload still reaches the one
+  // creation path (same branch, same registry row), and then the SELECTOR
+  // comes back with a fresh listing so the human picks any checkout —
+  // including the one just created. Nothing warps on its own any more: the
+  // created checkout is a row, never an automatic move.
+  test('the panel payload creates the branch and the selector comes back with it selectable (S7)', async () => {
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
     try {
       const root = makeRepo('wired-create-run');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
-      const { commands, mod } = await loadExtension();
+      const { commands } = await loadExtension();
       let mounts = 0;
+      let returnedSelector = null;
+      let switchesAfterCreation = null;
       built.ctx.ui.custom = async (factory, options) => {
         mounts += 1;
         built.customs.push(options);
@@ -519,11 +533,22 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
                 view.handleInput('c'); // S6: the create hotkey
                 return;
               }
-              view.handleInput('\x1b[B'); // the inline type list moves to Bug fix
-              view.handleInput('\x1b[A'); // and back to Feature, the expected type
-              view.handleInput('\t'); // Tab hands the flow to the name field
-              for (const char of 'panel-change') view.handleInput(char);
-              view.handleInput('enter'); // enter creates
+              if (mounts === 2) {
+                view.handleInput('\x1b[B'); // the inline type list moves to Bug fix
+                view.handleInput('\x1b[A'); // and back to Feature, the expected type
+                view.handleInput('\t'); // Tab hands the flow to the name field
+                for (const char of 'panel-change') view.handleInput(char);
+                view.handleInput('enter'); // enter creates
+                return;
+              }
+              // S7: the SELECTOR is back — nothing has been warped yet.
+              returnedSelector = view;
+              switchesAfterCreation = built.switches.length;
+              const others = view.state.checkouts.filter((entry) => entry.path !== root);
+              const at = others.findIndex((entry) => entry.name === 'feat-panel-change');
+              assert.ok(at >= 0, `the created checkout is a selectable row (${JSON.stringify(others.map((e) => e.name))})`);
+              for (let step = 0; step < at; step += 1) view.handleInput('\x1b[B');
+              view.handleInput('\r'); // now the human chooses it
             } catch (err) {
               clearTimeout(timer);
               reject(err);
@@ -540,8 +565,235 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       assert.equal(created.thread, 'wired-thread');
       assert.deepEqual(created.issues, [], 'S6: a created row carries no issue association');
       assert.equal(created.odd, null, 'S6: a created row carries no odd association');
-      assert.equal(built.switches.length, 1, 'the session warped into the new worktree');
-      assert.deepEqual(built.notes, [], 'creation then warp is silent on success');
+      // S7: the panel closed into the selector, not into a warp.
+      assert.equal(mounts, 3, 'the selector mounted again after the creation panel closed');
+      assert.ok(returnedSelector !== null, 'the returning surface is the warp selector');
+      assert.equal(switchesAfterCreation, 0, 'S7: creating never warps by itself');
+      // ...and the human picking that row is the ONE warp of this flow.
+      assert.equal(built.switches.length, 1, 'the chosen checkout is where the session went');
+      assert.equal(calls[0][0], 'forkFrom', 'the first visit to a fresh checkout forks');
+      assert.equal(calls[0][2], created.path, 'the warp landed in the created checkout');
+      assert.deepEqual(built.notes, [], 'creating and warping are silent on success');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // S7: a REFUSED creation must say WHY. The create path answers a TOOL result
+  // (`{content:[{type:"text",text}], isError}`), not a warp failure (`{text}`),
+  // so reading `.text` off it notified `undefined` and the human saw no reason
+  // at all — the flow just closed. The refusal is reported in the create path's
+  // own words, the selector comes back, and nothing was created.
+  test('a refused creation reports the create path\'s own reason and mutates nothing (S7)', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-refused');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      // The canonical target of the branch the panel derives is occupied by a
+      // FILE: the occupancy guard refuses before any branch or registry write.
+      const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-occupied-change');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, 'occupant\n');
+      const before = createdState(root);
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+      const { commands } = await loadExtension();
+      let mounts = 0;
+      built.ctx.ui.custom = async (factory, options) => {
+        mounts += 1;
+        built.customs.push(options);
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+          const done = (value) => { clearTimeout(timer); resolve(value); };
+          let view;
+          try {
+            view = factory(hostTui, plainTheme, {}, done);
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+          }
+          const drive = () => {
+            try {
+              if (mounts === 1) {
+                view.handleInput('c'); // the create hotkey
+                return;
+              }
+              if (mounts === 2) {
+                view.handleInput('\t'); // Tab hands the flow to the name field
+                for (const char of 'occupied-change') view.handleInput(char);
+                view.handleInput('enter'); // enter asks to create it
+                return;
+              }
+              view.handleInput('\x1b'); // the returned selector closes: nothing chosen
+            } catch (err) {
+              clearTimeout(timer);
+              reject(err);
+            }
+          };
+          if (mounts === 1) drive();
+          else tick().then(drive);
+        });
+      };
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(mounts, 3, 'the selector came back after the refused creation');
+      assert.deepEqual(built.switches, [], 'a refused creation moves nothing');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.ok(fs.existsSync(target), 'the occupant is untouched');
+      const errors = built.notes.filter(([, level]) => level === 'error');
+      assert.equal(errors.length, 1, `exactly one refusal is reported, got ${JSON.stringify(built.notes)}`);
+      const [message] = errors[0];
+      assert.equal(typeof message, 'string', `the refusal carries text, never undefined (${JSON.stringify(built.notes)})`);
+      assert.ok(message.includes(target), `the refusal names the occupied path: ${message}`);
+      assert.match(message, /occup/i, `the create path's own reason reaches the human: ${message}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // S7: `esc` in the create panel cancels the CREATION, not the warp flow. The
+  // selector comes back with everything it offered before, so a human who
+  // changes their mind about the name still gets to pick any checkout —
+  // including one they just created — and `esc` on THAT selector is what
+  // closes the flow.
+  test('cancelling the create panel returns to the selector, and Esc there closes it (S7)', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-cancel');
+      addRegisteredWorktree(root, 'feat/one');
+      const before = createdState(root);
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+      const { commands } = await loadExtension();
+      let mounts = 0;
+      let returnedSelector = null;
+      let switchesAfterCancel = null;
+      built.ctx.ui.custom = async (factory, options) => {
+        mounts += 1;
+        built.customs.push(options);
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+          const done = (value) => { clearTimeout(timer); resolve(value); };
+          let view;
+          try {
+            view = factory(hostTui, plainTheme, {}, done);
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+          }
+          const drive = () => {
+            try {
+              if (mounts === 1) {
+                view.handleInput('c'); // the create hotkey
+                return;
+              }
+              if (mounts === 2) {
+                view.handleInput('\t'); // Tab hands the flow to the name field
+                for (const char of 'never-created') view.handleInput(char);
+                view.handleInput('\x1b'); // esc cancels the CREATION
+                return;
+              }
+              // the SELECTOR is back, with nothing created
+              returnedSelector = view;
+              switchesAfterCancel = built.switches.length;
+              view.handleInput('\x1b'); // esc on the selector closes the flow
+            } catch (err) {
+              clearTimeout(timer);
+              reject(err);
+            }
+          };
+          if (mounts === 1) drive();
+          else tick().then(drive);
+        });
+      };
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(mounts, 3, 'the selector remounted after the create panel was cancelled');
+      assert.ok(returnedSelector !== null, 'the returning surface is the warp selector');
+      assert.equal(switchesAfterCancel, 0, 'a cancelled creation moves nothing');
+      assert.deepEqual(built.switches, [], 'esc on the returned selector closes without a move');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      const others = returnedSelector.state.checkouts.filter((entry) => entry.path !== root);
+      assert.ok(
+        others.some((entry) => entry.name === 'feat-one'),
+        `the existing checkouts are offered again (${JSON.stringify(others.map((entry) => entry.name))})`,
+      );
+      assert.ok(!others.some((entry) => entry.name === 'feat-never-created'), 'the cancelled name was never created');
+      assert.deepEqual(built.notes, [], 'cancelling is silent');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S7: leaving the returned selector without choosing moves nothing', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-back');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      const calls = [];
+      const sessionFile = sessionFileIn();
+      const built = makeWiredCtx({
+        cwd: root,
+        FakeSM: makeFakeSM(calls),
+        sessionFile,
+        sessionDir: path.dirname(sessionFile),
+        calls,
+        mount: async () => null,
+      });
+      const { commands } = await loadExtension();
+      let mounts = 0;
+      let switchesAfterCreation = null;
+      built.ctx.ui.custom = async (factory) => {
+        mounts += 1;
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+          const done = (value) => { clearTimeout(timer); resolve(value); };
+          let view;
+          try {
+            view = factory(hostTui, plainTheme, {}, done);
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+          }
+          const drive = () => {
+            try {
+              if (mounts === 1) view.handleInput('c');
+              else if (mounts === 2) {
+                view.handleInput('\t');
+                for (const char of 'back-out') view.handleInput(char);
+                view.handleInput('enter');
+              } else {
+                switchesAfterCreation = built.switches.length;
+                view.handleInput('\x1b'); // close the selector: nothing chosen
+              }
+            } catch (err) {
+              clearTimeout(timer);
+              reject(err);
+            }
+          };
+          if (mounts === 1) drive();
+          else tick().then(drive);
+        });
+      };
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(mounts, 3, 'the selector came back after the creation');
+      assert.equal(switchesAfterCreation, 0, 'S7: the creation did not warp');
+      assert.deepEqual(built.switches, [], 'closing the selector moves nothing');
+      assert.deepEqual(built.notes, [], 'and it notifies nothing');
+      assert.ok(registryLib.readRegistry(root).worktrees.some((row) => row.branch === 'feat/back-out'), 'the created branch stays registered');
     } finally {
       restoreEnv();
     }
@@ -967,7 +1219,9 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         const built = wiredCtx(root, driver);
         const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 2, 'the popup then the create panel mounted');
+        // S7: the cancel returns to the selector (the third mount), where `esc`
+        // is the key that closes the flow. Nothing was written either way.
+        assert.equal(driver.mounts(), 3, 'the popup, the create panel, then the popup again');
         assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) created nothing and wrote nothing');
         assert.equal(watcher.writes().length, 0, 'zero registry writes');
         assert.equal(watcher.creations().length, 0, 'zero checkout creations');
@@ -1034,6 +1288,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'first-mutation-thread' }));
     try {
       const root = makeRepo('first-mutation-create');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const before = createdState(root);
       const watcher = watchMutations();
@@ -1062,8 +1317,9 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         assert.ok(after.branches.includes('feat/nothing-yet'), `the derived branch exists (${after.branches})`);
         assert.equal(after.checkouts.length, before.checkouts.length + 1, 'the checkout was created');
         assert.ok(after.rows.some((row) => row.startsWith('feat/nothing-yet ')), 'the registry row was created');
-        assert.equal(built.switches.length, 1, 'the session warped into the new checkout');
-        assert.deepEqual(built.notes, [], 'creation then warp is silent');
+        // S7: the creation ends in the selector, never in an automatic warp.
+        assert.equal(built.switches.length, 0, 'S7: creating does not warp on its own');
+        assert.deepEqual(built.notes, [], 'creation is silent');
       } finally {
         watcher.restore();
       }
@@ -1072,12 +1328,15 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('a refused session preflight performs no mutation at all: no branch, no checkout, no write', async () => {
-    // A resolvable thread identity: without the preflight this fixture WOULD
-    // create, so a preflight that ran after the first mutation is caught.
+  // S7: the fork-source preflight existed ONLY because the creation used to
+  // end in a warp (a fork needs a session to fork from). Creation no longer
+  // warps, so a session Pi has not written to disk yet creates normally: the
+  // checkout and its registry row are the whole outcome.
+  test('creation needs no fork source: a session with no persisted file still creates (S7)', async () => {
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'refused-preflight-thread' }));
     try {
       const root = makeRepo('refused-preflight');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const before = createdState(root);
       const watcher = watchMutations();
@@ -1089,7 +1348,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           for (const char of 'refused-create') view.handleInput(char);
           confirmedAt = watcher.events.length;
           view.handleInput('enter'); // the explicit confirm key
-        }]);
+        }, ['\x1b']]);
         const built = makeWiredCtx({
           cwd: root,
           FakeSM: makeFakeSM([]),
@@ -1101,14 +1360,15 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
-        assert.deepEqual(watcher.kinds(), [], 'a refused preflight mutates nothing');
-        assert.equal(watcher.writes().length, 0, 'zero registry writes');
-        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
-        assert.deepEqual(createdState(root), before, 'no branch, no checkout, no registry row');
-        assert.deepEqual(built.notes, [[
-          'warp: no persisted session for this session and nothing in memory to carry over; open or write the session first and retry',
-          'error',
-        ]], 'the refusal is reported instead of a half-made worktree');
+        assert.deepEqual(watcher.kinds(), ['checkout-create', 'registry-write'], 'one creation then one write, in that order');
+        const after = createdState(root);
+        assert.equal(after.branches.length, before.branches.length + 1, 'the branch was created');
+        assert.ok(after.branches.includes('fix/refused-create'), `the derived branch exists (${after.branches})`);
+        assert.equal(after.checkouts.length, before.checkouts.length + 1, 'the checkout was created');
+        assert.ok(after.rows.some((row) => row.startsWith('fix/refused-create ')), 'the registry row was created');
+        assert.equal(driver.mounts(), 3, 'the selector came back after the creation');
+        assert.deepEqual(built.switches, [], 'S7: and nothing was warped');
+        assert.deepEqual(built.notes, [], 'the creation is silent');
       } finally {
         watcher.restore();
       }
@@ -1216,6 +1476,218 @@ describe('S1: the selector paints before the facts, then enriches', { concurrenc
       view.handleInput('\x1b');
       await handler;
       assert.deepEqual(built.notes, [], 'Esc stays silent');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S2: creating from the panel asks about the INVOKING checkout's uncommitted
+// work. Copying is a choice the human makes at creation time — the new
+// checkout is either born empty from the commit or carries the pending work —
+// and the question is asked ONCE, before anything is created, so a cancel
+// leaves no branch, no checkout and no registry row. The answer travels as the
+// create path's own `changes` selection ('all' or 'none'), never as a second
+// copy implementation.
+// ---------------------------------------------------------------------------
+
+// A fixture whose checkout sits on local main with one tracked file modified
+// in the working tree and one untracked file pending.
+function makePendingChangeRepo(tag) {
+  const root = makeRepo(tag);
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
+  git(root, ['add', 'a.txt']);
+  git(root, ['commit', '-m', 'a']);
+  // S2: the worktree is born from local main, so the committed file must be in
+  // main's tree for the pending change to apply.
+  git(root, ['branch', '-f', 'main', 'HEAD']);
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\ntwo\n');
+  fs.writeFileSync(path.join(root, 'b.txt'), 'fresh\n');
+  return root;
+}
+
+const panelTarget = (root, slug) => path.join(path.dirname(root), `${path.basename(root)}-worktrees`, slug);
+
+// Drive the real command: the selector opens, `c` opens the create panel, the
+// panel types `name` and confirms, and the RETURNED selector closes with Esc.
+// `mounts` is the observable number of overlays the run produced.
+async function driveCreateFlow({ root, name, beforeFlow }) {
+  const calls = [];
+  const FakeSM = makeFakeSM(calls);
+  const sessionFile = sessionFileIn();
+  const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+  const { commands, mod } = await loadExtension();
+  const mounts = [];
+  built.ctx.ui.custom = async (factory, options) => {
+    mounts.push(options);
+    const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+      const done = (value) => { clearTimeout(timer); resolve(value); };
+      let view;
+      try {
+        view = factory(hostTui, plainTheme, {}, done);
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+        return;
+      }
+      const drive = () => {
+        try {
+          if (mounts.length === 1) {
+            view.handleInput('c'); // the create hotkey
+            return;
+          }
+          if (mounts.length === 2) {
+            view.handleInput('\t'); // Tab hands the flow to the name field
+            for (const char of name) view.handleInput(char);
+            view.handleInput('enter'); // enter asks to create it
+            return;
+          }
+          view.handleInput('\x1b'); // the returned selector closes: nothing chosen
+        } catch (err) {
+          clearTimeout(timer);
+          reject(err);
+        }
+      };
+      if (mounts.length === 1) drive();
+      else tick().then(drive);
+    });
+  };
+  if (typeof beforeFlow === 'function') beforeFlow(mod);
+  await warpDef(commands).handler('', built.ctx);
+  return { built, mounts, mod };
+}
+
+describe('S2: creating from the panel offers the pending changes', { concurrency: false }, () => {
+  test('a dirty checkout asks once, and "YES COPY" carries the pending work into the new checkout', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-copy-yes');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-pending-change');
+      track(path.dirname(target));
+      let asked = 0;
+      const { built, mounts } = await driveCreateFlow({
+        root,
+        name: 'pending-change',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; }),
+      });
+      // The question is asked once, and only the selector surfaces mount.
+      assert.equal(asked, 1, 'the pending work is reported and the human is asked');
+      assert.equal(mounts.length, 3, 'selector, create panel, selector: the question is not a third overlay');
+      // The pending work reached the new checkout, and the source keeps it.
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the tracked change travelled');
+      assert.equal(fs.readFileSync(path.join(target, 'b.txt'), 'utf8'), 'fresh\n', 'the untracked file travelled');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+      const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.branch === 'feat/pending-change');
+      assert.ok(row, 'the created checkout is registered');
+      assert.deepEqual(built.switches, [], 'creating still warps nothing: the human picks afterwards');
+      assert.deepEqual(built.notes, [], 'nothing is reported: the question was the only interaction');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('"NO COPY" creates the checkout from the commit and copies nothing', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-copy-no');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-clean-change');
+      track(path.dirname(target));
+      let asked = 0;
+      const { mounts } = await driveCreateFlow({
+        root,
+        name: 'clean-change',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'no'; }),
+      });
+      assert.equal(asked, 1, 'the dirty checkout is reported');
+      assert.equal(mounts.length, 3, 'the selector returns after the creation');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\n', 'the checkout is born from the commit');
+      assert.equal(fs.existsSync(path.join(target, 'b.txt')), false, 'nothing was copied');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('cancelling the question creates nothing and returns to the selector', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-copy-cancel');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-uncopied-change');
+      track(path.dirname(target));
+      const before = createdState(root);
+      let asked = 0;
+      const { built, mounts } = await driveCreateFlow({
+        root,
+        name: 'uncopied-change',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return null; }),
+      });
+      assert.equal(asked, 1, 'the question was asked');
+      assert.equal(mounts.length, 3, 'closing the question hands the selector back');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.equal(fs.existsSync(target), false, 'the target path was never created');
+      assert.deepEqual(built.switches, [], 'nothing moved');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The question needs a REAL answer. A checkout whose pending changes cannot
+  // be read is NOT clean: creating anyway would silently leave the human's
+  // pending work behind right after they asked for a worktree. The creation
+  // therefore fails closed — one visible reason, no branch, no checkout, no
+  // registry row — and the selector comes back like every other closed flow.
+  // The failure is produced through git itself: a corrupt index breaks
+  // `git diff`/`git status` (the summary's reads) while `git worktree list`
+  // still answers, so the selector itself mounts normally.
+  test('an unreadable pending-change summary refuses the creation with a visible reason', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-summary-fail');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      fs.writeFileSync(path.join(root, '.git', 'index'), 'this is not a git index\n');
+      const before = createdState(root);
+      const target = panelTarget(root, 'feat-unreadable-change');
+      track(path.dirname(target));
+      const { built, mounts } = await driveCreateFlow({ root, name: 'unreadable-change' });
+      assert.equal(mounts.length, 3, 'the selector comes back instead of ending the flow');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.equal(fs.existsSync(target), false, 'the target path was never created');
+      assert.deepEqual(built.switches, [], 'nothing moved');
+      const errors = built.notes.filter(([, level]) => level === 'error');
+      assert.equal(errors.length, 1, `exactly one visible refusal, got ${JSON.stringify(built.notes)}`);
+      const [message] = errors[0];
+      assert.equal(typeof message, 'string', 'the refusal carries text, never undefined');
+      assert.match(message, /pending change/i, `the reason names what could not be read: ${message}`);
+      assert.match(message, /nothing was created/, 'and states that nothing was written');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a clean checkout never asks and creates exactly as before', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-copy-clean');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-clean-panel');
+      track(path.dirname(target));
+      let asked = 0;
+      const { mounts } = await driveCreateFlow({
+        root,
+        name: 'clean-panel',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; }),
+      });
+      assert.equal(asked, 0, 'a clean checkout never prompts');
+      assert.equal(mounts.length, 3, 'the selector returns after the creation');
+      assert.equal(fs.existsSync(target), true, 'the checkout was created');
     } finally {
       restoreEnv();
     }

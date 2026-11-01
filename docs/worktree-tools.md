@@ -28,10 +28,28 @@ destination. Expanded bodies use ordered labelled rows for paths, branches,
 status and warnings, rather than repeating raw output dumps: the create card
 is `status:`, `path:`, `registered:` and `codegraph:` — no `name:` and no
 `branch:` row, because the name is implied by the path and the branch is the
-tool's own input (S8); a listing entry is its identity — name, branch, path,
-kind and status — and no card row carries an issue number or an ODD document,
-since a worktree carries neither. Failure diagnostics remain visible. The cards
-follow gentle-shell's float recipe (`gentle-shell/lib/shell-card.ts`,
+tool's own input (S8); a listing entry is its identity — name, branch, path
+and thread — and no card row carries an issue number or an ODD document,
+since a worktree carries neither. Failure diagnostics remain visible.
+
+S6 makes the expanded listing a LIST instead of one coupled column of label
+rows: every checkout is its own block (`<name> · <branch>`, then `path:`,
+then `thread:` when it has one), and exactly one blank row separates each
+block from the next — never a trailing one. Being listed IS the checkout's
+existence proof (a row whose path is gone is pruned and never listed), so the
+expanded body prints no `status: live`/`status: exists` row at all; the
+statuses that DO carry information ride the trailing cell of the entry's own
+identity row instead of costing a row each: `<name> · <branch> · missing` (the
+path exists but git no longer lists the checkout) and
+`<name> · <branch> · unregistered` (a live checkout the registry does not own,
+only with `all: true`). The count row `checkouts: N` still leads, and the
+collapsed card is unchanged (`listed: N checkouts`). The card is only the
+human half: the agent-facing listing is minimized the same way in
+`lib/worktree-model-result.js` (see "Model-facing listing text" below), and
+`details.worktrees[]` keeps `status` and `kind` byte for byte, so a caller
+still gets the structured facts neither display repeats.
+
+The cards follow gentle-shell's float recipe (`gentle-shell/lib/shell-card.ts`,
 `CARD_STYLE.FLOAT`): one-column transparent margins, every row padded to the
 full target width, a blank padding row above the heading and between heading
 and body, and every row painted behind the tone background (`toolSuccessBg`
@@ -63,21 +81,21 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 
 | Tool | Parameters | Approval | Success text |
 | --- | --- | --- | --- |
-| `worktree_create` | `branch: string` (required — the branch is the whole input; there is no `issues` or `odd`, and a caller that still sends one is neither obeyed nor refused) | None — a create touches no existing data: the checkout and its registry row are both new, so it never asks, exactly as the panel's create path never did | `created: <slug> · <branch>` (`· already exists` only when the REQUESTED branch already has a worktree — another checkout the session owns never answers for it), then `path:`, then `registered: new|replaced|appended|unchanged` (what the registry write actually did: a new row, a row that replaced this branch's stale one, a row recorded beside a live checkout that kept the branch, or no write at all because the requested branch's checkout was returned), then exactly one CodeGraph row — `codegraph: initialized` / `codegraph: not initialized` on the existing-checkout path (the index state read from the checkout, never initialized there) and `codegraph: initialized`, `codegraph: not initialized (<reason>)`, or `codegraph: not run (<reason>)` for a fresh create — then `changes: already registered for this session` when the created checkout joined the current session's scope, then one `warning:` row per summarized warning. A worktree carries no issue or ODD association, so no association is verified, written or printed. A session may own several checkouts: the requested branch is created and registered even when this session already owns another one, and idempotency is keyed on the requested branch alone. A real creation registers the checkout through gentle-shell's `session_worktree_register` host tool when that tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when it is unavailable or its call fails, nothing is appended and the create still succeeds. The four principal-directory links are handled by the creation hooks described below |
-| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | `worktrees: <count> (name · branch · path · kind · status)` then one ` · `-joined row per checkout in listing order (principal, the session checkout when distinct, then the rest), each row being that checkout's identity alone — a worktree carries no issue or ODD association, so no such cell is printed even when the registry still stores one — then one `warning:` row per prune warning |
+| `worktree_create` | `branch: string` (required), `changes: "all" \| "none" \| string[]` (**required** — the pending changes of the invoking checkout to carry into the new worktree: `"all"` copies every uncommitted change, `"none"` copies nothing so the worktree is born from the commit, an array of checkout-relative paths copies only those. The field is mandatory twice over: the host validates the declaration before the tool runs, and the create itself refuses an omitted, `null` or EMPTY/whitespace-only string before anything is written (the only child that ran before that check is the read-only branch-name probe, which mutates nothing) — so nothing is ever copied or left behind on the caller's behalf, and "no text" is never read as "copy nothing". The three accepted values are exactly the word `"all"`, the word `"none"`, and a list of checkout-relative paths (an empty list is a legal, if empty, list). A value that is none of the three forms, an unknown file, or a destination that already modifies a selected path refuses the whole create before anything is written. There is no `issues` or `odd`, and a caller that still sends one is neither obeyed nor refused) | None — a create touches no existing data: the checkout and its registry row are both new, so it never asks, exactly as the panel's create path never did | `created: <slug> · <branch>` (`· already exists` only when the REQUESTED branch already has a worktree — another checkout the session owns never answers for it), then `path:`, then `registered: new|replaced|appended|unchanged` (what the registry write actually did: a new row, a row that replaced this branch's stale one, a row recorded beside a live checkout that kept the branch, or no write at all because the requested branch's checkout was returned), then exactly one CodeGraph row — `codegraph: initialized` / `codegraph: not initialized` on the existing-checkout path (the index state read from the checkout, never initialized there) and `codegraph: initialized`, `codegraph: not initialized (<reason>)`, or `codegraph: not run (<reason>)` for a fresh create — then `changes: already registered for this session` when the created checkout joined the current session's scope, then `copied: N files, +N/-N` when the selection transferred pending work, then one `warning:` row per summarized warning. A worktree carries no issue or ODD association, so no association is verified, written or printed. A session may own several checkouts: the requested branch is created and registered even when this session already owns another one, and idempotency is keyed on the requested branch alone. A real creation registers the checkout through gentle-shell's `session_worktree_register` host tool when that tool is available (the created checkout joins the current session's `/gentle:changes` scope, so the agent does not re-register it); when it is unavailable or its call fails, nothing is appended and the create still succeeds. The four principal-directory links are handled by the creation hooks described below |
+| `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | `worktrees: <count> (name · branch · path)` then one ` · `-joined row per checkout in listing order (principal, the session checkout when distinct, then the rest), each row being that checkout's identity — `<name> · <branch> · <path>` — plus exactly ONE trailing state cell when the row is not the ordinary registered-and-live case: `missing` (the path exists but git no longer lists the checkout) or `unregistered` (a live checkout the registry does not own; only with `all: true`). Being listed IS the existence proof — a checkout whose path is gone is pruned before it can be listed — so no `live`/`exists` cell is ever printed, and a `kind` that only repeats the row is not a cell either (`principal` repeats the row's own name, `agent` repeats "a registered worktree", `unregistered` repeats the status beside it); a kind the row does not already state still prints (S6). No issue or ODD cell appears: a worktree carries no association, so none is printed even when the registry still stores one. Then one `warning:` row per prune warning. `details.worktrees[]` keeps `name`, `path`, `branch`, `thread`, `status` and `kind` unchanged, so a caller retains every structured fact the compact text elides |
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`), naming pending changes as `Pending changes: N files, +N/-N` when dirty and nothing when clean; waived only when gentle-shell YOLO is active for this live session AND the checkout is proven clean — a dirty checkout and an unreadable summary both keep asking. A refusal keeps checkout and entry, and `force` still comes only from the caller | `outcome: removed`, then `name:`, `branch:`, `path:` and `branch state: kept|deleted`, plus `session: warped to <name> · <path>` when a live session was warped out first, `herdr workspace: <status> · <notice>` when that step reconciled, skipped or half-failed, and one `warning:` row per summarized warning. No association line, association warning or dropped-document list can appear: a worktree carries no issue and no ODD document |
 | `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `outcome: opened|resumed`, then `worktree:`, `branch:`, `path:`, `session:`, `workspace:`, `pane:` and `agent:` — the routing ids the caller needs to reach the session it just started |
-| `worktree_warp` | `name: string` (required — the worktree NAME `worktree list` prints, or the checkout path; name first then path), `changes?: string \| string[]` (optional — pending changes to copy into the destination checkout: omit or pass `""` or `[]` for no copy, `"all"` for everything, a list of files for selected changes only; there is no selector in the tool) | None — never opens a selector (selectors are human-only); warping to the checkout the session already runs in changes nothing | `outcome: moved|already there`, then `from: <source name> · <path>`, `to: <name> · <path>` (the continuation target) and `branch:`; a continuation turn keeps working in the new checkout |
+| `worktree_warp` | `name: string` (required — the worktree NAME `worktree list` prints, or the checkout path; name first then path), `changes?: string \| string[]` (optional — pending changes to copy into the destination checkout: omit or pass `""` or `[]` for no copy, `"all"` for everything, a list of files for selected changes only; the word `"none"` is not one of its values — that spelling belongs to `worktree_create` alone; there is no selector in the tool) | None — never opens a selector (selectors are human-only); warping to the checkout the session already runs in changes nothing | `outcome: handoff queued` — the tool QUEUES the move and never performs it: `worktree warp: handoff queued — the session moves when this turn ends`, then `to: <name>`, `path: <checkout path>`, `branch: <branch>` (plus `copied: N files` when its `changes` selection was transferred). The move itself is the queued `/herdr-gentle:warp` command, which switches after the turn settles and starts the continuation turn in the new checkout. `outcome: already there` keeps its byte-identical no-op text. The tool never claims a switch it did not perform, and its result carries no completed-move row |
 
-The session moves between checkouts through `/herdr-gentle:warp <name>` (its own command for humans — a selector, or an explicit name) and through the `worktree_warp` agent tool (a required name-or-path, an optional `changes` selection, no selector, then a continuation turn so the agent keeps working). The command's success text is the two-line compact `moved: <name> · <branch>` / `to: <name> · <branch>` (a raw path only when the checkout left sits outside every known checkout); the tool's result text is the S42 card rows (`moved: <name>` / `to: <name>` plus `path: now in "<path>"` / `branch: now in "<branch>"`). Warping to the checkout the session already runs in returns `worktree warp: <name> (already there)` (byte-identical text) but shows nothing and changes nothing.
+The session moves between checkouts through `/herdr-gentle:warp <name>` (its own command for humans — a selector, or an explicit name) and through the `worktree_warp` agent tool (a required name-or-path, an optional `changes` selection, no selector, then a continuation turn so the agent keeps working). The host keeps session control on the COMMAND context, so the tool never switches anything itself (S14): it resolves, validates, copies the requested changes and QUEUES that command, whose handler waits for idle and then moves the session with the same fork/resume rules the human path uses — see [The agent warp is a queued handoff](#the-agent-warp-is-a-queued-handoff). The command's success text is the two-line compact `moved: <name> · <branch>` / `to: <name> · <branch>` (a raw path only when the checkout left sits outside every known checkout); the tool's result is the pending handoff rows (`to:` / `path:` / `branch:`, never `moved:`), and the ONE `moved:`-shaped confirmation is the styled card the switched-to session paints after the real move. Warping to the checkout the session already runs in returns `worktree warp: <name> (already there)` (byte-identical text) but shows nothing and changes nothing, and it queues nothing.
 
-Pending changes travel only when asked (S61). Before the command moves the session it summarizes the source checkout's uncommitted changes through the shared `lib/worktree-changes.js` helper (staged and unstaged combined against HEAD, untracked files measured from disk, deletions and renames covered, binary files labelled never faked — `N files, +N/-N`). A clean checkout warps with no prompt; a dirty one opens a concise `YES COPY` / `NO COPY` choice where `Esc`/`Ctrl+C` cancels the warp with no switch and no copy. `YES COPY` copies every pending change into the destination checkout and then warps ordinarily; `NO COPY` warps ordinarily with nothing copied. The copy never mutates the source or either index, and a destination that already modifies a selected path rejects the whole warp with nothing copied, warped or switched. The tool's `changes` option is the same transfer without a prompt: omitted/empty means no copy, `"all"` copies everything, a list of files copies only those; an unknown file or a destination overlap fails the tool with no switch.
+Pending changes travel only when asked (S61). Before the command moves the session it summarizes the source checkout's uncommitted changes through the shared `lib/worktree-changes.js` helper (staged and unstaged combined against HEAD, untracked files measured from disk, deletions and renames covered, binary files labelled never faked — `N files, +N/-N`). A clean checkout warps with no prompt; a dirty one opens a concise `YES COPY` / `NO COPY` choice where `Esc`/`Ctrl+C` cancels the warp with no switch and no copy. `YES COPY` copies every pending change into the destination checkout and then warps ordinarily; `NO COPY` warps ordinarily with nothing copied. The copy never mutates the source or either index, and a destination that already modifies a selected path rejects the whole warp with nothing copied, warped or switched. The tool's `changes` option is the same transfer without a prompt: omitted/empty means no copy, `"all"` copies everything, a list of files copies only those; an unknown file or a destination overlap fails the tool with no switch. Its value set is UNCHANGED by the create work: an omitted, `""` or `[]` selection copies nothing, and any other string — `"none"` included — is refused with the original message (`invalid changes selection "<value>": pass "all", a list of files, or leave it empty for no copy`). `worktree_create` is the only surface that accepts the word `"none"`, and it adapts locally for it instead of widening this shared contract.
 
 Deleting a checkout confirms first unless gentle-shell YOLO is active for this live session **and** the checkout is proven clean: a checkout with pending changes is never waived, YOLO or not, and an unreadable summary reads as dirty. The confirmation names the checkout's pending changes when it has any (`Pending changes: N files, +N/-N`, read through the same helper; a clean checkout omits the warning). The shared close still needs `force: true` for a dirty checkout — the confirmation alone never smuggles force in — except in the warp selector's `Ctrl+D` flow, where the explicit Yes for that approved row passes `force: true` deliberately for exactly that target (never the principal, never protected/foreign, whose refusals run first).
 
 Structured `details` on success:
 
-- create: `{path, branch, registered, codegraph, hooks, warnings, pruned, replacedRows, changesRegistered, alreadyExists?}` —
+- create: `{path, branch, registered, codegraph, hooks, warnings, pruned, replacedRows, changesRegistered, base, copied?, copyError?, alreadyExists?}` —
   `registered` is what the registry write did (`new`, `replaced`,
   `appended`, or `unchanged` when the requested branch's checkout was
   returned without a write); `alreadyExists: true` appears only on that
@@ -91,7 +109,16 @@ Structured `details` on success:
   `replacedRows` lists the stale registry rows dropped by the one-owner-per-path
   rule below (`[{branch, path}]`, empty when nothing shared the target path);
   The `link-principal-entries` hook reports directory-link outcomes in
-  `hooks.steps`; `changesRegistered` is `true` when the
+  `hooks.steps`; `base` is the base the NEW branch was created from, read
+  through one `git rev-parse` and reported, never guessed —
+  `{source: 'main', ref: 'main', commit}`. It is absent on an ADOPTED branch
+  (adoption needs no base) and on a refused create, and there is no fallback:
+  a repository without a local `main` refuses the create instead of reporting
+  some other base. `copied` is `{files, added, deleted,
+  paths}` for a selection that transferred pending work (absent when nothing
+  was copied); a copy the destination rejects keeps the created checkout,
+  reports `copyError` and returns an error result naming the worktree it did
+  make. `changesRegistered` is `true` when the
   created checkout was registered on the current session via
   `session_worktree_register` (the trailing `changes:` line is then present)
   and `false` otherwise;
@@ -143,13 +170,8 @@ Structured `details` on success:
   `{status: 'reconciled', closedWorkspace, closedWorkspaces, openedWorkspace, session}` or
   `{status: 'skipped' | 'reconciled-partial', notice, closedWorkspaces?, failedWorkspace?, ...}` (see the
   close sequence).
-- warp tool (`worktree_warp`, T40/S49): `{tool: 'worktree_warp', name, path, branch, kind, fromName, fromDesc, from, to, alreadyThere, cancelled, resumed}` — same `kind`/`alreadyThere`/`cancelled` shapes as the command; `resumed` is `true` when the destination's recorded session was resumed. The tool never awaits `waitForIdle` (a self-deadlock from inside a tool) and switches through `withSession`, emitting the S42 card from the fresh context and starting the continuation turn with `triggerTurn: true` and `deliverAs: "followUp"`; refusals list the available checkouts. Its card (through the tool-card contract) keeps the S42 shape: compact `moved: <name>` / `to: <name>` with names only, expanded showing the full result text with the `path:`/`branch:` rows.
-- warp (its own command, not a tool): `{name, path, branch, kind, alreadyThere,
-  cancelled}` — `kind` is `principal`, `agent`, or `unregistered` (a lone live
-  checkout the registry does not own); `alreadyThere` is `true`
-  only for the `worktree warp: <name> (already there)` no-op; `cancelled`
-  is `true` only when the session switch was cancelled, in which case the
-  forked target session file was removed and nothing else changed.
+- warp tool (`worktree_warp`, S14): `{tool: 'worktree_warp', handoff: true, pending: true, pendingName, pendingPath, pendingBranch, from, target, kind}` — a QUEUED handoff, never a move: the keys the card renders as completed-move rows (`fromName`, `fromDesc`, `name`, `path`, `branch`, `alreadyThere`, `resumed`, `cancelled`) are deliberately absent, so the card falls back to the result's own first line (`handoff queued`) instead of painting a switch that has not happened. Refusals keep the tool's own error text and list the available checkouts; the already-there no-op keeps `{name, path, branch, kind, alreadyThere: true, cancelled: false}`.
+- warp command (`/herdr-gentle:warp`, human path and interior of the tool's handoff): `{name, path, branch, kind, alreadyThere, cancelled}` — `kind` is `principal`, `agent`, or `unregistered` (a lone live checkout the registry does not own); `alreadyThere` is `true` only for the `worktree warp: <name> (already there)` no-op; `cancelled` is `true` only when the session switch was cancelled, in which case the forked target session file was removed and nothing else changed. A handoff invocation carries the same details and adds no field: the queued argument is an internal `@<token>`, not a documented surface.
 - session open: `{worktree, branch, path, paneId, workspaceId, sessionId,
   resumed, agentName, notify}` — exactly these nine keys. `worktree` is
   the printed NAME (the slug, even when a branch spelling was passed);
@@ -165,21 +187,42 @@ Model-facing listing text (pinned by the tool and model-result tests) —
 the registered tool returns the rows below, built from `details`:
 
 ```text
-worktrees: <count> (name · branch · path · kind · status)
-<name> · <branch> · <path> · principal · live
-<name> · <branch> · <path> · agent · live
-<name> · <branch> · <path> · agent · missing
-<name> · <branch> · <path> · unregistered · unregistered   # only with all: true
-warning: <summarized prune warning>                       # only when something was pruned
+worktrees: <count> (name · branch · path)
+<name> · <branch> · <path>
+<name> · <branch> · <path> · missing
+<name> · <branch> · <path> · unregistered            # only with all: true
+<name> · <branch> · <path> · <kind>                  # only when the row does not already say it
+warning: <summarized prune warning>                  # only when something was pruned
 ```
 
-A row is the checkout's identity and nothing else: no `issues` cell and no
-`odd` cell, because a worktree carries neither — and `details.worktrees[]`
-carries no `issues`, `assignedOdd` or `odd` field either, so the structured
-result matches the text. The registry's legacy association records are still
-preserved byte for byte (a listing rewrites nothing) and the checkout's
-`odd/` directory is never scanned for an inventory, so no stored data is lost
-and no read is spent on an association the tool will not publish.
+S6 picks the compact form the same way the expanded card does. The legend
+declares only the three cells every row carries; the state cell is trailing and
+self-describing, so it needs no column. A listing is read for what it names and
+for what is wrong with it, so exactly one state survives — `missing` (the path
+exists but git no longer lists the checkout) and `unregistered` (a live
+checkout the registry does not own, only with `all: true`) — while everything
+that only repeated the row is gone: `live`/`exists` (being listed IS the
+existence proof, and a vanished path is pruned before it can be listed), the
+`agent` kind (it means "a registered worktree", which the row already is), the
+`principal` kind (it repeats the row's own name) and the `unregistered` kind
+(it repeats the status beside it — stated once, never twice). A kind the row
+does not already state is still printed, because dropping it would hide a fact
+the details carry, and an existence spelling in `kind` (`live`/`exists`) is
+treated as that same ordinary case rather than earning a second cell. Removing
+those cells costs the reader nothing and saves the context they used to spend
+on rows that said nothing.
+
+A row is therefore the checkout's identity plus that one state: no `issues`
+cell and no `odd` cell, because a worktree carries neither — and
+`details.worktrees[]` carries no `issues`, `assignedOdd` or `odd` field
+either, so the structured result matches the text. The registry's legacy
+association records are still preserved byte for byte (a listing rewrites
+nothing) and the checkout's `odd/` directory is never scanned for an
+inventory, so no stored data is lost and no read is spent on an association
+the tool will not publish. The structured `details` keep every fact the text
+elides — `status` (`live`, `missing`, `unregistered`) and `kind`
+(`principal`, `agent`, `unregistered`) arrive complete, unchanged and in the
+same order, so compacting the text never removes a field a caller can act on.
 
 The raw text the tool returns is the same terse line format the backend
 tests pin:
@@ -455,7 +498,11 @@ anything it does not own:
      anything is removed. A plain tool context cannot warp (session
      control lives on the command context), so from there this fails
      closed with the warp's own message instead of removing the
-     checkout from under the session.
+     checkout from under the session. It is deliberately NOT turned into
+     a queued handoff (S14): a queued switch lands only after the turn
+     settles, so the removal would run while the session is still parked
+     in the checkout being deleted. The agent warps out first with
+     `worktree_warp` (or `/herdr-gentle:warp principal`) and closes after.
 3. **Reconcile the Herdr workspaces — only after such a warp, group-aware (S35/S36).** Herdr
    exposes no workspace path move, so the recorded fallback runs: EVERY
    workspace of the removed checkout's group is closed in order — the
@@ -757,6 +804,68 @@ something to reset. The
 `gentle-sidebar-mode.json`, `gentle-moshi.json` and
 `gentle-worktree-mode.json` files are rewritten, never removed.
 
+### The agent warp is a queued handoff (S14)
+
+The host keeps session control — `waitForIdle` and `switchSession` — on the
+**extension command context**. A tool's context has neither, and a tool that
+awaited `waitForIdle` would wait for the very turn it runs inside (a
+self-deadlock). The agent-facing `worktree_warp` tool therefore cannot move the
+session, and it does not pretend to: it resolves, validates and copies the
+requested changes exactly as before, then **queues** the move to the one verb
+that can perform it.
+
+How the queue works: the tool calls
+`pi.sendUserMessage("/herdr-gentle:warp @<token>", { expandPromptTemplates:
+true })` — the host's documented route for a tool that needs a command (its own
+`examples/extensions/reload-runtime.ts` does the same for `reload`). The host
+dispatches a registered extension command immediately, even while the turn is
+still running, and binds the command context to it. The token is base64url of
+`{v, name, target, from, branch}`: one opaque argument whose charset cannot
+carry a space, a newline, a control character, a second argument or a second
+command, so nothing from a checkout name or path can be injected into the
+command line. The command decodes it, refuses anything malformed (naming nothing
+it carried), and then warps through the same resolver, fork/resume rules,
+records, rename and card a human invocation uses.
+
+What the handoff guarantees:
+
+- The switch waits for the turn. The command handler calls `await
+  ctx.waitForIdle()` first, so the assistant message, every tool result and the
+  session's own writes are persisted before the session is replaced; nothing is
+  torn mid-turn and the source session keeps its whole transcript.
+- The tool never claims the move. Its result is the pending handoff, its first
+  line says the session moves when the turn ends, and its details carry none of
+  the completed-move rows the tool card renders. The ONE `Warp · moved` card
+  comes from the switched-to session, after the real switch.
+- The move is exactly one switch. A queued command holds a command context of
+  the runtime it was queued in; if a second handoff from the same turn ever won
+  the race, the loser's context is stale and the host refuses it
+  (`This extension ctx is stale after session replacement`), so it cannot switch
+  a second time.
+- Drift fails closed. The handoff records the destination it resolved and the
+  checkout the session was in; when the command runs, the destination must still
+  be the checkout the name resolves to AND the session must still sit in the
+  recorded source. Otherwise it refuses (`changed since the handoff was queued`
+  / `the session moved since the handoff was queued`) and changes nothing — the
+  changes were never copied to a checkout the session then did not enter.
+- A handoff never prompts. The interactive `YES COPY` / `NO COPY` choice is a
+  human path; the tool's `changes` selection is the same transfer without a
+  question, so a queued command can never block on a picker nobody asked for.
+- The work continues. The switched-to session sends the card and
+  `Continue the task from here.` with `triggerTurn: true` and `deliverAs:
+  "followUp"` — on the fork AND on the resume path (a human invocation still
+  resumes silently, R2) — so the agent keeps working in the new checkout.
+
+What it does not guarantee, stated rather than hidden: the tool's result goes
+back to the model, and the model may take **one more turn in the checkout being
+left** before the run settles and the switch lands. Those writes stay in the
+source checkout (nothing is lost or overwritten), but they are not carried into
+the destination — the `changes` copy happened before the handoff was queued. The
+pending text says so (`the session moves when this turn ends`), and an agent
+that needs a change carried must copy it after it arrives, in the new checkout.
+A host with no `sendUserMessage` route refuses the tool before reading anything
+(`the host cannot dispatch the warp command`).
+
 ### Warp command (`/herdr-gentle:warp`, S23)
 
 `/herdr-gentle:warp <name>` moves the session to the named
@@ -819,29 +928,68 @@ prints it) and no key in the warp sets, clears or verifies one.
 
 Creation uses a compact bottom panel with **Type · Name** tabs and only the
 active field visible. `tab`/`shift+tab` or `←`/`→` switch fields; `↑`/`↓`
-choose the type. `enter` advances or confirms, `ctrl+s` submits from either
-field, and `esc` cancels. Typing on Type starts Name. The derived branch and
-path appear above the tabs; both remain neutral `-` until a valid candidate
-exists. A refused submission names its error without colouring an incomplete
-preview red. No Issues/ODD selector or association state is added to human
-creation. See [Tabbed bottom creation](warp-create-feedback.md).
+choose the type. `enter` on the Type tab advances and on the Name tab creates
+(it is the only create key), and `esc` cancels. Typing on Type starts Name. The
+derived branch and path appear above the tabs; both remain neutral `-` until a
+valid candidate exists. Neither the preview nor the submit key spawns a `git`
+child while the human types: the preview derives from the pure halves of the
+shared helpers, so painting a keystroke asks git for nothing (S1 — the live
+preview used to run `git check-ref-format` from `render()` on every keystroke,
+which froze Pi for the child's whole lifetime), and the only child it keeps is
+the memoized `git rev-parse` identity probe, read once when the preview first
+derives. The authoritative branch check is the create
+path's own awaited `validateBranchAsync`, so an invalid branch is still refused
+with the create tool's message and nothing created. A refused submission names
+its error without colouring an incomplete preview red. No Issues/ODD selector
+or association state is added to human creation. See
+[Tabbed bottom creation](warp-create-feedback.md).
 The type plus the typed name derives branch `<type>/<slug>` and checkout
 `<type>-<slug>` per the branch-pr skill's
 `^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)\/[a-z0-9._-]+$`,
 then creates through a git-only creation (a plain git checkout plus the
 registry row through the same `worktree_create` validations — never a
 Herdr workspace; the checkout lands beside the PRINCIPAL checkout even
-when the panel runs inside a linked worktree, while the branch HEAD still
-comes from the current checkout) and warps the session into it. The
-creation plus the warp run exactly once, after a session preflight, so an
-allocated-but-missing session file with nothing in memory refuses before
-any branch, checkout or registry write (a usable file, or valid in-memory
-entries the carry path clones, proceeds). A creation carries no `issues`
+when the panel runs inside a linked worktree) and STOPS there (S7).
+Every NEW branch is born from local `main` (S2), never from whatever the
+invoking checkout has checked out, so a session working inside a linked
+worktree cannot seed a "fresh" worktree with its own unmerged commits. The
+commit used is reported as `base` in the details, and a repository with NO
+local `main` refuses the create before anything is written (`cannot create
+worktree for branch '<b>': this repository has no local 'main' branch, and a
+new worktree is always born from local main — … nothing was created`) — there
+is no HEAD fallback to guess a base from. An existing branch is adopted as-is
+(its own commit, no `-b`, no base), so adoption needs no `main` at all. Before anything is
+written, the panel's creation offers the invoking checkout's pending work
+(S2/S3): a dirty checkout asks the same `YES COPY` / `NO COPY` question the
+warp asks (`Esc`/`Ctrl+C` cancels the creation with nothing written), and the
+answer becomes the create path's `changes` selection — `"all"` or `"none"` —
+so the transfer, its preflight and its refusals stay in one place. A clean
+checkout asks nothing. Only a POSITIVE "nothing pending" answer skips the
+question: when the pending-change summary cannot be read (a broken index, an
+unreadable `git status`/`git diff`, a missing helper) the creation FAILS CLOSED —
+one visible error naming what could not be read, no branch, no checkout, no
+registry row — and the selector returns, because silently creating without the
+copy would leave the human's pending work behind right after they asked for a
+worktree. The warp's own optional `changes` keeps the older, documented
+degradation (an unreadable summary still warps ordinarily with no copy); the two
+contracts differ on purpose and each is pinned by its own test. Creating is creation:
+nothing is warped by itself. Once the creation flow closes — created, refused
+with the reason shown, or cancelled with `esc` — the SELECTOR comes back with a
+freshly read listing that includes the checkout just made, and the human picks
+where the session goes,
+including that new row; only that pick warps, and `esc` on the returned selector
+moves nothing. A cancel is not a way out of the flow: it discards the form (no
+branch, no checkout, no registry row, no notification) and reopens the selector,
+which is what "volver a warp" asks for. Because creation no longer ends in a warp, it needs no fork
+source: a session Pi has not written to disk yet creates normally instead of
+being refused by a session preflight. A creation carries no `issues`
 and no `odd` on the create call — the row is born without an association —
 so the invalid, duplicate, occupied and principal
 refusals keep their exact shape; an empty or unrepresentable name refuses
 with an actionable message, and a duplicate branch refuses with the create
-tool's own message; an
+tool's own message — which is exactly what the human reads: a refusal is
+reported verbatim from the create path's tool result, never swallowed, and the
+selector comes back as it does after a successful creation; an
 explicit `<name>` skips the selector and also resolves a lone unregistered
 checkout. In either the panel or extended list, `Ctrl+D` on an eligible
 focused row always requests explicit human confirmation, even with YOLO active.
@@ -857,7 +1005,7 @@ the current checkout and an unregistered live checkout are safe no-ops,
 and the `view all worktrees` row is not a checkout. The project's live checkouts are discovered at session startup
 (S28: every repository worktree through git is registered when missing —
 the creation path is only where new ones are born) and freshly on every
-warp invocation. The agent tool (`worktree_warp`) resolves the same way — a required name-or-path, name first then path, unknown/foreign/ambiguous failing closed with the available checkouts listed — but never awaits `waitForIdle` (a self-deadlock from inside a tool) and never opens a selector. The command keeps the idle-slot wait (`await ctx.waitForIdle()` before forking); the tool switches through `withSession` from the tool context, emitting the S42 card from the fresh session and starting the continuation turn (`triggerTurn: true`, `deliverAs: "followUp"`). Session control
+Warp invocation. The agent tool (`worktree_warp`) resolves the same way — a required name-or-path, name first then path, unknown/foreign/ambiguous failing closed with the available checkouts listed — and never opens a selector. It also never waits for idle and never switches: both live on the command context, which is what it queues (S14). The command keeps the idle-slot wait (`await ctx.waitForIdle()` before forking) and the fork/resume, records, rename and card; the only difference on a queued handoff is that the switched-to session always sends the card AND the continuation sentence with `triggerTurn: true` / `deliverAs: "followUp"` — on the resume path too, where a human invocation stays silent (R2). Session control
 (`waitForIdle`/`switchSession`) lives on the extension command context, so
 a tool context cannot do this. The name resolves through the same resolver
 as close-by-name — one place, never two: an unknown name fails closed
@@ -1183,6 +1331,33 @@ Session start takes it in full through GitHub's own cursor pagination
 then a repository lookup plus one request per 100 issues — never a repeated
 download of the whole set, and no fixed issue cutoff. GraphQL is used instead
 of `gh issue list --search` because the search API caps its own result set.
+Both this snapshot and the interactive reads are scoped to the checkout's OWN
+repository — the unambiguous NON-BASE remote (branch `pushRemote`,
+`remote.pushDefault`, `origin`, or the tracking remote when not named like a
+base, else the only non-base remote) — because `gh` resolves the upstream base
+for a fork checkout with `origin` and `upstream` remotes. A fork whose remotes
+are `upstream` + `myfork` while the branch tracks `upstream` therefore still
+reads `myfork`; several non-base remotes with no attach point fail closed rather
+than guess. The scope travels as a HOST-QUALIFIED `GH_REPO`
+(`<host>/<owner>/<repo>`), and a single-remote checkout keeps `gh`'s own
+resolution (the reader then pins gh's host-qualified answer). The scope is used
+only when the selected remote proves the GitHub server `gh` will actually
+target (the remote's own `github.com` host, or the exact host named by
+`GH_HOST` — an enterprise or self-hosted server requires `GH_HOST`, because
+`gh api`/GraphQL use the default host) and a valid `owner/name`: a
+local/`file://` or non-GitHub remote, a `GH_HOST`/remote host mismatch, an
+unreadable URL, an invalid identifier or a git resolution error fails the read
+and the write closed without running `gh`,
+and another remote is never substituted; a config read that fails for any
+reason other than "not a git repository" (a corrupt or unreadable
+configuration) fails closed too. Before the list loads the scope is revalidated
+against the checkout's live git configuration; once loaded, the repository
+identity is PINNED for the reader, host included: reads and actions carry it,
+and if the checkout's remote moves (even to another server under the same
+`owner/name`) the list keeps the loaded repository while the writing actions
+refuse with a request to reopen and `o` still opens the issue it was read from.
+A `GH_HOST` that no longer selects the pinned server fails bound reads and
+actions closed, and an ambient `GH_REPO` never overrides the pin.
 An Issues open refreshes a primed snapshot's newest-20-UPDATED margin
 (one `--state all --limit 20` call) after mounting, separately from the
 interactive page read. It never primes a cold snapshot just to show that
@@ -1226,17 +1401,23 @@ counter stops a connection that never terminates.
 
 ## Responsiveness (S21)
 
-Every subprocess reached from an interactive path — the create panel and the
-create tool, close/delete, warp, open/enter and the warp
-selector's per-row reads — runs through the async runner and is awaited, so a
-slow or hanging child can never freeze repaint or keyboard input. What does not
+Every subprocess reached from an interactive path — the create tool (its base
+read, its pending-change summary and its copy), close/delete, warp, open/enter
+and the warp selector's per-row reads — runs through the async runner and is
+awaited, so a slow or hanging child can never freeze repaint or keyboard input.
+The base read and the pending-change summary added by S2/S3 are two extra
+awaited children, never a synchronous one: the create stays responsive while it
+copies, which `tools/worktree-blocking-budget.test.js` measures. The create
+PANEL reaches no child at all: its
+live preview derives from the pure halves of the shared helpers and its branch
+check is the create path's awaited one (S1). What does not
 change: the binary, the fixed argv and its element order, the per-call timeout,
 the refusal and confirmation text, and the order of side effects.
 
 Two sync children remain by design, and neither can stretch to a timeout
 freeze: the memoized `git rev-parse` identity probe (~20 ms, once per
-directory) and the Herdr reconcile that only runs when the session closes its
-OWN checkout after warping out of it.
+directory — and once per open create panel), and the Herdr reconcile that only
+runs when the session closes its OWN checkout after warping out of it.
 
 ## Registry and identity reads (S22)
 

@@ -1046,3 +1046,170 @@ describe('checkout-facts: one shared repository listing (T17, S23)', { concurren
     assert.equal(pending.length, 2, 'a cached read must not list again');
   });
 });
+
+// ---------------------------------------------------------------------------
+// worktree-issues S11: the warp rows load without freezing the host, and one
+// repository listing serves the whole read.
+//
+// "Warp data sometimes takes a long time to load" was measured, not guessed.
+// The child is slowed through PATH — a `git` shim that records its argv, sleeps
+// and then execs the real binary — so the SAME argv, stdout, status and error
+// shape reach the caller and only the wait changes. Two properties are then
+// observable:
+//
+//   * a 10 ms interval probe keeps ticking while the facts load. An awaited
+//     async child leaves the loop free; a `spawnSync` child freezes it for the
+//     child's whole lifetime, so the longest gap between two ticks exceeds the
+//     per-child delay as soon as ONE blocking child is on the path;
+//   * the children themselves are counted. The branch fact and the ahead/behind
+//     base both need `git worktree list`, and one listing per repository is
+//     enough for both.
+// ---------------------------------------------------------------------------
+
+// The real git binary, resolved BEFORE any shim takes over PATH: the fixture
+// itself must stay fast, so only the facts read is slowed.
+const REAL_GIT = String(spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout || '').trim();
+const SLOW_CHILD_DELAY_MS = 120;
+// Generous against scheduler jitter and far below one slowed child, so exactly
+// the blocking read fails and nothing flaky does.
+const MAX_LOOP_GAP_MS = SLOW_CHILD_DELAY_MS / 2;
+
+function makeSlowGitShim(tag) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `checkout-facts-shim-${slug(tag)}-`)));
+  const log = path.join(dir, 'argv.log');
+  fs.writeFileSync(path.join(dir, 'git'), [
+    '#!/bin/sh',
+    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+    `sleep ${(SLOW_CHILD_DELAY_MS / 1000).toFixed(3)}`,
+    `exec ${JSON.stringify(REAL_GIT)} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { dir, log };
+}
+
+function startTickProbe() {
+  const gaps = [];
+  let last = process.hrtime.bigint();
+  let ticks = 0;
+  const timer = setInterval(() => {
+    const now = process.hrtime.bigint();
+    gaps.push(Number(now - last) / 1e6);
+    last = now;
+    ticks += 1;
+  }, 10);
+  return {
+    stop() {
+      clearInterval(timer);
+      // The first gap spans the probe's start to its first tick, so a freeze
+      // that begins immediately shows up instead of being discarded.
+      return { ticks, maxGapMs: gaps.length === 0 ? 0 : Math.round(Math.max(...gaps)) };
+    },
+  };
+}
+
+describe('checkout-facts: the row read neither blocks the host nor repeats the listing (S11)', { concurrency: false }, () => {
+  test('three checkouts load on the async path with one repository listing', async () => {
+    const root = makeRepo('s11-async');
+    const wtA = addWorktree(root, 'feat/s11-a');
+    const wtB = addWorktree(root, 'feat/s11-b');
+    writeRow(root, fullRow(wtA, 'feat/s11-a'));
+    const shim = makeSlowGitShim('s11-async');
+    const facts = makeFacts(root);
+    // The warp command resolves the repository identity BEFORE the selector
+    // reads facts; that answer is what makes the synchronous registry lookup
+    // that follows a memo hit instead of a probe of its own.
+    await gitLib.repoIdentityAsync(root);
+
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${shim.dir}${path.delimiter}${savedPath}`;
+    let results;
+    let stats;
+    try {
+      const probe = startTickProbe();
+      results = await Promise.all([facts.facts(root), facts.facts(wtA), facts.facts(wtB)]);
+      stats = probe.stop();
+    } finally {
+      process.env.PATH = savedPath;
+    }
+
+    // The data is exactly what it always was: every fact of every row.
+    assert.deepEqual(results.map((got) => got.branch.value), ['main', 'feat/s11-a', 'feat/s11-b']);
+    for (const got of results) {
+      assert.equal(got.changes.available, true, JSON.stringify(got.changes));
+      assert.equal(got.changes.value.text, '0 files, +0/-0');
+      assert.deepEqual(got.aheadBehind.value, {
+        ahead: 0, behind: 0, base: 'main', baseSource: 'conventional',
+      });
+      assert.equal(typeof got.lastActivity.available, 'boolean', JSON.stringify(got.lastActivity));
+    }
+    // The principal and the registered worktree keep a readable activity time
+    // (the unregistered one is born after its only commit, which the fact
+    // honestly refuses to call activity — S8, unchanged).
+    assert.equal(results[0].lastActivity.source, 'commit');
+    assert.equal(results[1].lastActivity.source, 'commit');
+
+    // No blocking child on the path: every slowed child is awaited.
+    assert.ok(
+      stats.maxGapMs <= MAX_LOOP_GAP_MS,
+      `the facts read froze the host for ${stats.maxGapMs} ms over ${stats.ticks} probe ticks `
+      + `(one slowed child lasts ${SLOW_CHILD_DELAY_MS} ms)`,
+    );
+    assert.ok(stats.ticks >= 8, `the probe barely ran: ${stats.ticks} ticks`);
+    // One listing for the whole read: the branch fact and the ahead/behind
+    // base share it instead of each spawning its own.
+    const argv = fs.readFileSync(shim.log, 'utf8').split('\n').filter((line) => line.length > 0);
+    const listings = argv.filter((line) => line.startsWith('worktree list'));
+    assert.deepEqual(listings, ['worktree list --porcelain -z'], `children: ${argv.join('\n')}`);
+  });
+
+  test('the checkout identity is read through the async runner, never a blocking spawn', async () => {
+    const root = makeRepo('s11-identity');
+    const wt = addWorktree(root, 'feat/s11-identity');
+    writeRow(root, fullRow(wt, 'feat/s11-identity'));
+    const runner = countingRunner();
+    const facts = factsLib.createCheckoutFacts({
+      repoRoot: root, runAsync: runner.runAsync, ttlMs: 5000, now: () => 1000,
+    });
+    const got = await facts.facts(wt);
+    // The summary resolves the repository root, so the identity that used to be
+    // a `spawnSync` pair per checkout now rides the injected runner.
+    assert.ok(
+      runner.calls.includes('git rev-parse --show-toplevel'),
+      `the identity read never reached the async runner: ${runner.calls.join('\n')}`,
+    );
+    assert.equal(got.changes.available, true, JSON.stringify(got.changes));
+    assert.equal(got.changes.value.text, '0 files, +0/-0');
+    assert.deepEqual(got.aheadBehind.value, {
+      ahead: 0, behind: 0, base: 'main', baseSource: 'conventional',
+    });
+  });
+
+  test('an unreadable identity leaves the same verdict the shared reader gave', async () => {
+    const root = makeRepo('s11-identity-fail');
+    const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-s11-nonrepo-')));
+    const shim = makeSlowGitShim('s11-identity-fail');
+    const savedPath = process.env.PATH;
+    const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+    process.env.PATH = `${shim.dir}${path.delimiter}${savedPath}`;
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    try {
+      // The identity seam answers asynchronously, then fails: the change summary
+      // must still report the checkout's own unreadable-change verdict and keep
+      // the other facts intact, never a zero and never a throw.
+      const facts = makeFacts(root, {
+        repoIdentity: async () => {
+          throw new Error(`not a git repository: ${notRepo}`);
+        },
+      });
+      const got = await facts.facts(notRepo);
+      assert.equal(got.changes.available, false, JSON.stringify(got.changes));
+      assert.equal(got.changes.value, null);
+      assert.match(got.changes.reason, /not a git repository/);
+      assert.equal(got.lastActivity.available, false, JSON.stringify(got.lastActivity));
+    } finally {
+      process.env.PATH = savedPath;
+      if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+    }
+  });
+});

@@ -64,6 +64,9 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: new worktrees are born from LOCAL main, so every fixture that creates
+  // one needs that branch to exist (the create refuses without it).
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -208,7 +211,13 @@ function registryRows(root) {
 }
 
 describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
-  test('registers worktree_create with only the branch parameter', async () => {
+  // S3/S4: the pending-change selection is part of the tool's declared
+  // contract, and it is REQUIRED — a call that omits it never reaches the
+  // create: the runtime validates `parameters` before execute, so a property
+  // that the declaration does not mark optional is a field the caller must
+  // send. `optional` is how the plain-node Type double records Optional(), so
+  // its absence is the observable proof that the field is mandatory.
+  test('declares `branch` and a required three-form `changes`', async () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
@@ -218,7 +227,14 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
       assert.equal(tool.label, 'Worktree Create');
       assert.match(tool.description, /creat/i);
       assert.doesNotMatch(tool.description, /create or update/i, 'the tool never claims an update path');
-      assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ['branch']);
+      assert.deepEqual(Object.keys(tool.parameters.properties).sort(), ['branch', 'changes'], 'the branch and the changes selection, nothing else');
+      const changes = tool.parameters.properties.changes;
+      assert.ok(changes, 'the changes selection is declared');
+      assert.notEqual(changes.optional, true, 'changes is mandatory: an omitted field is refused before the create runs');
+      assert.match(changes.description, /"all"/, 'the declaration names the copy-everything form');
+      assert.match(changes.description, /"none"/, 'the declaration names the copy-nothing form');
+      assert.match(changes.description, /file/i, 'the declaration names the explicit file list form');
+      assert.deepEqual(tool.parameters.properties.branch, { type: 'string', description: tool.parameters.properties.branch.description }, 'the branch parameter is unchanged');
     } finally {
       restoreEnv();
     }
@@ -236,7 +252,7 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/simple' }, undefined, undefined, makeCtx({ repoRoot: root }),
+        'c1', { branch: 'feat/simple', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root }),
       );
       assert.equal(result.isError, undefined);
       assert.equal(
@@ -273,7 +289,7 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/cg-skip' }, undefined, undefined, makeCtx({ repoRoot: root }),
+        'c1', { branch: 'feat/cg-skip', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root }),
       );
       assert.equal(result.isError, undefined, 'a skipped hook never fails the create');
       assert.deepEqual(resultText(result).split('\n'), [
@@ -301,7 +317,7 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/cg-fail' }, undefined, undefined, makeCtx({ repoRoot: root }),
+        'c1', { branch: 'feat/cg-fail', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root }),
       );
       assert.equal(result.isError, undefined, 'a failed hook never turns the create into an error');
       assert.deepEqual(resultText(result).split('\n').slice(0, 4), [
@@ -336,10 +352,10 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const ctx = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      const first = await tools.get('worktree_create').execute('c1', { branch: 'feat/repeat' }, undefined, undefined, ctx);
+      const first = await tools.get('worktree_create').execute('c1', { branch: 'feat/repeat', changes: 'none' }, undefined, undefined, ctx);
       assert.equal(first.isError, undefined);
       assert.equal(codegraphCalls().length, 1);
-      const second = await tools.get('worktree_create').execute('c2', { branch: 'feat/repeat' }, undefined, undefined, ctx);
+      const second = await tools.get('worktree_create').execute('c2', { branch: 'feat/repeat', changes: 'none' }, undefined, undefined, ctx);
       assert.equal(second.isError, undefined);
       assert.deepEqual(resultText(second).split('\n'), [
         'created: feat-repeat \u00B7 feat/repeat \u00B7 already exists',
@@ -374,7 +390,7 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/no-card' }, undefined, undefined, makeCtx({ repoRoot: root }),
+        'c1', { branch: 'feat/no-card', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root }),
       );
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.deepEqual(resultText(result).split('\n'), [
@@ -389,7 +405,7 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
       // the agent reads.
       process.env.CODEGRAPH_EXIT = '1';
       const failed = await tools.get('worktree_create').execute(
-        'c2', { branch: 'feat/no-card-fail' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-2' }),
+        'c2', { branch: 'feat/no-card-fail', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-2' }),
       );
       assert.equal(failed.isError, undefined, 'a failed hook never fails the create');
       assert.deepEqual(failed.details.codegraph, { status: 'failed', detail: 'init failed' });
@@ -418,7 +434,7 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
       const tools = await loadExtension();
       const result = await tools.get('worktree_create').execute(
         'c1',
-        { branch: 'feat/assoc', issues: [999999], odd: 'odd/tasks/missing.md' },
+        { branch: 'feat/assoc', issues: [999999], odd: 'odd/tasks/missing.md', changes: 'none' },
         undefined, undefined, makeCtx({ repoRoot: root }),
       );
       assert.equal(result.isError, undefined, 'the create is not refused by an association');
@@ -444,14 +460,14 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const first = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/taken' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-1' }),
+        'c1', { branch: 'feat/taken', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-1' }),
       );
       assert.equal(first.isError, undefined);
       const target = expectedTarget(root, 'feat-taken');
       const before = registryRows(root).find((entry) => entry.branch === 'feat/taken');
       const second = await tools.get('worktree_create').execute(
         'c2',
-        { branch: 'feat/taken', issues: [1], odd: 'odd/tasks/x.md' },
+        { branch: 'feat/taken', issues: [1], odd: 'odd/tasks/x.md', changes: 'none' },
         undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-2' }),
       );
       assert.equal(second.isError, true, 'the second owner is refused');
@@ -459,6 +475,313 @@ describe('worktree_create tool contract (S1)', { concurrency: false }, () => {
       const after = registryRows(root).find((entry) => entry.branch === 'feat/taken');
       assert.deepEqual(after, before, 'the registered row is untouched: no update path exists');
       assert.equal(after.path, target);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S3/S4: the `changes` selection — "copy all", "copy nothing", or an explicit
+// file list — and its safety. Nothing here reads internal state: the create
+// result text, the checkouts git materialized on disk, the changed file
+// contents and the registry rows are the whole evidence. Every refused
+// selection is proven to have mutated NOTHING (no checkout, no registry row,
+// no backend call).
+// ---------------------------------------------------------------------------
+
+// A fixture whose checkout carries pending work: one tracked file modified in
+// the working tree and one untracked file.
+function makeDirtyRepo(tag) {
+  const root = makeRepo(tag);
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
+  git(root, ['add', 'a.txt']);
+  git(root, ['commit', '-m', 'a']);
+  // The committed file has to be part of the base the worktree is born from,
+  // or the pending change would be un-appliable by construction.
+  git(root, ['branch', '-f', 'main', 'HEAD']);
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\ntwo\n');
+  fs.writeFileSync(path.join(root, 'b.txt'), 'fresh\n');
+  return root;
+}
+
+// Every argv the herdr stub observed (empty when it never ran).
+function herdrArgv(log) {
+  try {
+    return fs.readFileSync(log, 'utf8').split('\n').filter((line) => line.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+describe('S3/S4: worktree_create changes selection', { concurrency: false }, () => {
+  // S4: the field is MANDATORY at runtime too, not only in the declaration. A
+  // call that omits it (or sends null) is refused before anything runs, so no
+  // branch, checkout, registry row or backend call can exist — the create
+  // cannot quietly decide "copy nothing" on the caller's behalf.
+  test('an omitted changes selection is refused before any mutation', async () => {
+    const root = makeDirtyRepo('changes-omitted');
+    const herdr = makeHerdrStub();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const tool = tools.get('worktree_create');
+      const params = [{ branch: 'feat/omitted' }, { branch: 'feat/omitted', changes: null }];
+      for (const sent of params) {
+        const result = await tool.execute('c1', sent, undefined, undefined, makeCtx({ repoRoot: root }));
+        assert.equal(result.isError, true, `expected a refusal for ${JSON.stringify(sent)}`);
+        const text = resultText(result);
+        assert.match(text, /changes/, `the refusal names the missing field: ${text}`);
+        assert.match(text, /"all"/, 'the refusal names the copy-everything form');
+        assert.match(text, /"none"/, 'the refusal names the copy-nothing form');
+        assert.match(text, /nothing was created/, 'the refusal states that nothing was written');
+      }
+      assert.equal(fs.existsSync(expectedTarget(root, 'feat-omitted')), false, 'no checkout was created');
+      assert.deepEqual(registryRows(root), [], 'no registry row was written');
+      assert.deepEqual(herdrArgv(herdr.log), [], 'no backend ran before the field was checked');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The declared field accepts exactly three things: the word "all", the word
+  // "none", or a list of file paths. An EMPTY (or whitespace-only) string is
+  // none of them, so it is refused like any other unusable value — the create
+  // never reads "no text" as "copy nothing" on the caller's behalf. The warp's
+  // optional `changes` keeps its own, documented rule (omitted/""/[] = no
+  // copy), which is pinned in tools/customize-warp.test.js.
+  test('an empty or whitespace-only selection is refused before any mutation', async () => {
+    const root = makeDirtyRepo('changes-empty-string');
+    const herdr = makeHerdrStub();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const tool = tools.get('worktree_create');
+      for (const changes of ['', '   ', '\t', '\n']) {
+        const result = await tool.execute(
+          'c1', { branch: 'feat/empty-selection', changes }, undefined, undefined, makeCtx({ repoRoot: root }),
+        );
+        assert.equal(result.isError, true, `expected a refusal for ${JSON.stringify(changes)}`);
+        const text = resultText(result);
+        assert.match(text, /invalid changes selection/, `the refusal names the field: ${text}`);
+        assert.match(text, /"all"/, 'the refusal names the copy-everything form');
+        assert.match(text, /"none"/, 'the refusal names the copy-nothing form');
+        assert.match(text, /file paths/, 'the refusal names the file-list form');
+        assert.match(text, /nothing was created/, 'the refusal states that nothing was written');
+      }
+      assert.equal(fs.existsSync(expectedTarget(root, 'feat-empty-selection')), false, 'no checkout was created');
+      assert.deepEqual(registryRows(root), [], 'no registry row was written');
+      assert.deepEqual(herdrArgv(herdr.log), [], 'no backend ran before the selection was validated');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an invalid changes selection is refused before any mutation', async () => {
+    const root = makeDirtyRepo('changes-invalid');
+    const herdr = makeHerdrStub();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const tool = tools.get('worktree_create');
+      // Every value that is neither "all", "none" nor a file list. An empty
+      // string and an empty list ARE a legal spelling of "copy nothing", so
+      // they are pinned by the "none" case below instead.
+      const invalid = ['some', 'ALL', 42, true, { all: true }, [''], [7], ['a.txt', '']];
+      for (const changes of invalid) {
+        const result = await tool.execute(
+          'c1', { branch: 'feat/bad-selection', changes }, undefined, undefined, makeCtx({ repoRoot: root }),
+        );
+        assert.equal(result.isError, true, `expected a refusal for ${JSON.stringify(changes)}`);
+        assert.match(
+          resultText(result),
+          /invalid changes selection/,
+          `the refusal names the field and the accepted forms: ${resultText(result)}`,
+        );
+        assert.match(resultText(result), /"all"/, 'the refusal names the copy-everything form');
+        assert.match(resultText(result), /"none"/, 'the refusal names the copy-nothing form');
+      }
+      assert.equal(fs.existsSync(expectedTarget(root, 'feat-bad-selection')), false, 'no checkout was created');
+      assert.deepEqual(registryRows(root), [], 'no registry row was written');
+      assert.deepEqual(herdrArgv(herdr.log), [], 'no backend ran before the selection was validated');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a listed file that is not pending is refused before any mutation', async () => {
+    const root = makeDirtyRepo('changes-unknown');
+    const herdr = makeHerdrStub();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_create').execute(
+        'c1',
+        { branch: 'feat/unknown-file', changes: ['a.txt', 'nope.txt'] },
+        undefined, undefined, makeCtx({ repoRoot: root }),
+      );
+      assert.equal(result.isError, true, 'a file the checkout does not have pending is refused');
+      assert.match(resultText(result), /unknown changed file/, `the refusal names the file: ${resultText(result)}`);
+      assert.match(resultText(result), /nope\.txt/);
+      assert.equal(fs.existsSync(expectedTarget(root, 'feat-unknown-file')), false, 'no checkout was created');
+      assert.deepEqual(registryRows(root), [], 'no registry row was written');
+      assert.deepEqual(herdrArgv(herdr.log), [], 'no backend ran before the selection was validated');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its changes');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('"all" carries every pending change into the new checkout and keeps the source', async () => {
+    const root = makeDirtyRepo('changes-all');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const target = expectedTarget(root, 'feat-copy-all');
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch: 'feat/copy-all', changes: 'all' }, undefined, undefined, makeCtx({ repoRoot: root }),
+      );
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.deepEqual(resultText(result).split('\n'), [
+        'created: feat-copy-all \u00B7 feat/copy-all',
+        `path: ${target}`,
+        'registered: new',
+        'codegraph: initialized',
+        'copied: 2 files, +2/-0',
+      ], 'the copy is reported as one row after the create rows');
+      // The pending work reached the new checkout...
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the tracked change travelled');
+      assert.equal(fs.readFileSync(path.join(target, 'b.txt'), 'utf8'), 'fresh\n', 'the untracked file travelled');
+      // ...and the source keeps it, index included.
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source is retained');
+      assert.equal(git(root, ['status', '--porcelain']).includes('a.txt'), true, 'the source index is untouched');
+      assert.deepEqual(result.details.copied, {
+        files: 2, added: 2, deleted: 0, paths: ['a.txt', 'b.txt'],
+      }, 'the details name exactly what was copied');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an explicit file list copies only the listed change', async () => {
+    const root = makeDirtyRepo('changes-paths');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const target = expectedTarget(root, 'feat-copy-one');
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch: 'feat/copy-one', changes: ['a.txt'] }, undefined, undefined, makeCtx({ repoRoot: root }),
+      );
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the listed change travelled');
+      assert.equal(fs.existsSync(path.join(target, 'b.txt')), false, 'the unlisted file stayed away');
+      assert.deepEqual(result.details.copied, {
+        files: 1, added: 1, deleted: 0, paths: ['a.txt'],
+      });
+      assert.equal(resultText(result).split('\n').at(-1), 'copied: 1 file, +1/-0');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // S2/S3: a copy that cannot be applied is REPORTED, never hidden. The
+  // worktree is created from local main while the pending change was written
+  // against another branch's tree, so the patch cannot apply. The worktree is
+  // already there: an honest result names it AND the copy failure, instead of
+  // claiming a copy that did not happen or silently dropping the selection.
+  test('a copy the destination rejects is reported, and the worktree it made is named', async () => {
+    const root = makeRepo('changes-copy-fail');
+    git(root, ['branch', '-f', 'main']); // local main stays at the empty first commit
+    git(root, ['checkout', '-b', 'feat/session']);
+    fs.writeFileSync(path.join(root, 'f.txt'), 'one\n');
+    git(root, ['add', 'f.txt']);
+    git(root, ['commit', '-m', 'only on the session branch']);
+    fs.writeFileSync(path.join(root, 'f.txt'), 'one\ntwo\n');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const target = expectedTarget(root, 'feat-copy-fail');
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch: 'feat/copy-fail', changes: 'all' }, undefined, undefined, makeCtx({ repoRoot: root }),
+      );
+      assert.equal(result.isError, true, 'the copy failure is an error result');
+      const text = resultText(result);
+      assert.match(text, /created: feat-copy-fail \u00B7 feat\/copy-fail/, `the result still names the worktree it made: ${text}`);
+      assert.match(text, /were NOT copied/, `the failure says the copy did not happen: ${text}`);
+      assert.equal(typeof result.details.copyError, 'string', 'the reason travels in the details');
+      assert.equal(result.details.path, target);
+      assert.equal(result.details.copied, undefined, 'no copy is claimed');
+      assert.equal(fs.existsSync(target), true, 'the created checkout is kept, never silently removed');
+      assert.ok(registryRows(root).some((row) => row.branch === 'feat/copy-fail'), 'the created checkout stays registered');
+      assert.equal(fs.readFileSync(path.join(root, 'f.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('"none" creates the checkout from the commit with nothing copied', async () => {
+    const root = makeDirtyRepo('changes-none');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      for (const changes of ['none', []]) {
+        const branch = `feat/copy-none-${String(changes).length}`;
+        const result = await tools.get('worktree_create').execute(
+          'c1', { branch, changes }, undefined, undefined, makeCtx({ repoRoot: root }),
+        );
+        assert.equal(result.isError, undefined, `expected success for ${JSON.stringify(changes)}: ${resultText(result)}`);
+        const target = expectedTarget(root, branch.replace('/', '-'));
+        assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\n', 'the checkout is born from the commit');
+        assert.equal(fs.existsSync(path.join(target, 'b.txt')), false, 'nothing was copied');
+        assert.equal('copied' in result.details, false, 'no copy is reported');
+        assert.ok(
+          !resultText(result).split('\n').some((line) => line.startsWith('copied: ')),
+          `no copy row appears: ${resultText(result)}`,
+        );
+      }
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its changes');
     } finally {
       restoreEnv();
     }

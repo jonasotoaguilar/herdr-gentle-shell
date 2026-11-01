@@ -65,7 +65,7 @@ const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => Str
 // behind a token instead of trusting an eyeballed colour. A role the map does
 // not name still gets its own code, so an unexpected role shows up instead of
 // passing silently.
-const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39 };
+const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
 
 function recordingTheme() {
   const calls = [];
@@ -1111,11 +1111,13 @@ describe('S1: no issue or ODD association is rendered', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S11: every footer and header token paints through the ONE shared palette
-// (lib/tui-paint.js) with the injected theme — a shortcut KEY is accent+bold,
-// its description muted, the frame title accent+bold, values accent and
-// counts/labels muted or dim — while the focus cue stays monochrome (`▸`), so
-// a theme that answers nothing still reads as a frame.
+// S11/T9: every footer and header token paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme — a shortcut KEY (a button) is
+// accent+bold, its description muted, a TITLE takes the reference UI's `dim`
+// title role (its Agents title: ~/.config/herdr-app/mods/agents/main.js:413),
+// ordinary values are the text role and counts/labels are muted
+// or dim — while the focus cue stays monochrome (`▸`), so a theme that answers
+// nothing still reads as a frame.
 describe('S11: the shared palette', () => {
   test('the panel legend paints every key accent+bold and its description muted', async () => {
     const theme = recordingTheme();
@@ -1157,30 +1159,34 @@ describe('S11: the shared palette', () => {
     assert.equal(helpers.visibleWidth(legend), 40, 'the compacted row is still cell-exact');
   });
 
-  test('the header palette: title accent+bold, values accent, facts muted and the close key a key', async () => {
+  test('the header palette: secondary title+bold, values ordinary text, facts muted and the close key a button', async () => {
     const theme = recordingTheme();
     const { view } = await opened({ theme });
     const lines = view.render(WIDE);
-    assert.match(lines[0], /\x1b\[1m\x1b\[96mWarp\x1b\[0m\x1b\[22m/, 'the frame title is accent+bold');
+    assert.match(lines[0], /\x1b\[1m\x1b\[33mWarp\x1b\[0m\x1b\[22m/,
+      'the frame title is the Agents view title role, bold');
+    assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === 'Warp'),
+      'the title never takes the button accent');
     assert.match(lines[0], /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m/, 'the close hint in the header is painted as a key');
     assert.match(lines[0], /\x1b\[34m╭─\x1b\[0m/, 'the frame rule keeps the border role');
-    assert.match(lines[1], /\x1b\[96mfeat-odd-viewer/, 'the current worktree name is a value (accent, not bold)');
+    assert.match(lines[1], /\x1b\[39mfeat-odd-viewer/, 'the current worktree name is ordinary text');
     assert.ok(!/\x1b\[1m\x1b\[96mfeat-odd-viewer/.test(lines[1]), 'a value is never emphasized like a key');
+    assert.ok(!/\x1b\[96mfeat-odd-viewer/.test(lines[1]), 'a value is never the button accent');
     assert.match(lines[2], /\x1b\[90mbranch feat\/alpha/, 'the facts line is muted');
     assert.match(lines.at(-3), /\x1b\[90mbranch feat\/alpha/, 'so is the focused worktree line');
   });
 
-  test('the list page row paints its label dim, the page value accent and the total muted', async () => {
+  test('the list page row paints its label dim, the page value as ordinary text and the total muted', async () => {
     const theme = recordingTheme();
     const { view } = await opened({ theme, rows: 20 });
     view.handleInput('v');
     const pageRow = view.render(WIDE).at(-3);
     assert.match(pageRow, /\x1b\[2mpage \x1b\[0m/, 'the `page` label is dim');
-    assert.match(pageRow, /\x1b\[96m1\/1\x1b\[0m/, 'the page number is a value');
+    assert.match(pageRow, /\x1b\[39m1\/1\x1b\[0m/, 'the page number is ordinary text');
     assert.match(pageRow, /\x1b\[90m · 4 worktrees\x1b\[0m/, 'the worktree count is muted');
   });
 
-  test('the search row paints its static label dim and the live query accent', async () => {
+  test('the search row paints its static label dim and the live query as ordinary text', async () => {
     const theme = recordingTheme();
     const { view } = await opened({ theme });
     view.handleInput('v');
@@ -1190,7 +1196,8 @@ describe('S11: the shared palette', () => {
     view.handleInput('l');
     const live = view.render(WIDE)[1];
     assert.match(live, /\x1b\[2mfilter: \x1b\[0m/, 'the label stays dim while typing');
-    assert.match(live, /\x1b\[96mal/, 'the typed query is painted accent');
+    assert.match(live, /\x1b\[39mal/, 'the typed query is ordinary text');
+    assert.ok(!/\x1b\[96mal/.test(live), 'the typed query is never the button accent');
   });
 
   test('a hostile theme never breaks the frame and keeps the keys and the focus mark readable', async () => {

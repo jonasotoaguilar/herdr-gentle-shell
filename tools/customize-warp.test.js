@@ -95,7 +95,10 @@ function restoreEnv() {
 }
 
 // Import the stubbed extension copy with the lib override in place.
-async function loadExtension() {
+// `options.sendUserMessage === false` models a host with no command dispatch
+// route (the tool then refuses instead of queueing); the default records every
+// dispatch as `[text, options]` so tests can drive the queued command.
+async function loadExtension(options = {}) {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
@@ -103,6 +106,7 @@ async function loadExtension() {
   const commands = new Map();
   const handlers = new Map();
   const messageRenderers = new Map();
+  const dispatches = [];
   const pi = {
     registerTool: (tool) => { tools.set(tool.name, tool); },
     registerCommand: (name, def) => { commands.set(name, def); },
@@ -113,10 +117,13 @@ async function loadExtension() {
       return () => {};
     },
   };
+  if (options.sendUserMessage !== false) {
+    pi.sendUserMessage = (text, sendOptions) => { dispatches.push([text, sendOptions]); };
+  }
   const factory = (await import(pathToFileURL(copy).href)).default;
   factory(pi);
   const mod = await import(pathToFileURL(copy).href);
-  return { tools, commands, handlers, messageRenderers, mod };
+  return { tools, commands, handlers, messageRenderers, mod, dispatches };
 }
 
 function warpDef(commands) {
@@ -2816,12 +2823,19 @@ describe('S43 point comparison + topmost identical ancestor (T33 RED)', { concur
   }
 });
 
-describe('worktree_warp agent tool (T40/S49)', { concurrency: false }, () => {
-  // The warp exists only as the /herdr-gentle:warp command and the agent
-  // has no exposed warp tool, so this one is built FOR agent use: a
-  // required name-or-path, no selector, no waitForIdle (self-deadlock),
-  // switch through withSession emitting the S42 card plus a continuation
-  // turn (triggerTurn:true, deliverAs:followUp).
+describe('worktree_warp agent tool (S14 handoff)', { concurrency: false }, () => {
+  // S14: the host keeps session control on the extension COMMAND context. A
+  // tool's context has neither `switchSession` nor a legal `waitForIdle` (the
+  // tool runs inside the turn it would wait for), so the tool cannot move the
+  // session itself. It resolves, validates and copies exactly as before, then
+  // QUEUES the `/herdr-gentle:warp` command through
+  // `pi.sendUserMessage(..., { expandPromptTemplates: true })`, and the command
+  // performs the move after the turn settles, continuing the work in the new
+  // checkout.
+  //
+  // The contexts below model the real host shapes: the TOOL context carries no
+  // session control at all, the COMMAND context carries both waitForIdle and
+  // switchSession. Nothing here fakes session control into a tool.
   function warpTool(tools) {
     const tool = tools.get('worktree_warp');
     assert.ok(tool, 'expected worktree_warp to be registered');
@@ -2832,38 +2846,36 @@ describe('worktree_warp agent tool (T40/S49)', { concurrency: false }, () => {
     return (result.content || []).map((part) => part.text || '').join('\n');
   }
 
-  // Tool context: selectors are human-only, so no ui.select exists here.
-  // waitForIdle is provided only as a spy the tool must never call.
-  function makeToolCtx({ cwd, FakeSM, sessionFile, entries = [], switchResult = { cancelled: false }, calls }) {
-    const waited = [];
-    const switches = [];
-    const sent = [];
-    const sm = new FakeSM();
-    Object.assign(sm, {
-      getSessionFile: () => sessionFile,
-      getLeafId: () => 'leaf-1',
-      getEntries: () => entries,
-      getSessionDir: () => path.dirname(sessionFile),
-    });
-    const ctx = {
+  // A tool context as the host builds it: cwd, session manager, status/notify
+  // UI — and NO `switchSession`/`waitForIdle`.
+  function makeToolCtx({ cwd, sessionFile, entries = [] }) {
+    return {
       cwd,
-      sessionManager: sm,
       ui: { notify: () => {}, setStatus: () => {} },
-      waitForIdle: async () => { waited.push(true); },
-      switchSession: async (file, options) => {
-        switches.push([file, typeof options?.withSession]);
-        if (switchResult && switchResult.cancelled === true) return switchResult;
-        if (typeof options?.withSession === 'function') {
-          const replaced = {
-            ui: { setStatus: () => {} },
-            sendMessage: async (message, sendOptions) => { sent.push([message, sendOptions]); },
-          };
-          await options.withSession(replaced);
-        }
-        return switchResult;
+      sessionManager: {
+        getSessionFile: () => sessionFile,
+        getLeafId: () => 'leaf-1',
+        getEntries: () => entries,
+        getSessionDir: () => path.dirname(sessionFile),
       },
     };
-    return { ctx, waited, switches, sent };
+  }
+
+  // The queued text must be the warp command carrying ONE `@<token>` argument,
+  // dispatched with prompt-template expansion (without it the host would treat
+  // the text as a prompt, not as the command).
+  function queuedToken(dispatches) {
+    assert.equal(dispatches.length, 1, `expected exactly one queued handoff, got ${dispatches.length}`);
+    const [text, sendOptions] = dispatches[0];
+    assert.ok(text.startsWith('/herdr-gentle:warp @'), `the queued text is the warp command: ${text}`);
+    assert.deepEqual(sendOptions, { expandPromptTemplates: true }, 'the command is dispatched, never sent as a prompt');
+    const token = text.slice('/herdr-gentle:warp '.length);
+    assert.match(token, /^@[A-Za-z0-9_-]+$/, 'the token is one opaque, charset-bounded argument');
+    return token;
+  }
+
+  function decodeRequest(token) {
+    return JSON.parse(Buffer.from(token.slice(1), 'base64url').toString('utf8'));
   }
 
   test('registers worktree_warp only when the worktree switch is on', async () => {
@@ -2885,76 +2897,132 @@ describe('worktree_warp agent tool (T40/S49)', { concurrency: false }, () => {
     }
   });
 
-  test('warps by name without selectors or idle waits, then continues the turn', async () => {
-    const root = makeRepo('wtool-move');
+  test('queues the move and claims only the handoff, never the switch', async () => {
+    const root = makeRepo('wtool-handoff');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const target = addRegistered(root, 'feat/agent-move');
-      const { tools } = await loadExtension();
+      const { tools, dispatches } = await loadExtension();
       const tool = warpTool(tools);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
       const sessionFile = sessionFileIn();
-      const { ctx, waited, switches, sent } = makeToolCtx({ cwd: root, FakeSM, sessionFile, calls });
+      const ctx = makeToolCtx({ cwd: root, sessionFile });
       const out = await tool.execute('call-1', { name: 'feat-agent-move' }, undefined, undefined, ctx);
-      assert.equal(out.isError, undefined, `expected success: ${toolText(out)}`);
-      assert.deepEqual(waited, [], 'the tool NEVER awaits waitForIdle (self-deadlock)');
-      assert.equal(switches.length, 1, 'exactly one session switch');
-      assert.equal(switches[0][1], 'function', 'the switch carries withSession');
-      assert.ok(toolText(out).includes('feat-agent-move'), 'the result names the checkout');
-      assert.ok(toolText(out).includes('feat/agent-move'), 'the result names the branch');
-      const continued = sent.filter(([, opts]) => opts && opts.triggerTurn === true);
-      assert.equal(continued.length, 1, 'exactly one continuation turn is requested');
-      assert.equal(continued[0][1].deliverAs, 'followUp', 'the continuation is a followUp');
-      const content = JSON.stringify(continued[0][0]);
-      assert.ok(!content.includes('Revalidate every cwd-dependent path'), 'the continuation carries no filler');
-      assert.ok(content.includes('feat-agent-move') || content.includes(target), 'the continuation says where the session now is');
-      assert.match(content, /continue/i, 'the continuation tells the agent to continue');
+      assert.equal(out.isError, undefined, `expected a queued handoff: ${toolText(out)}`);
+      const text = toolText(out);
+      const lines = text.split('\n');
+      assert.equal(lines[0], 'worktree warp: handoff queued \u2014 the session moves when this turn ends',
+        'the first line says QUEUED, never moved');
+      assert.ok(!/^moved:/m.test(text), 'a queued handoff never reports a completed move');
+      assert.ok(lines.includes('to: feat-agent-move'), `the pending text names the target: ${text}`);
+      assert.ok(lines.includes(`path: ${target}`), `the pending text names the target path: ${text}`);
+      assert.ok(lines.includes('branch: feat/agent-move'), `the pending text names the branch: ${text}`);
+      // The tool card renders completed-move rows from these keys, so a pending
+      // handoff must not carry them (an unrendered row set falls back to the
+      // text above, which is the honest one).
+      for (const key of ['fromName', 'fromDesc', 'name', 'path', 'branch', 'alreadyThere', 'resumed', 'cancelled']) {
+        assert.equal(key in (out.details || {}), false, `pending details carry no ${key}`);
+      }
+      assert.equal(out.details.handoff, true, 'the result is marked as a handoff');
+      assert.equal(out.details.pending, true, 'the result is marked as pending');
+      const request = decodeRequest(queuedToken(dispatches));
+      assert.deepEqual(request, { v: 1, name: 'feat-agent-move', target, from: root, branch: 'feat/agent-move' });
     } finally {
       restoreEnv();
     }
   });
 
-  test('a missing name refuses listing the available checkouts and switches nothing', async () => {
+  test('the queued command performs the move and starts the continuation turn', async () => {
+    const root = makeRepo('wtool-command');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/agent-move');
+      const { tools, dispatches, mod } = await loadExtension();
+      const tool = warpTool(tools);
+      const sessionFile = sessionFileIn();
+      const toolCtx = makeToolCtx({ cwd: root, sessionFile });
+      const queued = await tool.execute('call-1', { name: 'feat-agent-move' }, undefined, undefined, toolCtx);
+      assert.equal(queued.isError, undefined, `expected a queued handoff: ${toolText(queued)}`);
+      const request = decodeRequest(queuedToken(dispatches));
+      // The host now runs the queued command with a COMMAND context.
+      const calls = [];
+      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
+      const command = makeWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const out = await mod.executeWorktreeWarp(request.name, command.ctx, {
+        handoff: request, sessionManagerClass: FakeSM, oscStream: oscFake(false),
+      });
+      assert.equal(out.isError, undefined, `the handoff moves the session: ${out.text}`);
+      assert.equal(command.waited.length, 1, 'the command waits for idle exactly once, after the tool returned');
+      assert.equal(command.switches.length, 1, 'exactly one session switch');
+      assert.equal(command.switches[0][1], 'function', 'the switch carries withSession');
+      assert.ok(calls.some((call) => call[0] === 'forkFrom'), 'the destination session is forked');
+      const continued = command.sent.filter(([, options]) => options && options.triggerTurn === true);
+      assert.equal(continued.length, 1, 'exactly one continuation turn is requested');
+      assert.equal(continued[0][1].deliverAs, 'followUp', 'the continuation is a followUp');
+      const content = String(continued[0][0].content);
+      assert.match(content, /Continue the task from here/, 'the continuation tells the agent to continue');
+      assert.ok(content.includes('feat/agent-move'), `the continuation names the branch: ${content}`);
+      assert.equal(continued[0][0].details.name, 'feat-agent-move', 'the card names the target checkout');
+      assert.equal(continued[0][0].details.fromName, 'principal', 'the card names the checkout left');
+      assert.deepEqual(command.notes, [], 'a successful handoff warps silently (the card is the confirmation)');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an ordinary name invocation keeps its own contract: idle wait, no continuation turn', async () => {
+    const root = makeRepo('wtool-human');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/human-idle');
+      const { mod } = await loadExtension();
+      const calls = [];
+      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
+      const sessionFile = sessionFileIn();
+      const command = makeWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const out = await mod.executeWorktreeWarp('feat-human-idle', command.ctx, { sessionManagerClass: FakeSM, oscStream: oscFake(false) });
+      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
+      assert.equal(command.waited.length, 1, 'the command awaits waitForIdle once');
+      assert.equal(command.switches.length, 1, 'the command switches once');
+      const turns = command.sent.filter(([, options]) => options && options.triggerTurn === true);
+      assert.deepEqual(turns, [], 'a human warp starts no continuation turn');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a missing name refuses listing the available checkouts and queues nothing', async () => {
     const root = makeRepo('wtool-noname');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const target = addRegistered(root, 'feat/listed');
-      const { tools } = await loadExtension();
+      const { tools, dispatches } = await loadExtension();
       const tool = warpTool(tools);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const { ctx, waited, switches, sent } = makeToolCtx({ cwd: root, FakeSM, sessionFile, calls });
+      const ctx = makeToolCtx({ cwd: root, sessionFile });
       const out = await tool.execute('call-1', {}, undefined, undefined, ctx);
       assert.equal(out.isError, true, 'a missing name is a refusal');
       assert.ok(toolText(out).includes('feat-listed'), 'the refusal lists the available checkout');
       assert.ok(toolText(out).includes(target), 'the refusal lists the checkout path');
-      assert.deepEqual(waited, [], 'no idle wait on refusal');
-      assert.deepEqual(switches, [], 'no session switch on refusal');
-      assert.deepEqual(sent, [], 'no continuation on refusal');
+      assert.deepEqual(dispatches, [], 'nothing is queued on a refusal');
     } finally {
       restoreEnv();
     }
   });
 
-  test('an unknown name refuses listing the available checkouts and writes nothing', async () => {
+  test('an unknown name refuses listing the available checkouts, queues nothing and writes nothing', async () => {
     const root = makeRepo('wtool-unknown');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       addRegistered(root, 'feat/known');
       const before = JSON.stringify(require('../lib/worktree-registry.js').readRegistry(root));
-      const { tools } = await loadExtension();
+      const { tools, dispatches } = await loadExtension();
       const tool = warpTool(tools);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const { ctx, switches, sent } = makeToolCtx({ cwd: root, FakeSM, sessionFile, calls });
+      const ctx = makeToolCtx({ cwd: root, sessionFile });
       const out = await tool.execute('call-1', { name: 'no-such-checkout' }, undefined, undefined, ctx);
       assert.equal(out.isError, true, 'an unknown name fails closed');
       assert.ok(toolText(out).includes('feat-known'), 'the refusal lists the available checkout');
-      assert.deepEqual(switches, [], 'no session switch');
-      assert.deepEqual(sent, [], 'no continuation');
+      assert.deepEqual(dispatches, [], 'nothing is queued on a refusal');
       assert.equal(JSON.stringify(require('../lib/worktree-registry.js').readRegistry(root)), before, 'the registry is untouched');
     } finally {
       restoreEnv();
@@ -2966,80 +3034,183 @@ describe('worktree_warp agent tool (T40/S49)', { concurrency: false }, () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const target = addRegistered(root, 'feat/by-path');
-      const { tools } = await loadExtension();
+      const { tools, dispatches } = await loadExtension();
       const tool = warpTool(tools);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
       const sessionFile = sessionFileIn();
-      const { ctx, switches } = makeToolCtx({ cwd: root, FakeSM, sessionFile, calls });
+      const ctx = makeToolCtx({ cwd: root, sessionFile });
       const out = await tool.execute('call-1', { name: target }, undefined, undefined, ctx);
-      assert.equal(out.isError, undefined, `a live checkout path warps: ${toolText(out)}`);
-      assert.equal(switches.length, 1, 'exactly one session switch');
+      assert.equal(out.isError, undefined, `a live checkout path is accepted: ${toolText(out)}`);
+      const request = decodeRequest(queuedToken(dispatches));
+      assert.equal(request.target, target, 'the handoff names the checkout the path resolved to');
+      assert.equal(request.name, 'feat-by-path', 'the handoff names it by its slug');
     } finally {
       restoreEnv();
     }
   });
 
-  test('an already-there target returns without switching', async () => {
+  test('an already-there target returns without queueing anything', async () => {
     const root = makeRepo('wtool-there');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       addRegistered(root, 'feat/stay');
-      const { tools } = await loadExtension();
+      const { tools, dispatches } = await loadExtension();
       const tool = warpTool(tools);
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
       const target = fs.realpathSync(path.join(path.dirname(root), `${path.basename(root)}-cwarp-feat-stay`));
-      const { ctx, switches, sent } = makeToolCtx({ cwd: target, FakeSM, sessionFile, calls });
+      const ctx = makeToolCtx({ cwd: target, sessionFile });
       const out = await tool.execute('call-1', { name: 'feat-stay' }, undefined, undefined, ctx);
       assert.ok(toolText(out).includes('already there'), 'the already-there text reports itself');
-      assert.deepEqual(switches, [], 'no session switch when already there');
-      assert.deepEqual(sent, [], 'no continuation when already there');
+      assert.deepEqual(dispatches, [], 'no handoff when already there');
     } finally {
       restoreEnv();
     }
   });
 
-  test('the tool card keeps the S42 shape: names only compact, path and branch expanded', () => {
+  test('the pending handoff renders as its own line, never as a completed move', () => {
     const card = require('../lib/worktree-card.js').createWorktreeCardRenderer('worktree_warp');
     assert.equal(card.renderShell, 'self', 'the warp tool renders through the tool-card contract');
     const result = {
-      content: [{ type: 'text', text: 'moved: principal\nto: feat-target\npath: now in "/tmp/feat-target"\nbranch: now in "feat/target"' }],
-      details: { fromName: 'principal', fromDesc: 'principal \u00b7 main', name: 'feat-target', branch: 'feat/target', path: '/tmp/feat-target', to: '/tmp/feat-target' },
+      content: [{ type: 'text', text: 'worktree warp: handoff queued \u2014 the session moves when this turn ends\nto: feat-target\npath: /tmp/feat-target\nbranch: feat/target' }],
+      details: { tool: 'worktree_warp', handoff: true, pending: true, pendingName: 'feat-target', pendingPath: '/tmp/feat-target', pendingBranch: 'feat/target' },
     };
     const theme = { bold: (s) => s, fg: (_c, s) => s };
     const strip = (line) => String(line).replace(/\x1b\[[0-9;]*m/g, '');
     const compact = card.renderResult(result, {}, theme, {}).render(100).map(strip).join('\n');
-    assert.ok(compact.includes('moved: principal'), 'compact names the source checkout');
-    assert.ok(compact.includes('to: feat-target'), 'compact names the target checkout');
-    assert.ok(!compact.includes('feat/target'), 'compact carries no branch');
-    assert.ok(!compact.includes('/tmp/feat-target'), 'compact carries no path');
+    assert.ok(compact.includes('handoff queued'), 'the card reports the queued handoff');
+    assert.ok(!compact.includes('moved:'), 'the card never paints a move that has not happened');
     const expanded = card.renderResult(result, { expanded: true }, theme, {}).render(100).map(strip).join('\n');
-    assert.ok(expanded.includes('path: now in "/tmp/feat-target"'), 'expanded names the current path');
-    assert.ok(expanded.includes('branch: now in "feat/target"'), 'expanded names the current branch');
+    assert.ok(expanded.includes('handoff queued'), 'the expanded card keeps the same honest line');
+    assert.ok(!expanded.includes('now in "'), 'the expanded card adds no completed-move row');
   });
 
-  test('the command path still awaits idle exactly once per warp', async () => {
-    const root = makeRepo('wtool-cmdidle');
+  test('a host with no dispatch route refuses before reading anything', async () => {
+    const root = makeRepo('wtool-route');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
-      addRegistered(root, 'feat/cmd-idle');
+      addRegistered(root, 'feat/no-route');
+      const { tools } = await loadExtension({ sendUserMessage: false });
+      const tool = warpTool(tools);
+      const sessionFile = sessionFileIn();
+      const ctx = makeToolCtx({ cwd: root, sessionFile });
+      const out = await tool.execute('call-1', { name: 'feat-no-route' }, undefined, undefined, ctx);
+      assert.equal(out.isError, true, 'the warp refuses without a route');
+      assert.equal(toolText(out), 'worktree warp is unavailable here: the host cannot dispatch the warp command');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a handoff for a checkout that moved refuses instead of switching elsewhere', async () => {
+    const root = makeRepo('wtool-drift');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/drift-a');
+      const other = addRegistered(root, 'feat/drift-b');
       const { mod } = await loadExtension();
       const calls = [];
       const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
       const sessionFile = sessionFileIn();
-      const { ctx, waited, switches } = makeWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
-      ctx.sessionManager = Object.assign(new FakeSM(), {
+      const command = makeWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      // The name still resolves (to the same checkout), but the queued handoff
+      // names a DIFFERENT checkout: the tree moved in between.
+      const out = await mod.executeWorktreeWarp('feat-drift-a', command.ctx, {
+        handoff: { name: 'feat-drift-a', target: other, from: root, branch: 'feat/drift-a' },
+        sessionManagerClass: FakeSM, oscStream: oscFake(false),
+      });
+      assert.equal(out.isError, true, 'a drifted handoff refuses');
+      assert.match(out.text, /changed since the handoff was queued/);
+      assert.deepEqual(command.switches, [], 'no session switch');
+      assert.ok(!calls.some((call) => call[0] === 'forkFrom'), 'no fork');
+      assert.equal(fs.existsSync(target), true, 'the real checkout is untouched');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a handoff whose session already moved refuses instead of moving twice', async () => {
+    const root = makeRepo('wtool-from-drift');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/from-drift');
+      const { mod } = await loadExtension();
+      const calls = [];
+      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
+      const sessionFile = sessionFileIn();
+      // The session now sits in the target; the handoff was queued in the root.
+      const command = makeWarpCtx({ cwd: target, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const out = await mod.executeWorktreeWarp('feat-from-drift', command.ctx, {
+        handoff: { name: 'feat-from-drift', target, from: root, branch: 'feat/from-drift' },
+        sessionManagerClass: FakeSM, oscStream: oscFake(false),
+      });
+      assert.equal(out.isError, true, 'a stale handoff refuses');
+      assert.match(out.text, /the session moved since the handoff was queued/);
+      assert.deepEqual(command.switches, [], 'no session switch');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a tampered handoff token is refused and names nothing it carried', async () => {
+    const root = makeRepo('wtool-token');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/token');
+      const { commands } = await loadExtension();
+      const calls = [];
+      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
+      const sessionFile = sessionFileIn();
+      const command = makeWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const handler = commands.get('herdr-gentle:warp').handler;
+      const cases = [
+        '@not-a-token!',
+        '@',
+        `@${Buffer.from('{"v":2}', 'utf8').toString('base64url')}`,
+        `@${Buffer.from('{"v":1,"name":"x","target":"relative","from":"/a","branch":"b"}', 'utf8').toString('base64url')}`,
+        `@${Buffer.from('[]', 'utf8').toString('base64url')}`,
+      ];
+      for (const token of cases) {
+        await handler(token, command.ctx);
+        assert.equal(command.notes.length, 1, `the refusal is reported: ${token}`);
+        assert.equal(command.notes[0][0], 'worktree warp: invalid warp handoff; nothing was moved.');
+        assert.equal(command.notes[0][1], 'error');
+        command.notes.length = 0;
+      }
+      assert.deepEqual(command.waited, [], 'no idle wait for a rejected token');
+      assert.deepEqual(command.switches, [], 'no switch for a rejected token');
+      assert.deepEqual(calls, [], 'no fork for a rejected token');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the registered command decodes the queued token and warps through it', async () => {
+    const root = makeRepo('wtool-handler');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      addRegistered(root, 'feat/handled');
+      const { tools, commands, dispatches } = await loadExtension();
+      const tool = warpTool(tools);
+      const sessionFile = sessionFileIn();
+      const ctx = makeToolCtx({ cwd: root, sessionFile });
+      const queued = await tool.execute('call-1', { name: 'feat-handled' }, undefined, undefined, ctx);
+      assert.equal(queued.isError, undefined, `expected a queued handoff: ${toolText(queued)}`);
+      const token = queuedToken(dispatches);
+      const calls = [];
+      const FakeSM = makeFakeSM(calls, { sourceEntries: [] });
+      const command = makeWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      // The session manager handed to the command is the fake class, so the
+      // fork resolves through the instance constructor exactly as it does in
+      // the plain-node test environment.
+      command.ctx.sessionManager = Object.assign(new FakeSM(), {
         getSessionFile: () => sessionFile,
         getLeafId: () => 'leaf-1',
         getEntries: () => [],
         getSessionDir: () => path.dirname(sessionFile),
       });
-      const out = await mod.executeWorktreeWarp('feat-cmd-idle', ctx, { sessionManagerClass: FakeSM, oscStream: oscFake(false) });
-      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
-      assert.equal(waited.length, 1, 'the command awaits waitForIdle exactly once');
-      assert.equal(switches.length, 1, 'the command switches once');
+      await commands.get('herdr-gentle:warp').handler(token, command.ctx);
+      assert.equal(command.waited.length, 1, 'the command awaited idle');
+      assert.equal(command.switches.length, 1, 'the decoded handoff performed the switch');
+      assert.deepEqual(command.notes, [], 'a successful handoff stays silent');
     } finally {
       restoreEnv();
     }
@@ -3276,13 +3447,119 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
       const { ctx, switches } = makeToolCtx({
         cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
       });
-      const { mod } = await loadExtension();
+      const { mod, dispatches } = await loadExtension();
       const out = await mod.executeWorktreeWarpTool(
         { name: 'feat-tool-omitted-dest' }, ctx, { sessionManagerClass: FakeSM },
       );
       assert.equal(out.isError, undefined, `expected success: ${out.text}`);
-      assert.equal(switches.length, 1, 'the warp proceeds');
+      assert.equal(dispatches.length, 1, 'the warp is queued');
+      assert.deepEqual(switches, [], 'the tool itself never switches the session');
       assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'nothing was copied');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // S61 differential: `worktree_warp` is NOT part of the S3/S4 create change, so
+  // its `changes` contract and its error text must be byte-identical to what it
+  // always was. The three original shapes are pinned here — the word "none" is
+  // still REFUSED (the create is the only surface that accepts it, by adapting
+  // locally), and both invalid messages keep their exact original wording.
+  test('tool: the warp keeps refusing "none" and its exact invalid-selection wording (S61 unchanged)', async () => {
+    const root = makeFileRepo('tool-none-rejected');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/tool-none-rejected-dest');
+      fs.writeFileSync(path.join(root, 'a.txt'), 'one\nTWO\n');
+      const sessionFile = sessionFileIn();
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const { ctx, switches } = makeToolCtx({
+        cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+      });
+      const { mod } = await loadExtension();
+      const cases = [
+        ['none', `worktree warp: invalid changes selection "none": pass "all", a list of files, or leave it empty for no copy`],
+        ['some', `worktree warp: invalid changes selection "some": pass "all", a list of files, or leave it empty for no copy`],
+        [[''], 'worktree warp: invalid changes selection: every entry must be a non-empty file path'],
+        [42, 'worktree warp: invalid changes selection: pass "all", a list of files, or leave it empty for no copy'],
+      ];
+      for (const [changes, expected] of cases) {
+        const out = await mod.executeWorktreeWarpTool(
+          { name: 'feat-tool-none-rejected-dest', changes }, ctx, { sessionManagerClass: FakeSM },
+        );
+        assert.equal(out.isError, true, `the warp refuses ${JSON.stringify(changes)}`);
+        assert.equal(toolText(out), expected, `byte-identical refusal for ${JSON.stringify(changes)}`);
+      }
+      assert.deepEqual(switches, [], 'no switch');
+      assert.deepEqual(calls, [], 'no fork');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'nothing was copied');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE (S61): the warp's `changes` is OPTIONAL, and an empty string keeps
+  // its documented "copy nothing" meaning. The create's own field is stricter
+  // (only "all", "none" or a list; "" is refused there), so this pin keeps the
+  // two contracts from drifting into each other: the shared helper still treats
+  // "" as no copy, and the warp still simply switches.
+  test('tool: an empty changes string still warps with nothing copied (warp semantics unchanged)', async () => {
+    const root = makeFileRepo('tool-empty-string');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/tool-empty-dest');
+      fs.writeFileSync(path.join(root, 'a.txt'), 'one\nTWO\n');
+      const sessionFile = sessionFileIn();
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const { ctx, switches } = makeToolCtx({
+        cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+      });
+      const { mod, dispatches } = await loadExtension();
+      const out = await mod.executeWorktreeWarpTool(
+        { name: 'feat-tool-empty-dest', changes: '' }, ctx, { sessionManagerClass: FakeSM },
+      );
+      assert.equal(out.isError, undefined, `expected success: ${out.text}`);
+      assert.equal(dispatches.length, 1, 'the warp is queued');
+      assert.deepEqual(switches, [], 'the tool itself never switches the session');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'nothing was copied');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE (S61): a summary that cannot be read never blocks the WARP — the
+  // command degrades to an ordinary move with no copy, exactly as before the
+  // create-side fail-closed rule. Only the interactive CREATE refuses in that
+  // situation (the human is about to get a fresh worktree and would otherwise
+  // lose sight of their pending work).
+  test('command: an unreadable pending-change summary degrades to the ordinary warp', async () => {
+    const root = makeFileRepo('cmd-unreadable');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const target = addRegistered(root, 'feat/cmd-unreadable-dest');
+      fs.writeFileSync(path.join(root, 'a.txt'), 'one\nTWO\n');
+      // Break the summary's reads through git itself, after every fixture write.
+      fs.writeFileSync(path.join(root, '.git', 'index'), 'this is not a git index\n');
+      const sessionFile = sessionFileIn();
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const { ctx, switches } = makeFileWarpCtx({
+        cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
+      });
+      const { mod } = await loadExtension();
+      let asked = 0;
+      mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; });
+      try {
+        const out = await mod.executeWorktreeWarp('feat-cmd-unreadable-dest', ctx, { sessionManagerClass: FakeSM, oscStream: oscFake(false) });
+        assert.equal(out.isError, undefined, `the warp still moves: ${out.text}`);
+        assert.equal(asked, 0, 'an unreadable summary invents no question');
+        assert.equal(switches.length, 1, 'the ordinary warp proceeds');
+        assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'nothing was copied');
+      } finally {
+        mod.setWarpDirtyAsker(null);
+      }
     } finally {
       restoreEnv();
     }
@@ -3301,14 +3578,16 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
       const { ctx, switches } = makeToolCtx({
         cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
       });
-      const { mod } = await loadExtension();
+      const { mod, dispatches } = await loadExtension();
       const out = await mod.executeWorktreeWarpTool(
         { name: 'feat-tool-all-dest', changes: 'all' }, ctx, { sessionManagerClass: FakeSM },
       );
       assert.equal(out.isError, undefined, `expected success: ${out.text}`);
       assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nTWO\n');
       assert.equal(fs.readFileSync(path.join(target, 'new.txt'), 'utf8'), 'fresh\n');
-      assert.equal(switches.length, 1, 'the switch follows the copy');
+      assert.equal(dispatches.length, 1, 'the handoff is queued after the copy');
+      assert.ok(toolText(out).includes('copied: 2 files'), `the pending text reports the copy: ${toolText(out)}`);
+      assert.deepEqual(switches, [], 'the tool itself never switches the session');
     } finally {
       restoreEnv();
     }
@@ -3327,14 +3606,15 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
       const { ctx, switches } = makeToolCtx({
         cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
       });
-      const { mod } = await loadExtension();
+      const { mod, dispatches } = await loadExtension();
       const out = await mod.executeWorktreeWarpTool(
         { name: 'feat-tool-paths-dest', changes: ['a.txt'] }, ctx, { sessionManagerClass: FakeSM },
       );
       assert.equal(out.isError, undefined, `expected success: ${out.text}`);
       assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nTWO\n');
       assert.equal(fs.existsSync(path.join(target, 'extra.txt')), false, 'unselected files stay out');
-      assert.equal(switches.length, 1, 'the warp proceeds');
+      assert.equal(dispatches.length, 1, 'the warp is queued');
+      assert.deepEqual(switches, [], 'the tool itself never switches the session');
     } finally {
       restoreEnv();
     }

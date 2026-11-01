@@ -1468,10 +1468,13 @@ describe('S1: the listing shows no issue or ODD association', () => {
         'checkouts: 4',
         'a-x \u00B7 feat/x',
         'path: /repo/a-x',
+        '',
         'b-y \u00B7 feat/y',
         'path: /repo/b-y',
+        '',
         'c-z \u00B7 feat/z',
         'path: /repo/c-z',
+        '',
         'principal \u00B7 main',
         'path: /repo',
       ], `expanded listing rows at ${width}`);
@@ -1762,8 +1765,13 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
     assertFormatted(rows, 'large listing');
     assert.strictEqual(rows[0], 'checkouts: 12');
     for (const entry of entries) {
+      // S6: existence is implied by being listed, so `live` adds no cell; a
+      // status that DOES carry information rides the identity row it belongs to.
+      const identity = [entry.name, entry.branch, entry.status === 'live' ? '' : entry.status]
+        .filter((cell) => cell.length > 0)
+        .join(' \u00B7 ');
       assert.strictEqual(
-        rows.filter((row) => row === `${entry.name} \u00B7 ${entry.branch}`).length,
+        rows.filter((row) => row === identity).length,
         1,
         `${entry.name} has exactly one identity row: ${JSON.stringify(rows)}`,
       );
@@ -1774,7 +1782,13 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
     assert.ok(!rows.some((row) => /#\d/.test(row)), 'no issue number leaks into the card');
     assert.ok(rows.includes('thread: thread-1'), 'a known thread is detail, not noise');
     assert.ok(!rows.includes('thread: unknown'), 'the unknown thread placeholder never renders');
-    assert.strictEqual(rows.filter((row) => row === 'status: missing').length, 1, 'the missing status survives');
+    assert.strictEqual(
+      rows.filter((row) => row === 'feat-11 \u00B7 feat/branch-11 \u00B7 missing').length,
+      1,
+      'the missing status survives on the entry it belongs to',
+    );
+    assert.ok(!rows.some((row) => row.startsWith('status:')), 'no status row: ' + JSON.stringify(rows));
+    assert.ok(!rows.some((row) => row.endsWith('\u00B7 live')), 'the redundant live status never renders');
     for (const width of [30, 60, 100]) {
       const lines = renderLines(card.renderResult(result, { expanded: true }, THEME, {}), width);
       assertFits(lines, width);
@@ -1956,5 +1970,117 @@ describe('S12: compact precision and formatted expanded detail (T8)', () => {
       'path: now in "/repo/../feat-cards"',
       'branch: now in "feat/cards"',
     ], 'S42: expanded appends path then branch after the names');
+  });
+});
+
+describe('S6: the expanded listing is one block per checkout, without a live status', () => {
+  // The user's report (L10): the listing's status "no tiene sentido, pues si
+  // esta en la lista es porque existe" — every listed row IS a real checkout
+  // (a row whose path is gone is pruned and never listed), so `live` is a row
+  // that only repeats the fact that the entry exists. The statuses that carry
+  // information stay: `missing` (the path exists but git no longer lists the
+  // checkout) and `unregistered` (a live checkout the registry does not own).
+  // The same report asks for list separation — "no se nota separacion de
+  // listado en expanded, esta como todo acoplado" — so each entry is one block
+  // separated from the next by a blank row, and nothing is repeated per entry.
+  function rowsOf(lines) {
+    return lines.map((line) => stripAnsi(line).replace(/^\s*\u258E\s?/, '').replace(/\s+$/, ''))
+      .filter((row) => !row.includes('\u2500') && !row.includes('ctrl+o'));
+  }
+
+  function listResult(entries, extra = {}) {
+    return {
+      content: [{ type: 'text', text: entries.map((row) => `worktree list: ${row.name} ${row.branch}`).join('\n') }],
+      details: { worktrees: entries, count: entries.length, all: true, pruned: [], warnings: [], ...extra },
+    };
+  }
+
+  function expandedRowsOf(entries, width) {
+    const card = createWorktreeCardRenderer('worktree_list');
+    return rowsOf(renderLines(card.renderResult(listResult(entries), { expanded: true }, THEME, {}), width));
+  }
+
+  const ENTRIES = [
+    { name: 'principal', path: '/repo', branch: 'main', thread: null, status: 'live', kind: 'principal' },
+    { name: 'fix-worktree', path: '/repo/wt/fix-worktree', branch: 'fix/worktree-issues', thread: 't1', status: 'live', kind: 'agent' },
+    { name: 'feat-cards', path: '/repo/wt/feat-cards', branch: 'feat/cards', thread: 't2', status: 'missing', kind: 'agent' },
+    { name: 'feat-x', path: '/repo/wt/feat-x', branch: 'feat/x', thread: null, status: 'unregistered', kind: 'unregistered' },
+  ];
+
+  test('no live or exists status is printed, and the meaningful ones ride the identity row', () => {
+    const rows = expandedRowsOf(ENTRIES, 100);
+    const text = rows.join('\n');
+    assert.ok(!/\b(live|exists)\b/.test(text), `no redundant existence status: ${JSON.stringify(rows)}`);
+    assert.ok(!rows.some((row) => row.startsWith('status:')), `no status row at all: ${JSON.stringify(rows)}`);
+    assert.ok(
+      rows.includes('feat-cards \u00B7 feat/cards \u00B7 missing'),
+      `the missing status survives on the entry it belongs to: ${JSON.stringify(rows)}`,
+    );
+    assert.ok(
+      rows.includes('feat-x \u00B7 feat/x \u00B7 unregistered'),
+      `the unregistered status survives too: ${JSON.stringify(rows)}`,
+    );
+    assert.strictEqual(
+      rows.filter((row) => row.endsWith('missing')).length, 1,
+      `the missing status is stated once: ${JSON.stringify(rows)}`,
+    );
+  });
+
+  test('every entry is its own block, separated by exactly one blank row', () => {
+    const expected = [
+      'checkouts: 4',
+      'principal \u00B7 main',
+      'path: /repo',
+      '',
+      'fix-worktree \u00B7 fix/worktree-issues',
+      'path: /repo/wt/fix-worktree',
+      'thread: t1',
+      '',
+      'feat-cards \u00B7 feat/cards \u00B7 missing',
+      'path: /repo/wt/feat-cards',
+      'thread: t2',
+      '',
+      'feat-x \u00B7 feat/x \u00B7 unregistered',
+      'path: /repo/wt/feat-x',
+    ];
+    for (const width of [60, 100]) {
+      const rows = expandedRowsOf(ENTRIES, width);
+      assert.deepStrictEqual(rows, expected, `expanded listing blocks at ${width}`);
+      assert.strictEqual(
+        rows.filter((row) => row === '').length,
+        ENTRIES.length - 1,
+        `one separator between the blocks, none at the edges: ${JSON.stringify(rows)}`,
+      );
+      assert.strictEqual(rows[0], 'checkouts: 4', 'the count leads the listing');
+      assert.notStrictEqual(rows[rows.length - 1], '', 'the listing never ends on a separator');
+    }
+  });
+
+  test('the blocks stay framed and fitting at every width, wrapping instead of cutting', () => {
+    for (const width of [30, 60, 100]) {
+      const lines = renderLines(
+        createWorktreeCardRenderer('worktree_list').renderResult(listResult(ENTRIES), { expanded: true }, THEME, {}), width,
+      );
+      assertFits(lines, width);
+      assertFrame(lines);
+      const rows = rowsOf(lines).filter((row) => row !== '').join('');
+      assert.ok(!rows.includes('\u2026'), `${width}: expanded never truncates: ${JSON.stringify(rows)}`);
+      for (const entry of ENTRIES) {
+        assert.ok(rows.includes(entry.path), `${width}: ${entry.path} survives whole`);
+      }
+    }
+  });
+
+  test('preserve: the collapsed listing still states the action and the count only', () => {
+    const card = createWorktreeCardRenderer('worktree_list');
+    for (const width of [30, 60, 100]) {
+      const rows = rowsOf(renderLines(card.renderResult(listResult(ENTRIES), { expanded: false }, THEME, {}), width));
+      assert.deepStrictEqual(rows, ['listed: 4 checkouts'], `collapsed listing at ${width}`);
+    }
+    assert.deepStrictEqual(
+      rowsOf(renderLines(card.renderResult(listResult([]), { expanded: true }, THEME, {}), 60)),
+      ['checkouts: 0'],
+      'an empty listing is still one count row',
+    );
   });
 });

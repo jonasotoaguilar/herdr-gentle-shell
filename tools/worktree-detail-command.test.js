@@ -82,6 +82,8 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -430,7 +432,7 @@ describe('S8b: migration warnings cross command boundaries', { concurrency: fals
       // this call must create its own instead of returning that one.
       const fresh = { ...boot.ctx, sessionManager: { getSessionId: () => 'thread-fresh' } };
       const result = await tools.get('worktree_create').execute(
-        'migration', { branch: 'feat/fresh-row' }, undefined, undefined, fresh,
+        'migration', { branch: 'feat/fresh-row', changes: 'none' }, undefined, undefined, fresh,
       );
       assert.notEqual(result.isError, true, JSON.stringify(result));
       // The unaddressed legacy row is preserved VERBATIM: its one-document
@@ -494,10 +496,16 @@ describe('S12 feedback: create is a bottom interaction', { concurrency: false },
       const { commands } = await loadExtension();
       const built = scriptedCtx({ cwd: root, steps: [['c'], ['\x1b']] });
       await commands.get('herdr-gentle:warp').handler('', built.ctx);
-      assert.equal(built.mounts.length, 2, 'selector and create both mounted');
+      // S7: `esc` in the create panel cancels the CREATION and hands the
+      // selector back (the third mount); the scripted default `esc` on that
+      // returned selector is what closes the flow. Cancelling still writes
+      // nothing and says nothing.
+      assert.equal(built.mounts.length, 3, 'selector, create panel, then the selector again');
       const create = built.mounts[1];
       assert.deepEqual(create.options, { overlay: true, overlayOptions: { anchor: 'bottom-center', width: '100%', margin: 0, maxHeight: 24 } });
       assert.ok(create.component.render(100).length < 24, 'create keeps content height rather than filling the screen');
+      assert.ok(Array.isArray(built.mounts[2].component.state.checkouts), 'the returned surface is the warp selector');
+      assert.equal(built.mounts[2].component.state.name, undefined, 'and not another create panel');
       assert.equal(git(root, ['for-each-ref', '--format=%(refname)']), branches, 'cancel creates no branch');
       assert.equal(git(root, ['worktree', 'list', '--porcelain']), checkouts, 'cancel creates no checkout');
       assert.deepEqual(built.notes, [], 'cancel stays silent');

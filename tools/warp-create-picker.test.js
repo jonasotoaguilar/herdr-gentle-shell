@@ -1106,16 +1106,22 @@ describe('S2: one-row key legends', { concurrency: false }, () => {
   });
 });
 
-// S11: every picker footer and header paints through the ONE shared palette
-// (lib/tui-paint.js) with the injected theme — a shortcut KEY is accent+bold
-// and its description muted, a title is accent+bold, a static label is dim, a
-// live value (the typed query) is accent, a count is muted, and a rule takes
-// the border role. A hostile or absent theme degrades to plain text, and the
-// one-row compaction keeps the key role at every width.
+// S11/T9: every picker footer and header paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme — a shortcut KEY (a button) is
+// accent+bold and its description muted, a TITLE takes the reference UI's `dim`
+// title role and stays bold, a static label is dim, a live value (the typed
+// query, the typed name) is the normal text role, a count is muted, and a rule
+// takes the border role. A hostile or absent theme degrades to plain text, and
+// the one-row compaction keeps the key role at every width.
 // This module renders no error text: S1 removed the dataset fetches together
 // with their skip messages, so the palette's error role has no call site here.
 describe('S11: the shared palette', { concurrency: false }, () => {
-  const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91 };
+  const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
+  // T9 (S13): the title role is the reference UI's `dim` (its Agents title:
+  // ~/.config/herdr-app/mods/agents/main.js:413), asserted LITERALLY — the test
+  // pins the decision instead of reading it back out of the table.
+  const TITLE_PAINT = '\x1b[1m\x1b[33m';
+  const VALUE_PAINT = '\x1b[39m';
 
   // A theme that RECORDS which role painted each string and paints every role
   // with its own SGR code, so a rendered line can be read for the ROLE behind a
@@ -1255,19 +1261,31 @@ describe('S11: the shared palette', { concurrency: false }, () => {
     assert.match(writeLegend, /\x1b\[90mtype to write\x1b\[0m/, 'typing is prose, never a key');
   });
 
-  test('titles are accent+bold and rules take the border role', () => {
+  // T9 (S13): the picker's title is a TITLE — the theme's secondary heading
+  // role, bold — while the rules keep the border role and the keys stay the
+  // primary accent a button owns.
+  test('titles take the shared title role+bold and rules take the border role', () => {
     const theme = recordingTheme();
     const opened = [openMulti({ theme }), openSingle({ theme }), openWrite({ theme })];
     for (const { view } of opened) {
       const lines = view.render(100);
       assert.match(lines[0], /^\x1b\[34m─+\x1b\[0m$/, 'the opening rule is the border role');
       assert.match(lines[lines.length - 1], /^\x1b\[34m─+\x1b\[0m$/, 'the closing rule is the border role');
-      assert.match(lines[1], /^\x1b\[1m\x1b\[96m[^\x1b]+\x1b\[0m\x1b\[22m$/, 'the title is accent+bold');
+      assert.ok(lines[1].startsWith(TITLE_PAINT), 'the title is the shared title role, bold');
+      assert.ok(lines[1].endsWith('\x1b[0m\x1b[22m'), 'the emphasis closes through the theme');
+    }
+    for (const title of ['Select rows', 'Type', 'Name']) {
+      assert.ok(theme.calls.some((call) => call.role === 'customMessageLabel' && call.text === title),
+        `the ${title} title asks the injected theme for the title role`);
+      assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === title),
+        `the ${title} title never borrows the button accent`);
     }
     assert.ok(!theme.calls.some((call) => call.role === 'error'), 'no error role is painted on a healthy render');
   });
 
-  test('counts are muted, the search label dim and the live query a value', () => {
+  // T9 (S13): a typed query and a typed name are ordinary text, so they stay
+  // out of the accent a button owns; counts and the empty-list note stay muted.
+  test('counts are muted, the search label dim and the live query ordinary text', () => {
     const theme = recordingTheme();
     const { view } = openMulti({ theme });
     assert.match(findRaw(view.render(100), 'total'),
@@ -1278,15 +1296,16 @@ describe('S11: the shared palette', { concurrency: false }, () => {
     view.handleInput('t');
     for (const ch of 'ro') view.handleInput(ch);
     const live = findRaw(view.render(100), 'Search:');
-    assert.match(live, /\x1b\[2mSearch: \x1b\[0m\x1b\[96mro\x1b\[0m/, 'the typed query is the accent value role');
+    assert.ok(live.includes(`${VALUE_PAINT}ro\x1b[0m`), 'the typed query is the normal text role');
+    assert.ok(!/\x1b\[96mro\x1b\[0m/.test(live), 'the typed query is never the button accent');
     for (const ch of 'w zzz') view.handleInput(ch);
     assert.match(findRaw(view.render(100), '(no matches)'),
       /\x1b\[90m\(no matches\)\x1b\[0m/, 'the empty-list note is muted, never an error');
 
     const typed = recordingTheme();
     const write = openWrite({ theme: typed, initial: 'typed' });
-    assert.match(findRaw(write.view.render(100), 'typed'),
-      /\x1b\[96mtyped\x1b\[0m/, 'the typed name is a live value');
+    assert.ok(findRaw(write.view.render(100), 'typed').includes(`${VALUE_PAINT}typed\x1b[0m`),
+      'the typed name is ordinary text');
   });
 
   test('a hostile theme never breaks a render and keeps every key readable', () => {

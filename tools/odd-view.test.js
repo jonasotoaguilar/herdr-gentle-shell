@@ -45,10 +45,14 @@ const cellWidth = (line) => (realTui && typeof realTui.visibleWidth === 'functio
 
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text) };
 
-// S11: a theme that RECORDS which role it was asked to paint each string with
-// and paints every role with its own SGR code, so a rendered line can be read
-// for the ROLE behind a token instead of trusting an eyeballed colour.
-const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
+// S11/T9: a theme that RECORDS which role it was asked to paint each string
+// with and paints every role with its own SGR code, so a rendered line can be
+// read for the ROLE behind a token instead of trusting an eyeballed colour.
+// T9 (S13): the title role is `customMessageLabel`, the one the Pi Agents view
+// paints its own frame title with (`gentle-pi/lib/agents-view.ts:42,437`), which
+// the recording theme paints with SGR 33; `text` is normal body text and
+// `accent` the buttons.
+const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
 
 function recordingTheme() {
   const calls = [];
@@ -891,7 +895,8 @@ describe('S13: the odd frame repeats nothing', () => {
     assert.equal(lines.length, 20, 'the frame still fills every row');
     assert.match(lines[1], /› Search/, 'the search widget rides the search row');
     assert.ok(!/page/i.test(lines[1]), 'the page marker is gone with the pager (S3)');
-    assert.match(lines[1], / \d+-\d+\/\d+/, 'the reading position keeps the right edge');
+    assert.match(lines[1], / \d+\/\d+/, 'the reading position keeps the right edge');
+    assert.ok(!/\d+-\d+\//.test(lines[1]), 'S10: no redundant start-of-window range');
     assert.equal(lines.length - 3, 20 - 3, 'the panes keep the rows the status row used to take');
   });
 });
@@ -1525,13 +1530,13 @@ describe('createOddView footer scroll targets (S14)', () => {
     }
   });
 
-  test('the list token is labelled, so it never reads as the document scroll', async () => {
+  test('S8: the list scroll pair has no footer token, and the document token keeps its target', async () => {
     const view = build();
     await tick();
     const footer = footerOf(view.render(120));
-    assert.match(footer, /←\/→ list/, `the list scroll key names its target: ${footer}`);
-    assert.ok(!footer.includes('←/→ scroll'), 'the ambiguous unlabelled reading is gone');
-    assert.match(footer, /s sort: recent/, 'the sort token stays beside the two labelled scroll hints');
+    assert.ok(!footer.includes('←/→'), `the redundant list scroll hint is gone: ${footer}`);
+    assert.match(footer, /(ctrl\+shift\+j\/k|shift\+j\/k) doc/, 'the document scroll keeps its labelled token');
+    assert.match(footer, /s sort: recent/, 'the sort token stays beside the remaining scroll hint');
   });
 
   test('every document scroll binding still answers with its hint gone', async () => {
@@ -1563,7 +1568,7 @@ describe('createOddView footer scroll targets (S14)', () => {
     assert.equal(view.state.index, 0, 'no document scroll key ever moved the list');
   });
 
-  test('the list scroll keys keep working under their new label', async () => {
+  test('the list scroll keys keep working with no footer token', async () => {
     const names = Array.from({ length: 30 }, (_unused, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
     const view = build({ docs: names, rows: 12 });
     await tick();
@@ -1596,8 +1601,9 @@ describe('createOddView footer scroll targets (S14)', () => {
     const footer = view.render(160).at(-2);
     assert.match(footer, /\x1b\[1m\x1b\[96mctrl\+shift\+j\/k\x1b\[0m\x1b\[22m\x1b\[90m doc/,
       'the document hint paints its key accent+bold and its target muted');
-    assert.match(footer, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m\x1b\[90m list/,
-      'the list hint splits its key and target the same way');
+    assert.match(footer, /\x1b\[1m\x1b\[96mr\x1b\[0m\x1b\[22m\x1b\[90m reload/,
+      'the reload hint keeps the key/description split');
+    assert.ok(!strip(footer).includes('←/→'), 'S8: the list scroll pair is not painted at all');
   });
 });
 
@@ -1659,7 +1665,7 @@ describe('createOddView continuous list scrolling instead of pages (S3)', () => 
     await tick();
     const footer = footerOf(view.render(200));
     assert.ok(!/page/i.test(footer), `the legend drops the page hint: ${footer}`);
-    assert.match(footer, /←\/→ list/, 'the list scroll key is still named, with its target (S14)');
+    assert.ok(!footer.includes('←/→'), `S8: the list scroll pair costs no cells: ${footer}`);
     assert.match(footer, /(ctrl\+shift\+j\/k|shift\+j\/k) doc/, 'the document scroll is named once with its target');
   });
 
@@ -1732,7 +1738,8 @@ describe('createOddView continuous list scrolling instead of pages (S3)', () => 
     view.handleInput('J');
     const row = searchRowOf(view.render(80));
     assert.match(row, /› Search/, 'the search widget owns the left of the row');
-    assert.match(row, / \d+-\d+\/\d+/, 'the reading position keeps the right edge');
+    assert.match(row, / \d+\/\d+/, 'the reading position keeps the right edge');
+    assert.ok(!/\d+-\d+\//.test(row), 'S10: the reading position carries no range prefix');
   });
 });
 
@@ -1762,7 +1769,7 @@ describe('odd view palette (S11)', () => {
     const footer = view.render(160).at(-2);
     assert.match(footer, /\x1b\[1m\x1b\[96m↑↓\x1b\[0m\x1b\[22m/, 'the key token is painted accent+bold');
     assert.match(footer, /\x1b\[90m select/, 'its description is painted muted');
-    assert.match(footer, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m/, 'the list scroll key is a key run');
+    assert.match(footer, /\x1b\[1m\x1b\[96mshift\+j\/k\x1b\[0m\x1b\[22m/, 'the document scroll key is a key run');
     assert.match(footer, /\x1b\[1m\x1b\[96mT\x1b\[0m\x1b\[22m/, 'a single-letter key is painted the same way');
     assert.ok(theme.calls.some((call) => call.role === 'accent' && call.text === '↑↓'),
       'the accent role comes from the injected theme');
@@ -1783,12 +1790,21 @@ describe('odd view palette (S11)', () => {
     assert.match(footer, /\x1b\[1m\x1b\[96mbksp\x1b\[0m\x1b\[22m/, 'backspace keeps the same pair');
   });
 
-  test('the header paints the title accent+bold, its separator dim and the count muted', async () => {
+  // T9 (S13): the frame title takes `customMessageLabel`, the role the Pi Agents
+  // view paints its own frame title with, while the footer's keys
+  // keep the PRIMARY accent — so a title and a button never read as the same
+  // control. The document's markdown heading keeps its own `mdHeading` role.
+  test('the header paints the title with the reference dim title role, its separator dim and the count muted', async () => {
     const theme = recordingTheme();
     const view = paletteView(theme);
     await tick();
     const lines = view.render(120);
-    assert.match(lines[0], /\x1b\[1m\x1b\[96m✎ Odd\x1b\[0m\x1b\[22m/, 'the frame title is accent+bold');
+    assert.match(lines[0], /\x1b\[1m\x1b\[33m✎ Odd\x1b\[0m\x1b\[22m/,
+      'the frame title is the dim role, bold');
+    assert.ok(theme.calls.some((call) => call.role === 'customMessageLabel' && call.text === '✎ Odd'),
+      'the title asks the injected theme for the title role');
+    assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === '✎ Odd'),
+      'the title never competes with the primary accent a button uses');
     assert.match(lines[0], /\x1b\[2m · \x1b\[0m/, 'the separator is the dim label role');
     assert.match(lines[0], /\x1b\[90m2 documents\x1b\[0m/, 'the document count is muted, never accent');
     // The right-pane document title is the markdown heading, painted through the
@@ -1815,7 +1831,9 @@ describe('odd view palette (S11)', () => {
     assert.match(body, /› Search/, 'the search widget still renders');
   });
 
-  test('the search row paints its label dim and its live value accent', async () => {
+  // T9 (S13): text the reader typed is ordinary text, not the accent a button
+  // owns — the selected row stays told apart by its own band instead.
+  test('the search row paints its label dim and its live value as ordinary text', async () => {
     const theme = recordingTheme();
     const view = paletteView(theme);
     await tick();
@@ -1825,7 +1843,8 @@ describe('odd view palette (S11)', () => {
     for (const char of 'alp') view.handleInput(char);
     const live = view.render(120)[1];
     assert.match(live, /\x1b\[2m› \x1b\[0m/, 'the prompt keeps the dim label role while typing');
-    assert.match(live, /\x1b\[96malp/, 'the live query value is painted accent');
+    assert.match(live, /\x1b\[39malp/, 'the live query value is the theme text role');
+    assert.ok(!/\x1b\[96malp/.test(live), 'the typed value is never the button accent');
   });
 });
 
@@ -1995,5 +2014,178 @@ describe('createOddView list order (S12)', () => {
       assert.equal(lines.length, 20, `${width}: the frame still fills the rows`);
       for (const line of lines) assert.equal(helpers.visibleWidth(line), width, `${width}: rows stay ${width} wide`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worktree-issues-reliability T6 (S8,S9,S10), all through the public
+// render/handleInput surface:
+//   S8 «salen flecha izq/der ... esta bien el atajo pero demas marcarlo» — the
+//   list scroll pair keeps working and leaves the footer;
+//   S9 «el r en odd no hace nada pareceria» — a reload that changes no row must
+//   still say it ran, re-read the open document, and name a failure;
+//   S10 «pagina/linea ... sale el 1-, esta demas» — the reading position keeps
+//   the useful numbers and loses the range prefix.
+// ---------------------------------------------------------------------------
+describe('createOddView shortcut round (S8,S9,S10)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const footerOf = (lines) => strip(lines[lines.length - 2]);
+  const searchRowOf = (lines) => strip(lines[1]);
+  const bodyOf = (lines) => strip(lines.join('\n'));
+  const listCells = (lines) => lines.slice(2, -2).map((line) => strip(line).split('│')[1] || '');
+  const filled = (lines) => listCells(lines).filter((cell) => cell.trim() !== '');
+  const names = (count) => Array.from({ length: count }, (_unused, at) => doc(`document-${String(at + 1).padStart(2, '0')}`));
+
+  function build({ docs = [doc('alpha'), doc('beta')], rows = 20, load, reloadDocs } = {}) {
+    return createOddView({
+      docs,
+      loadDoc: load || (() => ({ ok: true, text: longDoc(200) })),
+      reloadDocs,
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => rows,
+      requestRender: () => {},
+      done: () => {},
+    });
+  }
+
+  test('S8: the footer no longer marks the list scroll pair, and ←/→ keep scrolling the list', async () => {
+    const view = build({ docs: names(14), rows: 12 });
+    await tick();
+    const footer = footerOf(view.render(80));
+    assert.ok(!footer.includes('←/→'), `the redundant list hint is gone: ${footer}`);
+    assert.ok(!/→\s*list/.test(footer), 'no list scroll token anywhere in the footer');
+    assert.match(footer, /esc close/, 'the rest of the legend survives');
+    const first = () => filled(view.render(80))[0];
+    assert.match(first(), /document-01/, 'the window starts at the first document');
+    view.handleInput('right');
+    assert.match(first(), /document-07/, '→ still moves the list one screenful');
+    view.handleInput('left');
+    assert.match(first(), /document-01/, '← still moves it back');
+    view.handleInput(']');
+    assert.match(first(), /document-07/, '] still moves it forward');
+    view.handleInput('[');
+    assert.match(first(), /document-01/, '[ still moves it back');
+  });
+
+  test('S9: r names its outcome on the footer, so a reload that changes nothing is not silent', async () => {
+    const same = [doc('alpha'), doc('beta')];
+    const view = build({ reloadDocs: () => ({ ok: true, docs: same }) });
+    await tick();
+    const before = footerOf(view.render(80));
+    assert.match(before, / r( |$)/, 'the idle footer still names the key');
+    view.handleInput('r');
+    await tick();
+    const after = footerOf(view.render(80));
+    assert.match(after, /r reloaded/, `the footer says the reload happened: ${after}`);
+    assert.notEqual(after, before, 'the reload is visible even when nothing else changed');
+  });
+
+  test('S9: r re-reads the focused document, so an edit on disk reaches the pane', async () => {
+    let text = '# alpha\n\nfirst body\n';
+    const view = build({
+      docs: [doc('alpha')],
+      load: () => ({ ok: true, text }),
+      reloadDocs: () => ({ ok: true, docs: [doc('alpha')] }),
+    });
+    await tick();
+    assert.match(bodyOf(view.render(80)), /first body/);
+    text = '# alpha\n\nsecond body\n';
+    view.handleInput('r');
+    await tick();
+    const body = bodyOf(view.render(80));
+    assert.match(body, /second body/, 'the reloaded pane shows the edited document');
+    assert.ok(!body.includes('first body'), 'the stale body is gone');
+  });
+
+  test('S9: a failing reload keeps the list and reports the failure instead of doing nothing', async () => {
+    const view = build({ reloadDocs: () => ({ ok: false, reason: 'no-checkout', docs: [] }) });
+    await tick();
+    view.handleInput('r');
+    await tick();
+    const lines = view.render(80);
+    assert.match(bodyOf(lines), /alpha/, 'the documents stay listed');
+    assert.match(footerOf(lines), /(^|· )r failed( ·|$)/, `the failure is named in the footer: ${footerOf(lines)}`);
+  });
+
+  // S9 at the reported width: the reader who saw `r` in the compact legend and
+  // then reloaded is on a ~60-column terminal. The idle token fits there, so the
+  // outcome must fit too instead of being pruned away as if nothing happened.
+  test('S9: the reload outcome stays in the compact legend at 60 columns, where the idle r fits', async () => {
+    for (const kitty of [null, true, false]) {
+      const label = kitty === null ? 'fallback helpers' : `kitty ${kitty}`;
+      const same = [doc('alpha'), doc('beta')];
+      const make = (reloadDocs) => {
+        const localHelpers = kitty === null
+          ? helpers
+          : { ...helpers, isKittyProtocolActive: () => kitty };
+        return createOddView({
+          docs: [doc('alpha'), doc('beta'), ...names(8)],
+          loadDoc: () => ({ ok: true, text: longDoc(120) }),
+          reloadDocs,
+          helpers: localHelpers,
+          theme: plainTheme,
+          rowsAvailable: () => 12,
+          requestRender: () => {},
+          done: () => {},
+        });
+      };
+      const idle = make(() => ({ ok: true, docs: same }));
+      const footer = footerOf(idle.render(60));
+      assert.match(footer, /(^|· )r( ·|$)/, `${label}: the premise — an idle r token fits at 60: ${footer}`);
+      assert.match(footer, /esc close/, `${label}: close survives at 60`);
+
+      const ok = make(() => ({ ok: true, docs: same }));
+      ok.handleInput('r');
+      await tick();
+      const after = footerOf(ok.render(60));
+      assert.match(after, /(^|· )r reloaded( ·|$)/, `${label}: the successful outcome is visible at 60: ${after}`);
+      assert.match(after, /esc close/, `${label}: close survives the larger token: ${after}`);
+
+      const failing = make(() => ({ ok: false }));
+      failing.handleInput('r');
+      await tick();
+      const failedFooter = footerOf(failing.render(60));
+      assert.match(failedFooter, /(^|· )r failed( ·|$)/, `${label}: the failure is visible at 60: ${failedFooter}`);
+      assert.match(failedFooter, /esc close/, `${label}: close survives the failure token: ${failedFooter}`);
+    }
+  });
+
+  test('S9: the compact legend keeps the keys working once the outcome token is painted', async () => {
+    const localHelpers = { ...helpers, isKittyProtocolActive: () => true };
+    let closed = 'pending';
+    const view = createOddView({
+      docs: names(14),
+      loadDoc: () => ({ ok: true, text: longDoc(40) }),
+      reloadDocs: () => ({ ok: true, docs: names(14) }),
+      helpers: localHelpers,
+      theme: plainTheme,
+      rowsAvailable: () => 12,
+      requestRender: () => {},
+      done: (result) => { closed = result; },
+    });
+    view.handleInput('r');
+    await tick();
+    assert.match(footerOf(view.render(60)), /r reloaded/, 'the preview frame is the reported 60-column one');
+    const first = () => filled(view.render(60))[0];
+    assert.match(first(), /document-01/, 'the window starts at the first document');
+    view.handleInput('right');
+    assert.match(first(), /document-07/, '→ still moves the list a screen under the outcome token');
+    view.handleInput('left');
+    assert.match(first(), /document-01/, '← still moves it back');
+    view.handleInput('escape');
+    assert.equal(closed, null, 'esc still closes the view');
+  });
+
+  test('S10: the reading position names the visible-through line and the total, with no 1- prefix', async () => {
+    const view = build({ docs: [doc('alpha')] });
+    await tick();
+    const top = searchRowOf(view.render(80));
+    assert.match(top, / 16\/399( |$)/, `the row shows the visible-through line and the total: ${top}`);
+    assert.ok(!/\d+-\d+\//.test(top), `no redundant range prefix: ${top}`);
+    view.handleInput('J');
+    const paged = searchRowOf(view.render(80));
+    assert.match(paged, / 31\/399( |$)/, `the position moves with the document: ${paged}`);
+    assert.ok(!/\d+-\d+\//.test(paged), 'and the range never comes back');
   });
 });

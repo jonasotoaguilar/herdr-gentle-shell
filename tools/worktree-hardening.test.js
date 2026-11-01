@@ -56,6 +56,8 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -672,7 +674,7 @@ describe('R4-4: stale cleanup drops exactly the thread-owned row', { concurrency
       try {
         const tools = await loadExtension();
         const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionId: () => 'creator' }, ui: { confirm: async () => true, notify: () => {} } };
-        const result = await tools.get('worktree_create').execute('c1', { branch: 'feat-new-' + arm, issues: [7] }, undefined, undefined, ctx);
+        const result = await tools.get('worktree_create').execute('c1', { branch: 'feat-new-' + arm, issues: [7], changes: 'none' }, undefined, undefined, ctx);
         const text = resultText(result);
         assert.equal(result.isError, undefined, `[${arm}] expected creation success, got: ${text}`);
         const after = reg.readRegistry(root);

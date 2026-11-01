@@ -161,13 +161,17 @@ function openRows({ outcome = 'opened', worktree, branch, path: target, session,
 }
 
 function listHeader(count) {
-  return `worktrees: ${count} (name · branch · path · kind · status)`;
+  return `worktrees: ${count} (name · branch · path)`;
 }
 
 // S1: a listing row is the checkout's identity alone — issue numbers and ODD
-// documents are not part of a worktree and never render.
+// documents are not part of a worktree and never render. S6: neither does a
+// redundant existence status or a kind the row already states, so only
+// `missing`/`unregistered` ride a trailing cell.
 function listRow({ name, branch, path: target, kind, status }) {
-  return [name, branch, target, kind, status].join(' · ');
+  const state = status === undefined || status === 'live' || status === 'exists' ? '' : status;
+  const kindCell = kind === undefined || kind === 'agent' || kind === name || kind === state ? '' : kind;
+  return [name, branch, target, kindCell, state].filter((cell) => cell.length > 0).join(' · ');
 }
 
 function scratchModeEnv() {
@@ -216,7 +220,10 @@ function makeCtx(repoRoot) {
 async function callSessionOpen(tools, params, ctx) {
   const tool = tools.get('worktree_session_open');
   assert.ok(tool, 'expected worktree_session_open to be registered');
-  return tool.execute('call-1', params, undefined, undefined, ctx);
+  // S4: `changes` is mandatory; the session cases are not about copying, so the
+  // no-copy selection is stated explicitly.
+  const sent = params && params.changes !== undefined ? params : { ...(params || {}), changes: 'none' };
+  return tool.execute('call-1', sent, undefined, undefined, ctx);
 }
 
 // A stub world where the registered worktree already has a Herdr
@@ -981,7 +988,7 @@ describe('worktree_session_open preserves the existing tools (S25)', { concurren
       );
       assert.deepEqual(
         Object.keys(tools.get('worktree_create').parameters.properties).sort(),
-        ['branch'],
+        ['branch', 'changes'],
       );
       assert.deepEqual(
         Object.keys(tools.get('worktree_close').parameters.properties).sort(),

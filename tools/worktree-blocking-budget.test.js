@@ -103,6 +103,8 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -299,7 +301,7 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
       const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-budget');
 
       const probe = startTickProbe();
-      const result = await tool.execute('call-1', { branch: 'feat/budget' }, undefined, undefined, ctx);
+      const result = await tool.execute('call-1', { branch: 'feat/budget', changes: 'none' }, undefined, undefined, ctx);
       const stats = probe.stop();
 
       // The conversion must not change behaviour: same success, same text,
@@ -315,6 +317,48 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
 
       // The property the user felt.
       assertLoopStayedFree(stats, 'worktree_create create');
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
+  // S2/S3: carrying the pending changes is part of the create, and it must not
+  // reintroduce the blocking child the S21 conversion removed. The transfer
+  // runs on the same async runner, so the loop stays free while it copies, and
+  // the copied work really lands in the new checkout.
+  test('copying pending changes into the new checkout keeps the loop free too', async () => {
+    const root = makeRepo('create-copy');
+    const shimDir = makeShimDir('create-copy');
+    const herdr = makeSlowHerdrStub(shimDir);
+    setSlowChildEnv({ shimDir, vars: { HERDR_BIN_PATH: herdr.bin } });
+    try {
+      const { tools } = await loadExtension();
+      const tool = tools.get('worktree_create');
+      assert.ok(tool, 'expected worktree_create to be registered');
+      const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-budget-copy');
+      // Pending work, committed through the real binary (the shim only slows
+      // the extension's own children).
+      fs.writeFileSync(path.join(root, 'pending.txt'), 'one\n');
+      git(root, ['add', 'pending.txt']);
+      git(root, ['commit', '-m', 'pending base']);
+      // S2: the checkout is born from local main, so the committed file must be
+      // part of main's tree for the pending change to apply.
+      git(root, ['branch', '-f', 'main', 'HEAD']);
+      fs.writeFileSync(path.join(root, 'pending.txt'), 'one\ntwo\n');
+      const { ctx } = makeCtx({ repoRoot: root });
+
+      const probe = startTickProbe();
+      const result = await tool.execute('call-1', { branch: 'feat/budget-copy', changes: 'all' }, undefined, undefined, ctx);
+      const stats = probe.stop();
+
+      assert.equal(result.isError, undefined, `create failed: ${resultText(result)}`);
+      assert.equal(
+        fs.readFileSync(path.join(target, 'pending.txt'), 'utf8'),
+        'one\ntwo\n',
+        'the pending change travelled into the new checkout',
+      );
+      assert.equal(resultText(result).split('\n').at(-1), 'copied: 1 file, +1/-0');
+      assertLoopStayedFree(stats, 'worktree_create copy');
     } finally {
       process.env.PATH = savedPath;
     }
@@ -467,7 +511,6 @@ function selectorDriver(keys) {
 describe('the warp selector delete path is gone, and Ctrl+D is inert (S4)', { concurrency: false }, () => {
   test('Ctrl+D asks nothing, removes nothing and never freezes the selector', async () => {
     const root = makeRepo('delete');
-    git(root, ['branch', 'main', 'HEAD']);
     const target = addRegisteredWorktree(root, 'feat/del');
     const shimDir = makeShimDir('delete');
     const herdr = makeSlowHerdrStub(shimDir);
@@ -500,6 +543,248 @@ describe('the warp selector delete path is gone, and Ctrl+D is inert (S4)', { co
       assert.equal(driver.mounts(), 1, 'the selector never reopened: the panel simply stayed up');
       assert.deepEqual(built.notes, [], 'and nothing is claimed');
     } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S1 (this round): the CREATION PANEL is a TUI action too, and round 3's S21
+// rule says no interactive path may block the host event loop. It used to: the
+// live branch/path preview re-ran `git check-ref-format` (a `spawnSync` child)
+// from `render()` on every keystroke, so each typed character froze Pi for the
+// whole child. Measured here, not asserted as `async`: the host paint is
+// modelled exactly like Pi does it (a `requestRender` mark, then a render on
+// the next loop turn), keystrokes are separate events, and a 10 ms probe must
+// keep ticking with no gap over MAX_GAP_MS while a 400 ms `git` child is on
+// PATH. The preview must still derive the SAME branch and canonical path the
+// create path uses — the wait moved, the derivation did not.
+// ---------------------------------------------------------------------------
+
+// A host-accurate driver for the two surfaces `c` reaches: the selector, then
+// the create panel. `requestRender` only marks; the paint happens on the next
+// turn, like the real host. Every keystroke is its own event.
+function createPanelDriver(chars) {
+  const views = [];
+  let mounts = 0;
+  let createView = null;
+  const mount = async (factory) => {
+    mounts += 1;
+    const index = mounts;
+    let dirty = false;
+    const hostTui = { requestRender: () => { dirty = true; }, terminal: { rows: 24 } };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('warp surface did not settle')), 30000);
+      const done = (value) => { clearTimeout(timer); resolve(value); };
+      let view;
+      try {
+        view = factory(hostTui, plainTheme, {}, done);
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+        return;
+      }
+      views.push(view);
+      const paint = () => {
+        if (!dirty) return;
+        dirty = false;
+        view.render(120); // the host's repaint: this is where a blocking panel stalls
+      };
+      const run = async () => {
+        try {
+          if (index === 1) {
+            view.render(120);
+            view.handleInput('c'); // the create hotkey
+            return;
+          }
+          if (index === 2) {
+            createView = view;
+            paint();
+            view.handleInput('\t'); // Type -> Name
+            paint();
+            for (const char of chars) {
+              view.handleInput(char);
+              paint();
+              // A keystroke is a separate loop turn in the real host.
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+            view.handleInput('\x1b'); // cancel: no branch, no checkout, no write
+            return;
+          }
+          view.handleInput('\x1b');
+        } catch (err) {
+          clearTimeout(timer);
+          reject(err);
+        }
+      };
+      if (index === 1) {
+        run().catch(reject);
+      } else {
+        setTimeout(() => { run().catch(reject); }, 0);
+      }
+    });
+  };
+  return { mount, views, mounts: () => mounts, createView: () => createView };
+}
+
+describe('the create panel keeps the host event loop free (S1)', { concurrency: false }, () => {
+  test('typing the change name never freezes Pi, and the preview still derives branch and path', async () => {
+    const root = makeRepo('panel');
+    const shimDir = makeShimDir('panel');
+    setSlowChildEnv({ shimDir });
+    try {
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const driver = createPanelDriver('budget-change');
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: driver.mount,
+      });
+      const { commands } = await loadExtension();
+      const def = commands.get('herdr-gentle:warp');
+      assert.ok(def, 'expected the warp command to be registered');
+
+      const probe = startTickProbe();
+      await def.handler('', built.ctx);
+      const stats = probe.stop();
+
+      // The derivation is unchanged: the same branch the create path builds and
+      // the same canonical principal-anchored checkout path, from git's own
+      // helpers — the panel simply no longer asks git on the render path.
+      const panelView = driver.createView();
+      assert.ok(panelView, 'the create panel mounted');
+      assert.equal(panelView.state.name, 'budget-change', 'every typed character reached the name field');
+      const frame = panelView.render(120).map((line) => line.replace(/\x1b\[[0-9;]*m/g, ''));
+      const text = frame.join('\n');
+      assert.match(text, /preview branch: feat\/budget-change/, `the branch preview derives\n${text}`);
+      assert.match(
+        text,
+        /preview path: .*feat-budget-change/,
+        `the canonical path preview derives\n${text}`,
+      );
+      // Cancelling wrote nothing: the panel is still a form, never a side effect.
+      assert.deepEqual(calls, [], 'no session switch happened');
+      assert.equal(registryLib.readRegistry(root).worktrees.length, 0, 'no registry row was written');
+      assert.deepEqual(built.notes, [], 'and nothing is claimed');
+
+      // The property the user feels.
+      assertLoopStayedFree(stats, 'the create panel typing');
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worktree-issues S11: the warp selector's ROW DATA was slow to load, and the
+// measurement says why. Opening the panel read every checkout's facts through
+// `lib/checkout-facts.js`, and each of those reads resolved the repository
+// identity with two `spawnSync` `git rev-parse` probes — so N checkouts froze
+// the host for 2·N children while the rows were merely loading, and the base
+// comparison spawned a SECOND `git worktree list` per checkout to learn a
+// branch the shared listing already carried.
+//
+// This test drives the real command with a `git` shim that slows EVERY child,
+// `rev-parse` included (the class of child the report was about), then asserts
+// the two properties the user felt: the loop keeps ticking while the rows load,
+// and the rows really do arrive — a frozen host that loads nothing would pass a
+// blocking test alone.
+// ---------------------------------------------------------------------------
+
+// The same PATH shim as `makeSlowGitShim`, but without the `rev-parse`
+// exemption: the identity probes are exactly what this case measures.
+function makeSlowEveryChildGitShim(scriptDir) {
+  const bin = path.join(scriptDir, 'git');
+  fs.writeFileSync(
+    bin,
+    [
+      '#!/bin/sh',
+      `sleep ${(CHILD_DELAY_MS / 1000).toFixed(3)}`,
+      `exec ${JSON.stringify(REAL_GIT)} "$@"`,
+      '',
+    ].join('\n'),
+    { mode: 0o755 },
+  );
+  return bin;
+}
+
+function stripFrame(lines) {
+  return lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, '')).join('\n');
+}
+
+// Bounded wait for an observed condition, without ever claiming a duration:
+// only the number of yields is bounded.
+async function waitFor(predicate, label, attempts = 200) {
+  for (let i = 0; i < attempts; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`never observed: ${label}`);
+}
+
+describe('the warp selector loads its rows without freezing the host (S11)', { concurrency: false }, () => {
+  test('the panel paints, the row data arrives, and no child blocks the loop', async () => {
+    const root = makeRepo('s11-selector');
+    const wtA = addRegisteredWorktree(root, 'feat/s11-a');
+    addRegisteredWorktree(root, 'feat/s11-b');
+    // Pending work in the focused checkout, so its data line carries a real
+    // change size and a real age instead of an unavailable one.
+    fs.writeFileSync(path.join(wtA, 'pending.txt'), 'one\ntwo\n');
+    const shimDir = makeShimDir('s11');
+    makeSlowEveryChildGitShim(shimDir);
+    setSlowChildEnv({ shimDir });
+    let view = null;
+    let probe = null;
+    try {
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      let mounted = null;
+      const mountReached = new Promise((resolve) => { mounted = resolve; });
+      const mount = async (factory) => new Promise((resolve) => {
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        view = factory(hostTui, plainTheme, {}, resolve);
+        mounted();
+      });
+      const built = makeWiredCtx({
+        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount,
+      });
+      const { commands } = await loadExtension();
+      const def = commands.get('herdr-gentle:warp');
+      assert.ok(def, 'expected the warp command to be registered');
+
+      probe = startTickProbe();
+      const handler = def.handler('', built.ctx);
+      await mountReached;
+
+      // The first frame is already usable, before any row finished reading.
+      const firstFrame = stripFrame(view.render(120));
+      assert.match(firstFrame, /Warp/, `the panel paints immediately\n${firstFrame}`);
+
+      // The row data arrives: the focused checkout's facts line names its
+      // branch, its change size and a real age.
+      await waitFor(() => {
+        const frame = stripFrame(view.render(120));
+        return /branch feat\/s11-a/.test(frame) && /modified just now/.test(frame) && !/reading …/.test(frame);
+      }, 'the current and focused rows to finish loading');
+      const frame = stripFrame(view.render(120));
+      assert.match(frame, /changes \+2 −0/, `the change size loaded\n${frame}`);
+      assert.ok(!/reading …/.test(frame), `no row is still reading\n${frame}`);
+      const stats = probe.stop();
+
+      // The property the report was about: the host never froze while the rows
+      // loaded, even though every child on the path was slow.
+      assertLoopStayedFree(stats, 'the warp selector row load');
+
+      // ...and the flow is unchanged: Esc closes silently and moves nothing.
+      view.handleInput('\x1b');
+      await handler;
+      assert.deepEqual(built.notes, [], 'Esc stays silent');
+      assert.deepEqual(calls, [], 'no session switch happened');
+      assert.equal(registryLib.readRegistry(root).worktrees.length, 2, 'the registry is untouched');
+    } finally {
+      if (probe) probe.stop();
+      if (view) view.handleInput('\x1b');
       process.env.PATH = savedPath;
     }
   });

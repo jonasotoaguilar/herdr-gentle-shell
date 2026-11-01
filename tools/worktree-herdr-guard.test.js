@@ -81,6 +81,8 @@ function makeRepo(tag) {
   git(real, ['config', 'user.email', 'test@example.com']);
   git(real, ['config', 'user.name', 'Test']);
   git(real, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(real, ['branch', 'main', 'HEAD']);
   return real;
 }
 
@@ -224,7 +226,10 @@ async function callCreate(tools, params, repoRoot) {
     sessionManager: { getSessionId: () => 'thread-1' },
     ui: { confirm: async () => true, notify: () => {} },
   };
-  return tool.execute('call-1', params, undefined, undefined, ctx);
+  // S4: `changes` is mandatory; these cases are about the binary guard, so the
+  // no-copy selection is stated explicitly.
+  const sent = params && params.changes !== undefined ? params : { ...(params || {}), changes: 'none' };
+  return tool.execute('call-1', sent, undefined, undefined, ctx);
 }
 
 const createdCheckouts = (repoRoot) => git(repoRoot, ['worktree', 'list', '--porcelain'])

@@ -328,18 +328,86 @@ describe('shared warning rows', () => {
 
 describe('worktree_list model text', () => {
   test('count plus one stable row per checkout, and no association cell', () => {
-    // kind and status are separate facts even when they agree: an
-    // unregistered checkout is both `kind: unregistered` and
-    // `status: unregistered`, and the row keeps both cells. S1 removed the
-    // issue/ODD association column from every worktree display, so a row is
-    // exactly the checkout's identity.
+    // S6: being listed IS the existence proof (a checkout whose path is gone
+    // is pruned, never listed), so `live` is not a cell; `kind` was a second
+    // spelling of what the row already said (`principal` repeated the name,
+    // `agent` repeated "a registered worktree", `unregistered` repeated the
+    // status). What survives is the state that changes how the row reads.
+    // S1 removed the issue/ODD association column from every worktree display,
+    // so a row is the checkout's identity plus that one state.
     assert.deepStrictEqual(linesOf(formatWorktreeModelResult('worktree_list', listResult())), [
-      'worktrees: 4 (name · branch · path · kind · status)',
-      'principal · main · /repo · principal · live',
-      'feat-cards · feat/cards · /repo/feat-cards · agent · live',
-      'feat-gone · feat/gone · /repo/feat-gone · agent · missing',
-      'stray-x · feat/stray · /repo/stray-x · unregistered · unregistered',
+      'worktrees: 4 (name · branch · path)',
+      'principal · main · /repo',
+      'feat-cards · feat/cards · /repo/feat-cards',
+      'feat-gone · feat/gone · /repo/feat-gone · missing',
+      'stray-x · feat/stray · /repo/stray-x · unregistered',
     ]);
+  });
+
+  test('S6: no redundant existence status and no repeated kind cell, ever', () => {
+    const text = textOf(formatWorktreeModelResult('worktree_list', listResult()));
+    assert.ok(!/\blive\b/.test(text), 'the redundant live status never reaches the model: ' + text);
+    assert.ok(!/\bexists\b/.test(text), 'the same for an exists spelling: ' + text);
+    assert.ok(!/\bagent\b/.test(text), 'the ordinary registered kind is not a cell: ' + text);
+    assert.ok(!text.includes('principal · live'), 'no principal kind cell either: ' + text);
+    assert.strictEqual(
+      text.split('\n').filter((row) => row.startsWith('principal · ')).length,
+      1,
+      'the principal checkout is one row: ' + text,
+    );
+  });
+
+  test('S6: unregistered is stated once and stays distinct from missing', () => {
+    const rows = linesOf(formatWorktreeModelResult('worktree_list', listResult()));
+    const stray = rows.find((row) => row.startsWith('stray-x · '));
+    assert.strictEqual(stray, 'stray-x · feat/stray · /repo/stray-x · unregistered', 'one unregistered cell: ' + stray);
+    assert.strictEqual(
+      stray.split('unregistered').length - 1,
+      1,
+      'the unregistered word appears exactly once in its row: ' + stray,
+    );
+    const gone = rows.find((row) => row.startsWith('feat-gone · '));
+    assert.ok(gone.endsWith(' · missing'), 'missing stays its own distinct state: ' + gone);
+    assert.ok(!stray.includes('missing'), 'a live-but-unowned checkout is not missing: ' + stray);
+    assert.ok(!gone.includes('unregistered'), 'a registered checkout is not unregistered: ' + gone);
+    assert.strictEqual(rows.filter((row) => row.endsWith(' · missing')).length, 1, 'one missing row: ' + JSON.stringify(rows));
+    assert.strictEqual(rows.filter((row) => row.endsWith(' · unregistered')).length, 1, 'one unregistered row: ' + JSON.stringify(rows));
+  });
+
+  test('S6: a kind the identity does not already carry is still surfaced', () => {
+    // The ordinary kinds collapse because the row already states them. A kind
+    // that is neither ordinary nor a repeat of the row's own words is a fact
+    // the details carry, so it is never dropped.
+    const details = {
+      worktrees: [{ name: 'odd-one', path: '/repo/odd-one', branch: 'feat/odd', thread: null, status: 'live', kind: 'foreign' }],
+      count: 1,
+      all: false,
+      pruned: [],
+      warnings: [],
+    };
+    assert.deepStrictEqual(
+      linesOf(formatWorktreeModelResult('worktree_list', listResult({ details }))),
+      ['worktrees: 1 (name · branch · path)', 'odd-one · feat/odd · /repo/odd-one · foreign'],
+    );
+  });
+
+  test('S6: a kind that only repeats an existence state earns no cell either', () => {
+    // `live`/`exists` are the existence states the listing itself already
+    // proves, so a producer that also spells one as `kind` must not buy a
+    // second cell for it. The details keep the field — only the text drops it.
+    const worktrees = [
+      { name: 'feat-a', path: '/repo/feat-a', branch: 'feat/a', thread: null, status: 'live', kind: 'live' },
+      { name: 'feat-b', path: '/repo/feat-b', branch: 'feat/b', thread: null, status: 'exists', kind: 'exists' },
+    ];
+    const result = formatWorktreeModelResult('worktree_list', listResult({
+      details: { worktrees, count: 2, all: false, pruned: [], warnings: [] },
+    }));
+    assert.deepStrictEqual(linesOf(result), [
+      'worktrees: 2 (name · branch · path)',
+      'feat-a · feat/a · /repo/feat-a',
+      'feat-b · feat/b · /repo/feat-b',
+    ], 'neither existence spelling reaches the text: ' + textOf(result));
+    assert.deepStrictEqual(result.details.worktrees, worktrees, 'the structured details keep every field');
   });
 
   test('thread ids, raw prefixes and associations never reach the model', () => {
@@ -406,13 +474,13 @@ describe('worktree_list model text', () => {
     original.details = { worktrees, count: 100, all: false, pruned: [], warnings: [], pruneError: null };
     const rows = linesOf(formatWorktreeModelResult('worktree_list', original));
     assert.strictEqual(rows.length, 101, 'one header plus one row per checkout');
-    assert.strictEqual(rows[0], 'worktrees: 100 (name · branch · path · kind · status)');
+    assert.strictEqual(rows[0], 'worktrees: 100 (name · branch · path)');
     for (let index = 0; index < 100; index += 1) {
-      const expectedStatus = index === 99 ? 'missing' : 'live';
+      const state = index === 99 ? ' · missing' : '';
       assert.strictEqual(
         rows[index + 1],
-        `feat-${index} · feat/branch-${index} · /repo/wt/feat-${index} · agent · ${expectedStatus}`,
-        `row ${index} is the checkout's identity alone: ${rows[index + 1]}`,
+        `feat-${index} · feat/branch-${index} · /repo/wt/feat-${index}${state}`,
+        `row ${index} is the checkout's identity plus its state: ${rows[index + 1]}`,
       );
     }
   });

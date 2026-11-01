@@ -14,9 +14,14 @@ and before the first source write, and the session works inside it. The
 principal checkout stays on the default branch and clean.
 
 The tools are `worktree_create`, `worktree_list`, `worktree_close`,
-`worktree_session_open` and `worktree_warp`. A worktree is created from the
-branch alone: it carries no issue or ODD association, and nothing about it is
-edited after creation. A SESSION may own several worktrees — a second branch
+`worktree_session_open` and `worktree_warp`. `worktree_create` takes the branch
+and a REQUIRED `changes` selection — `"all"`, `"none"`, or an explicit list of
+file paths — and always states it: omitting it is refused before anything is
+written, so a create never decides by itself whether pending work travels. Every
+new branch is born from local `main`; when the repository has no local `main` the
+create is refused (adopting an existing branch needs no base). A worktree
+carries no issue or ODD association, and nothing about it is edited after
+creation. A SESSION may own several worktrees — a second branch
 is a second checkout — while the one-job rule below still means one worktree
 and one session per job: `worktree_create` answers `already exists` only for
 the requested branch's own checkout, never for another one the session owns.
@@ -30,7 +35,8 @@ refused, so no agent can be started outside the project.
 When several ODD jobs are in flight — different groups of issues, different
 features — give each one its own worktree AND its own orchestrator session:
 
-1. `worktree_create` for the job's branch.
+1. `worktree_create` for the job's branch, stating `changes` (`"all"` to carry the
+   current checkout's pending work, `"none"` to start from local `main`).
 2. `worktree_session_open` with that worktree's name to open a Pi session in
    it. Pass `session` only to RESUME a session that already exists there.
 3. Delegate that job to that session. A delegated session is a peer

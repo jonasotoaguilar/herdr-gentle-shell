@@ -156,6 +156,29 @@ describe('normalizeChangesSelection', { concurrency: false }, () => {
     assert.equal(listed.ok, true);
     assert.equal(listed.mode, 'paths');
   });
+  // PRESERVE (S61): the shared helper is the WARP's contract and is not part of
+  // the S3/S4 create change, so it keeps its original value set and its original
+  // wording byte for byte. The create accepts the word "none" by adapting
+  // LOCALLY before calling this helper (tools/worktree-create-tool.test.js).
+  test('the helper keeps its original contract: "none" is not a value, and the wording is unchanged', () => {
+    assert.equal(changes.normalizeChangesSelection('none').ok, false);
+    assert.equal(
+      changes.normalizeChangesSelection('none').error,
+      'invalid changes selection \"none\": pass \"all\", a list of files, or leave it empty for no copy',
+    );
+    assert.equal(
+      changes.normalizeChangesSelection('some').error,
+      'invalid changes selection \"some\": pass \"all\", a list of files, or leave it empty for no copy',
+    );
+    assert.equal(
+      changes.normalizeChangesSelection(['']).error,
+      'invalid changes selection: every entry must be a non-empty file path',
+    );
+    assert.equal(
+      changes.normalizeChangesSelection(42).error,
+      'invalid changes selection: pass \"all\", a list of files, or leave it empty for no copy',
+    );
+  });
   test('anything else fails closed', () => {
     assert.equal(changes.normalizeChangesSelection('some').ok, false);
     assert.equal(changes.normalizeChangesSelection(42).ok, false);

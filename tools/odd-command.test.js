@@ -204,6 +204,34 @@ describe('/herdr-gentle:odd', () => {
     assert.match(body, /S1\. first rule/, 'the right pane shows the selected document');
   });
 
+  test('r re-lists the checkout from disk while the view is open and says it reloaded', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n\n## Specs\nS1. first rule\n' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    let component = null;
+    const { ctx } = makeCtx({
+      cwd: root,
+      customImpl: async (factory) => {
+        component = openComponent(factory, host).component;
+        return null;
+      },
+    });
+    await def.handler('', ctx);
+    const plain = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+    const frame = () => plain(component.render(80).join('\n'));
+    assert.match(frame(), /✎ Odd · 1 documents/, 'the view opens over the one document');
+    assert.ok(!frame().includes('gamma'), 'the new document is not there yet');
+    fs.writeFileSync(path.join(root, 'odd', 'tasks', 'gamma.md'), '# gamma\n\n## Specs\nS1. third rule\n');
+    component.handleInput('r');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const reloaded = frame();
+    assert.match(reloaded, /2 documents/, 'r re-reads odd/tasks from disk through the command wiring');
+    assert.match(reloaded, /gamma/, 'the document written while the view was open appears');
+    assert.match(reloaded, /r reloaded/, 'S9: the footer names the reload outcome');
+  });
+
   test('a checkout without odd documents notifies and opens nothing', async () => {
     const { commands, mod } = await loadExtension();
     const def = commands.get('herdr-gentle:odd');
@@ -563,5 +591,310 @@ describe('/herdr-gentle:odd never reads or writes an association (S1)', () => {
       modeLib.writeMode(true, process.env);
       await openWithRegistry('odd-s1-on', seeded);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S17: `o` hands the REAL terminal to $VISUAL/$EDITOR. This reproduction runs
+// the REAL command, the REAL odd view and the REAL pi-tui (ProcessTerminal +
+// TuiMainScreen) inside an ISOLATED PTY (`script(1)`), with a stand-in editor
+// that takes raw mode and owns the screen the way nvim does. It asserts the
+// terminal lifecycle, not pixels: while the editor is up, Pi must paint
+// nothing and read nothing — so the editor keeps every keystroke (Escape
+// included) and the overlay stays open behind it — and after the editor exits
+// the TUI is re-armed and Escape still closes the view normally.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd o owns the terminal while the editor runs (S17)', () => {
+  const { spawn: spawnChild } = require('node:child_process');
+
+  // util-linux `script(1)` allocates the PTY. BSD/macOS script takes different
+  // flags, so the check names the GNU one instead of guessing.
+  function hasUtilLinuxScript() {
+    try {
+      return /util-linux/.test(execFileSync('script', ['--version'], { encoding: 'utf8' }));
+    } catch {
+      return false;
+    }
+  }
+
+  const TUI_ENTRY = (() => {
+    try {
+      return require.resolve('@earendil-works/pi-tui/dist/index.js', { paths: [path.resolve(__dirname, '..')] });
+    } catch {
+      return null;
+    }
+  })();
+
+  const SKIP = !hasUtilLinuxScript()
+    ? 'needs util-linux script(1) to allocate an isolated PTY'
+    : (TUI_ENTRY ? false : 'needs @earendil-works/pi-tui installed beside this package');
+
+  // The PTY child: mounts the real command over the real TUI, forwards a real
+  // keystroke to it, and records every frame the TUI writes plus every key the
+  // view receives, so the parent can order them against the editor's window.
+  const HARNESS = `
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+
+const logPath = process.env.PTY_LOG;
+const log = (line) => fs.appendFileSync(logPath, line + '\\n');
+const realWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, ...rest) => {
+  try { log('tui-write ' + String(chunk).length); } catch {}
+  return realWrite(chunk, ...rest);
+};
+
+const commands = new Map();
+const pi = {
+  registerTool() {},
+  registerCommand(name, def) { commands.set(name, def); },
+  on() { return () => {}; },
+};
+
+let extension;
+try {
+  extension = await import(pathToFileURL(process.env.PTY_EXT).href);
+  extension.default(pi);
+} catch (err) {
+  log('harness-error ' + String((err && err.message) || err));
+  process.exit(2);
+}
+const tuiModule = await import(pathToFileURL(process.env.PTY_TUI).href);
+extension.setOddTuiLoader(async () => tuiModule);
+
+const terminal = new tuiModule.ProcessTerminal();
+const tui = new tuiModule.TuiMainScreen(terminal, false);
+let view = null;
+let opened = false;
+
+const root = {
+  render: () => ['harness root'],
+  invalidate() {},
+  handleInput(data) {
+    if (data === 'o' && !opened) {
+      opened = true;
+      log('key-open');
+      void runCommand();
+    }
+  },
+};
+
+function mountView(factory) {
+  return new Promise((resolve) => {
+    view = factory(tui, {}, {}, (result) => {
+      log('view-closed ' + JSON.stringify(result));
+      try { tui.removeChild(view); } catch {}
+      tui.setFocus(root);
+      tui.requestRender(true);
+      resolve(result);
+    });
+    const originalInput = view.handleInput.bind(view);
+    view.handleInput = (data) => {
+      log('view-input ' + JSON.stringify(data));
+      originalInput(data);
+    };
+    tui.addChild(view);
+    tui.setFocus(view);
+    tui.requestRender(true);
+    log('view-open');
+  });
+}
+
+async function runCommand() {
+  const def = commands.get('herdr-gentle:odd');
+  const ctx = {
+    cwd: process.env.PTY_REPO,
+    ui: {
+      notify: (message) => log('notify ' + JSON.stringify(String(message))),
+      select: async () => undefined,
+      custom: (factory) => mountView(factory),
+    },
+  };
+  try {
+    await def.handler('', ctx);
+    log('command-finished');
+  } catch (err) {
+    log('harness-error ' + String((err && err.message) || err));
+  }
+  const finish = process.env.PTY_FINISH;
+  const deadline = Date.now() + 8000;
+  while (!fs.existsSync(finish) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  log('harness-exit');
+  try { tui.stop(); } catch {}
+  process.exit(0);
+}
+
+tui.addChild(root);
+tui.setFocus(root);
+tui.start();
+log('tui-start');
+`;
+
+  // The stand-in editor takes the terminal exactly like nvim: raw mode first,
+  // then its own screen, then it reads its input. It announces each phase so
+  // the test can order Pi's frames and keys against that window.
+  const EDITOR = `
+import fs from 'node:fs';
+
+const logPath = '__EDITOR_LOG__';
+const log = (line) => { try { fs.appendFileSync(logPath, line + '\\n'); } catch {} };
+const listenPath = process.env.PTY_LISTEN;
+const releasePath = process.env.PTY_RELEASE;
+let listening = false;
+
+process.stdin.setRawMode(true);
+process.stdout.write('\\x1b[2J\\x1b[H[stand-in editor]\\n');
+log('editor-up');
+
+const timer = setInterval(() => {
+  if (fs.existsSync(releasePath)) {
+    clearInterval(timer);
+    log('editor-end');
+    try { process.stdin.setRawMode(false); } catch {}
+    process.exit(0);
+    return;
+  }
+  if (fs.existsSync(listenPath) && !listening) {
+    listening = true;
+    log('editor-listen');
+    process.stdin.on('data', (chunk) => log('editor-input ' + JSON.stringify(chunk.toString('latin1'))));
+  }
+}, 20);
+`;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function runScenario() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-pty-')));
+    const extCopy = path.join(dir, 'gentle-worktree-tools.mjs');
+    fs.writeFileSync(extCopy, stubbed);
+    const harnessPath = path.join(dir, 'harness.mjs');
+    fs.writeFileSync(harnessPath, HARNESS);
+    const editorPath = path.join(dir, 'editor.mjs');
+    const logPath = path.join(dir, 'events.log');
+    fs.writeFileSync(editorPath, EDITOR.replace('__EDITOR_LOG__', logPath));
+    const listenPath = path.join(dir, 'listen');
+    const releasePath = path.join(dir, 'release');
+    const finishPath = path.join(dir, 'finish');
+    fs.writeFileSync(logPath, '');
+    const root = makeRepo({ tag: 'odd-pty', docs: { 'alpha.md': '# alpha\n\n## Specs\nS1. first rule\n' } });
+
+    const child = spawnChild('script', ['-q', '-e', '-c', `node ${harnessPath}`, '/dev/null'], {
+      cwd: dir,
+      detached: true,
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color',
+        // `script(1)` runs its command through `$SHELL`. This machine's login
+        // shell re-applies its own universal VISUAL/EDITOR over the inherited
+        // environment, which would silently substitute the developer's real
+        // editor for the stand-in; a POSIX shell keeps the fixture exact.
+        SHELL: '/bin/sh',
+        GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+        PTY_LOG: logPath,
+        PTY_EXT: extCopy,
+        PTY_TUI: TUI_ENTRY,
+        PTY_REPO: root,
+        PTY_LISTEN: listenPath,
+        PTY_RELEASE: releasePath,
+        PTY_FINISH: finishPath,
+        VISUAL: `node ${editorPath}`,
+        EDITOR: '',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // The PTY's screen output is not asserted (the event log is), but it must
+    // be drained: a full pipe would block `script` and stop forwarding input.
+    child.stdout.resume();
+    child.stderr.resume();
+    const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+
+    const transcript = () => {
+      const text = fs.readFileSync(logPath, 'utf8');
+      return text === '' ? [] : text.replace(/\n$/, '').split('\n');
+    };
+    const waitFor = async (needle, timeoutMs = 8000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (transcript().includes(needle)) return true;
+        await sleep(25);
+      }
+      return false;
+    };
+    const send = (data) => {
+      try { child.stdin.write(data); } catch { /* the group is being torn down */ }
+    };
+
+    try {
+      // First `o`: Pi runs the command and mounts the reader, exactly like the
+      // `/herdr-gentle:odd` command does. Second `o`: the reader's own open key.
+      send('o');
+      assert.ok(await waitFor('view-open'), `the odd overlay opens in the PTY session: ${transcript().join(' | ')}`);
+      await sleep(200);
+      send('o');
+      assert.ok(await waitFor('editor-up'), `o hands the terminal to the editor: ${transcript().join(' | ')}`);
+      // A keystroke the open viewer would act on (it flips the list order and
+      // repaints). While the editor owns the terminal it must reach nobody.
+      send('s');
+      await sleep(400);
+      send('s');
+      fs.writeFileSync(listenPath, '');
+      assert.ok(await waitFor('editor-listen'), `the editor starts reading its input: ${transcript().join(' | ')}`);
+      send('\x1b');
+      await sleep(120);
+      send('\x1b');
+      await sleep(400);
+      fs.writeFileSync(releasePath, '');
+      assert.ok(await waitFor('editor-end'), `the editor exits when it is done: ${transcript().join(' | ')}`);
+      await sleep(500);
+      send('\x1b');
+      await waitFor('view-closed null', 4000);
+      fs.writeFileSync(finishPath, '');
+      const result = await Promise.race([exited, sleep(8000).then(() => ({ code: 'timeout' }))]);
+      const lines = transcript();
+      assert.equal(result.code, 0, `the PTY session ends cleanly (${result.code}/${result.signal}): ${lines.join(' | ')}`);
+
+      const start = lines.indexOf('editor-up');
+      const end = lines.indexOf('editor-end');
+      assert.ok(start >= 0 && end > start, `the editor window is recorded: ${lines.join(' | ')}`);
+      const window = lines.slice(start + 1, end);
+      assert.deepEqual(
+        window.filter((line) => line.startsWith('tui-write')),
+        [],
+        `Pi paints nothing while the editor owns the terminal: ${window.join(' | ')}`,
+      );
+      assert.deepEqual(
+        window.filter((line) => line.startsWith('view-input')),
+        [],
+        `Pi reads no input while the editor owns the terminal: ${window.join(' | ')}`,
+      );
+      assert.ok(
+        !window.some((line) => line.startsWith('view-closed')),
+        `Escape did not close the overlay behind the editor: ${window.join(' | ')}`,
+      );
+      assert.ok(
+        lines.slice(end).some((line) => line.startsWith('tui-write')),
+        `the TUI is re-armed after the editor exits: ${lines.join(' | ')}`,
+      );
+      const typed = lines.filter((line) => line.startsWith('editor-input')).join('');
+      const escapes = (typed.match(/\\u001b/g) || []).length;
+      assert.ok(escapes >= 2, `the editor owns Escape instead of Pi (${escapes} seen): ${lines.join(' | ')}`);
+      const closedAt = lines.indexOf('view-closed null');
+      assert.ok(closedAt > end, `Escape still closes the view after the editor exits: ${lines.join(' | ')}`);
+      assert.deepEqual(lines.filter((line) => line.startsWith('notify')), [], 'opening and closing notify nothing');
+    } finally {
+      // Releases the harness even when an assertion above already failed, so
+      // no scenario leaves a child holding the PTY.
+      try { fs.writeFileSync(finishPath, ''); } catch { /* already written */ }
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      try { child.stdin.destroy(); } catch { /* best effort */ }
+      await Promise.race([exited, sleep(1000)]);
+    }
+  }
+
+  test('the editor keeps the terminal, and Escape closes the view only afterwards', { skip: SKIP }, async () => {
+    await runScenario();
   });
 });

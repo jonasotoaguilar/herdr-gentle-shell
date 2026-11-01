@@ -47,9 +47,10 @@ function scratchDir(tag) {
   return dir;
 }
 
-// A real repository: `validateBranch` runs `git check-ref-format` and the
-// path derivation reads the real repository identity, so the preview is
-// proven against the same helpers the create path uses.
+// A real repository: the path derivation reads the real repository identity
+// (memoized once per panel), so the preview is proven against the same helpers
+// the create path uses. The panel spawns no `git check-ref-format` (S1): that
+// authority belongs to the create path, which awaits it.
 function makeRepo() {
   const dir = scratchDir('repo');
   execFileSync('git', ['init', '-q', dir], { stdio: 'ignore' });
@@ -278,21 +279,42 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
-  test('a git refusal is refused honestly on submit and never painted into the preview', () => {
+  // S1: the render path and the submit key BOTH stay free of the
+  // `check-ref-format` child. The preview derives a format-valid candidate from
+  // the pure helpers (so a derivable branch is previewed neutrally, never
+  // guessed at and never painted red) and the creation is handed on with the
+  // documented payload; the authoritative branch check runs in the create path
+  // (`worktree_create` → `validateBranchAsync`), which awaits it and refuses
+  // with its own message.
+  test('the panel never runs git branch validation: the create path owns `check-ref-format` (S1)', () => {
+    let validations = 0;
     const git = {
       slugifyBranch: () => '-bad',
-      validateBranch: (branch) => ({ ok: false, reason: `invalid branch name: ${branch}` }),
+      validateBranch: () => {
+        validations += 1;
+        return { ok: false, reason: 'the panel must never ask' };
+      },
       canonicalWorktreePath: () => '/nowhere',
     };
     const { view, finished } = openPanel({ git, initialName: 'x' });
     assert.equal(
       findLine(renderedLines(view, 100), 'preview branch:').trim(),
-      'preview branch: -',
-      'an underivable branch stays blank instead of going red',
+      'preview branch: feat/-bad',
+      'the preview derives the candidate locally instead of asking git while painting',
     );
+    assert.ok(!allText(renderedLines(view, 100)).includes('cannot create'), 'a derivable candidate is never an error');
+    assert.equal(validations, 0, 'painting the preview spawns no validation child');
     createNow(view);
-    assert.deepEqual(finished, [], 'the refusal creates nothing');
-    assert.match(allText(renderedLines(view, 100)), /cannot create: invalid branch name: feat\/-bad/);
+    assert.equal(validations, 0, 'submitting does not spawn one either: the create path validates');
+    assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'x' }], 'the documented payload is handed on');
+  });
+
+  test('a malformed name is still refused on submit, with its reason, and nothing is created', () => {
+    const { view, finished } = openPanel({ initialName: '!!!' });
+    assert.equal(findLine(renderedLines(view, 100), 'preview branch:').trim(), 'preview branch: -');
+    createNow(view);
+    assert.deepEqual(finished, [], 'an underivable name never creates');
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
   test('the name field renders a real placeholder and a cursor, and never treats the placeholder as the value', () => {
@@ -710,11 +732,12 @@ describe('S2: one-row key legends', { concurrency: false }, () => {
 // S11: the create surface paints through the ONE shared palette
 // (lib/tui-paint.js) with the injected theme — the footer's shortcut KEYS are
 // accent+bold and their descriptions muted, the panel title is accent+bold,
-// static labels are dim, live values (the derived branch/path, the picked
-// type, the typed name) are accent, and a refusal is the error role — while an
+// static labels are dim, a TITLE takes `customMessageLabel` (the Pi Agents view
+// title role) with weight, live
+// values are the normal text role, and a refusal is the error role — while an
 // untouched form paints no error at all.
 describe('S11: the shared palette', { concurrency: false }, () => {
-  const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39 };
+  const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
 
   // A theme that RECORDS which role painted each string and paints every role
   // with its own SGR code, so a rendered line can be read for the ROLE behind a
@@ -757,32 +780,35 @@ describe('S11: the shared palette', { concurrency: false }, () => {
       'the description asks the injected theme for the muted role');
   });
 
-  test('the title is accent+bold, labels dim and live values accent', () => {
+  test('the title takes the secondary heading role, labels dim and live values ordinary text', () => {
     const theme = recordingTheme();
     const { view } = openPanel({ theme, initialName: 'palette-work' });
     const lines = view.render(100);
     const text = lines.map(stripAnsi).join('\n');
-    assert.match(lines[1], /\x1b\[1m\x1b\[96mNew worktree\x1b\[0m\x1b\[22m/, 'the panel title is accent+bold');
-    assert.match(findRaw(lines, 'preview branch:'), /\x1b\[2mpreview branch: \x1b\[0m\x1b\[96mfeat\/palette-work/,
-      'the static label is dim and the derived branch is a value');
-    assert.match(findRaw(lines, 'preview path:'), /\x1b\[2mpreview path: \x1b\[0m\x1b\[96m/,
+    assert.match(lines[1], /\x1b\[1m\x1b\[33mNew worktree\x1b\[0m\x1b\[22m/,
+      'the panel title is the reference title role (dim), bold');
+    assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === 'New worktree'),
+      'the title never takes the button accent');
+    assert.match(findRaw(lines, 'preview branch:'), /\x1b\[2mpreview branch: \x1b\[0m\x1b\[39mfeat\/palette-work/,
+      'the static label is dim and the derived branch is ordinary text');
+    assert.match(findRaw(lines, 'preview path:'), /\x1b\[2mpreview path: \x1b\[0m\x1b\[39m/,
       'so is the derived path');
-    assert.match(findRaw(lines, 'Type · Name'), /\x1b\[1m\x1b\[96mType\x1b\[0m\x1b\[22m/,
-      'the active tab label is accent+bold');
+    assert.match(findRaw(lines, 'Type · Name'), /\x1b\[1m\x1b\[33mType\x1b\[0m\x1b\[22m/,
+      'the active tab label is a title');
     assert.match(findRaw(lines, 'Type · Name'), /\x1b\[2mName\x1b\[0m/, 'the inactive tab is dim');
-    assert.match(findRaw(lines, 'Type: '), /\x1b\[2mType: \x1b\[0m\x1b\[96mFeature \(feat\)\x1b\[0m/,
-      'the picked type is a live value under a dim label');
+    assert.match(findRaw(lines, 'Type: '), /\x1b\[2mType: \x1b\[0m\x1b\[39mFeature \(feat\)\x1b\[0m/,
+      'the picked type is ordinary text under a dim label');
     assert.ok(!theme.calls.some((call) => call.role === 'error'), 'an untouched form paints no error role');
     assert.ok(text.includes('preview branch: feat/palette-work'), 'the form is complete');
   });
 
-  test('the name row paints its dim label and the typed value accent', () => {
+  test('the name row paints its dim label and the typed value as ordinary text', () => {
     const theme = recordingTheme();
     const { view } = openPanel({ theme });
     focusName(view);
     typeText(view, 'typed');
-    assert.match(findRaw(view.render(100), 'Name:'), /\x1b\[2mName: \x1b\[0m\x1b\[96mtyped/,
-      'the label is dim and the typed name is a value');
+    assert.match(findRaw(view.render(100), 'Name:'), /\x1b\[2mName: \x1b\[0m\x1b\[39mtyped/,
+      'the label is dim and the typed name is ordinary text');
   });
 
   test('a refusal is the error role and the untouched placeholder stays dim', () => {

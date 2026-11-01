@@ -372,11 +372,18 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 ### Agent worktrees
 
 An agent thread may own several checkouts, each created with
-`worktree_create` (the branch is the whole input — success answers
+`worktree_create`, which takes exactly two parameters: the `branch`, and a
+required `changes` selection — `"all"` copies the current checkout's pending
+work into the new worktree, `"none"` copies nothing so it is born from the
+commit, and an explicit list of file paths copies only those. An omitted
+`changes` is refused before anything is written. Every NEW branch is born from
+local `main`; a repository with no local `main` is refused with a message saying
+so (adopting an existing branch needs no base). Success answers
 `created: <slug> · <branch>`, its path, `registered: new|replaced|appended|unchanged`
-for what the registry write did, and whether CodeGraph was initialized),
-inspected with `worktree_list`, and removed with `worktree_close` (the branch
-is kept). Idempotency is keyed to the requested
+for what the registry write did, whether CodeGraph was initialized, the `base`
+commit it used, and `copied: N files, +N/-N` when the selection carried work
+across. Checkouts are inspected with `worktree_list` and removed with
+`worktree_close` (the branch is kept). Idempotency is keyed to the requested
 branch: the same branch returns its own checkout as `already exists`, while
 any other branch is created even when the thread already owns one. Creation
 copies untracked env files, installs dependencies by detected lockfile,

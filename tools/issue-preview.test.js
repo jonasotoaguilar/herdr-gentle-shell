@@ -134,3 +134,81 @@ describe('issue preview formatter (S16)', () => {
     assert.ok(lines.every((line) => line.length <= 12));
   });
 });
+
+// T9 (S13): the preview's OWN TITLE is a title, not a control. It asks the
+// injected paint seam for the SAME role the shared table gives every other
+// title — `customMessageLabel`, the role the Pi Agents view paints its own frame
+// title with (`gentle-pi/lib/agents-view.ts:42`, painted at line 437) — so the Issues reading
+// pane, the two readers' frames and the plugin's panels cannot drift into two
+// title colours. Every non-title role stays exactly where it was.
+describe('the preview title follows the shared palette (S13)', () => {
+  // A paint seam that RECORDS which role each string was painted with, so the
+  // assertion is about the ROLE behind the title instead of a colour.
+  function spyPaint() {
+    const calls = [];
+    const paint = (role, text) => {
+      calls.push({ role, text: String(text) });
+      return String(text);
+    };
+    return { calls, paint };
+  }
+
+  function renderSpy(detail, comments, options = {}) {
+    const spy = spyPaint();
+    const emphasised = [];
+    const lines = issueDetailLines(detail, comments, {
+      width: 80,
+      now: NOW,
+      paint: spy.paint,
+      emphasis: (text) => {
+        emphasised.push(String(text));
+        return String(text);
+      },
+      ...options,
+    });
+    return { ...spy, emphasised, lines };
+  }
+
+  test('the title asks for the Agents view title role, never the button accent', () => {
+    const { calls } = renderSpy(FULL, []);
+    const titleCall = calls.find((call) => call.text === '#77 parity title');
+    assert.ok(titleCall, 'the title is painted through the caller seam');
+    assert.equal(titleCall.role, 'customMessageLabel',
+      'the title uses the role the Pi Agents view paints its own title with');
+    assert.notEqual(titleCall.role, 'accent',
+      'the title is never painted with the button role');
+    assert.notEqual(titleCall.role, 'mdHeading',
+      'a markdown heading role is not a UI title role');
+  });
+
+  test('the title keeps its emphasis and every metadata role is unchanged', () => {
+    const { calls, emphasised, lines } = renderSpy(FULL, [{ author: 'ana', body: 'first comment', createdAt: '2026-02-27T00:00:00.000Z' }]);
+    assert.ok(emphasised.includes('#77 parity title'), 'the title is still emphasised through the theme');
+    const roleOf = (needle) => {
+      const call = calls.find((entry) => entry.text.includes(needle));
+      assert.ok(call, `no painted call carries ${JSON.stringify(needle)}`);
+      return call.role;
+    };
+    assert.equal(roleOf('[open]'), 'accent', 'the open state keeps its own role');
+    assert.equal(roleOf('(end of issue)'), 'dim', 'the end marker stays dim');
+    assert.equal(roleOf('─ ana · 2d ago ─'), 'border', 'the comment rule stays the border role');
+    assert.equal(roleOf('#77 parity title'), 'customMessageLabel', 'the title is a title');
+    // The remaining fields are the formatter's plain text: no role is invented
+    // for labels, assignees, counters or the body.
+    const bodyLine = lines.find((line) => line.includes('the body'));
+    assert.ok(bodyLine !== undefined, 'the body still renders');
+    assert.ok(!calls.some((call) => call.text.includes('the body')), 'the body is painted by the caller, not roled here');
+    assert.ok(!calls.some((call) => call.text.startsWith('labels:')), 'labels stay plain text');
+    assert.ok(!calls.some((call) => call.text.startsWith('👍')), 'the counter stays plain text');
+  });
+
+  test('a closed issue and an unreadable-metadata note keep their own roles', () => {
+    const { calls } = renderSpy({ ...FULL, state: 'closed', metadataError: 'boom' }, []);
+    assert.ok(calls.some((call) => call.role === 'muted' && call.text === '[closed]'),
+      'a closed state is muted, not the title role');
+    assert.ok(calls.some((call) => call.role === 'muted' && call.text === 'metadata unavailable'),
+      'the unreadable-metadata note stays muted');
+    assert.ok(calls.some((call) => call.role === 'muted' && call.text === 'loading…') === false,
+      'a ready read paints no pending word');
+  });
+});

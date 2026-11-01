@@ -71,6 +71,8 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -186,7 +188,9 @@ describe('S1: list publishes no ODD association and no document inventory', { co
         assert.equal(Object.hasOwn(row, key), false, `details publish no ${key}: ${JSON.stringify(row)}`);
       }
       const line = text.split('\n').find((l) => l.includes('feat/odd-list'));
-      assert.equal(line, `feat-odd-list · feat/odd-list · ${target} · agent · live`);
+      // S6: the row is the identity plus an informative state — this checkout is
+      // registered and live, so neither `agent` nor `live` earns a cell.
+      assert.equal(line, `feat-odd-list · feat/odd-list · ${target}`);
       assert.doesNotMatch(text, /notes\.md|stored\.md/, 'neither the inventory nor the association document reaches the text');
       assert.doesNotMatch(text, /issues=|odd=|assignedOdd|available odd/i, `no association cell or key: ${text}`);
       // Legacy data preservation: the stored association is untouched.
@@ -218,7 +222,7 @@ describe('S1/S6: a create never takes an odd document', { concurrency: false }, 
         ['feat/bad-odd', missing],
       ]) {
         const result = await tools.get('worktree_create').execute(
-          'c1', { branch, odd }, undefined, undefined, makeCtx(root, `thread-${branch}`),
+          'c1', { branch, odd, changes: 'none' }, undefined, undefined, makeCtx(root, `thread-${branch}`),
         );
         const text = resultText(result);
         assert.equal(result.isError, undefined, `${branch}: an odd field must not refuse a create: ${text}`);
@@ -255,7 +259,7 @@ describe('S1: a create never updates an existing worktree', { concurrency: false
       // An association field and a foreign thread change nothing: there is no
       // update path, so this is the historical refusal.
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch, odd: doc, issues: [2] }, undefined, undefined, makeCtx(root, 'thread-other'),
+        'c1', { branch, odd: doc, issues: [2], changes: 'none' }, undefined, undefined, makeCtx(root, 'thread-other'),
       );
       assert.equal(result.isError, true, `expected the refusal, got: ${resultText(result)}`);
       assert.match(resultText(result), /already checked out/);
@@ -499,7 +503,7 @@ describe('S1: the principal checkout is never edited by a create', { concurrency
       fs.writeFileSync(doc, '# p\n');
       const { tools } = await loadExtension();
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch, odd: doc }, undefined, undefined, makeCtx(root, 'thread-p'),
+        'c1', { branch, odd: doc, changes: 'none' }, undefined, undefined, makeCtx(root, 'thread-p'),
       );
       // The principal is already a live checkout of that branch, so the create
       // refuses instead of recording anything against it.

@@ -1570,16 +1570,19 @@ describe('customize has no performance category (S22)', { concurrency: false }, 
 });
 
 // ---------------------------------------------------------------------------
-// S11: the customize panel paints through the ONE shared palette
+// S11/T9: the customize panel paints through the ONE shared palette
 // (lib/tui-paint.js) with the injected theme, exactly like the warp panel, the
-// create flow, odd and issues — a shortcut KEY is accent+bold and its
-// description muted, the panel title is accent+bold, a static label is dim, a
-// choice and a live value are accent, a position count is muted and the frame
-// plus its divider are the border role. Focus stays visible through its own
-// marks (▸/→), the legend still owns ONE row at every width, and a hostile
-// theme still renders every row in plain text.
+// create flow, odd and issues — a shortcut KEY (a BUTTON) is accent+bold and its
+// description muted, a TITLE (the panel title, a section heading) takes the
+// Agents view's own title role, a static label is dim, a choice is ordinary
+// text, a position count is muted and the frame plus its divider are the border
+// role. S13/S16: the panel keeps three levels apart — secondary titles, primary
+// buttons and normal rows — so it does not paint every row in the accent. Focus
+// stays visible through its own marks (▸/→) and the selected row's own band, the
+// legend still owns ONE row at every width, and a hostile theme still renders
+// every row in plain text.
 describe('S11: the shared palette', { concurrency: false }, () => {
-  const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39 };
+  const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
 
   function stripAnsi(line) {
     return String(line).replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\]8;;.*?\x07/g, '');
@@ -1674,24 +1677,29 @@ describe('S11: the shared palette', { concurrency: false }, () => {
     }
   });
 
-  test('the title is accent+bold, the section label dim, the choice a value and the count muted', async () => {
+  test('the title is the reference dim title role, the label dim, the choice ordinary text and the count muted', async () => {
     const theme = recordingTheme();
     const { component, cleanup } = await openThemedPanel(theme);
     try {
       const lines = component.render(80);
       const top = findRaw(lines, 'Customize · Herdr Gentle Shell');
-      assert.match(top, /\x1b\[1m\x1b\[96mCustomize · Herdr Gentle Shell\x1b\[0m\x1b\[22m/,
-        'the panel title is accent+bold');
-      assert.match(top, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m/, 'the esc hint on that row is a key');
+      assert.match(top, /\x1b\[1m\x1b\[33mCustomize · Herdr Gentle Shell\x1b\[0m\x1b\[22m/,
+        'the panel title is the Agents view title role, bold');
+      assert.ok(theme.calls.some((call) => call.role === 'customMessageLabel' && call.text === 'Customize · Herdr Gentle Shell'),
+        'the title asks the injected theme for the title role');
+      assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === 'Customize · Herdr Gentle Shell'),
+        'the title never takes the button accent');
+      assert.match(top, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m/, 'the esc hint on that row is a button key');
       const heading = findRaw(lines, 'CATEGORIES');
       assert.match(heading, /\x1b\[2mCATEGORIES\x1b\[0m/, 'the section label is dim');
-      assert.match(heading, /\x1b\[1m\x1b\[96mHerdr Sidebar\x1b\[0m\x1b\[22m/, 'the section heading is a title');
+      assert.match(heading, /\x1b\[1m\x1b\[33mHerdr Sidebar\x1b\[0m\x1b\[22m/, 'the section heading is a title');
       assert.match(heading, /\x1b\[90m1\/2\x1b\[0m/, 'the position count is muted');
       const row = findRaw(lines, 'Gentle (this extension)');
-      assert.match(row, /\x1b\[96m {2}→ Gentle \(this extension\)\x1b\[0m/, 'a choice is a live value');
+      assert.match(row, /\x1b\[39m {2}→ Gentle \(this extension\)\x1b\[0m/, 'a choice is ordinary text');
+      assert.ok(!/\x1b\[96m/.test(row), 'an unselected choice is never painted with the button accent');
       const preview = findRaw(lines, 'Preview · Gentle');
-      assert.match(preview, /\x1b\[2mPreview\x1b\[0m\x1b\[2m · \x1b\[0m\x1b\[96mGentle \(this extension\)\x1b\[0m/,
-        'the preview label is dim and the focused label it names is a value');
+      assert.match(preview, /\x1b\[2mPreview\x1b\[0m\x1b\[2m · \x1b\[0m\x1b\[39mGentle \(this extension\)\x1b\[0m/,
+        'the preview label is dim and the focused label it names is ordinary text');
       const detail = findRaw(lines, 'publishes agent state and SessionChanges');
       assert.match(detail, /\x1b\[90mpublishes agent state and SessionChanges from Gentle\x1b\[0m/,
         'the description under the preview is muted');

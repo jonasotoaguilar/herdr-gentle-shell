@@ -184,6 +184,17 @@ function openComponent(factory, host) {
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+// A write resolves the checkout's scope FRESH before it runs (S5), so a write
+// settles a few git probes later than a read. Poll the observable state instead
+// of assuming one macrotask is enough.
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
 const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
 
 // Captures the options the extension mounts the real view with, while leaving
@@ -743,8 +754,7 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
     component.handleInput('down');
     component.handleInput('space');
     component.handleInput('ctrl+s');
-    await tick();
-    assert.equal(component.state.mode, 'list', 'a successful label apply closes the editor');
+    assert.ok(await waitFor(() => component.state.mode === 'list'), 'a successful label apply closes the editor');
     const edit = ghCalls().find((call) => call.argv[1] === 'edit');
     assert.ok(edit, 'the label toggle reaches gh issue edit');
     assert.deepEqual(edit.argv.slice(0, 3), ['issue', 'edit', '76']);
@@ -757,17 +767,17 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
     for (const ch of 'triage') component.handleInput(ch);
     component.handleInput('enter');
     component.handleInput('ctrl+s');
-    await tick();
+    assert.ok(await waitFor(() => ghCalls().some((call) => call.argv[1] === 'create')), 'a new label reaches gh label create');
     const create = ghCalls().find((call) => call.argv[1] === 'create');
     assert.ok(create, 'a new label reaches gh label create');
     assert.deepEqual(create.argv.slice(0, 3), ['label', 'create', 'triage']);
+    assert.ok(await waitFor(() => component.state.mode === 'list'), 'creating a label applies and closes the editor');
 
     component.handleInput('c');
     assert.equal(component.state.mode, 'comment');
     for (const ch of 'hi') component.handleInput(ch);
     component.handleInput('ctrl+s');
-    await tick();
-    assert.equal(component.state.mode, 'list', 'a posted comment closes the input');
+    assert.ok(await waitFor(() => component.state.mode === 'list'), 'a posted comment closes the input');
     const comment = ghCalls().find((call) => call.argv[1] === 'comment');
     assert.ok(comment, 'the comment reaches gh issue comment');
     assert.deepEqual(comment.argv, ['issue', 'comment', '76', '--body', 'hi']);
@@ -784,15 +794,17 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
       worktreeGit.runArgv = originalRunArgv;
     }
     assert.equal(gitCalls.length, 1, 'the browser opener runs once');
-    assert.deepEqual(gitCalls[0].argv, ['issue', 'view', '76', '--web']);
+    // B1: the opener binds the identity the rows came from (here gh's own
+    // answer for a checkout with no fork remote), never a fresh resolution.
+    assert.deepEqual(gitCalls[0].argv,
+      ['issue', 'view', '76', '--web', '-R', 'github.com/jonasotoaguilar/herdr-gentle-shell']);
     assert.ok(!gitCalls[0].argv.join(' ').includes('xdg-open'), 'never an invented opener');
 
     component.handleInput('x');
     assert.equal(component.state.mode, 'confirm');
     assert.match(clean(component.render(110).join('\n')), /Confirm close #76/, 'the confirm names the close');
     component.handleInput('enter');
-    await tick();
-    assert.equal(component.state.mode, 'list');
+    assert.ok(await waitFor(() => component.state.mode === 'list'), 'the close settles');
     assert.ok(!clean(component.render(110).join('\n')).includes('#76'), 'the closed issue leaves the open list at once');
     const close = ghCalls().find((call) => call.argv[1] === 'close');
     assert.ok(close, 'close reaches gh issue close');
@@ -807,7 +819,7 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
     component.handleInput('X');
     assert.equal(component.state.mode, 'confirm', 'X asks the same close confirmation');
     component.handleInput('enter');
-    await tick();
+    assert.ok(await waitFor(() => ghCalls().filter((call) => call.argv[1] === 'close').length === 2), 'X closes too');
     const closes = ghCalls().filter((call) => call.argv[1] === 'close');
     assert.equal(closes.length, 2, 'X closes too');
     assert.deepEqual(closes[1].argv, ['issue', 'close', '76']);
@@ -820,6 +832,7 @@ describe('/herdr-gentle:issues actions (S3,S4,S10)', () => {
     component.handleInput('c');
     for (const ch of 'hey') component.handleInput(ch);
     component.handleInput('ctrl+s');
+    assert.ok(await waitFor(() => calls.some((call) => call.argv[1] === 'comment')), 'the comment reached gh');
     await tick();
     assert.equal(component.state.mode, 'comment', 'the failure keeps the input open');
     assert.equal(component.state.commentText, 'hey', 'the draft survives the failure');
@@ -1298,7 +1311,8 @@ describe('/herdr-gentle:issues mounted page seam (S5,D1)', () => {
       const call = narrow.pages[narrow.pages.length - 1];
       assert.deepEqual(call.params, { query: 'assignee:@me sort:updated-desc', after: 'row-3', first: 7 },
         'the bucket query, the caller cursor and the caller limit pass straight through');
-      assert.deepEqual(call.opts, { cwd: root }, 'the page read is scoped to this checkout');
+      assert.deepEqual(call.opts, { cwd: root, scope: 'github.com/jonasotoaguilar/herdr-gentle-shell' },
+        'the page read is scoped to this checkout and bound to the host-qualified pinned identity');
 
       const before = narrow.pages.length;
       await narrow.holder.options.loadIssuePage({ bucketId: 'involved', cursor: null, limit: 5 });
@@ -1607,6 +1621,498 @@ describe('/herdr-gentle:issues All connection paging (T2,S2)', () => {
       ghIssues.getIssueConnectionPage = realConnection;
       ghIssues.getIssuePage = realPage;
       run.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5: a fork checkout configures `origin` (the fork) and `upstream` (the
+// original). `gh repo view` answers the BASE — the original — for exactly that
+// layout (verified against gh 2.102.1), which is why all four tabs used to list
+// the original's issues. Every read and the browser opener now scope to the
+// checkout's OWN repository, while a checkout with one remote is unchanged.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues fork scope (S5)', () => {
+  const forkRoots = [];
+  after(() => {
+    for (const dir of forkRoots) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // A real checkout whose remotes model the fork; the default branch is the
+  // current one, exactly like a cloned fork.
+  function makeForkRepo({ tag = 'issues-fork', remotes = [['origin', 'myfork/project'], ['upstream', 'original/project']] } = {}) {
+    const root = makeRepo({ tag });
+    forkRoots.push(root);
+    // A bare `owner/name` becomes a GitHub URL; a full URL or a local path is
+    // used verbatim, so a case can model a non-GitHub remote.
+    for (const [name, repo] of remotes) {
+      const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(repo) || repo.includes(':') || repo.startsWith('/')
+        ? repo
+        : `git@github.com:${repo}.git`;
+      git(root, ['remote', 'add', name, url]);
+    }
+    return root;
+  }
+
+  // gh's own answers: `repo view` resolves the BASE repository for a fork
+  // layout, every repo-scoped command follows GH_REPO. The call log records
+  // which repository each call actually targeted.
+  function forkRunner({ repoView = 'original/project' } = {}) {
+    const base = makeIssuesRunner();
+    const runner = async (bin, argv, opts) => {
+      const env = (opts && opts.env) || {};
+      const repo = typeof env.GH_REPO === 'string' && env.GH_REPO !== '' ? env.GH_REPO : repoView;
+      base.calls.push({ bin, argv: argv.slice(), cwd: opts ? opts.cwd : undefined, repo });
+      if (argv[0] === 'repo' && argv[1] === 'view') {
+        return { status: 0, stdout: JSON.stringify({ nameWithOwner: repoView }), stderr: '', error: null };
+      }
+      // The shared fixture runner appends its own record; drop it so the log
+      // this test reads holds exactly one row per call.
+      const before = base.calls.length;
+      const out = await base.runner(bin, argv, opts);
+      base.calls.length = before;
+      return out;
+    };
+    return { runner, calls: base.calls };
+  }
+
+  // The `repo:` scope every search read asked for, verbatim.
+  function searchScopes(calls) {
+    return calls
+      .flatMap((call) => call.argv)
+      .filter((value) => value.startsWith('search=repo:'))
+      .map((value) => value.slice('search=repo:'.length).split(' ')[0]);
+  }
+
+  function graphqlValue(call, name) {
+    for (let at = 0; at < call.argv.length - 1; at += 1) {
+      if (call.argv[at] === '-F' && call.argv[at + 1].startsWith(`${name}=`)) {
+        return call.argv[at + 1].slice(name.length + 1);
+      }
+    }
+    return null;
+  }
+
+  test('every tab, the detail, labels and assignees read the checkout fork, not the base gh resolves', async () => {
+    const root = makeForkRepo();
+    const gh = forkRunner();
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      const before = gh.calls.length;
+      for (const bucketId of ['mine', 'assigned', 'involved', 'all']) {
+        const asked = await run.options.loadIssuePage({ bucketId, cursor: null, limit: 5 });
+        assert.equal(asked.ok, true, `the ${bucketId} tab answered`);
+      }
+      const reads = gh.calls.slice(before);
+      assert.deepEqual(
+        searchScopes(reads.filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql')),
+        ['myfork/project', 'myfork/project', 'myfork/project'],
+        'each scoped tab searches the fork, never the upstream',
+      );
+      for (const read of connectionReads(reads)) {
+        assert.equal(graphqlValue(read, 'owner'), 'myfork', 'the All tab walks the fork issue connection');
+        assert.equal(graphqlValue(read, 'name'), 'project');
+      }
+      assert.ok(!reads.some((call) => call.argv.some((value) => value.includes('original/project'))),
+        'no tab read carries the upstream repository');
+
+      const scopedBefore = gh.calls.length;
+      assert.equal((await run.options.loadIssue(76)).ok, true, 'the detail opened through the real client');
+      assert.equal((await run.options.loadLabels()).ok, true);
+      assert.equal((await run.options.loadAssignees()).ok, true);
+      const scoped = gh.calls.slice(scopedBefore);
+      assert.ok(scoped.length >= 3, 'the detail, label and assignee reads ran');
+      for (const call of scoped) {
+        assert.equal(call.repo, 'github.com/myfork/project',
+          `the read is scoped to the fork, host included (${call.argv.join(' ')})`);
+      }
+    } finally {
+      run.restore();
+    }
+  });
+
+  test('the browser opener opens the fork issue, not the upstream issue with the same number', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-open' });
+    const gh = forkRunner();
+    const log = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-'))), 'argv.log');
+    const stub = path.join(path.dirname(log), 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    process.env.GH_BIN_PATH = stub;
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      const opened = run.options.actions.openBrowser(76);
+      assert.equal(opened.ok, true, 'the opener ran through the fixed-argv runner');
+      const argv = fs.readFileSync(log, 'utf8').trim();
+      assert.equal(argv, 'issue view 76 --web -R github.com/myfork/project',
+        'the browser opens the checkout fork issue on the fork server, scoped explicitly');
+    } finally {
+      run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+    }
+  });
+
+  test('a single-remote checkout binds the opener to the repository gh resolves', async () => {
+    const root = makeForkRepo({ tag: 'issues-nofork', remotes: [['origin', 'myfork/project']] });
+    const gh = forkRunner({ repoView: 'myfork/project' });
+    const log = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-'))), 'argv.log');
+    const stub = path.join(path.dirname(log), 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    process.env.GH_BIN_PATH = stub;
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      assert.equal(run.options.actions.openBrowser(76).ok, true);
+      assert.equal(fs.readFileSync(log, 'utf8').trim(), 'issue view 76 --web -R github.com/myfork/project',
+        'the opener binds the one repository gh resolved for this checkout, host included');
+    } finally {
+      run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+    }
+  });
+
+  // The checkout's own remote cannot be proven to be a GitHub repository:
+  // every tab read, the detail/label reads and the browser opener must refuse
+  // WITHOUT running gh, so no read or write can land on another repository.
+  test('a non-GitHub checkout remote fails every read and the opener without running gh', async () => {
+    const root = makeForkRepo({
+      tag: 'issues-fork-local',
+      remotes: [['origin', 'file:///srv/mirror/project.git'], ['upstream', 'original/project']],
+    });
+    const gh = forkRunner();
+    const log = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-'))), 'argv.log');
+    const stub = path.join(path.dirname(log), 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    process.env.GH_BIN_PATH = stub;
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      for (const bucketId of ['mine', 'assigned', 'involved', 'all']) {
+        const asked = await run.options.loadIssuePage({ bucketId, cursor: null, limit: 5 });
+        assert.equal(asked.ok, false, `the ${bucketId} tab is refused`);
+        assert.match(asked.error, /checkout remote "origin" is a local path, not a GitHub repository/);
+      }
+      const labels = await run.options.loadLabels();
+      assert.equal(labels.ok, false, 'the label editor read is refused');
+      assert.match(labels.error, /is a local path, not a GitHub repository/);
+      const opened = run.options.actions.openBrowser(76);
+      assert.equal(opened.ok, false, 'the opener refuses instead of opening another repository');
+      assert.match(opened.error, /is a local path, not a GitHub repository/);
+      assert.equal(fs.existsSync(log), false, 'the browser opener never ran gh');
+      assert.ok(gh.calls.every((call) => call.cwd !== root),
+        'no gh command ran in this checkout at all');
+    } finally {
+      run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+    }
+  });
+
+  // B1: once the list is loaded from a repository, the SAME issue numbers
+  // belong to that repository. If the checkout's remote moves, an action must
+  // refuse (the displayed issue cannot be sent to another repo), and reads keep
+  // the loaded identity — no silent re-target.
+  test('after the remote moves, every action refuses and reads keep the displayed repository', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-drift' });
+    const gh = forkRunner();
+    const log = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-'))), 'argv.log');
+    const stub = path.join(path.dirname(log), 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    process.env.GH_BIN_PATH = stub;
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      // Before the move the action binds the displayed repository.
+      const bound = await run.options.actions.postComment(76, 'bound');
+      assert.equal(bound.ok, true, 'a write before the move succeeds');
+      const boundCall = gh.calls.filter((call) => call.argv[0] === 'issue' && call.argv[1] === 'comment').pop();
+      assert.equal(boundCall.repo, 'github.com/myfork/project', 'and it binds the displayed repository');
+
+      // The list was loaded from myfork/project; the checkout now points at a
+      // different fork where the same number is a different issue.
+      git(root, ['remote', 'set-url', 'origin', 'git@github.com:otherfork/project.git']);
+      const before = gh.calls.length;
+
+      const comment = await run.options.actions.postComment(76, 'hello');
+      assert.equal(comment.ok, false, 'the comment is refused');
+      assert.match(comment.error, /changed since this issue list loaded/);
+      const labels = await run.options.actions.editLabels(76, ['bug'], [], []);
+      assert.equal(labels.ok, false, 'the label edit is refused');
+      const state = await run.options.actions.setState(76, 'closed');
+      assert.equal(state.ok, false, 'the close is refused');
+      const assign = await run.options.actions.editAssignees(76, { add: ['bob'], remove: [] });
+      assert.equal(assign.ok, false, 'the assignee edit is refused');
+      const opened = run.options.actions.openBrowser(76);
+      assert.equal(opened.ok, true, 'the opener still opens the repository the rows came from');
+      assert.equal(fs.readFileSync(log, 'utf8').trim(), 'issue view 76 --web -R github.com/myfork/project',
+        'the browser opens the displayed repository, never the one the checkout resolves to now');
+
+      const mutations = gh.calls.slice(before).filter((call) => call.argv[0] === 'issue'
+        && ['edit', 'comment', 'close', 'reopen'].includes(call.argv[1]));
+      assert.deepEqual(mutations, [], 'no mutating gh command ran after the drift');
+      assert.ok(!gh.calls.slice(before).some((call) => call.argv[0] === 'label' && call.argv[1] === 'create'),
+        'no label was created on the new fork');
+
+      // Reads stay bound to the repository whose rows are on screen.
+      for (const bucketId of ['mine', 'assigned', 'involved', 'all']) {
+        const asked = await run.options.loadIssuePage({ bucketId, cursor: null, limit: 5 });
+        assert.equal(asked.ok, true, `the ${bucketId} tab still reads the loaded repository`);
+      }
+      const readOpen = await run.options.actions.reload({ state: 'open' });
+      assert.equal(readOpen.ok, true, 'the open reload still reads the loaded repository');
+      const readClosed = await run.options.actions.reload({ state: 'closed' });
+      assert.equal(readClosed.ok, true, 'the closed reload still reads the loaded repository');
+
+      const reads = gh.calls.slice(before);
+      assert.ok(reads.some((call) => call.argv.some((value) => value.includes('repo:myfork/project'))),
+        'the reads carry the displayed repository');
+      assert.ok(reads.every((call) => call.repo === 'github.com/myfork/project'
+        || call.repo === 'github.com/original/project'),
+      'no read follows the moved remote');
+      assert.ok(!reads.some((call) => call.repo === 'github.com/otherfork/project'),
+        'nothing reached the new fork');
+    } finally {
+      run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+    }
+  });
+
+  // B2: a config read that exits nonzero because the configuration is corrupt
+  // or unreadable is NOT "no repository". The command refuses to open, and a
+  // checkout whose config breaks while the reader is open refuses every action.
+  test('a corrupt checkout configuration refuses to open the viewer', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-corrupt-open' });
+    fs.appendFileSync(path.join(root, '.git', 'config'), '\n[broken\n');
+    const gh = forkRunner();
+    const { commands, mod, sessionStarts } = await loadExtension();
+    ghIssues.setGhRunner(gh.runner);
+    const scratch = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gate-')));
+    await fireSessionStart(sessionStarts, gateCtx(scratch, []));
+    const def = commands.get('herdr-gentle:issues');
+    assert.ok(def, 'the command stays registered');
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const { ctx, customs, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+    await def.handler('', ctx);
+    assert.equal(customs.length, 0, 'the viewer never opens on an unreadable configuration');
+    assert.ok(notes.length > 0, 'the refusal is reported');
+    assert.match(notes[0][0], /not a git repository/, 'the checkout cannot be resolved, so nothing runs');
+    assert.ok(gh.calls.every((call) => call.cwd !== root), 'no gh command ran in this checkout');
+  });
+
+  test('a configuration that breaks while the reader is open refuses every action', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-corrupt-action' });
+    const gh = forkRunner();
+    const log = path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-'))), 'argv.log');
+    const stub = path.join(path.dirname(log), 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    process.env.GH_BIN_PATH = stub;
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      const expected = /cannot read this checkout's git configuration/;
+      // The list is loaded from myfork/project; then the config becomes corrupt.
+      fs.appendFileSync(path.join(root, '.git', 'config'), '\n[broken\n');
+      const before = gh.calls.length;
+
+      const comment = await run.options.actions.postComment(76, 'hello');
+      assert.equal(comment.ok, false, 'the comment is refused');
+      assert.match(comment.error, expected);
+      const labels = await run.options.actions.editLabels(76, ['bug'], [], []);
+      assert.equal(labels.ok, false, 'the label edit is refused');
+      assert.match(labels.error, expected);
+      const state = await run.options.actions.setState(76, 'closed');
+      assert.equal(state.ok, false, 'the close is refused');
+      const assign = await run.options.actions.editAssignees(76, { add: ['bob'], remove: [] });
+      assert.equal(assign.ok, false, 'the assignee edit is refused');
+      // The opener needs no config read: it opens the identity the rows were
+      // read from, so a broken config cannot make it guess a repository.
+      const opened = run.options.actions.openBrowser(76);
+      assert.equal(opened.ok, true, 'the opener still opens the displayed repository');
+      assert.equal(fs.readFileSync(log, 'utf8').trim(), 'issue view 76 --web -R github.com/myfork/project',
+        'the opener binds the displayed repository');
+
+      const mutations = gh.calls.slice(before).filter((call) => call.argv[0] === 'issue'
+        && ['edit', 'comment', 'close', 'reopen'].includes(call.argv[1]));
+      assert.deepEqual(mutations, [], 'no mutating gh command ran');
+      assert.ok(!gh.calls.slice(before).some((call) => call.argv[0] === 'label' && call.argv[1] === 'create'),
+        'no label was created');
+
+      // Reads stay on the pinned identity: the loaded list does not change.
+      const page = await run.options.loadIssuePage({ bucketId: 'mine', cursor: null, limit: 5 });
+      assert.equal(page.ok, true, 'the already-loaded identity is still readable');
+      const reads = gh.calls.slice(before);
+      assert.ok(reads.some((call) => call.argv.some((value) => value.includes('repo:myfork/project'))),
+        'the read keeps the displayed repository');
+      assert.ok(!reads.some((call) => call.repo === 'otherfork/project'));
+    } finally {
+      run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+    }
+  });
+
+  // B1: the identity carries its HOST. A fork on github.com moved to an
+  // enterprise server under the SAME owner/name is a different repository, so
+  // the pin must refuse rather than send the displayed issue number there.
+  test('a host move to an enterprise server with the same owner/name fails closed', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-host-drift' });
+    const gh = forkRunner({ repoView: 'original/project' });
+    const stubDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-')));
+    const log = path.join(stubDir, 'argv.log');
+    const stub = path.join(stubDir, 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    const savedHost = process.env.GH_HOST;
+    process.env.GH_BIN_PATH = stub;
+    delete process.env.GH_HOST;
+    let run = null;
+    try {
+      run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+      // The same owner/name now lives on an enterprise server, and GH_HOST
+      // selects that server.
+      git(root, ['remote', 'set-url', 'origin', 'git@acme.ghe.com:myfork/project.git']);
+      process.env.GH_HOST = 'acme.ghe.com';
+      const before = gh.calls.length;
+
+      for (const action of [
+        () => run.options.actions.postComment(76, 'hello'),
+        () => run.options.actions.editLabels(76, ['bug'], [], []),
+        () => run.options.actions.setState(76, 'closed'),
+        () => run.options.actions.editAssignees(76, { add: ['bob'], remove: [] }),
+      ]) {
+        const refused = await action();
+        assert.equal(refused.ok, false, 'the action is refused');
+        assert.match(refused.error, /changed since this issue list loaded/);
+        assert.match(refused.error, /acme\.ghe\.com\/myfork\/project/,
+          'the drift names the enterprise identity');
+      }
+      assert.deepEqual(gh.calls.slice(before).filter((call) => call.argv[0] === 'issue'
+        && ['edit', 'comment', 'close', 'reopen'].includes(call.argv[1])), [],
+      'no mutating gh command ran on the enterprise server');
+
+      // A bound read is refused too: GH_HOST no longer selects the pinned
+      // server, so the pin fails closed instead of being redirected.
+      const page = await run.options.loadIssuePage({ bucketId: 'mine', cursor: null, limit: 5 });
+      assert.equal(page.ok, false, 'the read fails closed on the env drift');
+      assert.match(page.error, /GH_HOST selects acme\.ghe\.com/);
+
+      // The opener still opens the issue the rows came from, on its own host.
+      const opened = run.options.actions.openBrowser(76);
+      assert.equal(opened.ok, true, 'the opener binds the displayed host');
+      assert.equal(fs.readFileSync(log, 'utf8').trim(), 'issue view 76 --web -R github.com/myfork/project',
+        'the browser opens the github.com issue, never the enterprise one');
+      assert.ok(!gh.calls.slice(before).some((call) => call.repo === 'acme.ghe.com/myfork/project'),
+        'nothing was sent to the enterprise server');
+    } finally {
+      if (run) run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+      if (savedHost === undefined) delete process.env.GH_HOST;
+      else process.env.GH_HOST = savedHost;
+    }
+  });
+
+  // B1: an ambient GH_REPO must never override the pinned identity, and a
+  // change to it is drift, not a reason to follow it.
+  test('an ambient GH_REPO cannot override the pinned identity', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-env-repo' });
+    const gh = forkRunner();
+    const stubDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-issues-gh-bin-')));
+    const log = path.join(stubDir, 'argv.log');
+    const stub = path.join(stubDir, 'gh-stub');
+    fs.writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(log)}\n`);
+    fs.chmodSync(stub, 0o755);
+    const savedBin = process.env.GH_BIN_PATH;
+    const savedRepo = process.env.GH_REPO;
+    process.env.GH_BIN_PATH = stub;
+    delete process.env.GH_REPO;
+    let run = null;
+    try {
+      run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+      // A stray GH_REPO appears mid-session, naming another repository.
+      process.env.GH_REPO = 'ambient/other';
+      const refused = await run.options.actions.postComment(76, 'hello');
+      assert.equal(refused.ok, false, 'the write is refused on the drift');
+      assert.match(refused.error, /changed since this issue list loaded/);
+
+      // Reads still carry the pinned identity, never the ambient variable.
+      const before = gh.calls.length;
+      const page = await run.options.loadIssuePage({ bucketId: 'mine', cursor: null, limit: 5 });
+      assert.equal(page.ok, true);
+      assert.ok(gh.calls.slice(before).every((call) => call.repo === 'github.com/myfork/project'),
+        'the read carries the pin, not the ambient GH_REPO');
+
+      const opened = run.options.actions.openBrowser(76);
+      assert.equal(opened.ok, true);
+      assert.equal(fs.readFileSync(log, 'utf8').trim(), 'issue view 76 --web -R github.com/myfork/project');
+    } finally {
+      if (run) run.restore();
+      if (savedBin === undefined) delete process.env.GH_BIN_PATH;
+      else process.env.GH_BIN_PATH = savedBin;
+      if (savedRepo === undefined) delete process.env.GH_REPO;
+      else process.env.GH_REPO = savedRepo;
+    }
+  });
+
+  // B2: the fork clone that names its remotes `upstream` + `myfork` and tracks
+  // upstream (no `origin`). The base must never become the scope.
+  test('a fork with myfork and upstream, tracking upstream, reads myfork', async () => {
+    const root = makeForkRepo({
+      tag: 'issues-fork-no-origin',
+      remotes: [['upstream', 'original/project'], ['myfork', 'myfork/project']],
+    });
+    const branch = git(root, ['branch', '--show-current']).trim();
+    git(root, ['config', `branch.${branch}.remote`, 'upstream']);
+    git(root, ['config', `branch.${branch}.merge`, `refs/heads/${branch}`]);
+    const gh = forkRunner({ repoView: 'original/project' });
+    const run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+    try {
+      const before = gh.calls.length;
+      for (const bucketId of ['mine', 'assigned', 'involved', 'all']) {
+        const asked = await run.options.loadIssuePage({ bucketId, cursor: null, limit: 5 });
+        assert.equal(asked.ok, true, `the ${bucketId} tab answered`);
+      }
+      const reads = gh.calls.slice(before);
+      assert.deepEqual(
+        searchScopes(reads.filter((call) => call.argv[0] === 'api' && call.argv[1] === 'graphql')),
+        ['myfork/project', 'myfork/project', 'myfork/project'],
+        'the tracked upstream is never the scope',
+      );
+      assert.ok(reads.every((call) => call.repo === 'github.com/myfork/project'),
+        'every read carries the fork, host included');
+    } finally {
+      run.restore();
+    }
+  });
+
+  // B1: an explicit GH_REPO in the environment is the user's own scope, and it
+  // is pinned HOST-QUALIFIED so a later host change cannot redirect it.
+  test('an explicit GH_REPO is pinned with its host', async () => {
+    const root = makeForkRepo({ tag: 'issues-fork-env-pin' });
+    const gh = forkRunner();
+    const savedRepo = process.env.GH_REPO;
+    process.env.GH_REPO = 'ambient/repo';
+    let run = null;
+    try {
+      run = await capturedIssuesOptions(root, { runner: gh.runner, calls: gh.calls });
+      const before = gh.calls.length;
+      const page = await run.options.loadIssuePage({ bucketId: 'mine', cursor: null, limit: 5 });
+      assert.equal(page.ok, true);
+      assert.ok(gh.calls.slice(before).every((call) => call.repo === 'github.com/ambient/repo'),
+        'the pinned GH_REPO is host-qualified and used');
+    } finally {
+      if (run) run.restore();
+      if (savedRepo === undefined) delete process.env.GH_REPO;
+      else process.env.GH_REPO = savedRepo;
     }
   });
 });

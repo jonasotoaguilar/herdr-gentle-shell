@@ -126,11 +126,17 @@ function resultText(result) {
 // cell contract is pinned by tools/worktree-model-result.test.js; these suites
 // pin WHICH rows exist, in which order, with which identity.
 function listHeader(count) {
-  return `worktrees: ${count} (name · branch · path · kind · status)`;
+  return `worktrees: ${count} (name · branch · path)`;
 }
 
+// S6: an ordinary registered-and-live row spends no cell saying it is listed,
+// so only the state that changes how the row reads (`missing`, `unregistered`)
+// rides a trailing cell — and a kind the row already states (the principal's
+// own name, an unregistered row's state) never repeats it.
 function listRow({ name, branch, path: target, kind, status }) {
-  return [name, branch, target, kind, status].join(' · ');
+  const state = status === undefined || status === 'live' || status === 'exists' ? '' : status;
+  const kindCell = kind === undefined || kind === 'agent' || kind === name || kind === state ? '' : kind;
+  return [name, branch, target, kindCell, state].filter((cell) => cell.length > 0).join(' · ');
 }
 
 function livePaths(root) {
@@ -1378,7 +1384,7 @@ describe('S1: the listing publishes no issue or ODD association, in text or deta
   // identity only. The available-document scan is gone with the association,
   // so a listing never reads a checkout's `odd/` directory either.
   function header(count) {
-    return `worktrees: ${count} (name · branch · path · kind · status)`;
+    return `worktrees: ${count} (name · branch · path)`;
   }
 
   const ASSOCIATION_KEYS = ['issues', 'assignedOdd', 'odd', 'droppedOdd'];
@@ -1404,8 +1410,8 @@ describe('S1: the listing publishes no issue or ODD association, in text or deta
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
       assert.deepEqual(text.split('\n'), [
         header(2),
-        `principal · ${git(root, ['branch', '--show-current'])} · ${root} · principal · live`,
-        `feat-live · feat/live · ${live} · agent · live`,
+        `principal · ${git(root, ['branch', '--show-current'])} · ${root}`,
+        `feat-live · feat/live · ${live}`,
       ], 'the text is the checkout identity alone');
       assert.ok(!/issues=|odd=|assignedOdd|available odd/i.test(text), `no association cell or key: ${text}`);
       assert.ok(!text.includes('discovered-only') && !text.includes('active.md'), `no ODD document: ${text}`);
@@ -1470,7 +1476,7 @@ describe('S1: the listing publishes no issue or ODD association, in text or deta
       const result = await tools.get('worktree_list').execute('call-1', {}, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.ok(text.includes(`feat-held · feat/held · ${live} · agent · live`), `the row still lists: ${text}`);
+      assert.ok(text.includes(`feat-held · feat/held · ${live}`), `the row still lists: ${text}`);
       assert.equal(fs.existsSync(marker), false, 'the listing never scanned the checkout for ODD documents');
       const row = result.details.worktrees.find((item) => item.branch === 'feat/held');
       assert.equal(Object.hasOwn(row, 'odd'), false, 'and no inventory is published');
@@ -1501,8 +1507,8 @@ describe('S1: the listing publishes no issue or ODD association, in text or deta
         assert.equal(Object.hasOwn(extra, key), false, `an unregistered entry carries no ${key}: ${JSON.stringify(extra)}`);
       }
       assert.ok(
-        text.split('\n').includes(`feat-ghost · feat/ghost · ${realGhost} · unregistered · unregistered`),
-        `the unregistered row is its identity: ${text}`,
+        text.split('\n').includes(`feat-ghost · feat/ghost · ${realGhost} · unregistered`),
+        `the unregistered row is its identity plus that one state: ${text}`,
       );
       assert.ok(!text.includes('held.md'), `no document is inferred for it: ${text}`);
     } finally {
@@ -1536,7 +1542,7 @@ describe('S1: the listing publishes no issue or ODD association, in text or deta
         `no association notice is emitted: ${JSON.stringify(result.details.warnings)}`,
       );
       assert.ok(!/odd/i.test(text), `and none reaches the text: ${text}`);
-      assert.ok(text.includes(`feat-live · feat/live · ${live} · agent · live`), 'the live row is unaffected');
+      assert.ok(text.includes(`feat-live · feat/live · ${live}`), 'the live row is unaffected');
       assert.equal(result.details.worktrees.some((item) => Object.hasOwn(item, 'odd')), false, 'no row publishes an inventory');
     } finally {
       restoreEnv();

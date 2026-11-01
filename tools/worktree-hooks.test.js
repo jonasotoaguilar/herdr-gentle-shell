@@ -50,6 +50,8 @@ function makePrincipal(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
   const real = fs.realpathSync(dir);
   // The tool builds its checkouts beside the fixture root
   // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
@@ -766,7 +768,7 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
         ui: { confirm: async () => true, notify: () => {} },
       };
       const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-hooked');
-      const result = await tool.execute('call-1', { branch: 'feat/hooked', issues: [35] }, undefined, undefined, ctx);
+      const result = await tool.execute('call-1', { branch: 'feat/hooked', issues: [35], changes: 'none' }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, `hooks must never fail creation: ${JSON.stringify(result)}`);
       const text = (result.content || []).map((p) => p.text || '').join('\n');
       assert.deepEqual(text.split('\n'), [
@@ -805,6 +807,9 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
     fs.writeFileSync(path.join(root, 'Cargo.toml'), '[package]\n');
     git(root, ['add', 'Cargo.toml']);
     git(root, ['commit', '-m', 'add cargo marker']);
+    // S2: the checkout is born from LOCAL main, so the marker has to be in
+    // main's tree to be inherited.
+    git(root, ['branch', '-f', 'main', 'HEAD']);
     const modeDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-mode-')));
     const shimLog = path.join(path.dirname(herdr.bin), 'herdr-argv.log');
     setEnv({
@@ -827,7 +832,7 @@ describe('worktree_create hook wiring', { concurrency: false }, () => {
         ui: { confirm: async () => true, notify: () => {} },
       };
       const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-hookfail');
-      const result = await tool.execute('call-1', { branch: 'feat/hookfail', issues: [35] }, undefined, undefined, ctx);
+      const result = await tool.execute('call-1', { branch: 'feat/hookfail', issues: [35], changes: 'none' }, undefined, undefined, ctx);
       assert.equal(result.isError, undefined, 'hooks never turn success into error');
       const text = (result.content || []).map((p) => p.text || '').join('\n');
       assert.deepEqual(text.split('\n'), [

@@ -138,3 +138,99 @@ describe('renderOddMarkdown', () => {
     }
   });
 });
+
+// S12 (Issues preview): GitHub-flavored markdown treats a single newline inside
+// a paragraph as a space, so a body whose lines were hard-wrapped at the author's
+// terminal reads as ONE paragraph. The ODD documents keep their own
+// line-per-line shape, so the joined form is an explicit option and the default
+// is unchanged.
+describe('renderOddMarkdown joins wrapped paragraphs when asked (S12)', () => {
+  const flow = (width) => ({ width, paint: tag, measure: (s) => [...strip(s)].length, flowParagraphs: true });
+
+  test('consecutive plain source lines become one paragraph', () => {
+    const source = 'first source line\nsecond source line';
+    assert.equal(plain(renderOddMarkdown(source, flow(200))), 'first source line second source line');
+    assert.equal(plain(renderOddMarkdown(source, opts(200))), 'first source line\n\nsecond source line',
+      'the ODD document shape keeps one source line per block by default');
+  });
+
+  test('a joined paragraph still wraps to the requested width', () => {
+    const source = 'alpha beta gamma delta epsilon zeta eta theta';
+    const lines = renderOddMarkdown(source, flow(16));
+    assert.ok(lines.length > 1, 'the joined paragraph wraps');
+    for (const line of lines) assert.ok(strip(line).length <= 16, `line exceeds the width: ${strip(line)}`);
+    assert.equal(plain(lines).replace(/\n/g, ' '), source, 'every word survives the join and the wrap');
+  });
+
+  test('headings, lists, quotes and code blocks keep their own blocks', () => {
+    const source = [
+      'lead in',
+      'continues here',
+      '## Steps',
+      '- one',
+      '- two',
+      '> quoted',
+      '```sh',
+      'ls',
+      '```',
+      'trailing text',
+    ].join('\n');
+    const body = plain(renderOddMarkdown(source, flow(80)));
+    assert.ok(body.includes('lead in continues here'), 'plain lines joined into one paragraph');
+    assert.ok(!body.includes('continues here ## Steps'), 'a heading ends the paragraph');
+    assert.ok(/▌ Steps/.test(body), 'the heading keeps its mark');
+    assert.ok(/•\s+one/.test(body), 'list items stay their own rows');
+    assert.ok(body.includes('quoted') && !/\n>/.test(body), 'the quote keeps its own block');
+    assert.ok(body.includes('ls'), 'the code body survives');
+    assert.ok(body.includes('trailing text'), 'text after a fence is not swallowed');
+  });
+});
+
+// S12: the preview renders text that came from someone else's issue tracker, so
+// the renderer treats control sequences as display data. Roles are asserted
+// through the injected paint seam, never through a theme.
+describe('renderOddMarkdown styles and sanitizes untrusted text (S12)', () => {
+  const roles = (width) => ({
+    width,
+    paint: tag,
+    emphasis: (text) => `<strong>${text}</strong>`,
+    measure: (s) => [...strip(s)].length,
+  });
+
+  test('inline code and bold take their own roles', () => {
+    const body = renderOddMarkdown('use `gh auth` and **today**', roles(80)).join('\n');
+    assert.match(body, /<accent><dim>gh<\/dim><\/accent>/, 'inline code is accent on dim');
+    assert.match(body, /<strong><text>today<\/text><\/strong>/, 'bold goes through the emphasis seam');
+  });
+
+  test('a fenced block renders indented, dim, and inside the width budget', () => {
+    const source = ['```', 'git worktree add /tmp/very-long-branch-name-here ok', '```'].join('\n');
+    const lines = renderOddMarkdown(source, roles(24));
+    assert.ok(lines.length > 1, 'a long code line wraps');
+    for (const line of lines) {
+      assert.match(line, /^ {2}<dim>/, `code rows are indented and dim: ${JSON.stringify(line)}`);
+      assert.ok(strip(line).length <= 24, `code row exceeds the width: ${strip(line)}`);
+    }
+    const withoutSpace = (value) => String(value).replace(/\s+/g, '');
+    assert.equal(withoutSpace(plain(lines)), withoutSpace('git worktree add /tmp/very-long-branch-name-here ok'),
+      'no code character is dropped by the wrap');
+    const wide = renderOddMarkdown(source, roles(200));
+    assert.equal(plain(wide), '  git worktree add /tmp/very-long-branch-name-here ok', 'a code line that fits is untouched');
+  });
+
+  test('escape sequences, OSC titles and control characters never reach the output', () => {
+    const source = 'plain \x1b[31mred\x1b[0m \x1b]0;owned\x07text\x08\x07 end';
+    const lines = renderOddMarkdown(source, roles(80));
+    const joined = lines.join('');
+    assert.ok(!joined.includes('\x1b'), 'no escape byte reaches the output');
+    assert.ok(!joined.includes('\x07'), 'no BEL reaches the output');
+    assert.ok(!joined.includes('\x08'), 'no backspace reaches the output');
+    assert.equal(plain(lines), 'plain red text end', 'the visible text of the line survives intact');
+  });
+
+  test('a tab is folded to spaces so the width budget matches the terminal', () => {
+    const body = plain(renderOddMarkdown('a\tb', roles(80)));
+    assert.ok(!body.includes('\t'), 'no raw tab reaches the output');
+    assert.equal(body, 'a b');
+  });
+});

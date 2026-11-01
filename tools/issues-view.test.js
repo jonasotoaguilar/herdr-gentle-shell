@@ -63,7 +63,14 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 // for the ROLE behind a token instead of trusting an eyeballed colour. A role
 // the map does not name still gets its own code, so an unexpected role shows up
 // instead of passing silently.
-const ROLE_SGR = { accent: 96, muted: 90, dim: 2, border: 34, error: 91, text: 39 };
+const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
+// T9 (S13): the title role is `customMessageLabel`, the one the Pi Agents view
+// paints its own frame title with (gentle-pi/lib/agents-view.ts:42,437), so the
+// expectations below name the role LITERALLY instead of reading it back out of
+// the table they are meant to pin. `TITLE_PAINT` is the raw escape a recording
+// theme emits for that role + bold.
+const TITLE_PAINT = '\x1b[1m\x1b[33m';
+const CLOSE_PAINT = '\x1b[0m\x1b[22m';
 
 function recordingTheme() {
   const calls = [];
@@ -3370,7 +3377,10 @@ describe('issues preview shares lib/issue-preview.js (S16)', () => {
     assert.deepEqual(actual, expected, 'every field, label, count, blank line and end marker matches the shared formatter');
   });
 
-  test('the preview title takes the accent role the shared formatter paints', async () => {
+  // T9 (S13): the right-pane issue title is a TITLE, so it takes the same role
+  // the shared table gives the frame title and every other title — the preview
+  // formatter asks the palette for it instead of hardcoding `accent`.
+  test('the preview title takes the shared title role the formatter paints', async () => {
     const calls = [];
     const theme = {
       fg: (role, text) => { calls.push([role, text]); return String(text); },
@@ -3380,8 +3390,12 @@ describe('issues preview shares lib/issue-preview.js (S16)', () => {
     await tick();
     view.render(100);
     assert.ok(
-      calls.some(([role, text]) => role === 'accent' && text === '#7 shared preview title'),
-      'the title carries the shared formatter styling, not a second local variant',
+      calls.some(([role, text]) => role === 'customMessageLabel' && text === '#7 shared preview title'),
+      'the title is painted with the shared title role',
+    );
+    assert.ok(
+      !calls.some(([role, text]) => role === 'accent' && text === '#7 shared preview title'),
+      'the title is not painted with the button accent',
     );
   });
 
@@ -3918,18 +3932,27 @@ describe('issues view bucket arrows and palette (S10/S11)', () => {
       'the description asks the injected theme for the muted role');
   });
 
-  test('the header palette: title accent+bold, tab label accent, counts muted (S11)', async () => {
+  // T9 (S13): the frame title and the active tab are TITLES, so they take the
+  // Agents view's own title role; the footer keys keep the primary accent. The
+  // preview's own heading now asks the same shared table for its title role.
+  test('the header palette: secondary title, secondary active tab, muted counts (S11, S13)', async () => {
     const theme = recordingTheme();
     const { view } = twoBucketView({ rows: 24, theme });
     await tick();
     const lines = view.render(120);
-    assert.match(lines[0], /\x1b\[1m\x1b\[96m◈ Issues\x1b\[0m\x1b\[22m/, 'the frame title is accent+bold');
+    assert.ok(lines[0].includes(`${TITLE_PAINT}◈ Issues${CLOSE_PAINT}`),
+      'the frame title is the shared title role, bold');
+    assert.ok(theme.calls.some((call) => call.role === 'customMessageLabel' && call.text === '◈ Issues'),
+      'the title asks the injected theme for the title role');
+    assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === '◈ Issues'),
+      'the title never takes the button accent');
     const tabs = lines[2];
-    assert.match(tabs, /\x1b\[1m\x1b\[96m▸ My issues\x1b\[0m\x1b\[22m/, 'the active tab label is accent+bold');
+    assert.ok(tabs.includes(`${TITLE_PAINT}▸ My issues${CLOSE_PAINT}`),
+      'the active tab label is a title too');
     assert.match(tabs, /\x1b\[90m \(10\)/, 'the active tab count is muted');
     assert.match(tabs, /\x1b\[90mAssigned \(1\)\x1b\[0m/, 'an inactive tab label and its count are both muted');
-    assert.match(lines.join('\n'), /\x1b\[1m\x1b\[96m#1 issue title 1\x1b\[0m\x1b\[22m/,
-      'the right-pane document title is accent+bold');
+    assert.ok(lines.join('\n').includes(`${TITLE_PAINT}#1 issue title 1`),
+      'the right-pane document title shares the frame title role (S13)');
   });
 
   test('a hostile theme never breaks the frame and keeps the keys and focus readable (S11)', async () => {
@@ -3947,7 +3970,7 @@ describe('issues view bucket arrows and palette (S10/S11)', () => {
     assert.match(body, /› Search/, 'the search widget still renders');
   });
 
-  test('the search row paints its label dim and its live value accent (S11)', async () => {
+  test('the search row paints its label dim and its live value as ordinary text (S11, S13)', async () => {
     const theme = recordingTheme();
     const { view } = twoBucketView({ rows: 24, theme });
     await tick();
@@ -3957,6 +3980,127 @@ describe('issues view bucket arrows and palette (S10/S11)', () => {
     for (const char of 'bug') view.handleInput(char);
     const live = view.render(120)[1];
     assert.match(live, /\x1b\[2m› \x1b\[0m/, 'the prompt keeps the dim label role while typing');
-    assert.match(live, /\x1b\[96mbug/, 'the live query value is painted accent');
+    assert.match(live, /\x1b\[39mbug/, 'the live query value is the theme text role');
+    assert.ok(!/\x1b\[96mbug/.test(live), 'the typed value is never the button accent');
+  });
+});
+
+// S12: «em issues, la preview igual hagamoslo como un md estilizado». The
+// preview's FREE TEXT — the issue body and every comment body — renders through
+// `lib/odd-markdown.js`, the same renderer the ODD document pane uses, so a
+// report written in markdown reads as headings, inline formatting and code
+// instead of raw syntax. The metadata rows (number, title, state, labels,
+// counts) stay the shared formatter's own (S16), and a control sequence in a
+// body is display data: it can neither paint nor move the cursor.
+describe('issues preview renders styled markdown (S12)', () => {
+  const PANE_TOP = 4;
+  function rightPane(view, width, rows = 40) {
+    const panes = readerPanes(width);
+    return view.render(width)
+      .slice(PANE_TOP, Math.max(PANE_TOP, rows - 2))
+      .map((line) => [...strip(line)].slice(5 + panes.left, 5 + panes.left + panes.right).join(''))
+      .join('\n');
+  }
+
+  async function viewFor(body, { comments = [], theme = plainTheme } = {}) {
+    const detail = issue(9, { body, title: 'markdown body' });
+    const built = makeView({
+      pages: pagesOf([[detail], [], []]),
+      issues: [detail],
+      rows: 40,
+      theme,
+      loadIssue: () => ({ ok: true, issue: detail, comments }),
+    });
+    built.view.render(100);
+    await tick();
+    built.view.render(100);
+    return built.view;
+  }
+
+  test('a heading in the body renders as a heading, not as raw syntax', async () => {
+    const view = await viewFor('## Steps\n\nrun the tool');
+    const text = rightPane(view, 100);
+    assert.ok(!text.includes('## Steps'), 'the raw heading marker never reaches the pane');
+    assert.match(text, /▌ Steps/, 'the heading keeps its mark');
+    assert.match(text, /run the tool/, 'the body below the heading survives');
+  });
+
+  test('inline code and bold lose their markers and keep their words', async () => {
+    const view = await viewFor('use `gh auth` and **now** please');
+    const text = rightPane(view, 100);
+    assert.ok(!text.includes('`gh auth`'), 'the code marker is gone');
+    assert.ok(!text.includes('**now**'), 'the bold marker is gone');
+    assert.match(text, /gh auth/);
+    assert.match(text, /now please/);
+  });
+
+  test('a fenced block renders its body without the fence markers', async () => {
+    const view = await viewFor('before\n\n```sh\ngit status\n```\n\nafter');
+    const text = rightPane(view, 100);
+    assert.ok(!text.includes('```'), 'no fence marker reaches the pane');
+    assert.match(text, /git status/);
+    assert.match(text, /before/);
+    assert.match(text, /after/);
+  });
+
+  test('the markdown roles come from the theme, like the ODD document pane', async () => {
+    const theme = recordingTheme();
+    const view = await viewFor('## Steps\n\nuse `gh` now', { theme });
+    assert.ok(theme.calls.some((call) => call.role === 'mdHeading' && call.text.includes('Steps')),
+      'a heading is painted mdHeading');
+    assert.ok(theme.calls.some((call) => call.role === 'dim' && call.text.includes('gh')),
+      'inline code is painted dim');
+    assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('#9 markdown body')),
+      'the issue title keeps the shared formatter styling');
+  });
+
+  test('a comment body is markdown too, and keeps its author heading', async () => {
+    const view = await viewFor('issue body', {
+      comments: [{ author: 'ann', createdAt: new Date().toISOString(), body: '- first point\n- second point' }],
+    });
+    const text = rightPane(view, 100);
+    assert.match(text, /ann/, 'the comment author row survives');
+    assert.ok(!text.includes('- first point'), 'the bullet marker is replaced by the renderer mark');
+    assert.match(text, /• first point/);
+    assert.match(text, /second point/);
+  });
+
+  test('control sequences in a body cannot paint or move the cursor', async () => {
+    const view = await viewFor('plain \x1b[31mred\x1b[0m \x1b]0;owned\x07text');
+    const panes = readerPanes(100);
+    const raw = view.render(100)
+      .slice(PANE_TOP, 38)
+      .map((line) => [...line].slice(5 + panes.left, 5 + panes.left + panes.right).join(''))
+      .join('\n');
+    assert.ok(!raw.includes('\x1b'), 'no escape sequence from the issue body reaches the pane');
+    assert.ok(!raw.includes('\x07'), 'no BEL from the issue body reaches the pane');
+    assert.match(strip(raw), /plain red text/);
+  });
+
+  test('a markdown body keeps the reader scroll, the width, and every word', async () => {
+    const items = Array.from({ length: 40 }, (_, at) => `- item ${at + 1}`);
+    const view = await viewFor(['## Checklist', '', ...items].join('\n'));
+    const pane = readerPanes(100);
+    const first = rightPane(view, 100).split('\n')[0];
+    view.handleInput('pagedown');
+    view.render(100);
+    const scroll = view.state.scroll;
+    assert.ok(scroll > 0, 'the page key moved the document');
+    const moved = rightPane(view, 100).split('\n')[0];
+    assert.notEqual(moved, first, 'the pane actually moved');
+    view.render(100);
+    assert.equal(view.state.scroll, scroll, 'a repaint keeps the scroll position');
+    assert.equal(rightPane(view, 100).split('\n')[0], moved, 'and the same first row');
+    let seen = '';
+    view.handleInput('home');
+    for (let step = 0; step < 40; step += 1) {
+      seen += `${rightPane(view, 100)}\n`;
+      if (seen.includes('(end of issue)')) break;
+      view.handleInput('pagedown');
+    }
+    for (let at = 1; at <= 40; at += 1) assert.match(seen, new RegExp(`item ${at}\\b`), `lost item ${at}`);
+    assert.match(seen, /\(end of issue\)/, 'the end marker is still reachable by paging');
+    assert.ok(!seen.includes('…'), 'no markdown row is wider than the pane');
+    assert.equal(readerPanes(100).right, pane.right);
   });
 });
