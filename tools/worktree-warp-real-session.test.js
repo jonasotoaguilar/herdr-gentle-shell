@@ -839,7 +839,12 @@ describe('warp handoff on the real host (S14)', { skip: !SM_PATH, concurrency: f
         // The continuation turn runs after the switch: give it the same bounded
         // chance to finish before reading the files.
         const continuationDeadline = Date.now() + 5000;
-        while (Date.now() < continuationDeadline && runtimeHost.session.isIdle !== true) {
+        while (Date.now() < continuationDeadline) {
+          const file = runtimeHost.session.sessionFile;
+          const entries = file && fs.existsSync(file) ? readSessionLines(file) : [];
+          const notice = entries.some((entry) => entry.type === 'custom_message' && entry.customType === 'worktree-warp');
+          const continued = entries.some((entry) => contentTextOf(entry.message).includes('continued in the new checkout'));
+          if (notice && continued && runtimeHost.session.isIdle === true) break;
           await new Promise((resolve) => setTimeout(resolve, 25));
         }
       } finally {

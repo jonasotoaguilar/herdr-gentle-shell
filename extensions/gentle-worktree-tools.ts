@@ -4095,10 +4095,14 @@ function warpCreatePreflight(ctx) {
   return { ok: true };
 }
 
-// S61 tool-side copy for the `changes` option. Resolves to
-// {isError:false, copied} to continue or {isError:true, result} to
-// refuse with no copy and no switch. Never throws.
-async function warpToolMaybeCopyChanges({ ctx, git, params, fromCheckout, targetCwd }) {
+// S61 tool-side handling of the `changes` option: it VALIDATES the selection and
+// nothing more. The copy itself belongs to the command (see
+// `warpHandoffCopyChanges`), because the tool only QUEUES the move — a copy made
+// here would land in a checkout the command can still refuse, and the retry the
+// refusal asks for would then fail on its own stranded copy.
+// Resolves to {isError:false, selection} or {isError:true, result} with nothing
+// queued. Never throws.
+function warpToolChangesSelection(params) {
   let raw;
   try {
     raw = params ? params.changes : undefined;
@@ -4109,7 +4113,7 @@ async function warpToolMaybeCopyChanges({ ctx, git, params, fromCheckout, target
   try {
     changesLib = libRequire('worktree-changes.js');
   } catch (err) {
-    return { isError: false, copied: null };
+    return { isError: false, selection: { mode: 'none', paths: [] } };
   }
   let normalized;
   try {
@@ -4123,26 +4127,179 @@ async function warpToolMaybeCopyChanges({ ctx, git, params, fromCheckout, target
   if (!normalized.ok) {
     return { isError: true, result: errorResult(`worktree warp: ${normalized.error}`, { tool: 'worktree_warp' }) };
   }
-  if (normalized.mode === 'none') return { isError: false, copied: null };
+  return { isError: false, selection: { mode: normalized.mode, paths: normalized.paths.slice() } };
+}
+
+// The handoff's change selection, applied at MOVE time by the command: after
+// every refusal check above and before the switch. A handoff refused before this
+// point mutates NOTHING, and the copy that does run never mutates the source or
+// either index (lib/worktree-changes.js): an unknown file, a destination overlap
+// or a drifted snapshot rejects with zero destination mutation. Never throws.
+async function warpHandoffCopyChanges({ git, fromCheckout, targetCwd, changes }) {
+  if (!changes || changes.mode === 'none') return { ok: true, copied: null };
+  let changesLib = null;
+  try {
+    changesLib = libRequire('worktree-changes.js');
+  } catch (err) {
+    return { ok: true, copied: null };
+  }
   let copied;
   try {
     copied = await changesLib.copyChanges(
-      { from: fromCheckout, to: targetCwd, selectMode: normalized.mode, selection: normalized.paths },
+      { from: fromCheckout, to: targetCwd, selectMode: changes.mode, selection: changes.paths },
       { git },
     );
   } catch (err) {
-    return {
-      isError: true,
-      result: errorResult(`worktree warp: cannot copy changes: ${(err && err.message) || err} (nothing was copied)`, { tool: 'worktree_warp' }),
-    };
+    return { error: `cannot copy changes: ${(err && err.message) || err} (nothing was copied, warped or switched)` };
   }
   if (!copied || copied.ok !== true) {
-    return {
-      isError: true,
-      result: errorResult(`worktree warp: ${(copied && copied.error) || 'cannot copy changes'}`, { tool: 'worktree_warp' }),
-    };
+    return { error: (copied && copied.error) || 'cannot copy changes' };
   }
-  return { isError: false, copied };
+  return { ok: true, copied };
+}
+
+// The tool's selection preflight: a selection naming a file that is NOT pending
+// must refuse BEFORE the handoff is queued, because the command can only refuse
+// it — a queued request the command always rejects is the same false success the
+// token cap had. Read-only: the shared summary and matcher decide, nothing is
+// written. Destination state is deliberately NOT checked here: an overlap may be
+// this handoff's own earlier copy, which the command proves byte for byte and
+// skips at move time. Never throws.
+async function warpHandoffSelectionCheck({ git, fromCheckout, changes }) {
+  if (!changes || changes.mode === 'none') return { ok: true };
+  let changesLib = null;
+  try {
+    changesLib = libRequire('worktree-changes.js');
+  } catch (err) {
+    return { ok: true };
+  }
+  let summary;
+  try {
+    summary = await changesLib.summarizeChanges(fromCheckout, { git });
+  } catch (err) {
+    return { ok: false, error: `cannot read the pending changes: ${(err && err.message) || err} (nothing was queued)` };
+  }
+  if (!summary || summary.ok !== true) {
+    return { ok: false, error: `${(summary && summary.error) || 'cannot read the pending changes'} (nothing was queued)` };
+  }
+  let matched;
+  try {
+    matched = changesLib.matchSelection(summary, changes.mode, changes.paths);
+  } catch (err) {
+    return { ok: false, error: `cannot match the changes selection: ${(err && err.message) || err} (nothing was queued)` };
+  }
+  if (!matched || matched.ok !== true) {
+    return { ok: false, error: `${(matched && matched.error) || 'cannot match the changes selection'}; nothing was queued` };
+  }
+  return { ok: true };
+}
+
+// One side of the proof: what this process can actually observe at a path.
+// 'missing' is ENOENT and NOTHING else — a permission error, an I/O error, a
+// symlink or any non-regular file reads as 'failed', because a failed read is not
+// evidence of absence (treating it as "absent on both sides" is exactly how an
+// unreadable selected file was once passed off as an already-applied copy).
+// Never throws.
+function warpProofRead(file) {
+  try {
+    let stat;
+    try {
+      stat = fs.lstatSync(file);
+    } catch (err) {
+      return err && err.code === 'ENOENT' ? { state: 'missing' } : { state: 'failed' };
+    }
+    // A symlink is not provable: the copy materializes the referent's BYTES as a
+    // regular file, so "equal content" says nothing about the resulting file
+    // type. Any other non-regular file (fifo, socket, device, directory) has no
+    // byte content a copy could reproduce either.
+    if (stat.isSymbolicLink() || !stat.isFile()) return { state: 'failed' };
+    try {
+      return { state: 'bytes', bytes: fs.readFileSync(file) };
+    } catch {
+      return { state: 'failed' };
+    }
+  } catch {
+    return { state: 'failed' };
+  }
+}
+
+// Byte-identity proof for a retry whose copy an EARLIER attempt already left in
+// the destination (the move failed after the copy). Proven only when EVERY
+// selected path holds the same content on both sides — identical bytes on both,
+// or a TRACKED DELETION already applied (ENOENT on both) — because that is
+// exactly the post-copy state: skipping the copy can then neither lose nor change
+// anything, and nothing is written at all. The source, the destination's other
+// edits and both indexes are left untouched, and no file is deleted or reverted.
+// Anything unreadable (any non-ENOENT failure), non-regular, escaping or
+// different reads as NOT proved, so the caller fails closed instead of guessing.
+// Never throws.
+async function warpHandoffCopyAlreadyApplied({ git, fromCheckout, targetCwd, changes }) {
+  const notProved = { ok: false, applied: false, identical: [], differing: [], unreadable: [] };
+  try {
+    if (!changes || changes.mode === 'none') return notProved;
+    if (typeof fromCheckout !== 'string' || fromCheckout.length === 0) return notProved;
+    let changesLib = null;
+    try {
+      changesLib = libRequire('worktree-changes.js');
+    } catch (err) {
+      return notProved;
+    }
+    const summary = await changesLib.summarizeChanges(fromCheckout, { git });
+    if (!summary || summary.ok !== true) return notProved;
+    const matched = changesLib.matchSelection(summary, changes.mode, changes.paths);
+    if (!matched || matched.ok !== true || matched.entries.length === 0) return notProved;
+    const identical = [];
+    const differing = [];
+    const unreadable = [];
+    for (const entry of matched.entries) {
+      const destPath = path.resolve(targetCwd, entry.rel);
+      if (!changesLib.isInsideOrEqual(targetCwd, destPath)
+        || !changesLib.isInsideOrEqual(fromCheckout, entry.path)) {
+        // A path escaping either checkout proves nothing.
+        unreadable.push(entry.rel);
+        continue;
+      }
+      const source = warpProofRead(entry.path);
+      const dest = warpProofRead(destPath);
+      if (source.state === 'failed' || dest.state === 'failed') {
+        unreadable.push(entry.rel);
+      } else if (source.state === 'missing' && dest.state === 'missing') {
+        // Absent on both sides is a deletion already applied — but only a TRACKED
+        // deletion travels as a patch. An UNTRACKED entry with no source file is
+        // unreadable evidence (the shared helper calls it "the source file is
+        // unreadable"), never a proven copy.
+        if (entry.untracked === true) unreadable.push(entry.rel);
+        else identical.push(entry.rel);
+      } else if (source.state === 'bytes' && dest.state === 'bytes') {
+        if (Buffer.compare(source.bytes, dest.bytes) === 0) identical.push(entry.rel);
+        else differing.push(entry.rel);
+      } else {
+        // Present on one side only: the copy would still have work to do.
+        differing.push(entry.rel);
+      }
+    }
+    return {
+      ok: true,
+      applied: differing.length === 0 && unreadable.length === 0 && identical.length > 0,
+      identical, differing, unreadable,
+    };
+  } catch {
+    return notProved;
+  }
+}
+
+// How many copied files a report names before it summarizes the rest. A large
+// selection must never turn a failure message into a wall of paths.
+const WARP_COPY_REPORT_MAX_FILES = 12;
+
+// The `N files: a, b (+M more)` cell every copy report uses. Never throws.
+function warpCopyFilesSummary(files) {
+  const list = Array.isArray(files) ? files.filter((entry) => typeof entry === 'string') : [];
+  const count = list.length;
+  const shown = list.slice(0, WARP_COPY_REPORT_MAX_FILES);
+  const more = count - shown.length;
+  const detail = shown.length === 0 ? '' : `: ${shown.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`;
+  return { count, line: `${count} file${count === 1 ? '' : 's'}${detail}` };
 }
 // ---------------------------------------------------------------------------
 // The warp handoff (`worktree_warp` -> `/herdr-gentle:warp`).
@@ -4162,7 +4319,12 @@ async function warpToolMaybeCopyChanges({ ctx, git, params, fromCheckout, target
 // The request travels as ONE `@<token>` argument: base64url of a small JSON
 // object. The charset is [A-Za-z0-9_-], so a checkout name or path can never
 // inject a second argument, a newline, a control character, a second command
-// or a shell word — the token is the ONLY thing the command parses.
+// or a shell word — the token is the ONLY thing the command parses. What it
+// carries is checkout identity (name, target, source, branch) and the change
+// selection; never file contents, environment or credentials. The token is also
+// length-bounded, and that bound is enforced on the way OUT as well as in (see
+// `prepareWarpHandoff`): a token over the cap was previously queued and then
+// always rejected by the command, which reported a move that could never happen.
 const WARP_HANDOFF_VERSION = 1;
 const WARP_HANDOFF_PREFIX = '@';
 const WARP_HANDOFF_MAX_TOKEN = 2048;
@@ -4172,10 +4334,66 @@ const WARP_HANDOFF_MAX_NAME = 200;
 // for a tool to reach a command context. Null until the extension loads.
 let warpHandoffPi = null;
 
-// Encode a validated handoff request as the single command argument. Never
-// throws: an unencodable request returns the empty string, which the caller
-// treats as a refusal (nothing is dispatched).
+// The ONE token contract, shared by the encode and the decode side: a non-empty
+// base64url spelling within the length cap. Anything else is refused, and never
+// echoed back.
+function warpHandoffTokenAccepted(token) {
+  return typeof token === 'string'
+    && token.length > 0
+    && token.length <= WARP_HANDOFF_MAX_TOKEN
+    && /^[A-Za-z0-9_-]+$/.test(token);
+}
+
+// The change selection as it travels in the token: absent for "copy nothing",
+// `{mode: "all"}` for everything, `{mode: "paths", paths: [...]}` for a list.
+// The copy is applied by the command at move time, so the selection must travel
+// WITH the request instead of being acted on before it is queued. Null means the
+// value is not one of those three shapes. Never throws.
+function warpHandoffChangesPayload(changes) {
+  try {
+    if (!changes || typeof changes !== 'object' || Array.isArray(changes)) return undefined;
+    if (changes.mode === 'none') return undefined;
+    if (changes.mode === 'all') return { mode: 'all' };
+    if (changes.mode === 'paths' && Array.isArray(changes.paths) && changes.paths.length > 0) {
+      const paths = changes.paths.map((entry) => String(entry));
+      if (paths.some((entry) => entry.trim().length === 0)) return null;
+      return { mode: 'paths', paths };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Normalize a decoded/injected `changes` value into the internal shape. Null
+// means an unusable shape; `undefined`/absent means "copy nothing". Never throws.
+function normalizeHandoffChanges(value) {
+  try {
+    if (value === undefined || value === null) return { mode: 'none', paths: [] };
+    if (typeof value !== 'object' || Array.isArray(value)) return null;
+    if (value.mode === 'none') return { mode: 'none', paths: [] };
+    if (value.mode === 'all') return { mode: 'all', paths: [] };
+    if (value.mode === 'paths') {
+      if (!Array.isArray(value.paths) || value.paths.length === 0) return null;
+      const paths = value.paths;
+      if (!paths.every((entry) => typeof entry === 'string' && entry.trim().length > 0)) return null;
+      return { mode: 'paths', paths: paths.slice() };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Encode a handoff request as the single command argument. The token is bounded
+// on the way OUT here (length cap and charset), so an oversized or
+// unrepresentable request is refused before anything is queued — the defect this
+// closes was a cap enforced only on decode, which let the tool queue a token the
+// command always rejected. Returns {ok:true, token} or {ok:false, error}; the
+// error names the limit but never the rejected value or the produced token.
+// Never throws.
 function encodeWarpHandoff(request) {
+  let token;
   try {
     const payload = {
       v: WARP_HANDOFF_VERSION,
@@ -4184,24 +4402,56 @@ function encodeWarpHandoff(request) {
       from: String(request && request.from !== undefined ? request.from : ''),
       branch: String(request && request.branch !== undefined ? request.branch : ''),
     };
-    return `${WARP_HANDOFF_PREFIX}${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')}`;
+    const changes = warpHandoffChangesPayload(request && request.changes);
+    if (changes === null) {
+      return { ok: false, error: 'the warp handoff could not be encoded: the change selection is not "all" or a list of files' };
+    }
+    if (changes !== undefined) payload.changes = changes;
+    token = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   } catch {
-    return '';
+    return { ok: false, error: 'the warp handoff could not be encoded' };
   }
+  if (token.length === 0) {
+    return { ok: false, error: 'the warp handoff could not be encoded' };
+  }
+  if (!warpHandoffTokenAccepted(token)) {
+    return {
+      ok: false,
+      error: `the warp handoff is too large to queue: ${token.length} characters exceeds the ${WARP_HANDOFF_MAX_TOKEN}-character handoff limit; select fewer files in changes, or pass "all", and warp again`,
+    };
+  }
+  return { ok: true, token: `${WARP_HANDOFF_PREFIX}${token}` };
+}
+
+// Prepare (encode, bound, and PROVE the command will accept) one handoff
+// request. This is the tool's preflight: it runs before the handoff is queued at
+// all, so a token the command could never decode refuses here with nothing
+// queued, nothing copied and nothing claimed. Returns {ok:true, token, request}
+// or {ok:false, error}. Never throws.
+function prepareWarpHandoff(request) {
+  const encoded = encodeWarpHandoff(request);
+  if (!encoded.ok) return encoded;
+  // Round-trip through the command's own decoder: the tool may only claim
+  // "handoff queued" for a token the command will actually accept.
+  const decoded = decodeWarpHandoff(encoded.token);
+  if (!decoded.ok) {
+    return { ok: false, error: 'the warp handoff could not be verified; nothing was queued' };
+  }
+  return { ok: true, token: encoded.token, request: decoded.request };
 }
 
 // Decode and validate one `@<token>` argument. Strict on purpose: the token is
 // the only input this path trusts, so every field is re-checked here (shape,
-// version, absolute paths, bounded name) and any doubt reads as a refusal with
-// no echo of the rejected value. Returns {ok:true, request} or {ok:false,
-// error}. Never throws.
+// version, absolute paths, bounded name, a legal change selection) and any doubt
+// reads as a refusal with no echo of the rejected value. Returns {ok:true,
+// request} or {ok:false, error}. Never throws.
 function decodeWarpHandoff(raw) {
   try {
     if (typeof raw !== 'string' || !raw.startsWith(WARP_HANDOFF_PREFIX)) {
       return { ok: false, error: 'invalid warp handoff' };
     }
     const token = raw.slice(WARP_HANDOFF_PREFIX.length);
-    if (token.length === 0 || token.length > WARP_HANDOFF_MAX_TOKEN || !/^[A-Za-z0-9_-]+$/.test(token)) {
+    if (!warpHandoffTokenAccepted(token)) {
       return { ok: false, error: 'invalid warp handoff' };
     }
     let payload;
@@ -4223,7 +4473,11 @@ function decodeWarpHandoff(raw) {
     if (!path.isAbsolute(target) || !path.isAbsolute(from)) {
       return { ok: false, error: 'invalid warp handoff' };
     }
-    return { ok: true, request: { name, target, from, branch } };
+    const changes = normalizeHandoffChanges(payload.changes);
+    if (changes === null) {
+      return { ok: false, error: 'invalid warp handoff' };
+    }
+    return { ok: true, request: { name, target, from, branch, changes } };
   } catch {
     return { ok: false, error: 'invalid warp handoff' };
   }
@@ -4232,19 +4486,20 @@ function decodeWarpHandoff(raw) {
 // Dispatch the move to the one verb that can perform it. `pi.sendUserMessage`
 // returns void by contract (the host runs the command asynchronously), so this
 // can only report that the handoff was QUEUED — never that the session moved.
-// A host without the route, or one that throws synchronously, refuses here
-// with nothing dispatched. Never throws.
-function dispatchWarpHandoff(request) {
+// It dispatches a PREPARED handoff (`prepareWarpHandoff`), so a token the command
+// would reject can never leave this function claiming success. A host without
+// the route, or one that throws synchronously, refuses here with nothing
+// dispatched. Never throws.
+function dispatchWarpHandoff(prepared) {
   const pi = warpHandoffPi;
   if (!pi || typeof pi.sendUserMessage !== 'function') {
     return { ok: false, error: 'the host cannot dispatch the warp command here' };
   }
-  const token = encodeWarpHandoff(request);
-  if (token.length === 0) {
-    return { ok: false, error: 'the warp handoff could not be encoded' };
+  if (!prepared || prepared.ok !== true || typeof prepared.token !== 'string' || prepared.token.length === 0) {
+    return { ok: false, error: (prepared && prepared.error) || 'the warp handoff could not be encoded' };
   }
   try {
-    pi.sendUserMessage(`/herdr-gentle:warp ${token}`, { expandPromptTemplates: true });
+    pi.sendUserMessage(`/herdr-gentle:warp ${prepared.token}`, { expandPromptTemplates: true });
   } catch (err) {
     return { ok: false, error: `the warp handoff could not be queued: ${(err && err.message) || err}` };
   }
@@ -4262,11 +4517,14 @@ function normalizeWarpHandoff(value) {
     const from = typeof value.from === 'string' ? value.from : '';
     if (name.length === 0 || name.length > WARP_HANDOFF_MAX_NAME) return null;
     if (!path.isAbsolute(target) || !path.isAbsolute(from)) return null;
+    const changes = normalizeHandoffChanges(value.changes);
+    if (changes === null) return null;
     return {
       name,
       target,
       from,
       branch: typeof value.branch === 'string' ? value.branch : '',
+      changes,
     };
   } catch {
     return null;
@@ -4457,49 +4715,68 @@ async function executeWorktreeWarpTool(params, ctx, opts) {
   }
   // S61: the tool's `changes` option (named changes, never copy):
   // omitted/empty [] or "" copies nothing, "all" copies every pending
-  // change, a list of files copies only those. No human selector in the
-  // tool: the selection copies working-tree changes only (the source is
+  // change, a list of files copies only those. The selection is VALIDATED here
+  // and carried in the handoff token; the copy itself runs inside the command,
+  // at move time, after its refusal checks (see `warpHandoffCopyChanges`) — a
+  // copy made here would land in a checkout the command can still refuse, and
+  // the retry would then fail on its own stranded copy. No human selector in
+  // the tool: the selection copies working-tree changes only (the source is
   // retained, the destination index preserved) through the same
-  // lib/worktree-changes.js transfer the command uses, BEFORE the
-  // switch. A destination overlap rejects with no copy and no switch.
-  const toolChangesGate = await warpToolMaybeCopyChanges({
-    ctx, git, params, fromCheckout: sessionCheckout || fromCwd, targetCwd,
-  });
+  // lib/worktree-changes.js transfer the command uses.
+  const toolChangesGate = warpToolChangesSelection(params);
   if (toolChangesGate && toolChangesGate.isError) return toolChangesGate.result;
-  const toolCopiedChanges = toolChangesGate && toolChangesGate.copied ? toolChangesGate.copied : null;
+  const toolChanges = toolChangesGate && toolChangesGate.selection
+    ? toolChangesGate.selection
+    : { mode: "none", paths: [] };
+  // A selection that names no pending file is refused HERE: the command could
+  // only refuse it later, and queueing a request that is already known to fail
+  // is the same false "handoff queued" the token cap produced.
+  const toolSelectionCheck = await warpHandoffSelectionCheck({
+    git, fromCheckout: sessionCheckout || fromCwd, changes: toolChanges,
+  });
+  if (toolSelectionCheck && toolSelectionCheck.ok !== true) {
+    return errorResult(`worktree warp: ${toolSelectionCheck.error}`, { tool: "worktree_warp" });
+  }
   // The host keeps session control on the COMMAND context, so this tool never
-  // moves the session itself: it resolves, validates, copies the requested
-  // changes and then HANDS THE MOVE to the one verb that can perform it
+  // moves the session itself: it resolves and validates the request and then
+  // HANDS THE MOVE to the one verb that can perform it
   // (`/herdr-gentle:warp`, see `dispatchWarpHandoff`). The switch therefore
   // happens only AFTER this turn settles — the command handler waits for idle
   // first — so no message, tool result or pending change is torn mid-turn.
+  //
+  // The handoff is PREPARED before it is queued: the token is encoded, bounded
+  // and round-tripped through the command's own decoder, so "handoff queued" is
+  // only ever claimed for a request the command will accept. A refusal here
+  // queues nothing and touches no checkout.
   //
   // What this tool may claim: the handoff is QUEUED, never completed. The
   // first line says so, and the details carry no completed-move row (no
   // `fromName`/`name`/`path`/`branch`), so the card falls back to that line
   // instead of painting a move that has not happened. The one visible "moved"
   // card comes from the switched-to session once the move is real.
-  const handoffDispatched = dispatchWarpHandoff({
+  const handoffDispatched = dispatchWarpHandoff(prepareWarpHandoff({
     name: displayName,
     target: targetCwd,
     from: fromCwd,
     branch: displayBranch,
-  });
+    changes: toolChanges,
+  }));
   if (!handoffDispatched.ok) {
     return errorResult(
       `worktree warp: ${handoffDispatched.error}`,
       { tool: "worktree_warp", name: displayName, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
     );
   }
-  const copiedCount = toolCopiedChanges && Number.isFinite(toolCopiedChanges.files) ? toolCopiedChanges.files : 0;
-  const copiedNote = copiedCount > 0
-    ? `\ncopied: ${copiedCount} file${copiedCount === 1 ? "" : "s"}`
-    : "";
+  const changesNote = toolChanges.mode === "all"
+    ? "\nchanges: all (copied when the move lands)"
+    : toolChanges.mode === "paths"
+      ? `\nchanges: ${toolChanges.paths.length} file${toolChanges.paths.length === 1 ? "" : "s"} (copied when the move lands)`
+      : "";
   const pendingText =
     `worktree warp: handoff queued — the session moves when this turn ends\n` +
     `to: ${warpClean(displayName, "worktree")}\n` +
     `path: ${warpClean(targetCwd, "(unknown checkout)")}\n` +
-    `branch: ${warpClean(displayBranch, "(detached)")}${copiedNote}`;
+    `branch: ${warpClean(displayBranch, "(detached)")}${changesNote}`;
   return textResult(
     pendingText,
     {
@@ -5331,11 +5608,49 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   // same rule the already-there check uses); outside every checkout the
   // session cwd itself is summarized.
   //
-  // A HANDOFF never asks: its caller (`worktree_warp`) already resolved and
-  // copied the requested changes through the identical transfer, and an
-  // interactive picker fired from a queued command would block the move on a
-  // prompt nobody asked for.
+  // A HANDOFF never asks: its caller (`worktree_warp`) already validated the
+  // requested selection and an interactive picker fired from a queued command
+  // would block the move on a prompt nobody asked for. It carries the selection
+  // in its token instead, and the copy happens HERE — after every refusal check
+  // above and before the switch — so a handoff refused for decode, drift or a
+  // selection it cannot match mutates nothing. What the copy CANNOT promise is
+  // that the switch then succeeds: a host that cancels or throws after the copy
+  // leaves real files in the destination, which is why every later failure goes
+  // through `failAfterCopy` (below) and why a retry must prove the copied state
+  // byte for byte before it skips anything.
   const dirtyFrom = warpDeepestContaining(sessionId, warpLiveIdentities(live, repo.root)) || fromCwd;
+  // A handoff copy that has landed in the destination is REAL state. It is never
+  // rolled back automatically — deleting or reverting files nobody authorized us
+  // to touch is exactly the destructive guess this path refuses — so every
+  // failure after it names the destination, the copied files and the recovery.
+  // `skipped` marks the retry that PROVED the destination already holds exactly
+  // those bytes, so the wording says "already holds" instead of "copied now".
+  let handoffCopy = null;
+  const handoffCopyDetails = () => (handoffCopy
+    ? {
+      copyDestination: targetCwd,
+      copiedFiles: (handoffCopy.copied || []).slice(),
+      ...(handoffCopy.skipped === true ? { copyAlreadyPresent: true } : {}),
+    }
+    : {});
+  const handoffCopyLanding = () => {
+    const summary = warpCopyFilesSummary(handoffCopy && handoffCopy.copied);
+    return handoffCopy && handoffCopy.skipped === true
+      ? `${targetCwd} already holds the requested changes (${summary.line}, proved byte for byte from an earlier attempt)`
+      : `copied into ${targetCwd} before the move failed: ${summary.line}`;
+  };
+  const failAfterCopy = (text, details) => {
+    if (!handoffCopy) return warpFail(text, details);
+    // Two tails, because the two states are not the same: a copy this attempt
+    // made is REAL new state, while a skipped copy means the destination already
+    // held it and this attempt changed nothing there.
+    const tail = handoffCopy.skipped === true
+      ? `nothing was overwritten: ${warpClean(dirtyFrom, 'the source checkout')} keeps its pending work and ${targetCwd} keeps the copy it already held\n`
+        + `recovery: this attempt changed nothing in ${targetCwd}; warp again (the same byte-for-byte proof runs first), or warp again without changes to leave it as it is`
+      : `nothing was rolled back: ${warpClean(dirtyFrom, 'the source checkout')} keeps its pending work and ${targetCwd} keeps its copy\n`
+        + 'recovery: warp again with the same changes (a copy the destination already holds byte for byte is skipped, never duplicated), or commit or revert those files in the destination and warp again, or warp again without changes to leave the copy in place';
+    return warpFail(`${text}\n\n${handoffCopyLanding()}\n${tail}`, { ...details, ...handoffCopyDetails() });
+  };
   if (!handoff) {
     const dirtyGate = await warpMaybeCopyDirty({
       ctx, git, fromCheckout: dirtyFrom, targetCwd, options: opts,
@@ -5348,6 +5663,53 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     }
     if (dirtyGate && typeof dirtyGate.error === 'string') {
       return warpFail(dirtyGate.error, { name, alreadyThere: false, cancelled: false });
+    }
+  } else if (handoff.changes && handoff.changes.mode !== 'none') {
+    const copyGate = await warpHandoffCopyChanges({
+      git, fromCheckout: dirtyFrom, targetCwd, changes: handoff.changes,
+    });
+    if (copyGate && copyGate.ok === true) {
+      handoffCopy = copyGate.copied && Array.isArray(copyGate.copied.copied) && copyGate.copied.copied.length > 0
+        ? { copied: copyGate.copied.copied.slice(), skipped: false }
+        : null;
+    } else {
+      // The copy refused. One benign cause: an EARLIER attempt already copied
+      // exactly this content and the move failed afterwards (the host cancelled
+      // or threw the switch). Prove that state byte for byte and skip the copy
+      // only then; otherwise fail closed with the concrete recovery, never
+      // guessing and never overwriting what the destination holds.
+      const proof = await warpHandoffCopyAlreadyApplied({
+        git, fromCheckout: dirtyFrom, targetCwd, changes: handoff.changes,
+      });
+      if (proof.ok === true && proof.applied === true) {
+        handoffCopy = { copied: proof.identical.slice(), skipped: true };
+      } else if (proof.ok === true) {
+        // Nothing was proven byte for byte, so the copy is NOT skipped and
+        // nothing is overwritten. The message says what the destination actually
+        // holds — and, separately, which selected files could not be READ, since
+        // an unreadable file is not evidence of an absent one.
+        const held = proof.identical.length > 0
+          ? `${targetCwd} already holds ${warpCopyFilesSummary(proof.identical).line}; `
+          : '';
+        const problems = [];
+        if (proof.differing.length > 0) {
+          problems.push(`${proof.differing.join(', ')} ${proof.differing.length === 1 ? 'does' : 'do'} not match the source byte for byte`);
+        }
+        if (proof.unreadable.length > 0) {
+          problems.push(`${proof.unreadable.join(', ')} could not be read (a permission error, an unsafe file type or a path outside the checkout)`);
+        }
+        return warpFail(
+          `worktree warp: ${copyGate.error}\n\n${held}${problems.join(', and ')}; the copy cannot be skipped\n`
+          + 'nothing was rolled back and nothing was overwritten\n'
+          + `recovery: warp again without changes to leave the destination as it is, or reconcile those files in ${targetCwd} (commit or revert them) and warp again with the same changes`,
+          {
+            name, alreadyThere: false, cancelled: false,
+            copyDestination: targetCwd, copiedFiles: proof.identical.slice(),
+          },
+        );
+      } else {
+        return warpFail(`worktree warp: ${copyGate.error}`, { name, alreadyThere: false, cancelled: false });
+      }
     }
   }
   // The S19 compact both success paths report: the checkout left, then
@@ -5632,7 +5994,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     try {
       resumed = await ctx.switchSession(recordedSessionFile, { withSession: warpResumeWithSession });
     } catch (err) {
-      return warpFail(
+      return failAfterCopy(
         `worktree warp: the session switch to ${targetCwd} failed: ${(err && err.message) || err}; the recorded warp session was kept`,
         { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
       );
@@ -5641,7 +6003,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
       // Like the fork path, `cancelled` is a real outcome, not a
       // success — except the recorded file is kept: it still belongs to
       // this checkout, so a later warp resumes it.
-      return warpFail(
+      return failAfterCopy(
         `worktree warp: ${name} cancelled (the session stays in ${fromCwd})`,
         { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: true },
       );
@@ -5658,7 +6020,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     emitOsc7(options.oscStream || process.stdout, targetCwd);
     return {
       text: moveText,
-      details: { name: displayName, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+      details: { name: displayName, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false, ...handoffCopyDetails() },
     };
   }
   const sm = ctx.sessionManager || {};
@@ -5677,7 +6039,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     const entries = typeof sm.getEntries === "function" ? safe(() => sm.getEntries()) : undefined;
     carried = Array.isArray(entries) ? entries : [];
     if (carried.length === 0) {
-      return warpFail(
+      return failAfterCopy(
         "worktree warp: no persisted session for this session and nothing in memory to carry over; open or write the session first and retry",
         { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
       );
@@ -5685,7 +6047,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   }
   const SM = options.sessionManagerClass || await sessionManagerClassFor(ctx);
   if (!SM || typeof SM.forkFrom !== "function") {
-    return warpFail(
+    return failAfterCopy(
       "worktree warp is unavailable here: the host SessionManager has no forkFrom",
       { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
     );
@@ -5715,7 +6077,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     try {
       target = SM.forkFrom(forkSource, targetCwd, sessionDir);
     } catch (err) {
-      return warpFail(
+      return failAfterCopy(
         `worktree warp: could not fork the session into ${targetCwd}: ${(err && err.message) || err}`,
         { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
       );
@@ -5742,7 +6104,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
       fs.writeFileSync(allocatedFile, lines, { flag: "wx" });
       target = SM.open(allocatedFile, sessionDir, targetCwd);
     } catch (err) {
-      return warpFail(
+      return failAfterCopy(
         `worktree warp: could not carry this session into ${targetCwd}: ${(err && err.message) || err}`,
         { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
       );
@@ -5750,7 +6112,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     targetFile = target && typeof target.getSessionFile === "function" ? safe(() => target.getSessionFile()) : undefined;
   }
   if (typeof targetFile !== "string" || targetFile.length === 0) {
-    return warpFail(
+    return failAfterCopy(
       `worktree warp: the forked session for ${targetCwd} has no session file`,
       { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
     );
@@ -5778,7 +6140,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
       if (anchor !== null) target.branch(anchor);
       else target.resetLeaf();
     } catch (err2) {
-      return warpFail(
+      return failAfterCopy(
         `worktree warp: could not position the forked session at ${targetFile}: ${(err2 && err2.message) || err2}; the forked session file was kept for inspection`,
       { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
       );
@@ -5793,7 +6155,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     try {
       target.appendCustomEntry("worktree-warp", { from: fromCwd, to: targetCwd, name: displayName, branch: displayBranch });
     } catch (err) {
-      return warpFail(
+      return failAfterCopy(
         `worktree warp: could not record the transition into ${targetCwd}: ${(err && err.message) || err}; the forked session file was kept for inspection`,
         { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
       );
@@ -5821,7 +6183,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   try {
     switched = await ctx.switchSession(targetFile, { withSession: warpWithSession });
   } catch (err) {
-    return warpFail(
+    return failAfterCopy(
       `worktree warp: the session switch to ${targetCwd} failed: ${(err && err.message) || err}; the forked session file was kept at ${targetFile}`,
       { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
     );
@@ -5834,7 +6196,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     } catch {
       // Best effort: the report below is what matters.
     }
-    return warpFail(
+    return failAfterCopy(
       `worktree warp: ${name} cancelled (the session stays in ${fromCwd}; the forked session file was removed)`,
       { name, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: true },
     );
@@ -5864,7 +6226,7 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   emitOsc7(options.oscStream || process.stdout, targetCwd);
   return {
     text: moveText,
-    details: { name: displayName, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false },
+    details: { name: displayName, path: targetCwd, branch: displayBranch, kind: resolved.kind, alreadyThere: false, cancelled: false, ...handoffCopyDetails() },
   };
 }
 

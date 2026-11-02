@@ -85,11 +85,11 @@ allowlist uses). It is never lowered to a version that cannot be tested.
 | `worktree_list` | `all?: boolean` (optional) | None — prunes dead rows (see below), otherwise read-only | `worktrees: <count> (name · branch · path)` then one ` · `-joined row per checkout in listing order (principal, the session checkout when distinct, then the rest), each row being that checkout's identity — `<name> · <branch> · <path>` — plus exactly ONE trailing state cell when the row is not the ordinary registered-and-live case: `missing` (the path exists but git no longer lists the checkout) or `unregistered` (a live checkout the registry does not own; only with `all: true`). Being listed IS the existence proof — a checkout whose path is gone is pruned before it can be listed — so no `live`/`exists` cell is ever printed, and a `kind` that only repeats the row is not a cell either (`principal` repeats the row's own name, `agent` repeats "a registered worktree", `unregistered` repeats the status beside it); a kind the row does not already state still prints (S6). No issue or ODD cell appears: a worktree carries no association, so none is printed even when the registry still stores one. Then one `warning:` row per prune warning. `details.worktrees[]` keeps `name`, `path`, `branch`, `thread`, `status` and `kind` unchanged, so a caller retains every structured fact the compact text elides |
 | `worktree_close` | `name?: string`, `path?: string`, `branch?: string` (at most one required — exactly one selector; `name` accepts a name OR a path, name first then path), `force?: boolean` | `ctx.ui.confirm` when the host offers dialog UI (`ctx.hasUI`), naming pending changes as `Pending changes: N files, +N/-N` when dirty and nothing when clean; waived only when gentle-shell YOLO is active for this live session AND the checkout is proven clean — a dirty checkout and an unreadable summary both keep asking. A refusal keeps checkout and entry, and `force` still comes only from the caller | `outcome: removed`, then `name:`, `branch:`, `path:` and `branch state: kept|deleted`, plus `session: warped to <name> · <path>` when a live session was warped out first, `herdr workspace: <status> · <notice>` when that step reconciled, skipped or half-failed, and one `warning:` row per summarized warning. No association line, association warning or dropped-document list can appear: a worktree carries no issue and no ODD document |
 | `worktree_session_open` | `worktree: string` (required — the NAME `worktree list` prints, a branch name, or the checkout path; name first then path), `session?: string` (a Pi session id to RESUME; absent means a new session), `name?: string` (the agent/pane name, defaulting to the worktree name), `notify?: boolean` (default true; accepted and reported here, honoured by the finish subscription) | None — worktree-scoped by construction (see scope guard) | `outcome: opened|resumed`, then `worktree:`, `branch:`, `path:`, `session:`, `workspace:`, `pane:` and `agent:` — the routing ids the caller needs to reach the session it just started |
-| `worktree_warp` | `name: string` (required — the worktree NAME `worktree list` prints, or the checkout path; name first then path), `changes?: string \| string[]` (optional — pending changes to copy into the destination checkout: omit or pass `""` or `[]` for no copy, `"all"` for everything, a list of files for selected changes only; the word `"none"` is not one of its values — that spelling belongs to `worktree_create` alone; there is no selector in the tool) | None — never opens a selector (selectors are human-only); warping to the checkout the session already runs in changes nothing | `outcome: handoff queued` — the tool QUEUES the move and never performs it: `worktree warp: handoff queued — the session moves when this turn ends`, then `to: <name>`, `path: <checkout path>`, `branch: <branch>` (plus `copied: N files` when its `changes` selection was transferred). The move itself is the queued `/herdr-gentle:warp` command, which switches after the turn settles and starts the continuation turn in the new checkout. `outcome: already there` keeps its byte-identical no-op text. The tool never claims a switch it did not perform, and its result carries no completed-move row |
+| `worktree_warp` | `name: string` (required — the worktree NAME `worktree list` prints, or the checkout path; name first then path), `changes?: string \| string[]` (optional — pending changes to carry into the destination checkout: omit or pass `""` or `[]` for no copy, `"all"` for everything, a list of files for selected changes only; the word `"none"` is not one of its values — that spelling belongs to `worktree_create` alone; there is no selector in the tool) | None — never opens a selector (selectors are human-only); warping to the checkout the session already runs in changes nothing | `outcome: handoff queued` — the tool QUEUES the move and never performs it: `worktree warp: handoff queued — the session moves when this turn ends`, then `to: <name>`, `path: <checkout path>`, `branch: <branch>`, plus `changes: <all \| N files> (copied when the move lands)` when its `changes` selection is PENDING — the tool copies nothing, so it never prints a completed `copied:` row. A selection naming no pending file is refused in the tool before anything is queued (`worktree warp: unknown changed file … (nothing was copied); nothing was queued`), because the command could only refuse it later. The move itself is the queued `/herdr-gentle:warp` command, which switches after the turn settles, applies the selection and starts the continuation turn in the new checkout. `outcome: already there` keeps its byte-identical no-op text. The tool never claims a switch it did not perform, and its result carries no completed-move row |
 
-The session moves between checkouts through `/herdr-gentle:warp <name>` (its own command for humans — a selector, or an explicit name) and through the `worktree_warp` agent tool (a required name-or-path, an optional `changes` selection, no selector, then a continuation turn so the agent keeps working). The host keeps session control on the COMMAND context, so the tool never switches anything itself (S14): it resolves, validates, copies the requested changes and QUEUES that command, whose handler waits for idle and then moves the session with the same fork/resume rules the human path uses — see [The agent warp is a queued handoff](#the-agent-warp-is-a-queued-handoff). The command's success text is the two-line compact `moved: <name> · <branch>` / `to: <name> · <branch>` (a raw path only when the checkout left sits outside every known checkout); the tool's result is the pending handoff rows (`to:` / `path:` / `branch:`, never `moved:`), and the ONE `moved:`-shaped confirmation is the styled card the switched-to session paints after the real move. Warping to the checkout the session already runs in returns `worktree warp: <name> (already there)` (byte-identical text) but shows nothing and changes nothing, and it queues nothing.
+The session moves between checkouts through `/herdr-gentle:warp <name>` (its own command for humans — a selector, or an explicit name) and through the `worktree_warp` agent tool (a required name-or-path, an optional `changes` selection, no selector, then a continuation turn so the agent keeps working). The host keeps session control on the COMMAND context, so the tool never switches anything itself (S14): it resolves the checkout, validates the selection and QUEUES that command, whose handler waits for idle, re-runs every refusal check, applies the requested copy and then moves the session with the same fork/resume rules the human path uses — see [The agent warp is a queued handoff](#the-agent-warp-is-a-queued-handoff). The command's success text is the two-line compact `moved: <name> · <branch>` / `to: <name> · <branch>` (a raw path only when the checkout left sits outside every known checkout); the tool's result is the pending handoff rows (`to:` / `path:` / `branch:`, never `moved:`), and the ONE `moved:`-shaped confirmation is the styled card the switched-to session paints after the real move. Warping to the checkout the session already runs in returns `worktree warp: <name> (already there)` (byte-identical text) but shows nothing and changes nothing, and it queues nothing.
 
-Pending changes travel only when asked (S61). Before the command moves the session it summarizes the source checkout's uncommitted changes through the shared `lib/worktree-changes.js` helper (staged and unstaged combined against HEAD, untracked files measured from disk, deletions and renames covered, binary files labelled never faked — `N files, +N/-N`). A clean checkout warps with no prompt; a dirty one opens a concise `YES COPY` / `NO COPY` choice where `Esc`/`Ctrl+C` cancels the warp with no switch and no copy. `YES COPY` copies every pending change into the destination checkout and then warps ordinarily; `NO COPY` warps ordinarily with nothing copied. The copy never mutates the source or either index, and a destination that already modifies a selected path rejects the whole warp with nothing copied, warped or switched. The tool's `changes` option is the same transfer without a prompt: omitted/empty means no copy, `"all"` copies everything, a list of files copies only those; an unknown file or a destination overlap fails the tool with no switch. Its value set is UNCHANGED by the create work: an omitted, `""` or `[]` selection copies nothing, and any other string — `"none"` included — is refused with the original message (`invalid changes selection "<value>": pass "all", a list of files, or leave it empty for no copy`). `worktree_create` is the only surface that accepts the word `"none"`, and it adapts locally for it instead of widening this shared contract.
+Pending changes travel only when asked (S61). Before the command moves the session it summarizes the source checkout's uncommitted changes through the shared `lib/worktree-changes.js` helper (staged and unstaged combined against HEAD, untracked files measured from disk, deletions and renames covered, binary files labelled never faked — `N files, +N/-N`). A clean checkout warps with no prompt; a dirty one opens a concise `YES COPY` / `NO COPY` choice where `Esc`/`Ctrl+C` cancels the warp with no switch and no copy. `YES COPY` copies every pending change into the destination checkout and then warps ordinarily; `NO COPY` warps ordinarily with nothing copied. The copy never mutates the source or either index, and a destination that already modifies a selected path rejects the whole warp with nothing copied, warped or switched. The tool's `changes` option is the same transfer without a prompt: omitted/empty means no copy, `"all"` carries everything, a list of files carries only those; an unknown file is refused in the tool BEFORE anything is queued (nothing is copied and nothing is claimed), and a destination overlap fails the MOVE with no copy, no switch and no mutation of either checkout. That is why the tool itself copies nothing: it validates the selection and puts it in the handoff token, and the command applies it at move time, after every refusal check — a copy made before the handoff was queued would be stranded in a checkout the command then refused, and the retry the refusal asks for would fail on its own leftover copy. A failure AFTER that copy (the host cancels or throws the switch, a fork step fails) is reported with the destination, every copied file and the count, is never rolled back automatically, and the retry either PROVES byte identity and skips the copy or fails closed with the recovery — see [The agent warp is a queued handoff](#the-agent-warp-is-a-queued-handoff). Its value set is UNCHANGED by the create work: an omitted, `""` or `[]` selection copies nothing, and any other string — `"none"` included — is refused with the original message (`invalid changes selection "<value>": pass "all", a list of files, or leave it empty for no copy`). `worktree_create` is the only surface that accepts the word `"none"`, and it adapts locally for it instead of widening this shared contract.
 
 Deleting a checkout confirms first unless gentle-shell YOLO is active for this live session **and** the checkout is proven clean: a checkout with pending changes is never waived, YOLO or not, and an unreadable summary reads as dirty. The confirmation names the checkout's pending changes when it has any (`Pending changes: N files, +N/-N`, read through the same helper; a clean checkout omits the warning). The shared close still needs `force: true` for a dirty checkout — the confirmation alone never smuggles force in — except in the warp selector's `Ctrl+D` flow, where the explicit Yes for that approved row passes `force: true` deliberately for exactly that target (never the principal, never protected/foreign, whose refusals run first).
 
@@ -171,7 +171,7 @@ Structured `details` on success:
   `{status: 'skipped' | 'reconciled-partial', notice, closedWorkspaces?, failedWorkspace?, ...}` (see the
   close sequence).
 - warp tool (`worktree_warp`, S14): `{tool: 'worktree_warp', handoff: true, pending: true, pendingName, pendingPath, pendingBranch, from, target, kind}` — a QUEUED handoff, never a move: the keys the card renders as completed-move rows (`fromName`, `fromDesc`, `name`, `path`, `branch`, `alreadyThere`, `resumed`, `cancelled`) are deliberately absent, so the card falls back to the result's own first line (`handoff queued`) instead of painting a switch that has not happened. Refusals keep the tool's own error text and list the available checkouts; the already-there no-op keeps `{name, path, branch, kind, alreadyThere: true, cancelled: false}`.
-- warp command (`/herdr-gentle:warp`, human path and interior of the tool's handoff): `{name, path, branch, kind, alreadyThere, cancelled}` — `kind` is `principal`, `agent`, or `unregistered` (a lone live checkout the registry does not own); `alreadyThere` is `true` only for the `worktree warp: <name> (already there)` no-op; `cancelled` is `true` only when the session switch was cancelled, in which case the forked target session file was removed and nothing else changed. A handoff invocation carries the same details and adds no field: the queued argument is an internal `@<token>`, not a documented surface.
+- warp command (`/herdr-gentle:warp`, human path and interior of the tool's handoff): `{name, path, branch, kind, alreadyThere, cancelled}` — `kind` is `principal`, `agent`, or `unregistered` (a lone live checkout the registry does not own); `alreadyThere` is `true` only for the `worktree warp: <name> (already there)` no-op; `cancelled` is `true` only when the session switch was cancelled, in which case the forked target session file was removed and nothing else changed. A handoff invocation carries the same details and adds no field beyond the copy facts a handoff can produce: `copyDestination` and `copiedFiles` on a handoff result (success or failure) whose pending changes were copied into the destination, and `copyAlreadyPresent: true` when a retry proved the destination already held exactly those bytes and skipped the copy. A refusal that proves only PART of the copy carries only the files it could prove in `copiedFiles` and names the differing files in its text. The queued argument is an internal `@<token>`, not a documented surface.
 - session open: `{worktree, branch, path, paneId, workspaceId, sessionId,
   resumed, agentName, notify}` — exactly these nine keys. `worktree` is
   the printed NAME (the slug, even when a branch spelling was passed);
@@ -810,9 +810,10 @@ The host keeps session control — `waitForIdle` and `switchSession` — on the
 **extension command context**. A tool's context has neither, and a tool that
 awaited `waitForIdle` would wait for the very turn it runs inside (a
 self-deadlock). The agent-facing `worktree_warp` tool therefore cannot move the
-session, and it does not pretend to: it resolves, validates and copies the
-requested changes exactly as before, then **queues** the move to the one verb
-that can perform it.
+session, and it does not pretend to: it resolves the checkout, validates the
+requested `changes` selection and **queues** the move to the one verb that can
+perform it. The tool mutates NOTHING — the copy of the requested changes happens
+inside the command, at move time.
 
 How the queue works: the tool calls
 `pi.sendUserMessage("/herdr-gentle:warp @<token>", { expandPromptTemplates:
@@ -820,12 +821,26 @@ true })` — the host's documented route for a tool that needs a command (its ow
 `examples/extensions/reload-runtime.ts` does the same for `reload`). The host
 dispatches a registered extension command immediately, even while the turn is
 still running, and binds the command context to it. The token is base64url of
-`{v, name, target, from, branch}`: one opaque argument whose charset cannot
-carry a space, a newline, a control character, a second argument or a second
-command, so nothing from a checkout name or path can be injected into the
-command line. The command decodes it, refuses anything malformed (naming nothing
+`{v, name, target, from, branch}` plus, only when a copy was asked for,
+`changes: {mode: "all"}` or `changes: {mode: "paths", paths: [...]}`: one
+opaque argument whose charset cannot carry a space, a newline, a control
+character, a second argument or a second command, so nothing from a checkout
+name or path can be injected into the command line. It carries checkout
+identity and the selection only — never file contents, environment or
+credentials. The command decodes it, refuses anything malformed (naming nothing
 it carried), and then warps through the same resolver, fork/resume rules,
 records, rename and card a human invocation uses.
+
+The token is bounded — 2048 characters — and the bound is enforced on the way
+OUT as well as in. The tool encodes the request, checks the cap and round-trips
+the produced token through the command's own decoder before it queues anything,
+so "handoff queued" can only ever be claimed for a request the command accepts. A
+selection too large to fit refuses in the tool (`the warp handoff is too large to
+queue: … exceeds the 2048-character handoff limit; select fewer files in
+changes, or pass "all", and warp again`) with nothing queued, nothing copied and
+nothing claimed. Enforcing the cap only on decode was the defect: the tool
+happily queued a token the command always rejected, reporting a success that
+could never happen.
 
 What the handoff guarantees:
 
@@ -846,8 +861,42 @@ What the handoff guarantees:
   checkout the session was in; when the command runs, the destination must still
   be the checkout the name resolves to AND the session must still sit in the
   recorded source. Otherwise it refuses (`changed since the handoff was queued`
-  / `the session moved since the handoff was queued`) and changes nothing — the
-  changes were never copied to a checkout the session then did not enter.
+  / `the session moved since the handoff was queued`) before anything is copied,
+  so the destination is untouched and the retry is not blocked by a leftover
+  copy.
+- A handoff refused BEFORE the copy mutates nothing. Decode failures, an
+  oversized token, drift, a selection naming no pending file (refused in the
+  tool, before queueing) or a source that changed during confirmation all refuse
+  with ZERO destination mutation: the tool wrote nothing, and the shared copy
+  helper rejects before its first write.
+- A failure AFTER the copy is reported, never hidden and never "cleaned up". The
+  copy lands before the switch, so a host that then cancels or throws the switch
+  (or a fork step that fails) leaves real files in the destination. Nothing is
+  rolled back — deleting or reverting files is not this code's call to make, and
+  it would destroy the agent's own uncommitted work — so the result names the
+  destination, EVERY copied file and the count (`copied into <dest> before the
+  move failed: 2 files: a.txt, b.txt`), states that nothing was rolled back and
+  that the source keeps its pending work, and offers the recovery: warp again
+  with the same changes, or commit or revert those files in the destination and
+  warp again, or warp again without changes to leave the copy in place.
+  `details.copyDestination` and `details.copiedFiles` carry the same facts for a
+  machine reader.
+- A retry never guesses. An earlier copy makes the source and destination
+  overlap, so the copy cannot simply run again; instead the command PROVES the
+  state, read-only. It skips the copy only when EVERY selected path is proved: the
+  same bytes on both sides, or — for a TRACKED DELETION only — absent on both. A
+  read that fails for any reason other than "no such file" (a permission error,
+  an I/O error), a symlink or any other non-regular file, a path escaping either
+  checkout, an untracked entry whose source file is gone, or content that differs
+  all mean NOT proved. An unreadable file is never evidence of an absent one:
+  treating the two as the same would let the session move while silently omitting
+  the file. Anything unproved fails closed — the refusal names the destination,
+  the files that no longer match and, separately, the files that could not be
+  read, says nothing was rolled back or overwritten, and gives the recovery (warp
+  again without changes, or reconcile those files in the destination and warp
+  again). A proved skip reports `copyAlreadyPresent: true` with the file list. No
+  file is ever deleted, reverted or overwritten by this path, and neither index
+  is touched.
 - A handoff never prompts. The interactive `YES COPY` / `NO COPY` choice is a
   human path; the tool's `changes` selection is the same transfer without a
   question, so a queued command can never block on a picker nobody asked for.
@@ -859,12 +908,15 @@ What the handoff guarantees:
 What it does not guarantee, stated rather than hidden: the tool's result goes
 back to the model, and the model may take **one more turn in the checkout being
 left** before the run settles and the switch lands. Those writes stay in the
-source checkout (nothing is lost or overwritten), but they are not carried into
-the destination — the `changes` copy happened before the handoff was queued. The
-pending text says so (`the session moves when this turn ends`), and an agent
-that needs a change carried must copy it after it arrives, in the new checkout.
-A host with no `sendUserMessage` route refuses the tool before reading anything
-(`the host cannot dispatch the warp command`).
+source checkout (nothing is lost or overwritten). Because the copy runs at move
+time and re-reads the source then, `"all"` carries whatever is pending when the
+move actually happens (those late writes included), while an explicit file list
+carries only the files it names. The pending text says so (`the session moves
+when this turn ends`). It also does not guarantee a copy that has already landed
+is undone: see the post-copy rule above — the failure names it, and the recovery
+is the agent's decision, not an automatic revert. A host with no `sendUserMessage`
+route refuses the tool before reading anything (`the host cannot dispatch the warp
+command`).
 
 ### Warp command (`/herdr-gentle:warp`, S23)
 

@@ -3565,7 +3565,22 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
     }
   });
 
-  test('tool: changes "all" copies everything before the switch', async () => {
+  // The tool only QUEUES: it validates the selection and puts it in the token.
+  // The copy runs inside the command at move time, after its refusal checks, so
+  // a queued handoff can never strand a copy (T10/S14).
+  function queuedToken(dispatches) {
+    assert.equal(dispatches.length, 1, `expected exactly one queued handoff, got ${dispatches.length}`);
+    const [text, sendOptions] = dispatches[0];
+    assert.ok(text.startsWith('/herdr-gentle:warp @'), `the queued text is the warp command: ${text}`);
+    assert.deepEqual(sendOptions, { expandPromptTemplates: true }, 'the command is dispatched, never sent as a prompt');
+    return text.slice('/herdr-gentle:warp '.length);
+  }
+
+  function decodeRequest(token) {
+    return JSON.parse(Buffer.from(token.slice(1), 'base64url').toString('utf8'));
+  }
+
+  test('tool: changes "all" queues the handoff and the command copies it at move time', async () => {
     const root = makeFileRepo('tool-all');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -3583,11 +3598,24 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
         { name: 'feat-tool-all-dest', changes: 'all' }, ctx, { sessionManagerClass: FakeSM },
       );
       assert.equal(out.isError, undefined, `expected success: ${out.text}`);
+      assert.equal(dispatches.length, 1, 'the handoff is queued');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n',
+        'the tool copies nothing before the move is real');
+      assert.equal(fs.existsSync(path.join(target, 'new.txt')), false, 'the tool leaves no untracked copy behind');
+      assert.ok(toolText(out).includes('changes: all (copied when the move lands)'),
+        `the pending text names the pending copy: ${toolText(out)}`);
+      assert.deepEqual(switches, [], 'the tool itself never switches the session');
+      // The host now runs the queued command with its own COMMAND context.
+      const request = decodeRequest(queuedToken(dispatches));
+      const command = makeFileWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const moved = await mod.executeWorktreeWarp('feat-tool-all-dest', command.ctx, {
+        handoff: request, sessionManagerClass: FakeSM, oscStream: oscFake(false),
+      });
+      assert.equal(moved.isError, undefined, `the handoff moves: ${moved.text}`);
+      assert.equal(command.switches.length, 1, 'the move switches once');
       assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nTWO\n');
       assert.equal(fs.readFileSync(path.join(target, 'new.txt'), 'utf8'), 'fresh\n');
-      assert.equal(dispatches.length, 1, 'the handoff is queued after the copy');
-      assert.ok(toolText(out).includes('copied: 2 files'), `the pending text reports the copy: ${toolText(out)}`);
-      assert.deepEqual(switches, [], 'the tool itself never switches the session');
+      assert.equal(fs.readFileSync(path.join(root, 'new.txt'), 'utf8'), 'fresh\n', 'the source keeps its work');
     } finally {
       restoreEnv();
     }
@@ -3611,16 +3639,25 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
         { name: 'feat-tool-paths-dest', changes: ['a.txt'] }, ctx, { sessionManagerClass: FakeSM },
       );
       assert.equal(out.isError, undefined, `expected success: ${out.text}`);
-      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nTWO\n');
-      assert.equal(fs.existsSync(path.join(target, 'extra.txt')), false, 'unselected files stay out');
       assert.equal(dispatches.length, 1, 'the warp is queued');
       assert.deepEqual(switches, [], 'the tool itself never switches the session');
+      assert.ok(toolText(out).includes('changes: 1 file (copied when the move lands)'),
+        `the pending text names the selected file: ${toolText(out)}`);
+      const request = decodeRequest(queuedToken(dispatches));
+      assert.deepEqual(request.changes, { mode: 'paths', paths: ['a.txt'] }, 'the selection travels in the token');
+      const command = makeFileWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const moved = await mod.executeWorktreeWarp('feat-tool-paths-dest', command.ctx, {
+        handoff: request, sessionManagerClass: FakeSM, oscStream: oscFake(false),
+      });
+      assert.equal(moved.isError, undefined, `the handoff moves: ${moved.text}`);
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nTWO\n');
+      assert.equal(fs.existsSync(path.join(target, 'extra.txt')), false, 'unselected files stay out');
     } finally {
       restoreEnv();
     }
   });
 
-  test('tool: a destination overlap rejects with no switch and no copy', async () => {
+  test('tool: a destination overlap refuses at move time with no switch and no record fetch', async () => {
     const root = makeFileRepo('tool-overlap');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -3633,15 +3670,27 @@ describe('warp pending-changes guard (S61)', { concurrency: false }, () => {
       const { ctx, switches } = makeToolCtx({
         cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls,
       });
-      const { mod } = await loadExtension();
+      const { mod, dispatches } = await loadExtension();
       const out = await mod.executeWorktreeWarpTool(
         { name: 'feat-tool-overlap-dest', changes: 'all' }, ctx, { sessionManagerClass: FakeSM },
       );
-      assert.equal(out.isError, true);
-      assert.match(toolText(out), /destination already modifies/);
+      // The overlap is only knowable at move time now: the tool never writes to
+      // the destination, so it has nothing to check and nothing to strand.
+      assert.equal(out.isError, undefined, `the tool queues: ${toolText(out)}`);
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nDEST\n', 'the tool never writes');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\nSRC\n', 'the tool never writes');
       assert.deepEqual(switches, [], 'no session switch');
+      const request = decodeRequest(queuedToken(dispatches));
+      const command = makeFileWarpCtx({ cwd: root, sessionFile, sessionDir: path.dirname(sessionFile), calls });
+      const refused = await mod.executeWorktreeWarp('feat-tool-overlap-dest', command.ctx, {
+        handoff: request, sessionManagerClass: FakeSM, oscStream: oscFake(false),
+      });
+      assert.equal(refused.isError, true, 'the overlap refuses the move');
+      assert.match(refused.text, /destination already modifies/);
+      assert.deepEqual(command.switches, [], 'no session switch');
       assert.deepEqual(calls, [], 'no fork');
-      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nDEST\n');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\nDEST\n', 'the destination is untouched');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\nSRC\n', 'the source is untouched');
     } finally {
       restoreEnv();
     }
