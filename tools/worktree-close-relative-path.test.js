@@ -401,10 +401,12 @@ describe('worktree_close with a relative registry path', { concurrency: false },
         `the relative entry is missing, never live: ${text}`,
       );
       assert.ok(
-        text.split('\n').some((line) => line.startsWith('feat-b · feat-b · ') && line.endsWith(' · live')),
-        `the absolute entry stays live: ${text}`,
+        text.split('\n').some((line) => line === `feat-b · feat-b · ${far}`),
+        `the absolute entry appears without a redundant live status: ${text}`,
       );
-      assert.equal(result.details.worktrees.find((row) => row.branch === 'feat-b').thread, 'thread-2', 'thread identity remains in structured details');
+      const absoluteEntry = result.details.worktrees.find((row) => row.branch === 'feat-b');
+      assert.equal(absoluteEntry.status, 'live', 'the absolute entry stays live in structured details');
+      assert.equal(absoluteEntry.thread, 'thread-2', 'thread identity remains in structured details');
       void nested;
     } finally {
       restoreCwd();

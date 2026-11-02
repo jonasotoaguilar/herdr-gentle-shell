@@ -50,10 +50,10 @@ S19. "mira esa wea, como se haces mal eso, mira los colores"; "el color de odd y
 - T13 [S18] Investigate and fix notification regression; route: investigate and implement; commit: pending.
 - T12 [S17] ODD editor terminal handoff independently verified with PTY; route: implement; commit: pending.
 - T11 [S15] Dropped: CodeGraph request was for another project; route: none; commit: n/a.
-- T10 [S14] Investigate and restore agent worktree warp session switching; route: investigate and implement; commit: pending.
+- T10 [S14] Restore agent Warp handoff and protect pending-change retries; independently verified; commit: 1f9a577.
 - T9 [S13, S16] Align title/button colors and restore plugin Customize palette using the shown reference; route: investigate and implement; commit: pending.
 - T8 [S12] Render Issues preview as styled Markdown; route: implement; commit: pending.
-- T7 [S11] Investigate and improve intermittent Warp data loading latency; route: investigate and implement; commit: pending.
+- T7 [S11] Async Warp row loading independently measured and verified; route: implement; commit: 07b6484.
 - T6 [S8-S10] Simplified ODD indicators and added reload outcome; focused checks 124/124; route: implement; commit: pending.
 - T5 [S6] Compact human and agent listings; focused checks 197/197 under LC_ALL=C; route: implement; commit: pending.
 
@@ -97,4 +97,7 @@ L36. T12: independent PTY reproduced baseline overlap and verified terminal hand
 L37. "[Image#3] mira esa wea, como se haces mal eso, mira los colores"
 L38. "el color de odd y linea no coinciden, eso es lo erroneo nomas"
 L39. "color naranjo ya es de versioning usa un morado o algo asi"
+L40. T10 independent verification: real-host handoff 15/15, copy recovery 13/13, unreadable files fail closed; live Pi TUI cancellation remains unverified. Commit 1f9a577.
+L41. T7 independent verification: synthetic delayed-git 3-checkout load 324 ms versus 707 ms baseline, max loop gap 12 ms versus 514 ms; focused 157/157 pass. Full-suite load test failed once under parallel load; live Pi latency not measured. Commit 07b6484.
+L42. Serial combined suite after fixing stale relative-path assertion: LC_ALL=C node --test --test-concurrency=1 tools/*.test.js, 2360 pass, 0 fail, 0 skipped.
 L20. Independent verification: S7 success/refusal/cancel selector return passes; measured per-keystroke subprocess blocking fixed. The reported post-creation hang remains unconfirmed. Full suite 2220/2221, remaining failure also on baseline. Real-session checks previously skipped when SessionManager unavailable.
