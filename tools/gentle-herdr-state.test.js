@@ -4,6 +4,8 @@
 // herdr-prompt-state pattern: a Pi `ui_prompt_start` contributes to ask only
 // when it opens while at least one `tool_execution_start`ed tool call is in
 // flight; nested/duplicate lifecycle coalesces into one boolean leg).
+// `kind: "custom"` is a panel or overlay, never a question, and never
+// contributes: opening a panel must not change the session state.
 //
 // The extension is TypeScript with one package import that is unresolvable
 // under plain node (@earendil-works/pi-coding-agent, used only for
@@ -61,6 +63,7 @@ function harness() {
   };
   return {
     pi,
+    handlers,
     emitted,
     fire: (kind, event, ctx) => {
       for (const fn of handlers.get(kind) ?? []) fn(event, ctx);
@@ -128,6 +131,30 @@ test('prompt with no tool in flight never becomes ask', async () => {
   h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'custom' });
   h.fire('ui_prompt_end', {});
   assert.equal(blockedLabels(h).length, 0);
+});
+
+test('a custom panel never becomes ask, even mid-execution', async () => {
+  const { default: factory } = await factoryPromise;
+  const h = harness();
+  factory(h.pi);
+  startRootSession(h);
+  h.fire('tool_execution_start', { toolCallId: 't1' });
+  // Opening a panel (/gentle:agents, ODD viewer, changes view, design canvas)
+  // is navigation, never a question: ask stays reserved for real questions
+  // (choice/questionnaire/ask tools/permission waiting).
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'custom' });
+  assert.equal(blockedLabels(h).length, 0, 'a panel must not raise ask');
+  // Its matching end must not emit a clear either.
+  h.fire('ui_prompt_end', {});
+  assert.equal(blockedLabels(h).length, 0, 'a panel end must not emit a clear');
+  // The dialog kinds the leg exists for still ask while a tool is in flight.
+  h.fire('tool_execution_end', { toolCallId: 't1' });
+  h.fire('tool_execution_start', { toolCallId: 't2' });
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'confirm' });
+  const labels = blockedLabels(h);
+  assert.equal(labels.length, 1, 'a real dialog mid-execution still asks');
+  assert.equal(labels[0].active, true);
+  assert.match(labels[0].label, /^ask:q1-/);
 });
 
 test('tool end before the prompt leaves the session working', async () => {
@@ -1803,11 +1830,15 @@ test('T1: queued delegate after settle emits count0 with a fresh marker (never f
 // path-or-id binding with monotonic seq and a serial latest-wins coalesced
 // queue. Never done/finished, never notify.
 
-async function startNativeWire() {
+async function startNativeWire({ delayMethod = null, delayMs = 0 } = {}) {
   const net = require('node:net');
   const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-native-')), 'herdr.sock');
   const received = [];
   const conns = new Set();
+  // A request whose answer is answered late: the startup binding answers after
+  // `delayMs`, everything else answers at once. Used to measure that the host's
+  // `session_start` does not wait for the binding's own bound.
+  const delayFor = (method) => (delayMethod !== null && method === delayMethod ? delayMs : 0);
   const server = net.createServer((conn) => {
     conns.add(conn);
     conn.on('close', () => conns.delete(conn));
@@ -1826,9 +1857,14 @@ async function startNativeWire() {
           continue;
         }
         if (req && typeof req.method === 'string') received.push(req);
-        try {
-          conn.write(`${JSON.stringify({ id: req && req.id, result: true })}\n`);
-        } catch {}
+        const wait = delayFor(req && req.method);
+        const answer = () => {
+          try {
+            conn.write(`${JSON.stringify({ id: req && req.id, result: true })}\n`);
+          } catch {}
+        };
+        if (wait > 0) setTimeout(answer, wait);
+        else answer();
       }
     });
   });
@@ -2784,6 +2820,55 @@ test('LIVE-1 RED: session binding publishes pane.report_agent_session on session
     );
     assert.equal(bound.params.pane_id, 'pane-live-session');
     assert.equal(bound.params.agent, 'pi');
+  } finally {
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+// Startup latency: the binding used to be AWAITED by `session_start`, and the
+// host awaits every handler it is handed, so the binding's own 500/1500 ms
+// bound sat on the path to the first prompt. It is still INITIATED there (the
+// pane must be attributable from the first frame) and the beats behind it
+// still wait for it, so the only thing that changed is what the host waits on.
+// The wire answers the binding 300 ms late: the awaited startup phase must not
+// cover that wait, and the beats must still arrive after the binding.
+test('startup binding is off the awaited session path but still precedes the state beats', async () => {
+  const wire = await startNativeWire({ delayMethod: 'pane.report_agent_session', delayMs: 300 });
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-startup-binding', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    const sessionFile = '/tmp/gentle-startup-binding';
+    const ctx = {
+      mode: 'tui',
+      sessionManager: { getSessionId: () => 'sess-startup-binding', getSessionFile: () => sessionFile, getEntries: () => [] },
+      isIdle: () => false,
+    };
+    const startedAt = Date.now();
+    for (const handler of h.handlers.get('session_start') ?? []) await handler({ reason: 'startup' }, ctx);
+    const startupPhaseMs = Date.now() - startedAt;
+    assert.ok(
+      startupPhaseMs < 150,
+      `session_start waited ${startupPhaseMs} ms on a 300 ms binding answer; the host awaits every handler`,
+    );
+
+    // Work queued immediately after startup still lands after the binding: the
+    // native beat leg awaits it before sending.
+    h.fire('agent_start', {}, ctx);
+    h.fire('tool_execution_start', { toolCallId: 'startup-order-t1' });
+    const bound = await wire.waitFor(
+      (r) => r.method === 'pane.report_agent_session' && r.params.agent_session_path === sessionFile,
+      4000,
+      'the startup binding is still published',
+    );
+    assert.equal(bound.params.pane_id, 'pane-startup-binding');
+    await wire.waitFor((r) => r.method === 'pane.report_agent', 4000, 'a state beat behind the binding');
+    const methods = wire.received.map((r) => r.method);
+    const bindingAt = methods.indexOf('pane.report_agent_session');
+    const firstBeatAt = methods.indexOf('pane.report_agent');
+    assert.ok(bindingAt >= 0 && firstBeatAt > bindingAt,
+      `the pane binding still arrives before the first state beat it describes: ${JSON.stringify(methods)}`);
   } finally {
     restoreNativeEnv(prevEnv);
     await wire.close();

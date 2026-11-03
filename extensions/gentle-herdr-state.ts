@@ -1409,6 +1409,11 @@ const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
 // and changes with the plugin id, so when it holds none of our files
 // while the stored dir does, the stored dir wins. Fresh installs with no
 // stored files converge on the injected dir.
+// This family is IDENTICAL in lib/worktree-mode.js, lib/gentle-sidebar.js,
+// herdr-plugin/bin/gentle-status.js and herdr-plugin/lib/gentle-diagnostics.js:
+// the files this extension writes (sidebar mode, moshi flag) and the shared
+// ODD/Issues toggle must all prove the same dir, or the state splits across
+// both and a stored disabled toggle reads as missing (missing means enabled).
 const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
@@ -1418,6 +1423,7 @@ const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-interruptions.json",
   "installer-state",
   "gentle-worktree-mode.json",
+  "gentle-plugin-tools.json",
 ];
 
 function sidebarStoredDir() {
@@ -2801,9 +2807,12 @@ export default function (pi) {
   // `tool_execution_end` track tool calls in flight by id; a
   // `ui_prompt_start` contributes to ask only when it opens while at least
   // one tool execution is active, so commands/widgets that prompt while
-  // idle never become ask. Nested or duplicate prompt lifecycle coalesces
-  // into one boolean leg, cleared on the matching `ui_prompt_end`,
-  // session reset, and shutdown.
+  // idle never become ask. A `custom` prompt is a panel or overlay — the
+  // agents view, the ODD viewer, the changes view, the design canvas — and
+  // never contributes at all: opening a panel is navigation, not a question,
+  // and a false ask on every panel open is worse than missing one dialog.
+  // Nested or duplicate prompt lifecycle coalesces into one boolean leg,
+  // cleared on the matching `ui_prompt_end`, session reset, and shutdown.
   const runningTools = new Set(); // toolCallId -> in-flight tool execution
   let uiPromptActive = false;
   let askIntentId;
@@ -2966,6 +2975,15 @@ export default function (pi) {
   let nativePending = null;
   let nativeLastOk = undefined;
   let nativeSettledPending = false;
+  // LIVE-1 startup latency: the session binding is still INITIATED on
+  // session_start (so Herdr can attribute the pane from the first frame), but
+  // the host no longer waits for it. The host awaits every session_start
+  // handler in turn, and the binding's own bound is 500/1500 ms, which sat on
+  // the path to the first prompt. The promise is kept here so the beats that
+  // follow await it before sending: ordering (binding first, state after) is
+  // unchanged, only the host's startup return is freed. Reset with the session
+  // so a stale binding can never gate the next one.
+  let sessionReportPending = null;
   // T2 native-only terminal guard: agent_settled clears the metadata
   // pending-launch hint below, but a settle that observes in-flight
   // launches retains pending evidence here so native idle gating stays
@@ -3450,11 +3468,43 @@ export default function (pi) {
       ).catch(() => false));
   }
 
+  // Start the session binding without waiting for it (see
+  // `sessionReportPending`). Never rejects: the binding leg is already
+  // fail-silent, and the catch here keeps that true even if a future change
+  // makes it throw.
+  function startSessionReport(sessionStartSource) {
+    let pending;
+    try {
+      pending = reportSession(sessionStartSource);
+    } catch {
+      sessionReportPending = null;
+      return null;
+    }
+    sessionReportPending = Promise.resolve(pending).then(() => false, () => false);
+    return sessionReportPending;
+  }
+
+  // The ordering seam every beat awaits: the binding lands before state. Absent
+  // (or already settled) work costs one microtask.
+  async function awaitSessionBinding() {
+    const pending = sessionReportPending;
+    if (!pending) return;
+    try {
+      await pending;
+    } catch {
+      // An unreadable binding never blocks a beat.
+    }
+  }
+
   async function drainNative() {
     if (!enabled()) return;
     if (nativeInFlight) return;
     nativeInFlight = true;
     try {
+      // The pane binding lands before any state beat (see
+      // `sessionReportPending`), so a slow binding delays the beats instead of
+      // being overtaken by them.
+      await awaitSessionBinding();
       while (nativePending !== null) {
         const next = nativePending;
         nativePending = null;
@@ -3543,6 +3593,11 @@ export default function (pi) {
       publishQueued = true;
       return;
     }
+    // The pane binding lands before any state beat (see
+    // `sessionReportPending`). A session that ended while the binding was in
+    // flight publishes nothing: `rootSession` is re-read after the wait.
+    await awaitSessionBinding();
+    if (!rootSession || !sidebarPublishingEnabled()) return;
     reconcilePresence();
     queueNative();
     const tokens = buildTokens();
@@ -3690,6 +3745,7 @@ export default function (pi) {
     liveGen += 1;
     liveInFlight = false;
     liveQueued = false;
+    sessionReportPending = null;
     sessionCwd = undefined;
     changes = { files: 0, added: 0, deleted: 0 };
     agentActive = false;
@@ -3807,8 +3863,14 @@ export default function (pi) {
     }
   });
 
-  pi.on("ui_prompt_start", () => {
+  pi.on("ui_prompt_start", (event) => {
     if (!rootSession || uiPromptActive || runningTools.size === 0) return;
+    // A `custom` prompt is a panel or overlay (agents view, ODD viewer, changes
+    // view, design canvas), not a question: opening one is navigation and must
+    // never change the session state. Ask stays reserved for real questions —
+    // the choice/questionnaire/permission legs above and the ask tools tracked
+    // by execution — so only the dialog kinds this leg exists for count.
+    if (isRecord(event) && event.kind === "custom") return;
     uiPromptActive = true;
     updateBlocker();
   });
@@ -4037,7 +4099,7 @@ export default function (pi) {
 
   // -- agent lifecycle ---------------------------------------------------------
 
-  pi.on("session_start", async (event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     if (ctx?.mode !== "tui") return;
     const nextId = (() => {
       try {
@@ -4052,10 +4114,13 @@ export default function (pi) {
     refreshSessionRef(ctx);
     moshiCtxRef = ctx;
     if (moshiEnabled()) moshiEnsureContext();
-    // LIVE-1: bind the session before any state beat so Herdr attributes
-    // the pane from the first frame (mirrors the managed publisher: await
-    // on session_start, fire-and-forget on agent_start).
-    await reportSession(event?.reason);
+    // LIVE-1: bind the session before any state beat so Herdr attributes the
+    // pane from the first frame (mirrors the managed publisher). The binding is
+    // INITIATED here but not awaited: the host awaits this handler, and the
+    // binding's own 500/1500 ms bound used to sit on the path to the first
+    // prompt. Every beat awaits `sessionReportPending` first, so the binding
+    // still lands ahead of the state it describes.
+    startSessionReport(event?.reason);
     refreshChanges();
     agentActive = ctx?.isIdle?.() === false;
     settled = false;
