@@ -1929,6 +1929,13 @@ function nativeStates(received) {
   return received.filter((r) => r.method === 'pane.report_agent').map((r) => r.params);
 }
 
+// A report that missed its answer window is retried with a NEW id but the SAME
+// `seq`, so a state transition is counted by seq: a slow host must not read as
+// a second transition. A genuine duplicate publish mints a new seq and fails.
+function nativeTransitionCount(received, state) {
+  return new Set(nativeStates(received).filter((p) => p.state === state).map((p) => p.seq)).size;
+}
+
 test('T2: default path always publishes native states (no opt-in flag)', async () => {
   const wire = await startNativeWire();
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-default-off', undefined);
@@ -2051,7 +2058,7 @@ test('T2: error emits blocked once; review execution never blocks; no finished t
     const blocked = await wire.waitFor((r) => r.method === 'pane.report_agent' && r.params.state === 'blocked', 5000, 'real error emits blocked');
     assert.ok(blocked.params.seq >= 1);
     await new Promise((r) => setTimeout(r, 400));
-    const blockedCount = nativeStates(wire.received).filter((p) => p.state === 'blocked').length;
+    const blockedCount = nativeTransitionCount(wire.received, 'blocked');
     assert.equal(blockedCount, 1, 'blocked emits once until the next agent_start');
     for (const r of wire.received) {
       assert.ok(!String(r.method).toLowerCase().includes('notif'), 'never emit a notification toast');
@@ -2249,7 +2256,7 @@ test('N1 RED: real human-wait emits blocked once with the ask label', async () =
     );
     assert.match(blocked.params.message ?? '', /^ask:/, 'blocked carries the ask intent label');
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(nativeStates(wire.received).filter((p) => p.state === 'blocked').length, 1, 'wait blocked emits once');
+    assert.equal(nativeTransitionCount(wire.received, 'blocked'), 1, 'wait blocked emits once');
     h.fireEvent('rpiv:ask-user:blocked', { active: false });
     await wire.waitFor(
       (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
@@ -2283,7 +2290,7 @@ test('N1 RED: real error emits blocked once with the error label', async () => {
     );
     assert.match(blocked.params.message ?? '', /^error:/, 'blocked carries the error label');
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(nativeStates(wire.received).filter((p) => p.state === 'blocked').length, 1, 'error blocked emits once');
+    assert.equal(nativeTransitionCount(wire.received, 'blocked'), 1, 'error blocked emits once');
     n1NoNotify(wire.received, 'error blocked');
   } finally {
     restoreNativeEnv(prevEnv);
