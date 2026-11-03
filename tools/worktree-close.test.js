@@ -88,7 +88,14 @@ function makeRepo(tag) {
   fs.writeFileSync(path.join(dir, 'README.md'), 'hello\n');
   git(dir, ['add', 'README.md']);
   git(dir, ['commit', '-m', 'init']);
-  return fs.realpathSync(dir);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 // Stub `gh` mirroring the create-test fixture style (unused by the list /
@@ -237,6 +244,36 @@ function branchExists(root, branch) {
 
 function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
+}
+
+// S12/T8 model-facing text: the listing is one header row plus one ` · `-joined
+// row per checkout; a successful close is ordered label rows. S1 removed issue
+// and ODD associations from every worktree surface, so a row is the checkout's
+// identity and nothing else. S6 then made the row minimal: being listed IS the
+// existence proof, so `live`/`exists` is never a cell, and a kind the row
+// already states (`principal` repeats the name, `agent` means "registered",
+// `unregistered` repeats the state) is not one either — only the informative
+// `missing`/`unregistered` state rides a trailing cell. The exact cell contract
+// is pinned by tools/worktree-model-result.test.js; these suites pin which rows
+// exist, in which order, with which identity and warnings.
+function listHeader(count) {
+  return `worktrees: ${count} (name · branch · path)`;
+}
+
+// S1: a listing row is the checkout's identity alone — issue numbers and ODD
+// documents are not part of a worktree and never render. S6: the identity is
+// `name · branch · path` plus at most one trailing state cell.
+function listRow({ name, branch, path: target, kind, status }) {
+  const state = status === undefined || status === 'live' || status === 'exists' ? '' : status;
+  const kindCell = kind === undefined || kind === 'agent' || kind === 'live' || kind === 'exists'
+    || kind === name || kind === state
+    ? ''
+    : kind;
+  return [name, branch, target, kindCell, state].filter((cell) => cell.length > 0).join(' · ');
+}
+
+function removedRows({ name, branch, path: target }) {
+  return ['outcome: removed', `name: ${name}`, `branch: ${branch}`, `path: ${target}`, 'branch state: kept'];
 }
 
 // Isolated mode state per test: missing file means enabled.
@@ -393,7 +430,7 @@ describe('worktree_list registration', { concurrency: false }, () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
-      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_list', 'worktree_session_open', 'worktree_upsert', 'worktree_warp']);
+      assert.deepEqual([...tools.keys()].sort(), ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp']);
       const listParams = tools.get('worktree_list').parameters;
       assert.deepEqual(Object.keys(listParams.properties), ['all']);
       assert.equal(listParams.properties.all.type, 'boolean');
@@ -416,15 +453,18 @@ describe('worktree_list output', { concurrency: false }, () => {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
       // S19 retires `worktree list: none`: with no agent worktrees the
-      // output is exactly the principal line.
+      // output is exactly the principal row.
       const branch = git(root, ['branch', '--show-current']);
-      const expected = `worktree list: principal ${branch} principal`;
+      const expected = [
+        listHeader(1),
+        listRow({ name: 'principal', branch, path: root, kind: 'principal', status: 'live' }),
+      ];
       const plain = await callList(tools, {}, ctx);
       assert.equal(plain.isError, undefined);
-      assert.equal(resultText(plain), expected);
+      assert.deepEqual(resultText(plain).split('\n'), expected);
       const withAll = await callList(tools, { all: true }, ctx);
       assert.equal(withAll.isError, undefined);
-      assert.equal(resultText(withAll), expected);
+      assert.deepEqual(resultText(withAll).split('\n'), expected);
       // Listing never creates the registry file.
       assert.equal(registryBytes(root), null);
     } finally {
@@ -449,12 +489,12 @@ describe('worktree_list output', { concurrency: false }, () => {
       const result = await callList(tools, {}, ctx);
       assert.equal(result.isError, undefined);
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(
-        resultText(result),
-        `worktree list: principal ${branch} principal\n`
-        + `worktree list: feat-one feat/one thread=thread-1 issues=35\n`
-        + `worktree list: feat-two feat/two thread=thread-2 issues=35,7`,
-      );
+      assert.deepEqual(resultText(result).split('\n'), [
+        listHeader(3),
+        listRow({ name: 'principal', branch, path: root, kind: 'principal', status: 'live' }),
+        listRow({ name: 'feat-one', branch: 'feat/one', path: first, kind: 'agent', status: 'live', issues: [35] }),
+        listRow({ name: 'feat-two', branch: 'feat/two', path: second, kind: 'agent', status: 'live', issues: [35, 7] }),
+      ]);
       // The list never mutates the registry file and leaves no lock behind.
       assert.deepEqual(registryBytes(root), before);
       assert.deepEqual(registryLeftovers(root), []);
@@ -483,7 +523,15 @@ describe('worktree_list output', { concurrency: false }, () => {
       // registry, named in details.pruned and in the warning (which also
       // says git may still record the checkout until `git worktree prune`).
       const branch = git(root, ['branch', '--show-current']);
-      assert.equal(resultText(result), `worktree list: principal ${branch} principal`);
+      const rows = resultText(result).split('\n');
+      assert.deepEqual(rows.slice(0, 2), [
+        listHeader(1),
+        listRow({ name: 'principal', branch, path: root, kind: 'principal', status: 'live' }),
+      ]);
+      assert.ok(
+        rows.slice(2).some((row) => row.startsWith('warning: ') && row.includes(target)),
+        `the prune warning reaches the agent text: ${JSON.stringify(rows)}`,
+      );
       assert.deepEqual(result.details.worktrees.map((item) => item.kind), ['principal']);
       assert.deepEqual(result.details.pruned, [target]);
       assert.ok(
@@ -513,18 +561,18 @@ describe('worktree_list output', { concurrency: false }, () => {
       const { ctx } = makeCtx({ repoRoot: root });
       const branch = git(root, ['branch', '--show-current']);
       const plain = await callList(tools, {}, ctx);
-      assert.equal(
-        resultText(plain),
-        `worktree list: principal ${branch} principal\n`
-        + `worktree list: feat-known feat/known thread=thread-1 issues=35`,
-      );
+      assert.deepEqual(resultText(plain).split('\n'), [
+        listHeader(2),
+        listRow({ name: 'principal', branch, path: root, kind: 'principal', status: 'live' }),
+        listRow({ name: 'feat-known', branch: 'feat/known', path: known, kind: 'agent', status: 'live', issues: [35] }),
+      ]);
       const all = await callList(tools, { all: true }, ctx);
-      assert.equal(
-        resultText(all),
-        `worktree list: principal ${branch} principal\n`
-        + `worktree list: feat-known feat/known thread=thread-1 issues=35\n`
-        + `worktree list: feat-ghost feat/ghost unregistered`,
-      );
+      assert.deepEqual(resultText(all).split('\n'), [
+        listHeader(3),
+        listRow({ name: 'principal', branch, path: root, kind: 'principal', status: 'live' }),
+        listRow({ name: 'feat-known', branch: 'feat/known', path: known, kind: 'agent', status: 'live', issues: [35] }),
+        listRow({ name: 'feat-ghost', branch: 'feat/ghost', path: ghost, kind: 'unregistered', status: 'unregistered' }),
+      ]);
       assert.deepEqual(registryBytes(root), before, 'listing never mutates the registry');
     } finally {
       restoreEnv();
@@ -578,10 +626,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const result = await callClose(tools, { branch: 'feat/bye' }, ctx);
 
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-bye · feat/bye',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-bye', branch: 'feat/bye', path: target }));
       assert.deepEqual(result.details, {
         path: target, branch: 'feat/bye', removed: true, branchKept: true, thread: 'thread-1',
       });
@@ -626,10 +671,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { path: target }, ctx);
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-by-path · feat/by-path',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-by-path', branch: 'feat/by-path', path: target }));
       assert.deepEqual(result.details, {
         path: target, branch: 'feat/by-path', removed: true, branchKept: true, thread: 'thread-1',
       });
@@ -759,18 +801,15 @@ describe('worktree_close', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
-      const created = await tools.get('worktree_upsert').execute(
-        'call-1', { branch: 'feat/clean-close', issues: [35] }, undefined, undefined, ctx,
+      const created = await tools.get('worktree_create').execute(
+        'call-1', { branch: 'feat/clean-close', issues: [35], changes: 'none' }, undefined, undefined, ctx,
       );
       assert.equal(created.isError, undefined, `setup create failed: ${resultText(created)}`);
       const target = created.details.path;
       assert.equal(fs.existsSync(path.join(target, 'odd')), false, 'no hook-created odd symlink dirties the checkout');
       const result = await callClose(tools, { branch: 'feat/clean-close' }, ctx);
       assert.equal(result.isError, undefined, `clean tool-created checkout closes without force, got: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-clean-close · feat/clean-close',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-clean-close', branch: 'feat/clean-close', path: target }));
       assert.ok(!livePaths(root).includes(target), 'checkout removed');
       assert.equal(branchExists(root, 'feat/clean-close'), true, 'the branch is kept');
       const calls = shimArgv(herdr.log);
@@ -794,10 +833,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { branch: 'feat/force-me', force: true }, ctx);
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-force-me · feat/force-me',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-force-me', branch: 'feat/force-me', path: target }));
       assert.deepEqual(result.details, {
         path: target, branch: 'feat/force-me', removed: true, branchKept: true, thread: 'thread-1',
       });
@@ -853,10 +889,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const { ctx, confirms } = makeCtx({ repoRoot: root, hasUI: true, confirm: true });
       const result = await callClose(tools, { branch: 'feat/approved-close' }, ctx);
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-approved-close · feat/approved-close',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-approved-close', branch: 'feat/approved-close', path: target }));
       assert.equal(confirms.length, 1);
       const [title, message] = confirms[0];
       assert.ok(title.includes('feat/approved-close'), `title names the branch: ${title}`);
@@ -885,10 +918,7 @@ describe('worktree_close', { concurrency: false }, () => {
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(confirms.length, 0, 'YOLO waives the clean close confirmation');
       assert.ok(yoloChannels.includes('gentle:yolo:host-ui'), 'the host YOLO channel was consulted');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-yolo-clean · feat/yolo-clean',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-yolo-clean', branch: 'feat/yolo-clean', path: target }));
       assert.ok(!fs.existsSync(target), 'the checkout is gone');
     } finally {
       restoreEnv();
@@ -994,10 +1024,7 @@ describe('worktree_close', { concurrency: false }, () => {
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { branch: 'feat/fallback-close' }, ctx);
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-fallback-close · feat/fallback-close',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-fallback-close', branch: 'feat/fallback-close', path: target }));
       assert.deepEqual(result.details, {
         path: target, branch: 'feat/fallback-close', removed: true, branchKept: true, thread: 'thread-1',
       });
@@ -1155,10 +1182,7 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { name: 'feat-by-name' }, ctx);
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-by-name · feat/by-name',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-by-name', branch: 'feat/by-name', path: target }));
       assert.ok(!livePaths(root).includes(target), 'checkout removed');
       assert.equal(branchExists(root, 'feat/by-name'), true, 'the branch is kept');
       const registryLib = require('../lib/worktree-registry.js');
@@ -1276,7 +1300,11 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       // The row stays reachable by branch, which is unambiguous.
       const byBranch = await callClose(tools, { branch: 'principal' }, ctx);
       assert.equal(byBranch.isError, undefined, `the branch still resolves: ${resultText(byBranch)}`);
-      assert.equal(resultText(byBranch), `removed: principal · principal\nbranch kept`);
+      assert.deepEqual(
+        resultText(byBranch).split('\n'),
+        removedRows({ name: 'principal', branch: 'principal', path: clash }),
+        'the branch resolves the row that only the name could not disambiguate',
+      );
     } finally {
       restoreEnv();
     }
@@ -1331,10 +1359,7 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { name: 'release-1' }, ctx);
       assert.equal(result.isError, undefined, `the name is unique in the listing: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: release-1 · release-1',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'release-1', branch: 'release-1', path: target }));
     } finally {
       restoreEnv();
     }
@@ -1358,13 +1383,14 @@ describe('S24: worktree_close accepts name (T33 RED)', { concurrency: false }, (
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root });
       const listed = await callList(tools, { all: true }, ctx);
-      assert.equal((resultText(listed).match(/feat-mix/g) || []).length, 1, `printed once: ${resultText(listed)}`);
+      assert.equal(
+        resultText(listed).split('\n').filter((line) => line.startsWith('feat-mix · ')).length,
+        1,
+        `printed once: ${resultText(listed)}`,
+      );
       const result = await callClose(tools, { name: 'feat-mix' }, ctx);
       assert.equal(result.isError, undefined, `a name the listing prints once still closes: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-mix · feat/mix',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-mix', branch: 'feat/mix', path: registered }));
       assert.equal(fs.existsSync(dead), false, 'the dead path was never a checkout');
       assert.notDeepEqual(registryBytes(root), before, 'the registered row was closed');
     } finally {
@@ -1386,10 +1412,7 @@ describe('S19: bounded close compact (agent text)', { concurrency: false }, () =
       const { ctx } = makeCtx({ repoRoot: root });
       const result = await callClose(tools, { branch: 'feat/s19-bye' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-s19-bye · feat/s19-bye',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows({ name: 'feat-s19-bye', branch: 'feat/s19-bye', path: target }));
       assert.equal(target, result.details.path);
       assert.equal(result.details.branchKept, true);
       assert.equal(branchExists(root, 'feat/s19-bye'), true, 'the branch is kept');
@@ -2196,6 +2219,99 @@ describe('close pending-changes summary (S61)', { concurrency: false }, () => {
       await callClose(tools, { branch: 'feat/clean-summary' }, ctx);
       assert.equal(confirms.length, 1, 'the existing confirmation still runs once');
       assert.ok(!confirms[0][1].includes('Pending changes'), 'a clean checkout omits the dirty warning');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S1: the close publishes no association and destroys none', { concurrency: false }, () => {
+  // S1 removed the issue/ODD association from every worktree surface. The
+  // close used to print "a worktree carries ONE odd document, so the registry
+  // kept the first and dropped: …" for a legacy row the write normalized on
+  // its way through, and to carry the same sentence in details.warnings plus
+  // the discarded names in details.droppedOdd. The registry now writes every
+  // row it does not address back byte for byte, so there is no loss to
+  // report — and no association content may reach the text, the warnings or
+  // the details either.
+  function registryFile(root) {
+    return require('../lib/worktree-registry.js').registryPath(root);
+  }
+
+  // Hand-write a legacy registry: the row being closed carries the old
+  // `odd[]` list, and so does a second row the close never addresses.
+  function writeLegacyRows(root, target, { neighbourOdd = ['odd/tasks/other-a.md', 'odd/tasks/other-b.md'] } = {}) {
+    const doc = JSON.parse(fs.readFileSync(registryFile(root), 'utf8'));
+    doc.worktrees = doc.worktrees.map((row) => (row.path === target
+      ? { ...row, odd: ['odd/kept.md', 'odd/dropped.md'] }
+      : row));
+    doc.worktrees.push({
+      branch: 'feat/neighbour',
+      path: path.join(path.dirname(target), 'neighbour-legacy'),
+      thread: 'thread-neighbour',
+      issues: [7],
+      odd: neighbourOdd.slice(),
+      note: 'kept verbatim',
+    });
+    fs.writeFileSync(registryFile(root), `${JSON.stringify(doc, null, 2)}\n`);
+    return doc.worktrees[doc.worktrees.length - 1];
+  }
+
+  test('no ODD document, warning or droppedOdd reaches the text or details', async () => {
+    const root = makeRepo('close-no-association');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/legacy', { thread: 'thread-1', issues: [35] });
+      writeLegacyRows(root, target);
+
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { branch: 'feat/legacy' }, ctx);
+      assert.equal(result.isError, undefined, resultText(result));
+      assert.deepEqual(resultText(result).split('\n'), [
+        'outcome: removed',
+        'name: feat-legacy',
+        'branch: feat/legacy',
+        `path: ${target}`,
+        'branch state: kept',
+      ], 'the close text names the outcome and the checkout, nothing else');
+      assert.deepEqual(result.details, {
+        path: target,
+        branch: 'feat/legacy',
+        removed: true,
+        branchKept: true,
+        thread: 'thread-1',
+      }, 'the details carry the close contract, with no warnings or droppedOdd');
+      assert.doesNotMatch(resultText(result), /odd\/|droppedOdd|ONE odd document/i, 'no association content reaches the agent text');
+      assert.equal(fs.existsSync(target), false, 'the checkout is still removed');
+      assert.equal(branchExists(root, 'feat/legacy'), true, 'the branch is still kept');
+      assert.equal(require('../lib/worktree-registry.js').findByBranch(root, 'feat/legacy'), null, 'the entry is still dropped');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a row the close never addresses keeps its stored documents byte for byte', async () => {
+    const root = makeRepo('close-neighbour-legacy');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(stdEnv({ herdr, gh, modeEnv }));
+    try {
+      const target = addRegistered(root, 'feat/closes', { thread: 'thread-2' });
+      const neighbour = writeLegacyRows(root, target);
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const result = await callClose(tools, { branch: 'feat/closes' }, ctx);
+      assert.equal(result.isError, undefined, resultText(result));
+      const stored = JSON.parse(fs.readFileSync(registryFile(root), 'utf8')).worktrees
+        .find((row) => row.branch === neighbour.branch);
+      assert.deepEqual(stored, neighbour, 'every field of the untouched row survives');
+      assert.equal(JSON.stringify(stored), JSON.stringify(neighbour), 'byte for byte, key order included');
+      assert.doesNotMatch(JSON.stringify(result.details), /other-a\.md|other-b\.md|droppedOdd/, 'and nothing of it is published');
     } finally {
       restoreEnv();
     }

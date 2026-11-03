@@ -56,7 +56,14 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 function setEnv(vars) {
   for (const [k, v] of Object.entries(vars)) {
@@ -88,6 +95,9 @@ function makeCtx(repoRoot) {
   return { cwd: repoRoot, hasUI: false, sessionManager: { getSessionId: () => 'thread-1' }, ui: { confirm: async () => true, notify: () => {} } };
 }
 function resultText(r) { return (r.content || []).map((p) => p.text || '').join('\n'); }
+function removedRows(branch, target) {
+  return ['outcome: removed', `name: ${branch}`, `branch: ${branch}`, `path: ${target}`, 'branch state: kept'];
+}
 function livePaths(root) {
   return git(root, ['worktree', 'list', '--porcelain']).split('\n').filter((l) => l.startsWith('worktree ')).map((l) => l.slice(9));
 }
@@ -179,7 +189,7 @@ describe('CE1: duplicate branch entries — close drops by path identity', { con
       // Close the SECOND checkout by path (forces path-identity resolution).
       const result = await tools.get('worktree_close').execute('c1', { path: realB, force: true }, undefined, undefined, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
-      assert.match(resultText(result), /^removed: /);
+      assert.deepEqual(resultText(result).split('\n'), removedRows('feat-a', realB));
       // The removed checkout is gone from disk and registry ...
       assert.equal(fs.existsSync(realB), false, 'removed checkout gone from disk');
       assert.ok(!livePaths(root).includes(realB), 'removed checkout not listed');
@@ -255,7 +265,7 @@ describe('CE3: herdr relative paths with foreign cwd', { concurrency: false }, (
       const tools = await loadExtension();
       const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
-      assert.match(resultText(result), /^removed: /);
+      assert.deepEqual(resultText(result).split('\n'), removedRows('feat-target', realT));
       // Victim survives on disk and in git list; intended is the one removed.
       assert.ok(fs.existsSync(realV), 'victim directory survives');
       assert.ok(livePaths(root).includes(realV), 'victim still listed');
@@ -437,10 +447,7 @@ describe('R4-1: duplicate herdr list paths with different ids fall back to git',
       const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success via git fallback, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'removed: feat-target · feat-target',
-        'branch kept',
-      ]);
+      assert.deepEqual(text.split('\n'), removedRows('feat-target', realT));
       assert.ok(fs.existsSync(realV), 'victim directory survives on disk');
       assert.ok(livePaths(root).includes(realV), 'victim still listed by git');
       assert.equal(fs.existsSync(realT), false, 'target removed from disk');
@@ -592,10 +599,7 @@ describe('R4-2: removal of another checkout fails naming the vanished path', { c
       const tools = await loadExtension();
       const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'removed: feat-target · feat-target',
-        'branch kept',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), removedRows('feat-target', realT));
       assert.equal(fs.existsSync(realT), false, 'target removed');
     } finally { restoreEnvCwd(); }
   });
@@ -622,10 +626,7 @@ describe('R4-3: removeWorktreeByPath drops every duplicate row', { concurrency: 
       const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'removed: feat-a · feat-a',
-        'branch kept',
-      ]);
+      assert.deepEqual(text.split('\n'), removedRows('feat-a', realT));
       assert.equal(fs.existsSync(realT), false, 'checkout removed from disk');
       assert.ok(!livePaths(root).includes(realT), 'checkout gone from git list');
       const after = reg.readRegistry(root);
@@ -673,7 +674,7 @@ describe('R4-4: stale cleanup drops exactly the thread-owned row', { concurrency
       try {
         const tools = await loadExtension();
         const ctx = { cwd: root, hasUI: false, sessionManager: { getSessionId: () => 'creator' }, ui: { confirm: async () => true, notify: () => {} } };
-        const result = await tools.get('worktree_upsert').execute('c1', { branch: 'feat-new-' + arm, issues: [7] }, undefined, undefined, ctx);
+        const result = await tools.get('worktree_create').execute('c1', { branch: 'feat-new-' + arm, issues: [7], changes: 'none' }, undefined, undefined, ctx);
         const text = resultText(result);
         assert.equal(result.isError, undefined, `[${arm}] expected creation success, got: ${text}`);
         const after = reg.readRegistry(root);
@@ -764,10 +765,7 @@ describe('S13: close drops a row whose path reaches the checkout through a symli
       const result = await tools.get('worktree_close').execute('c1', { path: realT, force: true }, undefined, undefined, makeCtx(root));
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'removed: feat-target · feat-target',
-        'branch kept',
-      ]);
+      assert.deepEqual(text.split('\n'), removedRows('feat-target', realT));
       assert.equal(fs.existsSync(realT), false, 'removed checkout gone from disk');
       assert.ok(!livePaths(root).includes(realT), 'removed checkout not listed');
       // Both rows reach the removed checkout: none may survive as stale bookkeeping.

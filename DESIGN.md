@@ -194,7 +194,7 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 |---|---|---|
 | `agent_start` / `isIdle=false` (main actively working, incl. 0 active subs) | `gentle_work_v1=<hash>:0:<exp>` + `gentle_orchestrating_v1=<hash>:<exp>` (root marker while main actively works) + clear `herdr:blocked` labels | `gentle` (machine key `orchestrating`) while the principal session actively works, even with zero subagents |
 | TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total; the consumer renders the oldest role plus this total in parentheses only when above one) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | oldest running role word (known short word or unknown sanitized name), else generic `gentle` (no delegation — a single delegate carries no suffix; a fresh root marker reduces to `orchestrating` only with no delegation active |
-| `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt`, plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
+| `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt` dialog spans (`kind` other than `custom` — a panel or overlay such as the agents view, ODD viewer, changes view or design canvas never counts, because opening a panel is navigation, not a question), plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
 | Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` with `reviewerRunAcknowledged: true` in the runtime args; `correctionLines` (native planning, never a reviewer), forecast-only calls, `gentle_review` (any operation), `gentle_review_scope`, and all sidebar/hook signals never enter — unknown legacy shapes stay dark (conservative) | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label. Bounded approximation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today |
 | agent error / task failed / transport failure | `herdr:blocked` label `error:<code>` | `blocked` (machine key `error`) |
 | `agent_settled` + 0 active subs | `gentle_work_v1=<hash>:0:<exp>`; clear `blocked` labels | `done` |
@@ -645,18 +645,27 @@ overlay over the current checkout's `odd/tasks/*.md` (name list plus styled
 document), implemented in `lib/odd-docs.js` (discovery/read),
 `lib/odd-markdown.js` (renderer) and `lib/odd-view.js` (view) — it writes
 nothing and never leaves the checkout; `/herdr-gentle:issues` opens a
-three-page overlay (My issues / Assigned / Involved) over the current
-checkout's repository GitHub issues (issue list plus the selected issue
-with its comments), implemented in `lib/gh-issues.js` (the only place
-that runs `gh`), `lib/issues-view.js` (the pure view) and the command in
-`extensions/gentle-worktree-tools.ts` next to `/herdr-gentle:odd` —
-listing, search, paging, filtering and scrolling never write; only
-the assignment save, the label edit, the comment and the close/reopen
-write. The viewers retain shortcut legends rather than a duplicate `?`
-help overlay. ODD and Issues remain registered with Worktree tools disabled,
-but their association toggles and saves are unavailable; save callbacks also
-re-read the mode before writing. Warp itself is registered only with
-Worktree tools enabled. The sidebar and Moshi actions stay inline in
+four-tab overlay (My issues / Assigned / Involved / All) over the current
+checkout's repository GitHub issues, implemented in `lib/gh-issues.js`
+(the only place that runs `gh`), `lib/issues-view.js` (the pure view) and
+the command in `extensions/gentle-worktree-tools.ts`. The interactive pager
+searches the whole active bucket through GitHub, debounces typing, keeps
+query-bound cursors, reuses loaded tabs and explicitly refreshes with `r`.
+It never adds All to the shared three-bucket snapshot's totals. The reader
+30/70 geometry and lossless title wrapping live in `lib/view-layout.js`;
+complete metadata and comments use `lib/issue-preview.js`. Preview keys and
+capability-based legends use `lib/preview-scroll-keys.js`, not OS guesses or a
+Pi host fork.
+
+Listing, search, paging and scrolling never write. Issues permits only its
+explicit label, assignee, comment and close actions; it paints saving before
+invoking a callback and locks input until completion. Neither viewer writes a
+worktree association, and no surface assigns issues or ODD documents to a
+worktree any more: a worktree is created and listed, never modified.
+Enrichment applies to the mounted viewer; closed-view outcomes cannot
+authorize registry writes. The viewers retain one-row shortcut legends rather
+than a duplicate `?` overlay. ODD and Issues
+follow their own `Plugin tools` toggles (`ODD command`, `Issues command`) and stay registered with `Worktree tools` disabled. Warp is registered only with `Worktree tools` enabled. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
@@ -813,11 +822,11 @@ list, not silent.
 
 ## 12. Agent worktree tools (`worktree_*`)
 
-Agent-callable worktrees: `worktree_upsert` / `worktree_list` /
+Agent-callable worktrees: `worktree_create` / `worktree_list` /
 `worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
-listed in the Pi package's `pi.extensions`), plus the `Worktree tools`
-rows of `/herdr-gentle:customize` (`Enabled` / `Disabled`, plus read-only
-`customize status`). Surface is
+listed in the Pi package's `pi.extensions`), plus the `Plugin tools ·
+Worktree tools` toggle of `/herdr-gentle:customize` (`Enabled` / `Disabled`,
+plus the read-only `customize status`). Surface is
 extension tools via `pi.registerTool()` — codemode is a QuickJS sandbox
 with no filesystem, network, or timers and adds no tools, so it cannot
 implement this; it may call these tools. Normative detail (parameters,
@@ -827,22 +836,38 @@ design decisions.
 
 ### Ownership rule
 
-The worktree belongs to the THREAD, not to the feature or task: one
-thread maps to one worktree, the same rule as `~/.pi/agent/AGENTS.md`.
-The registry entry records the owning thread (`thread`, resolved from
-`GENTLE_WORKTREE_THREAD` else the Pi session id, failing closed when
-neither exists); `worktree_list` shows which thread owns each checkout;
-`worktree_close` reports the owner instead of refusing, because a
-delivered thread is routinely closed from a later session; and
-`worktree_upsert` from a thread that already owns a live registered
-worktree returns that checkout (`created: false`) instead of creating a
-second. A second thread never adopts another thread's checkout.
+The worktree belongs to the THREAD, not to the feature or task, and a
+thread may own SEVERAL checkouts: a second branch is a second worktree,
+not a replay of the first one. The registry entry records the owning
+thread (`thread`, resolved from `GENTLE_WORKTREE_THREAD` else the Pi
+session id, failing closed when neither exists); `worktree_list` shows
+which thread owns each checkout; `worktree_close` reports the owner
+instead of refusing, because a delivered thread is routinely closed from
+a later session; and `worktree_create` is idempotent on the REQUEST, never
+on the thread: the same branch that already has this thread's checkout
+returns that checkout (`alreadyExists: true`, the text says
+`already exists`), while any other branch is created and registered even
+when the thread already owns another checkout. `already exists` is keyed
+to the requested branch's own worktree; a checkout the thread owns for a
+different branch never answers for it. A second thread never adopts
+another thread's checkout, and a branch already checked out at a live path
+is refused rather than shared.
+
+A worktree carries NO issue or ODD association: `worktree_create` takes the
+branch and nothing else, never verifies or writes an association, and its
+output names the checkout, its path, what the registry write actually did
+(`registered: new | replaced | appended | unchanged`) and the one CodeGraph
+fact of the creation. Legacy `issues`/`odd` fields already in the registry
+are preserved byte for byte by every write that does not address their row,
+and no surface displays them.
 
 ### Registry
 
 `<git-common-dir>/pi-worktrees.json` — inside `.git`, never in a working
 tree, never committed, shared by every checkout of the repository.
-Entries `{branch, path, thread, issues[], odd[], createdAt, updatedAt}`.
+Entries `{branch, path, thread, issues[], odd, createdAt, updatedAt}`
+(`odd` is ONE document or `null`; both association fields are legacy — the
+create tool writes no association and only preserves what is stored).
 Reads tolerate malformed content (reported, never thrown, file left
 untouched, never silently enabling); writes are atomic (temp file plus
 rename) under an exclusive lock file with bounded wait and stale-lock
@@ -860,8 +885,11 @@ anything: copy unversioned env files only when present, untracked, and
 absent at the target (never overwrite, never copy a tracked file);
 install dependencies for every lockfile-detected stack (a missing binary
 is `skipped`, a non-zero exit is `failed` plus a warning, never fatal);
-symlink `odd/` always (created in the principal first when absent) and
-`.agents/` / `.claude/` only when present, never `.codegraph/`; run
+link `.agents/`, `.pi/`, `.claude/` and `odd/` to their principal counterparts
+only when each source exists as a directory, Git tracks nothing under it and
+Git ignores it. Tracked entries arrive via checkout; untracked but nonignored
+entries are not linked. Existing targets are never removed or replaced, and
+missing source directories are never created. Never share `.codegraph/`; run
 `codegraph init` when the CLI is available. Hook outcomes travel inside
 the success `details`, never turning a verified creation into an error.
 The pre-existing `~/.config/herdr` `worktree-hooks` plugin stays
@@ -870,19 +898,27 @@ replaced.
 
 ### Mode gate
 
-The `Worktree tools` rows of `/herdr-gentle:customize` flip a shared mode
-file (`gentle-worktree-mode.json`,
-`{version:1,enabled:boolean}`) in the plugin state directory, default
-enabled, malformed failing closed. Gating is two-level — load-time
-registration plus per-execution re-read — and the panel itself always
-stays registered so the mode can be flipped back. Registration changes
+The `Plugin tools` section of `/herdr-gentle:customize` groups three
+independent toggles. `Worktree tools` flips a shared mode file
+(`gentle-worktree-mode.json`, `{version:1,enabled:boolean}`) in the plugin state
+directory, default enabled, malformed failing closed. `ODD command` and `Issues
+command` share `gentle-plugin-tools.json`
+(`{version:1,odd:boolean,issues:boolean}`) in the same directory, both default
+enabled, malformed failing closed on both; they gate the registered commands
+only, never the automatic ODD naming. Gating is two-level — load-time
+registration plus per-invocation re-read — and the panel itself always
+stays registered so every toggle can be flipped back. Registration changes
 reload the extension runtime automatically when the registration must
-change (`enabled !== toolsRegistered`, i.e. enabling while the runtime
-loaded disabled or vice versa), which `customize status` reports. Create never
+change (the requested value differs from what this load registered, i.e.
+enabling while the runtime loaded disabled or vice versa), which `customize
+status` reports; without a reload the gated invocation still refuses, so the
+toggle holds and the notification says it applies from the next session.
+Create never
 prompts — a create touches no existing data; close prompts when the host
 offers dialog UI, waived under gentle-shell YOLO only for a checkout proven
-clean; list is read-only
-and never prompts.
+clean. Warp keyboard deletion is separate: it always prompts, even under YOLO,
+and discloses pending changes and commits ahead of main (or unknown evidence).
+List is read-only and never prompts.
 
 ### Known limitations (stated, not solved here)
 

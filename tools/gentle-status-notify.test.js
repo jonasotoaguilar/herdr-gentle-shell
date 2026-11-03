@@ -124,6 +124,9 @@ function runOnce(sb, extraEnv = {}) {
       AGENTS_FILE: sb.agentsFile,
       NOTIFY_LOG: sb.notifyLog,
       FAIL_FILE: extraEnv.FAIL_ONCE ? sb.failFile : '',
+      // The trace is off unless the case asks for GENTLE_PERF_TRACE=1: the
+      // variable is its only switch, so an ambient value must never leak in.
+      GENTLE_PERF_TRACE: '',
       ...extraEnv,
     },
   });
@@ -309,3 +312,61 @@ describe('adaptive poll (P1)', () => {
 });
 
 
+
+// S18/S24: the daemon records its own frame timing and pane/token COUNTS, only
+// while GENTLE_PERF_TRACE switches the trace on. There is no flag file: the
+// environment of the process is the whole switch.
+describe('performance trace frames', () => {
+  function traceFile() {
+    return path.join(sandbox.stateDir, 'perf-trace.jsonl');
+  }
+  function readTrace() {
+    if (!fs.existsSync(traceFile())) return [];
+    return fs.readFileSync(traceFile(), 'utf8').split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l));
+  }
+  function runTraced(sb) {
+    return runOnce(sb, { GENTLE_PERF_TRACE: '1' });
+  }
+
+  it('writes one daemon frame line per frame while tracing is on, and nothing while it is off', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'a'))]);
+
+    runOnce(sandbox);
+    assert.deepEqual(readTrace(), [], 'a disabled trace writes no daemon line');
+    assert.equal(fs.existsSync(traceFile()), false, 'and creates no log file');
+
+    runTraced(sandbox);
+
+    const lines = readTrace();
+    assert.equal(lines.length, 1, 'exactly one line for one frame');
+    const [line] = lines;
+    assert.deepEqual(Object.keys(line).slice(0, 2), ['at', 'kind']);
+    assert.equal(line.kind, 'daemon');
+    assert.equal(typeof line.ms, 'number');
+    assert.ok(line.ms >= 0, 'a frame duration');
+    assert.equal(line.panes, 1, 'one owned pane was reduced');
+    assert.equal(typeof line.tokens, 'number');
+    assert.ok(line.tokens > 0, 'the frame published the owned family');
+    for (const key of Object.keys(line)) {
+      assert.ok(['at', 'kind', 'run', 'ms', 'panes', 'tokens'].includes(key), `${key} is allowlisted`);
+    }
+    // Counts only: no pane id, session path or token value may reach the log.
+    const raw = fs.readFileSync(traceFile(), 'utf8');
+    for (const leaked of ['pane-1', sessionPath(sandbox, 'a'), 'gentle_work_v1', sandbox.workDir]) {
+      assert.equal(raw.includes(leaked), false, `${leaked} never reaches the log`);
+    }
+  });
+
+  it('only `1` and `true` record: every other value of the variable writes nothing', () => {
+    writeAgents(sandbox, [askEntry(sandbox, sessionPath(sandbox, 'b'))]);
+
+    for (const value of ['', '0', 'false', 'TRUE', 'yes', 'garbage']) {
+      runOnce(sandbox, { GENTLE_PERF_TRACE: value });
+      assert.equal(readTrace().length, 0, `${JSON.stringify(value)} leaves the trace off`);
+    }
+    assert.equal(fs.existsSync(traceFile()), false, 'no log is created by an off value');
+
+    runOnce(sandbox, { GENTLE_PERF_TRACE: 'true' });
+    assert.equal(readTrace().length, 1, '`true` switches the trace on');
+  });
+});

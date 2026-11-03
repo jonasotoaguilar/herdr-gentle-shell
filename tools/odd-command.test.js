@@ -110,15 +110,20 @@ async function loadExtension() {
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
   const commands = new Map();
+  const handlers = new Map();
   const pi = {
     registerTool: () => {},
     registerCommand: (name, def) => { commands.set(name, def); },
-    on: () => () => {},
+    on: (event, handler) => {
+      if (!handlers.has(event)) handlers.set(event, []);
+      handlers.get(event).push(handler);
+      return () => {};
+    },
   };
   process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
   const mod = await import(pathToFileURL(copy).href);
   mod.default(pi);
-  return { commands, mod };
+  return { commands, handlers, mod };
 }
 
 const stubTui = {
@@ -168,6 +173,18 @@ function openComponent(factory, host) {
   return { component, done: () => settled };
 }
 
+// S21: the interactive listing is awaited, so a frame that depends on a fresh
+// listing is polled to its settled text instead of read after one tick.
+async function waitForFrame(frame, pattern, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const text = frame();
+    if (pattern.test(text)) return text;
+    if (Date.now() > deadline) return text;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 describe('/herdr-gentle:odd', () => {
   test('is registered and opens the two-pane view over the current checkout documents', async () => {
     const { commands, mod } = await loadExtension();
@@ -202,6 +219,35 @@ describe('/herdr-gentle:odd', () => {
     assert.match(body, /alpha/);
     assert.match(body, /beta/);
     assert.match(body, /S1\. first rule/, 'the right pane shows the selected document');
+  });
+
+  test('r re-lists the checkout from disk while the view is open and says it reloaded', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n\n## Specs\nS1. first rule\n' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    let component = null;
+    const { ctx } = makeCtx({
+      cwd: root,
+      customImpl: async (factory) => {
+        component = openComponent(factory, host).component;
+        return null;
+      },
+    });
+    await def.handler('', ctx);
+    const plain = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+    const frame = () => plain(component.render(80).join('\n'));
+    assert.match(frame(), /✎ Odd · 1 documents/, 'the view opens over the one document');
+    assert.ok(!frame().includes('gamma'), 'the new document is not there yet');
+    fs.writeFileSync(path.join(root, 'odd', 'tasks', 'gamma.md'), '# gamma\n\n## Specs\nS1. third rule\n');
+    component.handleInput('r');
+    // S21: the reload goes through the AWAITED listing, so the outcome lands when
+    // the checkout's Git reads answer instead of inside the key handler.
+    const reloaded = await waitForFrame(frame, /r reloaded/);
+    assert.match(reloaded, /2 documents/, 'r re-reads odd/tasks from disk through the command wiring');
+    assert.match(reloaded, /gamma/, 'the document written while the view was open appears');
+    assert.match(reloaded, /r reloaded/, 'S9: the footer names the reload outcome');
   });
 
   test('a checkout without odd documents notifies and opens nothing', async () => {
@@ -253,11 +299,13 @@ describe('/herdr-gentle:odd', () => {
   });
 });
 
-describe('/herdr-gentle:odd assignment (S8/T9)', () => {
+// S10b: the odd viewer no longer associates a checkout with documents. These
+// drive the public command end to end: the frame never shows an association
+// and the removed keys (`space`, list `ctrl+s`) never write, even though the
+// command still supplies the old `assigned`/`saveAssignment` options.
+describe('/herdr-gentle:odd read-only association (S10b)', () => {
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
   const clean = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
-  const rowFor = (body, name) => body.split('\n').find((line) =>
-    new RegExp(`[▸ ] [✓·✎] ${name}( |$)`).test(line));
 
   function registryFile(root) {
     const common = git(root, ['rev-parse', '--git-common-dir']).trim();
@@ -279,18 +327,9 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
     return git(root, ['branch', '--show-current']).trim();
   }
 
-  // Thread identity for created rows resolves exactly like the create
-  // path: GENTLE_WORKTREE_THREAD first, then the Pi session id. The
-  // viewer tests run without a session manager, so the env override is
-  // the identity under test; the previous value is always restored.
-  function withThread(value) {
-    const prev = process.env.GENTLE_WORKTREE_THREAD;
-    if (value === undefined) delete process.env.GENTLE_WORKTREE_THREAD;
-    else process.env.GENTLE_WORKTREE_THREAD = value;
-    return () => {
-      if (prev === undefined) delete process.env.GENTLE_WORKTREE_THREAD;
-      else process.env.GENTLE_WORKTREE_THREAD = prev;
-    };
+  // S8: the registry stores ONE odd path or `null`, never a list.
+  function storedRow(root, odd) {
+    return { branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd };
   }
 
   async function openOdd(root) {
@@ -305,218 +344,99 @@ describe('/herdr-gentle:odd assignment (S8/T9)', () => {
     });
     await def.handler('', ctx);
     assert.ok(factory, 'the overlay opens');
-    const { component } = openComponent(factory, host);
-    return { component, notes };
+    const { component, done } = openComponent(factory, host);
+    return { component, notes, done };
   }
 
-  test('reads the stored assignment for the current checkout', async () => {
+  // The list rows are the cells between the left border and the divider; the
+  // title icon (`✎`) and the legend separators (`·`) live outside them.
+  const listRows = (body) => body.split('\n').filter((line) => /│ [▸ ] (alpha|beta)( |$)/.test(line));
+
+  test('renders no association mark, hint or unsaved claim even with a stored odd', async () => {
     const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
-    writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
-    }]);
+    writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
     const { component, notes } = await openOdd(root);
-    const body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/, 'the stored row carries ✓');
-    assert.match(rowFor(body, 'beta'), /·/, 'the unassigned row carries ·');
-    const titleLine = body.split('\n')[0];
-    assert.match(titleLine, /✎ Odd · 2 documents/, 'the title carries only the viewer name and the count');
-    assert.ok(!titleLine.includes(path.basename(root)), 'the concise title does not repeat the checkout name');
-    assert.match(body, /(alpha|beta) · \d+-\d+\/\d+ · 1 assigned/, 'the status row names the selected document and the assigned count');
+    const body = clean(component.render(220).join('\n'));
+    const rows = listRows(body);
+    assert.equal(rows.length, 2, 'both documents still list');
+    assert.ok(rows.every((line) => !/[✓✎]/.test(line)), 'no association mark on any row');
+    assert.match(rows[0], /│ ▸ (alpha|beta)( |$)/, 'the focused row renders unmarked');
+    assert.ok(!body.includes('assigned'), 'no assigned count is claimed');
+    assert.ok(!body.includes('unsaved'), 'no unsaved claim exists');
+    assert.ok(!body.includes('space toggle'), 'the space toggle leaves the legend');
+    assert.ok(!body.includes('ctrl+s'), 'the save key leaves the legend');
+    assert.match(body, /(ctrl\+shift\+j\/k|shift\+j\/k) doc/, 'the reading legend names the effective fallback and the target it scrolls (S14)');
+    assert.match(body, /› Search /, 'the search row names the filter alone, with no key above (S4)');
+    assert.ok(!/› Search \(T\)/.test(body), 'the search row never carries the (T) key hint (S4)');
+    assert.match(body, /T search/, 'the filter key lives in the footer instead (S4)');
+    assert.ok(!/T filter/.test(body), 'the footer never repeats the search hint (S13)');
+    assert.match(body, /o open/, 'the open legend stays');
+    assert.match(body, /esc close/, 'the close legend stays');
     assert.deepEqual(notes, [], 'reading writes nothing and notifies nothing');
   });
 
-  test('ctrl+s persists the whole pending set through the registry', async () => {
-    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
-    const file = writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
-    }]);
-    const { component } = await openOdd(root);
-    component.handleInput('down');
-    component.handleInput('space');
-    component.handleInput('ctrl+s');
-    await tick();
-    const stored = JSON.parse(readRaw(file));
-    assert.deepEqual(stored.worktrees[0].odd, ['odd/tasks/alpha.md', 'odd/tasks/beta.md']);
-    const body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/);
-    assert.match(rowFor(body, 'beta'), /✓/, 'the saved toggle is applied');
-    assert.ok(!body.includes('unsaved'), 'a successful save clears the pending state');
+  test('the stored odd changes no cell: the frame matches a row with odd null', async () => {
+    const withOdd = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    writeRegistry(withOdd, [storedRow(withOdd, 'odd/tasks/alpha.md')]);
+    const withoutOdd = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    writeRegistry(withoutOdd, [storedRow(withoutOdd, null)]);
+    const first = await openOdd(withOdd);
+    const second = await openOdd(withoutOdd);
+    assert.equal(
+      clean(first.component.render(100).join('\n')),
+      clean(second.component.render(100).join('\n')),
+      'the stored association renders nothing in either direction',
+    );
   });
 
-  test('saving creates the registry row when absent', async () => {
-    const restoreThread = withThread('test-thread');
-    try {
-    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-    const file = registryFile(root);
-    const expectedBranch = branchOf(root);
-    assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
-    const { component } = await openOdd(root);
-    let body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/, 'nothing is marked when no row exists');
-    component.handleInput('space');
-    component.handleInput('ctrl+s');
-    await tick();
-    assert.ok(fs.existsSync(file), 'the save creates the registry');
-    const stored = JSON.parse(readRaw(file));
-    assert.equal(stored.worktrees.length, 1);
-    assert.equal(stored.worktrees[0].path, root);
-    assert.equal(stored.worktrees[0].branch, expectedBranch, 'the created row carries the checkout real branch');
-    assert.equal(stored.worktrees[0].thread, 'test-thread', 'the created row carries the resolved thread identity');
-    assert.deepEqual(stored.worktrees[0].odd, ['odd/tasks/alpha.md']);
-    body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /✓/, 'the created row reads back as stored');
-    } finally { restoreThread(); }
-  });
-
-  test('a refusing registry reports the error without writing', async () => {
-    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
-    const file = writeRegistry(root, []);
-    fs.writeFileSync(file, '{not json');
+  test('space and list ctrl+s leave the registry bytes unchanged', async () => {
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n', 'beta.md': '# beta\n' } });
+    const file = writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
     const before = readRaw(file);
     const { component } = await openOdd(root);
-    let body = clean(component.render(100).join('\n'));
-    assert.match(rowFor(body, 'alpha'), /·/, 'a malformed registry leaves the view usable with nothing marked');
     component.handleInput('down');
     assert.equal(component.state.index, 1, 'navigation still works');
     component.handleInput('space');
+    component.handleInput('space');
     component.handleInput('ctrl+s');
     await tick();
-    body = clean(component.render(100).join('\n'));
-    assert.match(body, /save failed/, 'the failed save shows its error');
-    assert.match(rowFor(body, 'beta'), /✎/, 'the pending mark survives the refusal');
-    assert.equal(readRaw(file), before, 'the refusing registry is left untouched');
+    assert.equal(readRaw(file), before, 'the removed keys write nothing to the registry');
   });
 
-  test('toggling without ctrl+s writes nothing to the registry', async () => {
+  test('with no registry at all, space and ctrl+s create nothing', async () => {
     const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-    const file = writeRegistry(root, [{
-      branch: branchOf(root), path: root, thread: 'test-thread', issues: [], odd: ['odd/tasks/alpha.md'],
-    }]);
-    const before = readRaw(file);
+    const file = registryFile(root);
+    assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
     const { component } = await openOdd(root);
-    component.handleInput('space');
-    component.handleInput('escape');
-    await tick();
-    assert.equal(readRaw(file), before, 'no write happens without ctrl+s');
-  });
-
-  test('creating the row records the real branch and the resolved thread identity', async () => {
-    const restoreThread = withThread('odd-test-thread-a');
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      const file = registryFile(root);
-      assert.ok(!fs.existsSync(file), 'the fixture starts with no registry');
-      const expectedBranch = branchOf(root);
-      assert.ok(expectedBranch.length > 0, 'the fixture checkout has a real branch');
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.ok(!body.includes('save failed'), 'the save succeeds');
-      const stored = JSON.parse(readRaw(file));
-      assert.equal(stored.worktrees.length, 1);
-      assert.equal(stored.worktrees[0].branch, expectedBranch, 'the created row carries the checkout real branch, never a placeholder');
-      assert.equal(stored.worktrees[0].thread, 'odd-test-thread-a', 'the created row carries the resolved thread, never a placeholder');
-    } finally { restoreThread(); }
-  });
-
-  test('without a resolvable thread identity the save refuses and writes nothing', async () => {
-    const restoreThread = withThread(undefined);
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      const file = writeRegistry(root, []);
-      const before = readRaw(file);
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.match(body, /save failed/, 'the refusal surfaces in the view');
-      assert.match(body, /thread identity/, 'the error names the missing thread identity');
-      assert.equal(readRaw(file), before, 'the registry file stays byte-identical');
-      assert.deepEqual(JSON.parse(readRaw(file)).worktrees, [], 'no row is created');
-    } finally { restoreThread(); }
-  });
-
-  test('without a determinable branch the save refuses and writes nothing', async () => {
-    const restoreThread = withThread('odd-test-thread-c');
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      git(root, ['checkout', '--detach', 'HEAD']);
-      const file = writeRegistry(root, []);
-      const before = readRaw(file);
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.match(body, /save failed/, 'the refusal surfaces in the view');
-      assert.match(body, /branch/, 'the error names the missing branch');
-      assert.equal(readRaw(file), before, 'the registry file stays byte-identical');
-      assert.deepEqual(JSON.parse(readRaw(file)).worktrees, [], 'no row is created');
-    } finally { restoreThread(); }
-  });
-
-  test('updating one row leaves the other row untouched (no data loss)', async () => {
-    const root = makeRepo({ docs: { 'beta.md': '# beta\n', 'alpha.md': '# alpha\n' } });
-    const otherPath = path.join(os.tmpdir(), `wt-odd-other-${process.pid}-${Date.now()}`);
-    const stamp = '2026-01-01T00:00:00.000Z';
-    const file = writeRegistry(root, [
-      {
-        branch: branchOf(root), path: root, thread: 'test-thread', issues: [3],
-        odd: ['odd/tasks/alpha.md'], createdAt: stamp, updatedAt: stamp,
-      },
-      {
-        branch: 'other-branch', path: otherPath, thread: 'other-thread', issues: [7],
-        odd: ['odd/tasks/keep.md'], createdAt: stamp, updatedAt: stamp,
-      },
-    ]);
-    const otherBefore = JSON.parse(readRaw(file)).worktrees[1];
-    const { component } = await openOdd(root);
-    component.handleInput('down');
     component.handleInput('space');
     component.handleInput('ctrl+s');
     await tick();
-    const stored = JSON.parse(readRaw(file));
-    assert.equal(stored.worktrees.length, 2, 'both rows still exist');
-    assert.deepEqual(stored.worktrees[1], otherBefore, 'the untouched row keeps its issues/odd/thread/timestamps');
-    assert.deepEqual(stored.worktrees[0].odd, ['odd/tasks/alpha.md', 'odd/tasks/beta.md'], 'only the current row odd changes');
-    assert.deepEqual(stored.worktrees[0].issues, [3], 'the current row issues survive');
+    assert.equal(fs.existsSync(file), false, 'no registry row is created by the removed keys');
   });
 
-  test('a same-branch row at a different live checkout is kept, not replaced', async () => {
-    const restoreThread = withThread('odd-test-thread-e');
-    try {
-      const root = makeRepo({ docs: { 'alpha.md': '# alpha\n' } });
-      const targetBranch = branchOf(root);
-      const wtBase = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-collide-')));
-      const linked = path.join(wtBase, 'linked');
-      git(root, ['worktree', 'add', linked, '-b', 'collide-branch']);
-      const linkedReal = fs.realpathSync(linked);
-      const stamp = '2026-02-01T00:00:00.000Z';
-      const keeper = {
-        branch: targetBranch, path: linkedReal, thread: 'keeper-thread', issues: [9],
-        odd: ['odd/tasks/keep.md'], createdAt: stamp, updatedAt: stamp,
-      };
-      const file = writeRegistry(root, [keeper]);
-      const keeperBefore = JSON.parse(readRaw(file)).worktrees[0];
-      const { component } = await openOdd(root);
-      component.handleInput('space');
-      component.handleInput('ctrl+s');
-      await tick();
-      const body = clean(component.render(100).join('\n'));
-      assert.ok(!body.includes('save failed'), 'the save succeeds');
-      const stored = JSON.parse(readRaw(file));
-      assert.equal(stored.worktrees.length, 2, 'both rows still exist');
-      const kept = stored.worktrees.find((row) => row.path === linkedReal);
-      assert.deepEqual(kept, keeperBefore, 'the colliding row keeps its issues/odd/thread/createdAt');
-      const created = stored.worktrees.find((row) => row.path === root);
-      assert.ok(created, 'the new checkout is registered alongside it');
-      assert.equal(created.branch, targetBranch);
-      assert.equal(created.thread, 'odd-test-thread-e');
-      assert.deepEqual(created.odd, ['odd/tasks/alpha.md']);
-    } finally { restoreThread(); }
+  test('the viewer still reads, filters, scrolls and closes with a stored odd', async () => {
+    const long = ['# alpha', ...Array.from({ length: 60 }, (_, index) => `line ${index + 1}`)].join('\n');
+    const longBeta = ['# beta', ...Array.from({ length: 60 }, (_, index) => `beta line ${index + 1}`)].join('\n');
+    const root = makeRepo({ docs: { 'alpha.md': `${long}\n`, 'beta.md': `${longBeta}\n` } });
+    writeRegistry(root, [storedRow(root, 'odd/tasks/alpha.md')]);
+    const { component, notes, done } = await openOdd(root);
+    component.handleInput('ctrl+shift+j');
+    assert.ok(component.state.scroll > 0, 'the preview still scrolls');
+    component.handleInput('T');
+    component.handleInput('b');
+    component.handleInput('enter');
+    let body = clean(component.render(100).join('\n'));
+    assert.ok(!listRows(body).some((line) => line.includes('alpha')), 'the filter still narrows the list');
+    assert.ok(listRows(body).some((line) => line.includes('beta')), 'the match stays listed');
+    component.handleInput('/');
+    component.handleInput('\x7f');
+    component.handleInput('enter');
+    body = clean(component.render(100).join('\n'));
+    assert.equal(listRows(body).length, 2, 'the filter still clears');
+    assert.equal(component.state.index, 0, 'navigation is untouched');
+    component.handleInput('escape');
+    assert.equal(done(), null, 'esc still closes with a null result');
+    assert.deepEqual(notes, [], 'reading and closing notify nothing');
   });
 });
 
@@ -584,14 +504,13 @@ describe('/herdr-gentle:odd external open (K3)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// S29: `/herdr-gentle:odd` stays registered while the worktree mode is off or
-// malformed; only the worktree association is disabled. This file covers the
-// extension seam (mode read plus refuse-to-save); the view-side hiding of the
-// association marks, hints and keys is asserted in tools/odd-view.test.js.
+// S1: the odd reader associates nothing with the checkout. The command hands
+// the view NO `assigned`, NO `saveAssignment` and NO `assignmentEnabled` — the
+// association was removed from the product, not merely gated — so opening the
+// reader performs zero registry writes in every worktree-mode state.
 // ---------------------------------------------------------------------------
-describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
+describe('/herdr-gentle:odd never reads or writes an association (S1)', () => {
   const modeLib = require('../lib/worktree-mode.js');
-  const S29_REFUSAL = 'worktree tools are disabled; enable them in /herdr-gentle:customize to assign issues or odd documents';
 
   function modeDir() {
     return track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-mode-')));
@@ -629,6 +548,12 @@ describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
     return { holder, restore: () => { lib.createOddView = original; } };
   }
 
+  function assertNoAssociationOptions(options) {
+    for (const key of ['assigned', 'assignedOdd', 'saveAssignment', 'assignmentEnabled']) {
+      assert.equal(key in options, false, `the view is handed no ${key}: ${JSON.stringify(Object.keys(options))}`);
+    }
+  }
+
   async function openOdd(root) {
     const { commands, mod } = await loadExtension();
     mod.setOddTuiLoader(async () => stubTui);
@@ -643,76 +568,573 @@ describe('/herdr-gentle:odd assignment mode gate (S29)', () => {
     return commands;
   }
 
-  test('mode off: the command exists, assignmentEnabled is false and the callback refuses with zero writes', async () => {
+  async function openWithRegistry(tag, seed) {
+    const root = makeRepo({ docs: { 'a.md': '# a\n\n## Specs\nS1. one rule\n' }, tag });
+    const file = oddRegistryFile(root);
+    if (seed) fs.writeFileSync(file, `${JSON.stringify(seed(root), null, 2)}\n`);
+    const before = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    const capture = captureOddView();
+    try {
+      const commands = await openOdd(root);
+      assert.ok(commands.has('herdr-gentle:odd'), 'the command stays registered');
+      assert.ok(capture.holder.options, 'the view was constructed');
+      assertNoAssociationOptions(capture.holder.options);
+    } finally {
+      capture.restore();
+    }
+    const after = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    assert.equal(after, before, 'reading writes nothing to the registry');
+  }
+
+  const seeded = (root) => ({
+    version: 1,
+    worktrees: [{ branch: git(root, ['branch', '--show-current']).trim(), path: root, thread: 'test-thread', issues: [], odd: 'odd/tasks/a.md' }],
+  });
+
+  test('mode off: no association option and no registry write', async () => {
     await withModeDir(async () => {
       modeLib.writeMode(false, process.env);
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n\n## Specs\nS1. one rule\n' }, tag: 'odd-s29-off' });
-        const file = oddRegistryFile(root);
-        const commands = await openOdd(root);
-        assert.ok(commands.has('herdr-gentle:odd'), 'the command stays registered while the mode is off');
-        assert.ok(capture.holder.options, 'the view was constructed');
-        assert.equal(capture.holder.options.assignmentEnabled, false, 'the disabled mode travels to the view');
-        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the refusal is honest and exact');
-        assert.equal(fs.existsSync(file), false, 'a refused save writes no registry');
-      } finally {
-        capture.restore();
-      }
+      await openWithRegistry('odd-s1-off', seeded);
     });
   });
 
-  test('malformed mode: assignmentEnabled is false and the callback refuses', async () => {
+  test('malformed mode: no association option and no registry write', async () => {
     await withModeDir(async () => {
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-malformed' });
-        const file = oddRegistryFile(root);
-        const commands = await openOdd(root);
-        assert.ok(commands.has('herdr-gentle:odd'));
-        assert.equal(capture.holder.options.assignmentEnabled, false, 'a malformed mode never enables assignment');
-        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL });
-        assert.equal(fs.existsSync(file), false, 'a malformed mode never writes');
-      } finally {
-        capture.restore();
-      }
+      await openWithRegistry('odd-s1-malformed', seeded);
     }, { malformed: true });
   });
 
-  test('mode switched off after opening: the callback re-reads and refuses', async () => {
+  test('mode enabled and then switched off: still no association option and no write', async () => {
     await withModeDir(async () => {
       modeLib.writeMode(true, process.env);
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-switched' });
-        const file = oddRegistryFile(root);
-        await openOdd(root);
-        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode opened normally');
-        modeLib.writeMode(false, process.env);
-        const result = await capture.holder.options.saveAssignment(['odd/tasks/a.md']);
-        assert.deepEqual(result, { ok: false, error: S29_REFUSAL }, 'the callback re-reads the mode, not the snapshot');
-        assert.equal(fs.existsSync(file), false, 'the registry is untouched');
-      } finally {
-        capture.restore();
-      }
+      await openWithRegistry('odd-s1-on', seeded);
     });
   });
+});
 
-  test('enabled mode: assignmentEnabled stays true (regression)', async () => {
-    await withModeDir(async () => {
-      // Explicit, not inferred: a missing file also means enabled, but the
-      // test names the enabled state it exercises.
-      modeLib.writeMode(true, process.env);
-      const capture = captureOddView();
-      try {
-        const root = makeRepo({ docs: { 'a.md': '# a\n' }, tag: 'odd-s29-on' });
-        await openOdd(root);
-        assert.equal(capture.holder.options.assignmentEnabled, true, 'the enabled mode passes true');
-      } finally {
-        capture.restore();
-      }
+// ---------------------------------------------------------------------------
+// S17: `o` hands the REAL terminal to $VISUAL/$EDITOR. This reproduction runs
+// the REAL command, the REAL odd view and the REAL pi-tui (ProcessTerminal +
+// TuiMainScreen) inside an ISOLATED PTY (`script(1)`), with a stand-in editor
+// that takes raw mode and owns the screen the way nvim does. It asserts the
+// terminal lifecycle, not pixels: while the editor is up, Pi must paint
+// nothing and read nothing — so the editor keeps every keystroke (Escape
+// included) and the overlay stays open behind it — and after the editor exits
+// the TUI is re-armed and Escape still closes the view normally.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd o owns the terminal while the editor runs (S17)', () => {
+  const { spawn: spawnChild } = require('node:child_process');
+
+  // util-linux `script(1)` allocates the PTY. BSD/macOS script takes different
+  // flags, so the check names the GNU one instead of guessing.
+  function hasUtilLinuxScript() {
+    try {
+      return /util-linux/.test(execFileSync('script', ['--version'], { encoding: 'utf8' }));
+    } catch {
+      return false;
+    }
+  }
+
+  const TUI_ENTRY = (() => {
+    try {
+      return require.resolve('@earendil-works/pi-tui/dist/index.js', { paths: [path.resolve(__dirname, '..')] });
+    } catch {
+      return null;
+    }
+  })();
+
+  const SKIP = !hasUtilLinuxScript()
+    ? 'needs util-linux script(1) to allocate an isolated PTY'
+    : (TUI_ENTRY ? false : 'needs @earendil-works/pi-tui installed beside this package');
+
+  // The PTY child: mounts the real command over the real TUI, forwards a real
+  // keystroke to it, and records every frame the TUI writes plus every key the
+  // view receives, so the parent can order them against the editor's window.
+  const HARNESS = `
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+
+const logPath = process.env.PTY_LOG;
+const log = (line) => fs.appendFileSync(logPath, line + '\\n');
+const realWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, ...rest) => {
+  try { log('tui-write ' + String(chunk).length); } catch {}
+  return realWrite(chunk, ...rest);
+};
+
+const commands = new Map();
+const pi = {
+  registerTool() {},
+  registerCommand(name, def) { commands.set(name, def); },
+  on() { return () => {}; },
+};
+
+let extension;
+try {
+  extension = await import(pathToFileURL(process.env.PTY_EXT).href);
+  extension.default(pi);
+} catch (err) {
+  log('harness-error ' + String((err && err.message) || err));
+  process.exit(2);
+}
+const tuiModule = await import(pathToFileURL(process.env.PTY_TUI).href);
+extension.setOddTuiLoader(async () => tuiModule);
+
+const terminal = new tuiModule.ProcessTerminal();
+const tui = new tuiModule.TuiMainScreen(terminal, false);
+let view = null;
+let opened = false;
+
+const root = {
+  render: () => ['harness root'],
+  invalidate() {},
+  handleInput(data) {
+    if (data === 'o' && !opened) {
+      opened = true;
+      log('key-open');
+      void runCommand();
+    }
+  },
+};
+
+function mountView(factory) {
+  return new Promise((resolve) => {
+    view = factory(tui, {}, {}, (result) => {
+      log('view-closed ' + JSON.stringify(result));
+      try { tui.removeChild(view); } catch {}
+      tui.setFocus(root);
+      tui.requestRender(true);
+      resolve(result);
     });
+    const originalInput = view.handleInput.bind(view);
+    view.handleInput = (data) => {
+      log('view-input ' + JSON.stringify(data));
+      originalInput(data);
+    };
+    tui.addChild(view);
+    tui.setFocus(view);
+    tui.requestRender(true);
+    log('view-open');
+  });
+}
+
+async function runCommand() {
+  const def = commands.get('herdr-gentle:odd');
+  const ctx = {
+    cwd: process.env.PTY_REPO,
+    ui: {
+      notify: (message) => log('notify ' + JSON.stringify(String(message))),
+      select: async () => undefined,
+      custom: (factory) => mountView(factory),
+    },
+  };
+  try {
+    await def.handler('', ctx);
+    log('command-finished');
+  } catch (err) {
+    log('harness-error ' + String((err && err.message) || err));
+  }
+  const finish = process.env.PTY_FINISH;
+  const deadline = Date.now() + 8000;
+  while (!fs.existsSync(finish) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  log('harness-exit');
+  try { tui.stop(); } catch {}
+  process.exit(0);
+}
+
+tui.addChild(root);
+tui.setFocus(root);
+tui.start();
+log('tui-start');
+`;
+
+  // The stand-in editor takes the terminal exactly like nvim: raw mode first,
+  // then its own screen, then it reads its input. It announces each phase so
+  // the test can order Pi's frames and keys against that window.
+  const EDITOR = `
+import fs from 'node:fs';
+
+const logPath = '__EDITOR_LOG__';
+const log = (line) => { try { fs.appendFileSync(logPath, line + '\\n'); } catch {} };
+const listenPath = process.env.PTY_LISTEN;
+const releasePath = process.env.PTY_RELEASE;
+let listening = false;
+
+process.stdin.setRawMode(true);
+process.stdout.write('\\x1b[2J\\x1b[H[stand-in editor]\\n');
+log('editor-up');
+
+const timer = setInterval(() => {
+  if (fs.existsSync(releasePath)) {
+    clearInterval(timer);
+    log('editor-end');
+    try { process.stdin.setRawMode(false); } catch {}
+    process.exit(0);
+    return;
+  }
+  if (fs.existsSync(listenPath) && !listening) {
+    listening = true;
+    log('editor-listen');
+    process.stdin.on('data', (chunk) => log('editor-input ' + JSON.stringify(chunk.toString('latin1'))));
+  }
+}, 20);
+`;
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function runScenario() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-odd-pty-')));
+    const extCopy = path.join(dir, 'gentle-worktree-tools.mjs');
+    fs.writeFileSync(extCopy, stubbed);
+    const harnessPath = path.join(dir, 'harness.mjs');
+    fs.writeFileSync(harnessPath, HARNESS);
+    const editorPath = path.join(dir, 'editor.mjs');
+    const logPath = path.join(dir, 'events.log');
+    fs.writeFileSync(editorPath, EDITOR.replace('__EDITOR_LOG__', logPath));
+    const listenPath = path.join(dir, 'listen');
+    const releasePath = path.join(dir, 'release');
+    const finishPath = path.join(dir, 'finish');
+    fs.writeFileSync(logPath, '');
+    const root = makeRepo({ tag: 'odd-pty', docs: { 'alpha.md': '# alpha\n\n## Specs\nS1. first rule\n' } });
+
+    const child = spawnChild('script', ['-q', '-e', '-c', `node ${harnessPath}`, '/dev/null'], {
+      cwd: dir,
+      detached: true,
+      env: {
+        ...process.env,
+        TERM: 'xterm-256color',
+        // `script(1)` runs its command through `$SHELL`. This machine's login
+        // shell re-applies its own universal VISUAL/EDITOR over the inherited
+        // environment, which would silently substitute the developer's real
+        // editor for the stand-in; a POSIX shell keeps the fixture exact.
+        SHELL: '/bin/sh',
+        GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+        PTY_LOG: logPath,
+        PTY_EXT: extCopy,
+        PTY_TUI: TUI_ENTRY,
+        PTY_REPO: root,
+        PTY_LISTEN: listenPath,
+        PTY_RELEASE: releasePath,
+        PTY_FINISH: finishPath,
+        VISUAL: `node ${editorPath}`,
+        EDITOR: '',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // The PTY's screen output is not asserted (the event log is), but it must
+    // be drained: a full pipe would block `script` and stop forwarding input.
+    child.stdout.resume();
+    child.stderr.resume();
+    const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+
+    const transcript = () => {
+      const text = fs.readFileSync(logPath, 'utf8');
+      return text === '' ? [] : text.replace(/\n$/, '').split('\n');
+    };
+    const waitFor = async (needle, timeoutMs = 8000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (transcript().includes(needle)) return true;
+        await sleep(25);
+      }
+      return false;
+    };
+    const send = (data) => {
+      try { child.stdin.write(data); } catch { /* the group is being torn down */ }
+    };
+
+    try {
+      // First `o`: Pi runs the command and mounts the reader, exactly like the
+      // `/herdr-gentle:odd` command does. Second `o`: the reader's own open key.
+      send('o');
+      assert.ok(await waitFor('view-open'), `the odd overlay opens in the PTY session: ${transcript().join(' | ')}`);
+      await sleep(200);
+      send('o');
+      assert.ok(await waitFor('editor-up'), `o hands the terminal to the editor: ${transcript().join(' | ')}`);
+      // A keystroke the open viewer would act on (it flips the list order and
+      // repaints). While the editor owns the terminal it must reach nobody.
+      send('s');
+      await sleep(400);
+      send('s');
+      fs.writeFileSync(listenPath, '');
+      assert.ok(await waitFor('editor-listen'), `the editor starts reading its input: ${transcript().join(' | ')}`);
+      send('\x1b');
+      await sleep(120);
+      send('\x1b');
+      await sleep(400);
+      fs.writeFileSync(releasePath, '');
+      assert.ok(await waitFor('editor-end'), `the editor exits when it is done: ${transcript().join(' | ')}`);
+      await sleep(500);
+      send('\x1b');
+      await waitFor('view-closed null', 4000);
+      fs.writeFileSync(finishPath, '');
+      const result = await Promise.race([exited, sleep(8000).then(() => ({ code: 'timeout' }))]);
+      const lines = transcript();
+      assert.equal(result.code, 0, `the PTY session ends cleanly (${result.code}/${result.signal}): ${lines.join(' | ')}`);
+
+      const start = lines.indexOf('editor-up');
+      const end = lines.indexOf('editor-end');
+      assert.ok(start >= 0 && end > start, `the editor window is recorded: ${lines.join(' | ')}`);
+      const window = lines.slice(start + 1, end);
+      assert.deepEqual(
+        window.filter((line) => line.startsWith('tui-write')),
+        [],
+        `Pi paints nothing while the editor owns the terminal: ${window.join(' | ')}`,
+      );
+      assert.deepEqual(
+        window.filter((line) => line.startsWith('view-input')),
+        [],
+        `Pi reads no input while the editor owns the terminal: ${window.join(' | ')}`,
+      );
+      assert.ok(
+        !window.some((line) => line.startsWith('view-closed')),
+        `Escape did not close the overlay behind the editor: ${window.join(' | ')}`,
+      );
+      assert.ok(
+        lines.slice(end).some((line) => line.startsWith('tui-write')),
+        `the TUI is re-armed after the editor exits: ${lines.join(' | ')}`,
+      );
+      const typed = lines.filter((line) => line.startsWith('editor-input')).join('');
+      const escapes = (typed.match(/\\u001b/g) || []).length;
+      assert.ok(escapes >= 2, `the editor owns Escape instead of Pi (${escapes} seen): ${lines.join(' | ')}`);
+      const closedAt = lines.indexOf('view-closed null');
+      assert.ok(closedAt > end, `Escape still closes the view after the editor exits: ${lines.join(' | ')}`);
+      assert.deepEqual(lines.filter((line) => line.startsWith('notify')), [], 'opening and closing notify nothing');
+    } finally {
+      // Releases the harness even when an assertion above already failed, so
+      // no scenario leaves a child holding the PTY.
+      try { fs.writeFileSync(finishPath, ''); } catch { /* already written */ }
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      try { child.stdin.destroy(); } catch { /* best effort */ }
+      await Promise.race([exited, sleep(1000)]);
+    }
+  }
+
+  test('the editor keeps the terminal, and Escape closes the view only afterwards', { skip: SKIP }, async () => {
+    await runScenario();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S21 («se traba a veces» / «se demora mucho en cargar»): /odd is an
+// INTERACTIVE path, so the command must never read the checkout through a
+// `spawnSync` listing before the overlay exists. The open paints the cheap
+// local scan at once, the git-ranked order is awaited OFF the event loop and
+// applied to the live view when it lands, and `r` re-lists the same way.
+//
+// The listing is injected at the module boundary the command requires
+// (`lib/odd-docs.js`, reached through GENTLE_WORKTREE_LIB_DIR), so a slow
+// history walk is simulated DETERMINISTICALLY: nothing here waits on a real
+// sleeping git, and no assertion depends on machine speed.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd interactive listing (S21)', () => {
+  const oddDocsLib = require('../lib/odd-docs.js');
+
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  async function waitFor(predicate, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (predicate()) return true;
+      if (Date.now() > deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  // Replace the async listing for the duration of one test: each call takes
+  // the next response (a promise to wait on, or a settled listing).
+  function stubAsyncListing(responses) {
+    const original = oddDocsLib.listOddDocsAsync;
+    const calls = [];
+    oddDocsLib.listOddDocsAsync = (root) => {
+      calls.push(root);
+      const next = responses.length > 0 ? responses.shift() : Promise.resolve({ ok: true, docs: [] });
+      return next;
+    };
+    return { calls, restore: () => { oddDocsLib.listOddDocsAsync = original; } };
+  }
+
+  function docEntry(root, name, body) {
+    return { name, file: `${name}.md`, path: path.join(root, 'odd', 'tasks', `${name}.md`), body };
+  }
+
+  const plain = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+
+  test('the overlay opens from the local scan and takes the git order when it lands', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({
+      docs: {
+        'alpha.md': '# settings\n\nS1. shared rule\n',
+        'beta.md': '# notes\n\nS2. unique note\n',
+      },
+    });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    const settle = deferred();
+    const listing = stubAsyncListing([settle.promise]);
+    try {
+      let component = null;
+      const { ctx, customs } = makeCtx({
+        cwd: root,
+        customImpl: async (factory) => {
+          component = openComponent(factory, host).component;
+          return null;
+        },
+      });
+      await def.handler('', ctx);
+      assert.equal(customs.length, 1, 'the overlay opens without waiting for the history walk');
+      assert.equal(listing.calls.length, 1, 'the git-ranked listing is started for the open view');
+      const frame = () => plain(component.render(80).join('\n'));
+      const first = frame();
+      assert.equal(first.indexOf('beta') < first.indexOf('alpha'), true, 'the cheap scan order paints first');
+      assert.match(first, /S2\. unique note/, 'the focused document is already readable in that first frame');
+
+      // The ranked answer arrives: alpha was committed last, so it moves up.
+      settle.resolve({ ok: true, docs: [docEntry(root, 'alpha'), docEntry(root, 'beta')] });
+      const settled = await waitFor(() => frame().indexOf('alpha') < frame().indexOf('beta'));
+      assert.equal(settled, true, 'the git-ranked order replaces the cheap one');
+      const after = frame();
+      assert.match(after, /S2\. unique note/, 'the reader keeps reading the same document across the settle');
+      assert.match(after, /✎ Odd · 2 documents/, 'no document is lost while the order settles');
+    } finally {
+      listing.restore();
+    }
+  });
+
+  test('the command never reads the checkout through the synchronous listing', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n\nS1. first rule\n' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    const original = oddDocsLib.listOddDocs;
+    oddDocsLib.listOddDocs = () => { throw new Error('the interactive path must not spawnSync a listing'); };
+    try {
+      let component = null;
+      const { ctx, notes } = makeCtx({
+        cwd: root,
+        customImpl: async (factory) => {
+          component = openComponent(factory, host).component;
+          return null;
+        },
+      });
+      await def.handler('', ctx);
+      assert.ok(component, 'the overlay still opens over the checkout');
+      assert.match(plain(component.render(80).join('\n')), /alpha/, 'and it lists the document');
+      assert.deepEqual(notes, [], 'nothing was reported as unreadable');
+    } finally {
+      oddDocsLib.listOddDocs = original;
+    }
+  });
+
+  test('r re-lists through the asynchronous listing and reports it once it lands', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n\nS1. first rule\n' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    const opened = { ok: true, docs: oddDocsLib.listOddDocs(root).docs };
+    const reloaded = deferred();
+    const listing = stubAsyncListing([Promise.resolve(opened), reloaded.promise]);
+    try {
+      let component = null;
+      const { ctx } = makeCtx({
+        cwd: root,
+        customImpl: async (factory) => {
+          component = openComponent(factory, host).component;
+          return null;
+        },
+      });
+      await def.handler('', ctx);
+      const frame = () => plain(component.render(80).join('\n'));
+      assert.match(frame(), /✎ Odd · 1 documents/, 'the view opens over the one document');
+
+      component.handleInput('r');
+      // The press returns at once: the reload is awaited, never a blocking read
+      // inside the key handler, and no outcome is claimed before it answers.
+      assert.ok(!frame().includes('zeta'), 'the reload has not landed yet');
+      assert.ok(!/r reloaded/.test(frame()), 'and the footer does not claim it did');
+
+      reloaded.resolve({ ok: true, docs: [docEntry(root, 'alpha'), docEntry(root, 'zeta')] });
+      const done = await waitFor(() => /r reloaded/.test(frame()));
+      assert.equal(done, true, 'the footer reports the reload once the listing answers');
+      const after = frame();
+      assert.match(after, /2 documents/, 'r re-lists through the asynchronous listing');
+      assert.match(after, /zeta/, 'the document the listing returned appears');
+    } finally {
+      listing.restore();
+    }
+  });
+
+  test('a checkout without documents answers from the local scan and starts no listing', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: {} });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(12);
+    const listing = stubAsyncListing([Promise.resolve({ ok: true, docs: [docEntry(root, 'ghost')] })]);
+    try {
+      const { ctx, customs, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+      await def.handler('', ctx);
+      assert.equal(customs.length, 0, 'no overlay when there is nothing to read');
+      assert.deepEqual(listing.calls, [], 'nothing to rank, so no history walk is started at all');
+      assert.deepEqual(notes, [['No odd documents under odd/tasks/ in this checkout.', 'info']], 'the same one line as before');
+    } finally {
+      listing.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ODD command is one of the three "Plugin tools" toggles. It gates the
+// COMMAND only: the automatic ODD capture (the tool_call/tool_result observers
+// that name a session) keeps running whether the command is on or off, and a
+// runtime that could not be reloaded still refuses the invocation.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd Plugin tools toggle', { concurrency: false }, () => {
+  function pluginTools(state) {
+    const fsx = fs;
+    fsx.writeFileSync(
+      path.join(process.env.GENTLE_STATUS_STATE_DIR, 'gentle-plugin-tools.json'),
+      `${JSON.stringify({ version: 1, ...state })}\n`,
+    );
+  }
+
+  test('a disabled ODD command registers no command but keeps the automatic capture', async () => {
+    pluginTools({ odd: false, issues: true });
+    const { commands, handlers } = await loadExtension();
+    assert.ok(!commands.has('herdr-gentle:odd'), 'the disabled command is not registered');
+    assert.ok(commands.has('herdr-gentle:customize'), 'the panel stays registered so it can be flipped back');
+    assert.ok(handlers.get('tool_call').length > 0, 'automatic capture still observes tool calls');
+    assert.ok(handlers.get('tool_result').length > 0, 'automatic capture still observes tool results');
+    // Restore the shared default the rest of the file relies on.
+    pluginTools({ odd: true, issues: true });
+  });
+
+  test('a disabled command invoked through a stale runtime refuses and opens nothing', async () => {
+    pluginTools({ odd: true, issues: true });
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    assert.ok(def, 'registered at load while enabled');
+    pluginTools({ odd: false, issues: true });
+    const root = makeRepo({ docs: { alpha: '# Alpha' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const { ctx, customs, selects, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+    await def.handler('', ctx);
+    assert.equal(customs.length, 0, 'no overlay');
+    assert.deepEqual(selects, [], 'no fallback menu either');
+    assert.deepEqual(notes, [[
+      'odd command is disabled; open /herdr-gentle:customize and apply the Plugin tools ODD command toggle to enable it',
+      'error',
+    ]]);
+    pluginTools({ odd: true, issues: true });
   });
 });

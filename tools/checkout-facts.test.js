@@ -46,21 +46,55 @@ function git(cwd, args) {
   return (result.stdout || '').trim();
 }
 
+function gitAt(cwd, args, iso) {
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'C', GIT_AUTHOR_DATE: iso, GIT_COMMITTER_DATE: iso },
+  });
+  assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
+  return (result.stdout || '').trim();
+}
+
 function slug(text) {
   return String(text).replace(/[^a-z0-9]+/gi, '-');
 }
 
-// Principal checkout with one commit on `defaultBranch`.
-function makeRepo(tag, defaultBranch = 'main') {
+// An initialized repository with NO commit: git records no beginning yet.
+function makeEmptyRepo(tag, defaultBranch = 'main') {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `checkout-facts-${slug(tag)}-`)));
   git(dir, ['init', '-b', defaultBranch]);
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['config', 'commit.gpgsign', 'false']);
+  return fs.realpathSync(dir);
+}
+
+// Principal checkout with one commit on `defaultBranch`.
+function makeRepo(tag, defaultBranch = 'main') {
+  const dir = makeEmptyRepo(tag, defaultBranch);
   fs.writeFileSync(path.join(dir, 'base.txt'), 'base\n');
   git(dir, ['add', '.']);
   git(dir, ['commit', '-m', 'init']);
-  return fs.realpathSync(dir);
+  return dir;
+}
+
+// A principal whose history carries TWO root commits (an unrelated branch
+// merged in), the older one dated 2020-01-01.
+function makeTwoRootRepo(tag) {
+  const root = makeRepo(tag);
+  git(root, ['checkout', '--orphan', 'side']);
+  git(root, ['rm', '-rf', '.']);
+  gitAt(root, ['commit', '--allow-empty', '-m', 'side root'], '2020-01-01T00:00:00Z');
+  git(root, ['checkout', 'main']);
+  gitAt(root, ['merge', '--allow-unrelated-histories', '--no-ff', '-m', 'merge side', 'side'], '2022-01-01T00:00:00Z');
+  return root;
+}
+
+// The EARLIEST root-commit timestamp of a checkout, read with git itself.
+function rootCommitsMs(cwd) {
+  return Math.min(...git(cwd, ['log', '--max-parents=0', '--format=%ct', 'HEAD'])
+    .split('\n').map((line) => Number(line.trim()) * 1000));
 }
 
 // Linked worktree on a new branch cut from the principal's HEAD.
@@ -94,6 +128,29 @@ function makeFacts(root, extra = {}) {
   });
 }
 
+// Deterministic async control for the listing seam: the test decides WHEN a
+// listing settles, so coalescing and ownership are asserted by call counts
+// instead of wall-clock thresholds.
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+// Drain pending microtasks/timers until `predicate` holds, without assuming a
+// duration: only the number of yields is bounded, never a speed claim.
+async function until(predicate, label) {
+  for (let i = 0; i < 200; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.fail(`never observed: ${label}`);
+}
+
 function countingRunner() {
   const calls = [];
   return {
@@ -105,6 +162,9 @@ function countingRunner() {
   };
 }
 
+// A LEGACY registry row: it still stores an issue association and ONE odd
+// document, which S1 preserves as stored data while the public facts payload
+// carries no association field at all.
 const fullRow = (wtPath, branch) => ({
   branch,
   path: wtPath,
@@ -132,6 +192,45 @@ describe('worktree-git lastCommitTime', { concurrency: false }, () => {
     assert.equal(result.ok, false);
     assert.equal(typeof result.error, 'string');
     assert.equal(result.timestampMs, undefined);
+  });
+});
+
+describe('worktree-git firstCommitTime', { concurrency: false }, () => {
+  test('reads the root commit timestamp, not the last commit', async () => {
+    const root = makeRepo('first-commit');
+    const rootMs = rootCommitsMs(root);
+    // Dated explicitly so the two timestamps cannot collide by sharing a second.
+    gitAt(root, ['commit', '--allow-empty', '-m', 'second'], '2022-06-01T00:00:00Z');
+    const result = await gitLib.firstCommitTime(root);
+    assert.equal(result.ok, true);
+    assert.equal(result.timestampMs, rootMs);
+    assert.equal(result.committedAt, new Date(result.timestampMs).toISOString());
+    assert.notEqual(result.timestampMs, Number(git(root, ['log', '-1', '--format=%ct'])) * 1000);
+  });
+
+  test('several root commits answer the earliest one deterministically', async () => {
+    const root = makeTwoRootRepo('first-commit-multi');
+    assert.equal(git(root, ['rev-list', '--max-parents=0', 'HEAD']).split('\n').length, 2,
+      'the fixture really carries two root commits');
+    const result = await gitLib.firstCommitTime(root);
+    assert.equal(result.ok, true);
+    assert.equal(result.timestampMs, Date.parse('2020-01-01T00:00:00Z'));
+  });
+
+  test('never throws on a directory that is not a checkout', async () => {
+    const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-firstcommit-')));
+    const result = await gitLib.firstCommitTime(notRepo);
+    assert.equal(result.ok, false);
+    assert.equal(typeof result.error, 'string');
+    assert.equal(result.timestampMs, undefined);
+  });
+
+  test('a repository with no commit is an error, never a zero time', async () => {
+    const empty = makeEmptyRepo('first-commit-empty');
+    const result = await gitLib.firstCommitTime(empty);
+    assert.equal(result.ok, false);
+    assert.equal(result.timestampMs, undefined);
+    assert.match(result.error, /first commit/i);
   });
 });
 
@@ -201,6 +300,46 @@ describe('worktree-git listWorktrees (unchanged behaviour)', { concurrency: fals
   });
 });
 
+// T17/S23: the async twin an interactive path uses so a repository listing
+// never blocks the host event loop. Same fixed argv, same parser, same
+// entries as the sync API — a faster path may not answer differently.
+describe('worktree-git listWorktreesAsync (T17)', { concurrency: false }, () => {
+  test('lists the principal, linked and detached checkouts exactly like the sync API', async () => {
+    const root = makeRepo('async-listing');
+    const linked = addWorktree(root, 'feat/async-listing');
+    const detached = fs.realpathSync(track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-wt-detached-'))));
+    git(root, ['worktree', 'add', '--detach', detached, 'HEAD']);
+    const listed = await gitLib.listWorktreesAsync(root);
+    assert.deepEqual(listed, gitLib.listWorktrees(root));
+    // Order is git's business, identity is the contract: compare per path.
+    const byPath = new Map(listed.map((entry) => [path.resolve(entry.path), entry]));
+    assert.equal(byPath.size, 3);
+    for (const [entryPath, branch, isDetached] of [
+      [root, 'main', false],
+      [linked, 'feat/async-listing', false],
+      [detached, null, true],
+    ]) {
+      const entry = byPath.get(entryPath);
+      assert.ok(entry, `missing listing entry for ${entryPath}`);
+      assert.equal(entry.branch, branch);
+      assert.equal(entry.detached, isDetached);
+      assert.equal(entry.bare, false);
+      assert.match(entry.head, /^[0-9a-f]{40}$/);
+    }
+  });
+
+  test('a directory that is not a repository rejects with the same message', async () => {
+    const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-notrepo-async-')));
+    await assert.rejects(() => gitLib.listWorktreesAsync(notRepo), /git worktree list failed/);
+  });
+
+  test('a blown-up runner resolves as an error, never as an empty listing', async () => {
+    const root = makeRepo('async-listing-error');
+    const runAsync = async () => ({ status: null, stdout: '', stderr: '', error: 'spawn unavailable' });
+    await assert.rejects(() => gitLib.listWorktreesAsync(root, { runAsync }), /git worktree list failed/);
+  });
+});
+
 describe('checkout-facts', { concurrency: false }, () => {
   test('a fresh worktree reports its branch, base, zero changes and zero ahead/behind', async () => {
     const root = makeRepo('fresh');
@@ -218,8 +357,13 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.deepEqual(got.aheadBehind.value, {
       ahead: 0, behind: 0, base: 'main', baseSource: 'conventional',
     });
-    assert.deepEqual(got.issues, { available: true, value: ['#12', '#31'], reason: null });
-    assert.deepEqual(got.odd, { available: true, value: ['odd/tasks/warp-popup.md'], reason: null });
+    // S1: a worktree receives no issue and no ODD document, so neither field
+    // reaches the payload even though the registry row still stores both.
+    assert.equal('issues' in got, false, 'no issue association reaches the payload');
+    assert.equal('odd' in got, false, 'no ODD association reaches the payload');
+    assert.deepEqual(Object.keys(got).sort(), [
+      'aheadBehind', 'branch', 'cached', 'changes', 'checkout', 'createdAt', 'fetchedAt', 'lastActivity',
+    ], 'the payload is exactly the facts the selector renders');
     assert.deepEqual(got.createdAt, { available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry' });
     const commitMs = Number(git(wt, ['log', '-1', '--format=%ct'])) * 1000;
     assert.deepEqual(got.lastActivity, {
@@ -317,8 +461,9 @@ describe('checkout-facts', { concurrency: false }, () => {
     const root = makeRepo('unreadable');
     const broken = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-broken-')));
     fs.writeFileSync(path.join(broken, 'file.txt'), 'x\n');
-    // A registry row exists for this path, so the failure must be scoped:
-    // the registry facts stay available while the git facts go unavailable.
+    // A registry row exists for this path, so the failure must be scoped: the
+    // git facts go unavailable while the registry-sourced creation and every
+    // other fact keep their own answer.
     writeRow(root, fullRow(broken, 'feat/broken'));
     const got = await makeFacts(root).facts(broken);
     for (const field of ['branch', 'changes', 'aheadBehind', 'lastActivity']) {
@@ -327,19 +472,18 @@ describe('checkout-facts', { concurrency: false }, () => {
       assert.equal(typeof got[field].reason, 'string');
       assert.ok(got[field].reason.length > 0);
     }
-    assert.deepEqual(got.issues, { available: true, value: ['#12', '#31'], reason: null });
+    assert.deepEqual(got.createdAt, { available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry' });
+    assert.equal('issues' in got, false, 'a broken git read never brings an association back');
+    assert.equal('odd' in got, false);
   });
 
-  test('a checkout with no registry row reports issues/odd unavailable and createdAt from the birth time', async () => {
+  test('a checkout with no registry row reports createdAt from the birth time, never an association', async () => {
     const root = makeRepo('no-row');
     const wt = addWorktree(root, 'feat/no-row');
     const birth = 1_700_000_000_000;
     const got = await makeFacts(root, { fs: birthFs(birth) }).facts(wt);
-    for (const field of ['issues', 'odd']) {
-      assert.equal(got[field].available, false, `${field} must be unavailable`);
-      assert.equal(got[field].value, null, `${field} must not carry a value`);
-      assert.match(got[field].reason, /registry/i);
-    }
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
     assert.deepEqual(got.createdAt, {
       available: true, value: new Date(birth).toISOString(), reason: null, source: 'birthtime',
     });
@@ -349,15 +493,13 @@ describe('checkout-facts', { concurrency: false }, () => {
     assert.equal(got.aheadBehind.available, true);
   });
 
-  test('a malformed registry makes only the registry facts unavailable', async () => {
+  test('a malformed registry only makes the registry-sourced creation unavailable', async () => {
     const root = makeRepo('bad-row');
     const wt = addWorktree(root, 'feat/bad-row');
     fs.writeFileSync(path.join(root, '.git', 'pi-worktrees.json'), '{not json');
     const got = await makeFacts(root).facts(wt);
-    for (const field of ['issues', 'odd']) {
-      assert.equal(got[field].available, false);
-      assert.match(got[field].reason, /registry/i);
-    }
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
     // A malformed registry has no row, so the birth-time fallback answers.
     assert.equal(got.createdAt.available, true);
     assert.equal(got.createdAt.source, 'birthtime');
@@ -588,5 +730,486 @@ describe('checkout-facts', { concurrency: false }, () => {
     const diffCalls = runner.calls.filter((call) => call.includes('git diff')).length;
     assert.equal(diffCalls, 1, runner.calls.join('\n'));
     assert.equal(a.changes.value.files, b.changes.value.files);
+  });
+
+  // --- S12: honest created/modified per checkout KIND --------------------
+
+  test('the principal reports the git beginning as created, never its registration', async () => {
+    const root = makeRepo('principal-created');
+    // A registration time far from the history's beginning proves the
+    // principal's creation comes from git, not from its registry row.
+    writeRow(root, fullRow(root, 'main'));
+    commit(root, 'later work', { 'later.txt': 'l\n' });
+    const firstMs = rootCommitsMs(root);
+    const lastMs = Number(git(root, ['log', '-1', '--format=%ct', 'HEAD'])) * 1000;
+    const got = await makeFacts(root).facts(root);
+    assert.deepEqual(got.createdAt, {
+      available: true, value: new Date(firstMs).toISOString(), reason: null, source: 'root-commit',
+    });
+    assert.notEqual(got.createdAt.value, '2024-01-02T03:04:05.000Z', 'a registration time is never the creation');
+    assert.deepEqual(got.lastActivity, {
+      available: true, value: new Date(lastMs).toISOString(), reason: null, source: 'commit',
+    });
+    // The unrelated facts keep reporting this checkout's own data.
+    assert.deepEqual(got.branch, { available: true, value: 'main', reason: null, detached: false });
+    assert.equal(got.changes.value.files, 0);
+    assert.deepEqual(got.aheadBehind.value, { ahead: 0, behind: 0, base: 'main', baseSource: 'conventional' });
+  });
+
+  test('a principal whose history began twice still reports the earliest root commit', async () => {
+    const root = makeTwoRootRepo('principal-multi-root');
+    const got = await makeFacts(root).facts(root);
+    assert.deepEqual(got.createdAt, {
+      available: true, value: '2020-01-01T00:00:00.000Z', reason: null, source: 'root-commit',
+    });
+  });
+
+  test('the principal is the checkout git lists first, never the calling directory or its branch', async () => {
+    const root = makeRepo('principal-identity');
+    const wt = addWorktree(root, 'feat/principal-identity');
+    writeRow(root, fullRow(wt, 'feat/principal-identity'));
+    // Read from INSIDE the linked worktree: the principal is still the
+    // principal, because git lists the main worktree first.
+    const principal = await makeFacts(wt).facts(root);
+    assert.equal(principal.createdAt.source, 'root-commit', JSON.stringify(principal.createdAt));
+    // ...and the calling checkout itself keeps its own creation.
+    const linked = await makeFacts(wt).facts(wt);
+    assert.deepEqual(linked.createdAt, {
+      available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry',
+    });
+  });
+
+  test('a principal with no history reports an honest unavailable creation, never a birth time', async () => {
+    const root = makeEmptyRepo('principal-empty');
+    const got = await makeFacts(root, { fs: birthFs(1_700_000_000_000) }).facts(root);
+    assert.equal(got.createdAt.available, false, JSON.stringify(got.createdAt));
+    assert.equal(got.createdAt.value, null);
+    assert.equal(got.createdAt.source, null);
+    assert.match(got.createdAt.reason, /first commit/i);
+    assert.equal(got.lastActivity.available, false, JSON.stringify(got.lastActivity));
+    assert.equal(got.lastActivity.value, null);
+  });
+
+  test('a linked worktree with an unreadable registry createdAt still reports its directory birth time', async () => {
+    const root = makeRepo('created-row-invalid');
+    const wt = addWorktree(root, 'feat/created-row-invalid');
+    writeRow(root, { ...fullRow(wt, 'feat/created-row-invalid'), createdAt: 'sometime last week' });
+    const birth = 1_700_000_000_000;
+    const got = await makeFacts(root, { fs: birthFs(birth) }).facts(wt);
+    assert.deepEqual(got.createdAt, {
+      available: true, value: new Date(birth).toISOString(), reason: null, source: 'birthtime',
+    });
+  });
+
+  test('a linked worktree reports the newest uncommitted file as its modification', async () => {
+    const root = makeRepo('worktree-dirty-modified');
+    const wt = addWorktree(root, 'feat/worktree-dirty-modified');
+    writeRow(root, fullRow(wt, 'feat/worktree-dirty-modified'));
+    const commitMs = Number(git(wt, ['log', '-1', '--format=%ct'])) * 1000;
+    const dirty = path.join(wt, 'wip.txt');
+    fs.writeFileSync(dirty, 'wip\n');
+    // Pin the mtime past the commit so the assertion never depends on how
+    // fast the fixture ran.
+    const dirtyMs = commitMs + 3_600_000;
+    fs.utimesSync(dirty, new Date(dirtyMs), new Date(dirtyMs));
+    const got = await makeFacts(root).facts(wt);
+    assert.equal(got.lastActivity.source, 'dirty', JSON.stringify(got.lastActivity));
+    assert.equal(Date.parse(got.lastActivity.value), dirtyMs);
+  });
+
+  // S1: worktrees stopped receiving issues and ODD documents. Legacy registry
+  // rows still store both, and that data is preserved untouched — it is simply
+  // never read into the public facts payload.
+  test('legacy issue and ODD registry data is never read into the payload', async () => {
+    const root = makeRepo('legacy-association');
+    const wt = addWorktree(root, 'feat/legacy-association');
+    // A row whose association fields THROW when touched: the read path is
+    // gone, so building the facts must never reach either one.
+    const hostile = {
+      branch: 'feat/legacy-association',
+      path: wt,
+      thread: 'warp-popup',
+      createdAt: '2024-01-02T03:04:05.000Z',
+      get issues() {
+        throw new Error('the issues association must not be read');
+      },
+      get odd() {
+        throw new Error('the odd association must not be read');
+      },
+    };
+    const facts = makeFacts(root, { readRegistry: () => ({ ok: true, worktrees: [hostile] }) });
+    const got = await facts.facts(wt);
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
+    // The one fact the registry row legitimately owns still answers from it.
+    assert.deepEqual(got.createdAt, {
+      available: true, value: '2024-01-02T03:04:05.000Z', reason: null, source: 'registry',
+    });
+  });
+
+  // PRESERVE: the registry is only ever READ here. The legacy association data
+  // stays exactly as stored — no write, no migration, no erasure.
+  test('reading the facts leaves the stored registry row byte-identical', async () => {
+    const root = makeRepo('registry-preserved');
+    const wt = addWorktree(root, 'feat/registry-preserved');
+    writeRow(root, fullRow(wt, 'feat/registry-preserved'));
+    const registryFile = path.join(root, '.git', 'pi-worktrees.json');
+    const before = fs.readFileSync(registryFile);
+    const got = await makeFacts(root).facts(wt);
+    assert.deepEqual(fs.readFileSync(registryFile), before, 'the registry is never rewritten');
+    assert.equal('issues' in got, false);
+    assert.equal('odd' in got, false);
+    // ...and the legacy data is still there for whoever owns it now.
+    const stored = JSON.parse(fs.readFileSync(registryFile, 'utf8')).worktrees[0];
+    assert.deepEqual(stored.issues, ['#12', '#31']);
+    assert.deepEqual(stored.odd, ['odd/tasks/warp-popup.md']);
+  });
+
+  test('peek() never resurrects an association field from the cache', async () => {
+    const root = makeRepo('peek-no-association');
+    const wt = addWorktree(root, 'feat/peek-no-association');
+    writeRow(root, fullRow(wt, 'feat/peek-no-association'));
+    const facts = makeFacts(root);
+    await facts.facts(wt);
+    const shown = facts.peek(wt);
+    assert.equal('issues' in shown, false);
+    assert.equal('odd' in shown, false);
+    assert.equal(shown.branch.value, 'feat/peek-no-association');
+  });
+
+  // PRESERVE: an unusable path still answers every fact unavailable — and now
+  // that set carries no association field at all.
+  test('an unusable checkout path answers the same facts without any association field', async () => {
+    const root = makeRepo('empty-path');
+    for (const [given, reported] of [['', ''], [undefined, null]]) {
+      const got = await makeFacts(root).facts(given);
+      assert.equal(got.checkout, reported);
+      assert.equal('issues' in got, false);
+      assert.equal('odd' in got, false);
+      for (const field of ['branch', 'createdAt', 'lastActivity', 'changes', 'aheadBehind']) {
+        assert.equal(got[field].available, false, `${field} must be unavailable`);
+        assert.equal(got[field].value, null, `${field} must not carry a value`);
+        assert.equal(got[field].reason, 'checkout path is empty');
+      }
+    }
+  });
+});
+
+// T17/S23: the repository listing is ONE read while it is pending. Before
+// this, `Promise.all` over N checkouts ran N identical synchronous
+// `git worktree list` spawns, because each facts() call listed the repository
+// inline. The fix coalesces only the PENDING listing: nothing settles into a
+// long-lived cache, so a later read still asks git again.
+const gitEntry = (entryPath, branch) => ({
+  path: entryPath, branch, head: null, detached: false, bare: false,
+});
+
+// Isolate the LISTING: every other git read is stubbed, so a runner call can
+// only be the repository listing. That makes the count an exact statement
+// about coalescing instead of an incidental total.
+function listingOnlyFacts(root, extra = {}) {
+  return factsLib.createCheckoutFacts({
+    repoRoot: root,
+    ttlMs: 5000,
+    now: () => 1000,
+    summarize: async () => ({ ok: true, files: 0, added: 0, deleted: 0, binaryCount: 0, entries: [] }),
+    aheadBehind: async () => ({ ok: true, ahead: 0, behind: 0, base: 'main', baseSource: 'explicit' }),
+    lastCommit: async () => ({ ok: true, timestampMs: 1_700_000_000_000 }),
+    firstCommit: async () => ({ ok: true, timestampMs: 1_600_000_000_000 }),
+    ...extra,
+  });
+}
+
+describe('checkout-facts: one shared repository listing (T17, S23)', { concurrency: false }, () => {
+  test('three concurrent checkout facts list the repository once and keep their own branches', async () => {
+    const root = makeRepo('shared-listing');
+    const wtA = addWorktree(root, 'feat/shared-a');
+    const wtB = addWorktree(root, 'feat/shared-b');
+    const runner = countingRunner();
+    const facts = listingOnlyFacts(root, { runAsync: runner.runAsync });
+    const [principal, a, b] = await Promise.all([facts.facts(root), facts.facts(wtA), facts.facts(wtB)]);
+    assert.deepEqual(runner.calls, ['git worktree list --porcelain -z']);
+    assert.deepEqual(principal.branch, { available: true, value: 'main', reason: null, detached: false });
+    assert.equal(principal.createdAt.source, 'root-commit');
+    assert.deepEqual(a.branch, { available: true, value: 'feat/shared-a', reason: null, detached: false });
+    assert.deepEqual(b.branch, { available: true, value: 'feat/shared-b', reason: null, detached: false });
+  });
+
+  test('the default listing runs through the async runner, never the sync spawn', async () => {
+    const root = makeRepo('async-default-listing');
+    const runner = countingRunner();
+    const facts = listingOnlyFacts(root, { runAsync: runner.runAsync });
+    await facts.facts(root);
+    assert.deepEqual(runner.calls, ['git worktree list --porcelain -z']);
+  });
+
+  test('a later batch lists again instead of reusing a settled listing', async () => {
+    const root = makeRepo('renamed-branch');
+    const wt = addWorktree(root, 'feat/rename');
+    const runner = countingRunner();
+    let clock = 1000;
+    const facts = listingOnlyFacts(root, { runAsync: runner.runAsync, now: () => clock });
+    const first = await facts.facts(wt);
+    assert.equal(first.branch.value, 'feat/rename');
+    assert.deepEqual(runner.calls, ['git worktree list --porcelain -z']);
+    git(wt, ['branch', '-m', 'feat/renamed']);
+    clock += 5001; // past the per-checkout TTL, so this read is cold again
+    const second = await facts.facts(wt);
+    assert.equal(second.branch.value, 'feat/renamed');
+    assert.deepEqual(runner.calls, [
+      'git worktree list --porcelain -z',
+      'git worktree list --porcelain -z',
+    ]);
+  });
+
+  test('a failed listing is shared once, then retried by the next read', async () => {
+    const root = makeRepo('listing-retry');
+    const wtA = addWorktree(root, 'feat/retry-a');
+    const wtB = addWorktree(root, 'feat/retry-b');
+    const wtC = addWorktree(root, 'feat/retry-c');
+    let calls = 0;
+    const facts = listingOnlyFacts(root, {
+      listWorktrees: async (repo) => {
+        calls += 1;
+        if (calls === 1) throw new Error('listing exploded');
+        return gitLib.listWorktrees(repo);
+      },
+    });
+    const [a, b] = await Promise.all([facts.facts(wtA), facts.facts(wtB)]);
+    assert.equal(calls, 1, 'a pending rejection is shared, not retried per checkout');
+    for (const got of [a, b]) {
+      assert.equal(got.branch.available, false);
+      assert.equal(got.branch.value, null);
+      assert.match(got.branch.reason, /listing exploded/);
+    }
+    const retried = await facts.facts(wtC);
+    assert.equal(calls, 2, 'the rejected listing must not stay owned');
+    assert.deepEqual(retried.branch, { available: true, value: 'feat/retry-c', reason: null, detached: false });
+  });
+
+  // PRESERVE: the seam stays injectable as sync OR async, and the async
+  // default answers exactly what the previous synchronous path answered.
+  test('a synchronous listing override answers the same as the async default', async () => {
+    const root = makeRepo('sync-override');
+    const wt = addWorktree(root, 'feat/sync-override');
+    let calls = 0;
+    const injected = listingOnlyFacts(root, {
+      listWorktrees: (repo) => {
+        calls += 1;
+        return gitLib.listWorktrees(repo);
+      },
+    });
+    const [fromSync, fromDefault] = await Promise.all([injected.facts(wt), listingOnlyFacts(root).facts(wt)]);
+    assert.equal(calls, 1);
+    assert.deepEqual(fromSync, fromDefault);
+    assert.deepEqual(fromSync.branch, { available: true, value: 'feat/sync-override', reason: null, detached: false });
+  });
+
+  test('invalidating a pending listing cannot interfere with newer work', async () => {
+    const root = makeRepo('invalidate-pending');
+    const wtA = addWorktree(root, 'feat/invalidate-a');
+    const wtB = addWorktree(root, 'feat/invalidate-b');
+    const pending = [];
+    const facts = listingOnlyFacts(root, {
+      listWorktrees: () => {
+        const next = deferred();
+        pending.push(next);
+        return next.promise;
+      },
+    });
+    const firstRead = facts.facts(wtA);
+    await until(() => pending.length === 1, 'the first listing to be requested');
+    // A concurrent checkout of the SAME repository rides the pending listing.
+    const concurrentRead = facts.facts(wtB);
+    // Yields only, no timing claim: any listing the concurrent read starts is
+    // requested long before this loop ends.
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pending.length, 1, 'a concurrent checkout must share the pending listing');
+    // An invalidate() drops the PENDING listing too: a listing that began
+    // before the change it invalidated may not be served to a later read.
+    facts.invalidate(wtA);
+    const secondRead = facts.facts(wtA);
+    await until(() => pending.length === 2, 'the post-invalidate listing');
+    pending[1].resolve([gitEntry(root, 'main'), gitEntry(wtA, 'feat/fresh'), gitEntry(wtB, 'feat/invalidate-b')]);
+    const fresh = await secondRead;
+    assert.equal(fresh.branch.value, 'feat/fresh');
+    // The superseded reads still settle with their own (older) answer...
+    pending[0].resolve([gitEntry(root, 'main'), gitEntry(wtA, 'feat/stale'), gitEntry(wtB, 'feat/invalidate-b')]);
+    const stale = await firstRead;
+    assert.equal(stale.branch.value, 'feat/stale');
+    assert.equal((await concurrentRead).branch.value, 'feat/invalidate-b');
+    // ...without clearing the newer ownership or repopulating the cache.
+    assert.equal(facts.peek(wtA).branch.value, 'feat/fresh');
+    const again = await facts.facts(wtA);
+    assert.equal(again.branch.value, 'feat/fresh');
+    assert.equal(again.cached, true);
+    assert.equal(pending.length, 2, 'a cached read must not list again');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// worktree-issues S11: the warp rows load without freezing the host, and one
+// repository listing serves the whole read.
+//
+// "Warp data sometimes takes a long time to load" was measured, not guessed.
+// The child is slowed through PATH — a `git` shim that records its argv, sleeps
+// and then execs the real binary — so the SAME argv, stdout, status and error
+// shape reach the caller and only the wait changes. Two properties are then
+// observable:
+//
+//   * a 10 ms interval probe keeps ticking while the facts load. An awaited
+//     async child leaves the loop free; a `spawnSync` child freezes it for the
+//     child's whole lifetime, so the longest gap between two ticks exceeds the
+//     per-child delay as soon as ONE blocking child is on the path;
+//   * the children themselves are counted. The branch fact and the ahead/behind
+//     base both need `git worktree list`, and one listing per repository is
+//     enough for both.
+// ---------------------------------------------------------------------------
+
+// The real git binary, resolved BEFORE any shim takes over PATH: the fixture
+// itself must stay fast, so only the facts read is slowed.
+const REAL_GIT = String(spawnSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout || '').trim();
+const SLOW_CHILD_DELAY_MS = 120;
+// Generous against scheduler jitter and far below one slowed child, so exactly
+// the blocking read fails and nothing flaky does.
+const MAX_LOOP_GAP_MS = SLOW_CHILD_DELAY_MS / 2;
+
+function makeSlowGitShim(tag) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `checkout-facts-shim-${slug(tag)}-`)));
+  const log = path.join(dir, 'argv.log');
+  fs.writeFileSync(path.join(dir, 'git'), [
+    '#!/bin/sh',
+    `printf '%s\\n' "$*" >> ${JSON.stringify(log)}`,
+    `sleep ${(SLOW_CHILD_DELAY_MS / 1000).toFixed(3)}`,
+    `exec ${JSON.stringify(REAL_GIT)} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { dir, log };
+}
+
+function startTickProbe() {
+  const gaps = [];
+  let last = process.hrtime.bigint();
+  let ticks = 0;
+  const timer = setInterval(() => {
+    const now = process.hrtime.bigint();
+    gaps.push(Number(now - last) / 1e6);
+    last = now;
+    ticks += 1;
+  }, 10);
+  return {
+    stop() {
+      clearInterval(timer);
+      // The first gap spans the probe's start to its first tick, so a freeze
+      // that begins immediately shows up instead of being discarded.
+      return { ticks, maxGapMs: gaps.length === 0 ? 0 : Math.round(Math.max(...gaps)) };
+    },
+  };
+}
+
+describe('checkout-facts: the row read neither blocks the host nor repeats the listing (S11)', { concurrency: false }, () => {
+  test('three checkouts load on the async path with one repository listing', async () => {
+    const root = makeRepo('s11-async');
+    const wtA = addWorktree(root, 'feat/s11-a');
+    const wtB = addWorktree(root, 'feat/s11-b');
+    writeRow(root, fullRow(wtA, 'feat/s11-a'));
+    const shim = makeSlowGitShim('s11-async');
+    const facts = makeFacts(root);
+    // The warp command resolves the repository identity BEFORE the selector
+    // reads facts; that answer is what makes the synchronous registry lookup
+    // that follows a memo hit instead of a probe of its own.
+    await gitLib.repoIdentityAsync(root);
+
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${shim.dir}${path.delimiter}${savedPath}`;
+    let results;
+    let stats;
+    try {
+      const probe = startTickProbe();
+      results = await Promise.all([facts.facts(root), facts.facts(wtA), facts.facts(wtB)]);
+      stats = probe.stop();
+    } finally {
+      process.env.PATH = savedPath;
+    }
+
+    // The data is exactly what it always was: every fact of every row.
+    assert.deepEqual(results.map((got) => got.branch.value), ['main', 'feat/s11-a', 'feat/s11-b']);
+    for (const got of results) {
+      assert.equal(got.changes.available, true, JSON.stringify(got.changes));
+      assert.equal(got.changes.value.text, '0 files, +0/-0');
+      assert.deepEqual(got.aheadBehind.value, {
+        ahead: 0, behind: 0, base: 'main', baseSource: 'conventional',
+      });
+      assert.equal(typeof got.lastActivity.available, 'boolean', JSON.stringify(got.lastActivity));
+    }
+    // The principal and the registered worktree keep a readable activity time
+    // (the unregistered one is born after its only commit, which the fact
+    // honestly refuses to call activity — S8, unchanged).
+    assert.equal(results[0].lastActivity.source, 'commit');
+    assert.equal(results[1].lastActivity.source, 'commit');
+
+    // No blocking child on the path: every slowed child is awaited.
+    assert.ok(
+      stats.maxGapMs <= MAX_LOOP_GAP_MS,
+      `the facts read froze the host for ${stats.maxGapMs} ms over ${stats.ticks} probe ticks `
+      + `(one slowed child lasts ${SLOW_CHILD_DELAY_MS} ms)`,
+    );
+    assert.ok(stats.ticks >= 8, `the probe barely ran: ${stats.ticks} ticks`);
+    // One listing for the whole read: the branch fact and the ahead/behind
+    // base share it instead of each spawning its own.
+    const argv = fs.readFileSync(shim.log, 'utf8').split('\n').filter((line) => line.length > 0);
+    const listings = argv.filter((line) => line.startsWith('worktree list'));
+    assert.deepEqual(listings, ['worktree list --porcelain -z'], `children: ${argv.join('\n')}`);
+  });
+
+  test('the checkout identity is read through the async runner, never a blocking spawn', async () => {
+    const root = makeRepo('s11-identity');
+    const wt = addWorktree(root, 'feat/s11-identity');
+    writeRow(root, fullRow(wt, 'feat/s11-identity'));
+    const runner = countingRunner();
+    const facts = factsLib.createCheckoutFacts({
+      repoRoot: root, runAsync: runner.runAsync, ttlMs: 5000, now: () => 1000,
+    });
+    const got = await facts.facts(wt);
+    // The summary resolves the repository root, so the identity that used to be
+    // a `spawnSync` pair per checkout now rides the injected runner.
+    assert.ok(
+      runner.calls.includes('git rev-parse --show-toplevel'),
+      `the identity read never reached the async runner: ${runner.calls.join('\n')}`,
+    );
+    assert.equal(got.changes.available, true, JSON.stringify(got.changes));
+    assert.equal(got.changes.value.text, '0 files, +0/-0');
+    assert.deepEqual(got.aheadBehind.value, {
+      ahead: 0, behind: 0, base: 'main', baseSource: 'conventional',
+    });
+  });
+
+  test('an unreadable identity leaves the same verdict the shared reader gave', async () => {
+    const root = makeRepo('s11-identity-fail');
+    const notRepo = track(fs.mkdtempSync(path.join(os.tmpdir(), 'checkout-facts-s11-nonrepo-')));
+    const shim = makeSlowGitShim('s11-identity-fail');
+    const savedPath = process.env.PATH;
+    const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+    process.env.PATH = `${shim.dir}${path.delimiter}${savedPath}`;
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    try {
+      // The identity seam answers asynchronously, then fails: the change summary
+      // must still report the checkout's own unreadable-change verdict and keep
+      // the other facts intact, never a zero and never a throw.
+      const facts = makeFacts(root, {
+        repoIdentity: async () => {
+          throw new Error(`not a git repository: ${notRepo}`);
+        },
+      });
+      const got = await facts.facts(notRepo);
+      assert.equal(got.changes.available, false, JSON.stringify(got.changes));
+      assert.equal(got.changes.value, null);
+      assert.match(got.changes.reason, /not a git repository/);
+      assert.equal(got.lastActivity.available, false, JSON.stringify(got.lastActivity));
+    } finally {
+      process.env.PATH = savedPath;
+      if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+    }
   });
 });

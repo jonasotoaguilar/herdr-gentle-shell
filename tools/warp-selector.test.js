@@ -108,7 +108,7 @@ function resetYolo() {
   yoloResponder = null;
 }
 
-async function loadExtension() {
+async function loadExtension({ sendUserMessage } = {}) {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-ext-')));
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
@@ -119,6 +119,7 @@ async function loadExtension() {
     registerCommand: (name, def) => { commands.set(name, def); },
     registerMessageRenderer: () => {},
     on: () => () => {},
+    ...(sendUserMessage ? { sendUserMessage } : {}),
     events: {
       emit: (channel, payload) => {
         if (typeof yoloResponder === 'function') yoloResponder(channel, payload);
@@ -189,7 +190,7 @@ describe('/herdr-gentle:warp outside a Git checkout (S11)', { concurrency: false
     });
     try {
       const outside = plainDir('tool-outside');
-      const { tools } = await loadExtension();
+      const { tools } = await loadExtension({ sendUserMessage: () => { throw new Error('must not dispatch outside a repository'); } });
       const tool = tools.get('worktree_warp');
       assert.ok(tool, 'expected worktree_warp to be registered');
       const switched = [];
@@ -246,9 +247,18 @@ function addRegisteredWorktree(root, branch) {
   track(target);
   git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
   const real = fs.realpathSync(target);
-  const upserted = registryLib.upsertWorktree(root, { branch, path: real, thread: 'thread-1', issues: [], odd: [] });
+  const upserted = registryLib.upsertWorktree(root, { branch, path: real, thread: 'thread-1', issues: [], odd: null });
   assert.equal(upserted.ok, true, `registry upsert failed: ${upserted.error}`);
   return real;
+}
+
+// S4 (round 3): these repositories are created with `git init`, whose default
+// branch is `master`, so the deletion prompt's ahead-of-MAIN read has no base
+// to compare with. A test that creates `main` here pins a KNOWN ahead count
+// (0 unless the target gained commits); a test that omits it is deliberately
+// the "main missing" case whose evidence must read as unknown, never as 0.
+function addMainBranch(root) {
+  git(root, ['branch', 'main', 'HEAD']);
 }
 
 // SessionManager double: the warp resolves the class from the instance's own
@@ -418,12 +428,17 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       await warpDef(commands).handler('', built.ctx);
       assert.equal(built.customs.length, 1, 'the popup mounted once');
       const options = built.customs[0];
-      assert.equal(options.overlay, true, 'the popup is an overlay');
-      assert.equal(options.overlayOptions.anchor, 'center');
-      assert.ok(options.overlayOptions.maxHeight >= 10, 'the overlay gives the popup its 10 rows');
-      assert.match(rendered, /Warp/, 'the popup title renders');
-      assert.match(rendered, /current:/, 'the current checkout renders');
-      assert.match(rendered, /create a worktree/, 'the create row renders');
+      assert.equal(options.overlay, true, 'the panel is an overlay');
+      // T3/S3-S4: a bottom panel, not a centred popup box. Its height is the
+      // view's own content, so no maxHeight and no minimum width are pinned.
+      assert.equal(options.overlayOptions.anchor, 'bottom-center');
+      assert.equal(options.overlayOptions.width, '100%');
+      assert.equal(options.overlayOptions.margin, 0);
+      assert.equal(options.overlayOptions.minWidth, undefined, 'full width needs no minimum');
+      assert.equal(options.overlayOptions.maxHeight, undefined, 'the panel computes its own height');
+      assert.match(rendered, /Warp/, 'the panel title renders');
+      assert.match(rendered, /feat-one/, 'the registered worktree renders as a row');
+      assert.ok(!rendered.includes('create a worktree'), 'S6: creation is a hotkey, not a row');
       assert.deepEqual(built.notes, [], 'Esc is silent');
     } finally {
       restoreEnv();
@@ -438,7 +453,7 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['\x1b[B', '\r']); // down past create, enter
+      const driver = selectorDriver(['\r']); // enter on the first (only) worktree row
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: driver.mount });
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
@@ -457,35 +472,136 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('wired-create-open');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['\r']); // enter on the create row
+      const driver = selectorDriver(['c']); // S6: the create hotkey
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: driver.mount });
       const { commands } = await loadExtension();
       await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.customs.length, 2, 'the selector then the create panel mounted');
+      // S7: `esc` on the create panel cancels the CREATION and hands the
+      // selector back, so the flow mounts the selector, the create panel, then
+      // the selector again — closing that one is what ends it.
+      assert.equal(built.customs.length, 3, 'the selector, the create panel, then the selector again');
       assert.equal(built.customs[1].overlay, true, 'the create panel is an overlay too');
+      assert.equal(built.customs[2].overlay, true, 'the returned selector is the same bottom overlay');
       assert.ok(!built.notes.some(([message]) => /nothing was created/.test(message)), 'no create failure');
     } finally {
       restoreEnv();
     }
   });
 
-  test("the panel payload reaches the existing creation path: the branch is created, registered and warped into", async () => {
+  // S7: creation is CREATION. The panel payload still reaches the one
+  // creation path (same branch, same registry row), and then the SELECTOR
+  // comes back with a fresh listing so the human picks any checkout —
+  // including the one just created. Nothing warps on its own any more: the
+  // created checkout is a row, never an automatic move.
+  test('the panel payload creates the branch and the selector comes back with it selectable (S7)', async () => {
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
     try {
       const root = makeRepo('wired-create-run');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
       const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
-      const { commands, mod } = await loadExtension();
-      // Deterministic sources: no `gh`, no filesystem scan.
-      mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: [] }));
-      mod.setWarpCreateOddLister(() => []);
+      const { commands } = await loadExtension();
+      let mounts = 0;
+      let returnedSelector = null;
+      let switchesAfterCreation = null;
+      built.ctx.ui.custom = async (factory, options) => {
+        mounts += 1;
+        built.customs.push(options);
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+          const done = (value) => { clearTimeout(timer); resolve(value); };
+          let view;
+          try {
+            view = factory(hostTui, plainTheme, {}, done);
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+          }
+          const drive = () => {
+            try {
+              if (mounts === 1) {
+                view.handleInput('c'); // S6: the create hotkey
+                return;
+              }
+              if (mounts === 2) {
+                view.handleInput('\x1b[B'); // the inline type list moves to Bug fix
+                view.handleInput('\x1b[A'); // and back to Feature, the expected type
+                view.handleInput('\t'); // Tab hands the flow to the name field
+                for (const char of 'panel-change') view.handleInput(char);
+                view.handleInput('enter'); // enter creates
+                return;
+              }
+              // S7: the SELECTOR is back — nothing has been warped yet.
+              returnedSelector = view;
+              switchesAfterCreation = built.switches.length;
+              const others = view.state.checkouts.filter((entry) => entry.path !== root);
+              const at = others.findIndex((entry) => entry.name === 'feat-panel-change');
+              assert.ok(at >= 0, `the created checkout is a selectable row (${JSON.stringify(others.map((e) => e.name))})`);
+              for (let step = 0; step < at; step += 1) view.handleInput('\x1b[B');
+              view.handleInput('\r'); // now the human chooses it
+            } catch (err) {
+              clearTimeout(timer);
+              reject(err);
+            }
+          };
+          if (mounts === 1) drive();
+          else tick().then(drive);
+        });
+      };
+      await warpDef(commands).handler('', built.ctx);
+      const rows = registryLib.readRegistry(root).worktrees;
+      const created = rows.find((row) => row.branch === 'feat/panel-change');
+      assert.ok(created, `the payload branch was created and registered (${JSON.stringify(rows)})`);
+      assert.equal(created.thread, 'wired-thread');
+      assert.deepEqual(created.issues, [], 'S6: a created row carries no issue association');
+      assert.equal(created.odd, null, 'S6: a created row carries no odd association');
+      // S7: the panel closed into the selector, not into a warp.
+      assert.equal(mounts, 3, 'the selector mounted again after the creation panel closed');
+      assert.ok(returnedSelector !== null, 'the returning surface is the warp selector');
+      assert.equal(switchesAfterCreation, 0, 'S7: creating never warps by itself');
+      // ...and the human picking that row is the ONE warp of this flow.
+      assert.equal(built.switches.length, 1, 'the chosen checkout is where the session went');
+      assert.equal(calls[0][0], 'forkFrom', 'the first visit to a fresh checkout forks');
+      assert.equal(calls[0][2], created.path, 'the warp landed in the created checkout');
+      assert.deepEqual(built.notes, [], 'creating and warping are silent on success');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // S7: a REFUSED creation must say WHY. The create path answers a TOOL result
+  // (`{content:[{type:"text",text}], isError}`), not a warp failure (`{text}`),
+  // so reading `.text` off it notified `undefined` and the human saw no reason
+  // at all — the flow just closed. The refusal is reported in the create path's
+  // own words, the selector comes back, and nothing was created.
+  test('a refused creation reports the create path\'s own reason and mutates nothing (S7)', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-refused');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      // The canonical target of the branch the panel derives is occupied by a
+      // FILE: the occupancy guard refuses before any branch or registry write.
+      const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-occupied-change');
+      track(target);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, 'occupant\n');
+      const before = createdState(root);
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+      const { commands } = await loadExtension();
       let mounts = 0;
       built.ctx.ui.custom = async (factory, options) => {
         mounts += 1;
@@ -505,12 +621,16 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
           const drive = () => {
             try {
               if (mounts === 1) {
-                view.handleInput('\r'); // enter on the create row
+                view.handleInput('c'); // the create hotkey
                 return;
               }
-              view.handleInput('\x1b[B'); // type -> name
-              for (const char of 'panel-change') view.handleInput(char);
-              view.handleInput('\x13'); // ctrl+s creates
+              if (mounts === 2) {
+                view.handleInput('\t'); // Tab hands the flow to the name field
+                for (const char of 'occupied-change') view.handleInput(char);
+                view.handleInput('enter'); // enter asks to create it
+                return;
+              }
+              view.handleInput('\x1b'); // the returned selector closes: nothing chosen
             } catch (err) {
               clearTimeout(timer);
               reject(err);
@@ -521,183 +641,159 @@ describe('W5 wiring: the redesigned warp surface', { concurrency: false }, () =>
         });
       };
       await warpDef(commands).handler('', built.ctx);
-      const rows = registryLib.readRegistry(root).worktrees;
-      const created = rows.find((row) => row.branch === 'feat/panel-change');
-      assert.ok(created, `the payload branch was created and registered (${JSON.stringify(rows)})`);
-      assert.equal(created.thread, 'wired-thread');
-      assert.equal(built.switches.length, 1, 'the session warped into the new worktree');
-      assert.deepEqual(built.notes, [], 'creation then warp is silent on success');
+
+      assert.equal(mounts, 3, 'the selector came back after the refused creation');
+      assert.deepEqual(built.switches, [], 'a refused creation moves nothing');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.ok(fs.existsSync(target), 'the occupant is untouched');
+      const errors = built.notes.filter(([, level]) => level === 'error');
+      assert.equal(errors.length, 1, `exactly one refusal is reported, got ${JSON.stringify(built.notes)}`);
+      const [message] = errors[0];
+      assert.equal(typeof message, 'string', `the refusal carries text, never undefined (${JSON.stringify(built.notes)})`);
+      assert.ok(message.includes(target), `the refusal names the occupied path: ${message}`);
+      assert.match(message, /occup/i, `the create path's own reason reaches the human: ${message}`);
     } finally {
       restoreEnv();
     }
   });
 
-  test('the extended-list delete flow stays reachable and still guarded', async () => {
-    setEnv(warpStateEnv());
+  // S7: `esc` in the create panel cancels the CREATION, not the warp flow. The
+  // selector comes back with everything it offered before, so a human who
+  // changes their mind about the name still gets to pick any checkout —
+  // including one they just created — and `esc` on THAT selector is what
+  // closes the flow.
+  test('cancelling the create panel returns to the selector, and Esc there closes it (S7)', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
     try {
-      const root = makeRepo('wired-delete');
-      const target = addRegisteredWorktree(root, 'feat/del');
+      const root = makeRepo('wired-create-cancel');
+      addRegisteredWorktree(root, 'feat/one');
+      const before = createdState(root);
       const calls = [];
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      // `v` opens the extended list; Ctrl+D on the principal is guarded;
-      // down + Ctrl+D targets the agent worktree.
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => {
-        closeCalls.push(params);
-        return { isError: false, text: 'removed: feat-del \u00b7 feat/del', details: {} };
-      });
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+      const { commands } = await loadExtension();
+      let mounts = 0;
+      let returnedSelector = null;
+      let switchesAfterCancel = null;
+      built.ctx.ui.custom = async (factory, options) => {
+        mounts += 1;
+        built.customs.push(options);
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+          const done = (value) => { clearTimeout(timer); resolve(value); };
+          let view;
+          try {
+            view = factory(hostTui, plainTheme, {}, done);
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+          }
+          const drive = () => {
+            try {
+              if (mounts === 1) {
+                view.handleInput('c'); // the create hotkey
+                return;
+              }
+              if (mounts === 2) {
+                view.handleInput('\t'); // Tab hands the flow to the name field
+                for (const char of 'never-created') view.handleInput(char);
+                view.handleInput('\x1b'); // esc cancels the CREATION
+                return;
+              }
+              // the SELECTOR is back, with nothing created
+              returnedSelector = view;
+              switchesAfterCancel = built.switches.length;
+              view.handleInput('\x1b'); // esc on the selector closes the flow
+            } catch (err) {
+              clearTimeout(timer);
+              reject(err);
+            }
+          };
+          if (mounts === 1) drive();
+          else tick().then(drive);
+        });
+      };
       await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'the principal row is never deletable');
-      assert.equal(built.confirms[0][0], `Delete worktree 'feat-del'?`);
-      assert.equal(built.confirms[0][1], `Delete worktree checkout at ${target} for branch 'feat/del'? This removes the checkout but keeps the branch.`);
-      assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once for the approved row');
-      assert.deepEqual(built.notes, [['removed: feat-del \u00b7 feat/del', 'info']], 'the success text is unchanged');
-      assert.equal(driver.mounts(), 2, 'the selector reopened after the delete');
+
+      assert.equal(mounts, 3, 'the selector remounted after the create panel was cancelled');
+      assert.ok(returnedSelector !== null, 'the returning surface is the warp selector');
+      assert.equal(switchesAfterCancel, 0, 'a cancelled creation moves nothing');
+      assert.deepEqual(built.switches, [], 'esc on the returned selector closes without a move');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      const others = returnedSelector.state.checkouts.filter((entry) => entry.path !== root);
+      assert.ok(
+        others.some((entry) => entry.name === 'feat-one'),
+        `the existing checkouts are offered again (${JSON.stringify(others.map((entry) => entry.name))})`,
+      );
+      assert.ok(!others.some((entry) => entry.name === 'feat-never-created'), 'the cancelled name was never created');
+      assert.deepEqual(built.notes, [], 'cancelling is silent');
     } finally {
       restoreEnv();
     }
   });
 
-  test('a refused deletion changes nothing and reopens the selector', async () => {
-    setEnv(warpStateEnv());
+  test('S7: leaving the returned selector without choosing moves nothing', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
     try {
-      const root = makeRepo('wired-delete-cancel');
-      addRegisteredWorktree(root, 'feat/del');
+      const root = makeRepo('wired-create-back');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
       const calls = [];
-      const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x1b[B', '\x04']);
       const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => false,
+        cwd: root,
+        FakeSM: makeFakeSM(calls),
+        sessionFile,
+        sessionDir: path.dirname(sessionFile),
+        calls,
+        mount: async () => null,
       });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
+      const { commands } = await loadExtension();
+      let mounts = 0;
+      let switchesAfterCreation = null;
+      built.ctx.ui.custom = async (factory) => {
+        mounts += 1;
+        const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+          const done = (value) => { clearTimeout(timer); resolve(value); };
+          let view;
+          try {
+            view = factory(hostTui, plainTheme, {}, done);
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+            return;
+          }
+          const drive = () => {
+            try {
+              if (mounts === 1) view.handleInput('c');
+              else if (mounts === 2) {
+                view.handleInput('\t');
+                for (const char of 'back-out') view.handleInput(char);
+                view.handleInput('enter');
+              } else {
+                switchesAfterCreation = built.switches.length;
+                view.handleInput('\x1b'); // close the selector: nothing chosen
+              }
+            } catch (err) {
+              clearTimeout(timer);
+              reject(err);
+            }
+          };
+          if (mounts === 1) drive();
+          else tick().then(drive);
+        });
+      };
       await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1);
-      assert.deepEqual(closeCalls, [], 'a refusal removes nothing');
-      assert.deepEqual(built.notes, [], 'a refusal notifies nothing');
-      assert.equal(driver.mounts(), 2, 'the selector reopened');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a dirty target names its pending changes and the approval carries force for exactly that row', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-dirty');
-      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
-      git(root, ['add', 'a.txt']);
-      git(root, ['commit', '-m', 'seed']);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1);
-      assert.match(built.confirms[0][1], /Pending changes: 1 file, \+1\/-0\.$/, 'the dirty row names its pending changes');
-      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes carries force for that row');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('YOLO active waives the deletion confirmation for a clean row', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-yolo');
-      const target = addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      // confirmImpl refuses everything: the row must be deleted without ever
-      // consulting it, which is what proves the waiver.
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => false,
-      });
-      answerYolo('ON');
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 0, 'YOLO waives the clean row confirmation');
-      assert.deepEqual(closeCalls, [{ path: target }], 'the shared close ran once, without force');
-      assert.deepEqual(built.notes, [['removed', 'info']], 'the success text is unchanged');
-    } finally {
-      restoreEnv();
-      resetYolo();
-    }
-  });
-
-  test('YOLO never waives the deletion confirmation of a dirty row', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-yolo-dirty');
-      fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
-      git(root, ['add', 'a.txt']);
-      git(root, ['commit', '-m', 'seed']);
-      const target = addRegisteredWorktree(root, 'feat/del');
-      fs.appendFileSync(path.join(target, 'a.txt'), 'dirty\n');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x04', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      answerYolo('ON');
-      const { commands, mod } = await loadExtension();
-      const closeCalls = [];
-      mod.setWarpCloseRunner(async (params) => { closeCalls.push(params); return { isError: false, text: 'removed', details: {} }; });
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(built.confirms.length, 1, 'a dirty row is confirmed even under YOLO');
-      assert.deepEqual(closeCalls, [{ path: target, force: true }], 'the explicit Yes still carries force for that row');
-    } finally {
-      restoreEnv();
-      resetYolo();
-    }
-  });
-
-  test('the ordinary delete failure text is unchanged and nothing is removed silently', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('wired-delete-fail');
-      addRegisteredWorktree(root, 'feat/del');
-      const calls = [];
-      const FakeSM = makeFakeSM(calls);
-      const sessionFile = sessionFileIn();
-      const driver = selectorDriver(['v', '\x1b[B', '\x04']);
-      const built = makeWiredCtx({
-        cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
-        mount: driver.mount, confirmImpl: () => true,
-      });
-      const { commands, mod } = await loadExtension();
-      const refusal = 'cannot close the worktree at /somewhere: dirty checkout';
-      mod.setWarpCloseRunner(async () => ({ isError: true, text: refusal, details: {} }));
-      await warpDef(commands).handler('', built.ctx);
-      assert.deepEqual(built.notes, [[refusal, 'error']], 'the close refusal is reported verbatim');
-      assert.equal(driver.mounts(), 2, 'the selector reopened after the failure');
+      assert.equal(mounts, 3, 'the selector came back after the creation');
+      assert.equal(switchesAfterCreation, 0, 'S7: the creation did not warp');
+      assert.deepEqual(built.switches, [], 'closing the selector moves nothing');
+      assert.deepEqual(built.notes, [], 'and it notifies nothing');
+      assert.ok(registryLib.readRegistry(root).worktrees.some((row) => row.branch === 'feat/back-out'), 'the created branch stays registered');
     } finally {
       restoreEnv();
     }
@@ -898,237 +994,7 @@ function wiredCtx(root, driver, extra = {}) {
   });
 }
 
-// The editing panel's fixture world: issues in the SOURCE (recency) order,
-// odd documents in modification order, and previews that never spawn `gh`.
-const SOURCE_ISSUES = [
-  { number: 7, title: 'newest update' },
-  { number: 2, title: 'middle update' },
-  { number: 9, title: 'oldest update' },
-];
-const SOURCE_ODD = [
-  { name: 'w1-a', path: '/fixtures/odd/w1-a.md' },
-  { name: 'w1-b', path: '/fixtures/odd/w1-b.md' },
-];
-
-function panelSources(mod) {
-  mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: SOURCE_ISSUES.map((row) => ({ ...row })) }));
-  mod.setWarpCreateOddLister(() => SOURCE_ODD.map((doc) => ({ ...doc })));
-  // Both seams are optional while the wiring is incomplete (RED), so a
-  // missing setter never makes a suite reach for a live `gh`.
-  if (typeof mod.setWarpCreateIssuePreviewReader === 'function') {
-    mod.setWarpCreateIssuePreviewReader((number) => ({
-      ok: true,
-      issue: { number, title: `Issue ${number}`, state: 'open', author: 'ana', body: `body ${number}` },
-      comments: [],
-    }));
-  }
-  if (typeof mod.setWarpCreateOddPreviewReader === 'function') {
-    mod.setWarpCreateOddPreviewReader((doc) => ({ ok: true, text: `# ${doc.name}\n\nspecs` }));
-  }
-}
-
-// Drive the registry's write seam: the count and the patch are what prove
-// "both fields, exactly one write". The extension requires the same module
-// object, so a local wrapper observes every save without touching git.
-function watchRegistryWrites() {
-  const original = registryLib.updateWorktree;
-  const writes = [];
-  registryLib.updateWorktree = (repoRoot, key, patch, opts) => {
-    writes.push({ key, patch });
-    return original(repoRoot, key, patch, opts);
-  };
-  return {
-    writes,
-    restore: () => { registryLib.updateWorktree = original; },
-  };
-}
-
-// The popup's `e` on the admin worktree row: the only other row is the
-// create row, so one Down reaches it.
-const EDIT_KEYS = ['\x1b[B', 'e'];
-
-describe('T12: editing the focused checkout (S13)', { concurrency: false }, () => {
-  test('e opens the panel in editing mode with the checkout REAL branch and path, frozen and pre-selected from the registry', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-open');
-      const target = addRegisteredWorktree(root, 'feat/real-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const driver = multiDriver([EDIT_KEYS, (view) => {
-        view.handleInput('\x1b[B'); // frozen type -> frozen name
-        for (const char of 'zz') view.handleInput(char); // inert typing
-        view.handleInput('\x1b');
-      }, ['\x1b']]);
-      const built = wiredCtx(root, driver);
-      const { commands, mod } = await loadExtension();
-      panelSources(mod);
-      await warpDef(commands).handler('', built.ctx);
-      assert.equal(driver.mounts(), 3, 'the selector, the edit panel, then the selector again');
-      const text = clean(driver.views[1].render(160).join('\n'));
-      assert.match(text, /Edit worktree/, 'the panel opened in editing mode');
-      assert.ok(text.includes(`checkout branch: feat/real-target`), `the checkout's OWN branch renders verbatim\n${text}`);
-      assert.ok(text.includes(`checkout path: ${target}`), `the checkout's OWN path renders verbatim\n${text}`);
-      assert.match(text, /Type: Feature \(feat\) \[frozen\]/, 'the type is frozen');
-      assert.match(text, /Name: real-target \[frozen\]/, 'the name is frozen and never re-derived');
-      assert.ok(!text.includes('preview branch:'), 'no invented create-time branch');
-      assert.match(text, /\[x\] #2/, 'the assigned issue arrives pre-selected');
-      // The panel shows one dataset at a time; the summary line is the
-      // visible proof the assigned odd document is pre-selected too.
-      assert.match(text, /selected: 1 issue · 1 odd/, 'the assigned odd document arrives pre-selected');
-      assert.deepEqual(built.notes, [], 'Esc is silent');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('esc writes nothing: the registry keeps its row byte for byte and the selector reopens', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-esc');
-      const target = addRegisteredWorktree(root, 'feat/esc-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const registryFile = registryLib.registryPath(root);
-      const before = fs.readFileSync(registryFile, 'utf8');
-      const watcher = watchRegistryWrites();
-      try {
-        const driver = multiDriver([EDIT_KEYS, (view) => view.handleInput('\x1b'), ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 3, 'the selector reopened after the cancel');
-        assert.deepEqual(watcher.writes, [], 'Esc performed no registry write');
-        const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-        assert.deepEqual(row.issues, [2], 'the assigned issues are untouched');
-        assert.deepEqual(row.odd, ['w1-a'], 'the assigned odd documents are untouched');
-        assert.equal(fs.readFileSync(registryFile, 'utf8'), before, 'the registry file is byte for byte unchanged');
-        assert.deepEqual(built.notes, [], 'a cancel notifies nothing');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('confirming writes BOTH fields exactly once, and the selector reopens with the fresh values', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-save');
-      const target = addRegisteredWorktree(root, 'feat/save-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const watcher = watchRegistryWrites();
-      try {
-        const driver = multiDriver([
-          EDIT_KEYS,
-          (view) => {
-            view.handleInput('\t'); // issues pane
-            view.handleInput(' '); // toggle #7 on
-            view.handleInput('\t'); // odd pane
-            view.handleInput('\x1b[B'); // second document
-            view.handleInput(' '); // toggle w1-b on
-            view.handleInput('\x13'); // ctrl+s saves
-          },
-          ['\x1b[B', '\x1b'], // focus the checkout row, then close
-        ]);
-        const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(watcher.writes.length, 1, 'exactly ONE registry write carries both fields');
-        assert.equal(watcher.writes[0].key, target, 'the write targets the edited checkout');
-        assert.deepEqual(
-          Object.keys(watcher.writes[0].patch).sort(),
-          ['issues', 'odd'],
-          'the single patch carries both assignment fields',
-        );
-        const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-        assert.deepEqual(row.issues, [2, 7], 'the selected issues were saved');
-        // The panel echoes a stored bare name unchanged and adds a toggled
-        // document by its absolute path (its documented row identity), so
-        // the saver stores both spellings sorted.
-        assert.deepEqual(row.odd, ['/fixtures/odd/w1-b.md', 'w1-a'], 'the selected odd documents were saved');
-        assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
-        // S1: the popup reads the focused row's facts after the mount; wait
-        // for the async read instead of assuming it was pre-fetched.
-        const reopened = await waitForFactsFooter(driver.views[2]);
-        assert.match(reopened, /issues 2/, `the reopened popup shows the saved issue count\n${reopened}`);
-        assert.deepEqual(built.notes, [], 'a successful save is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a refusing registry surfaces its error and changes nothing displayed', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-refuse');
-      const target = addRegisteredWorktree(root, 'feat/refuse-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const original = registryLib.updateWorktree;
-      registryLib.updateWorktree = () => ({ ok: false, error: 'registry is read-only' });
-      try {
-        const driver = multiDriver([
-          EDIT_KEYS,
-          (view) => {
-            view.handleInput('\t');
-            view.handleInput(' '); // try to add #7
-            view.handleInput('\x13');
-          },
-          ['\x1b[B', '\x1b'],
-        ]);
-        const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        await warpDef(commands).handler('', built.ctx);
-        assert.deepEqual(
-          built.notes,
-          [['warp: cannot save the assignment: registry is read-only', 'error']],
-          'the refusing registry surfaces its own error',
-        );
-        const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.path === target);
-        assert.deepEqual(row.issues, [2], 'the refused write changed nothing');
-        assert.deepEqual(row.odd, ['w1-a'], 'the refused write changed nothing');
-        const reopened = await waitForFactsFooter(driver.views[2]);
-        assert.match(reopened, /issues 1/, `the reopened popup still shows the old assignment\n${reopened}`);
-        assert.ok(!reopened.includes('#7'), 'nothing optimistic is displayed');
-      } finally {
-        registryLib.updateWorktree = original;
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-});
-
-describe('T12: the popup and its panes keep the SOURCE order (S15)', { concurrency: false }, () => {
-  test('the Issues pane renders the source order verbatim, not a numeric or alphabetical re-sort', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('edited-order');
-      const target = addRegisteredWorktree(root, 'feat/order-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [], odd: [] }).ok, true);
-      const driver = multiDriver([EDIT_KEYS, (view) => view.handleInput('\x1b'), ['\x1b']]);
-      const built = wiredCtx(root, driver);
-      const { commands, mod } = await loadExtension();
-      panelSources(mod);
-      await warpDef(commands).handler('', built.ctx);
-      const lines = driver.views[1].render(160).map(clean);
-      const at = (needle) => lines.findIndex((line) => line.includes(needle));
-      const newest = at('#7 newest update');
-      const middle = at('#2 middle update');
-      const oldest = at('#9 oldest update');
-      assert.ok(newest >= 0 && middle >= 0 && oldest >= 0, `all three rows render\n${lines.join('\n')}`);
-      assert.ok(newest < middle, `insertion (recency) order wins over the numeric order\n${lines.join('\n')}`);
-      assert.ok(middle < oldest, `insertion (recency) order wins over the numeric order\n${lines.join('\n')}`);
-    } finally {
-      restoreEnv();
-    }
-  });
-
+describe('T12: the popup rows keep the activity order (S15)', { concurrency: false }, () => {
   test('the popup rows are ordered by last activity (commit time), oldest last', async () => {
     setEnv(warpStateEnv());
     try {
@@ -1217,6 +1083,23 @@ function watchMutations() {
   };
 }
 
+// Every removal argv the shared close issues, recorded in ORDER. The keyboard
+// delete's fail-closed contract is "no remover ran at all", which is only
+// observable here: a run that leaves the fixture intact after a refused
+// `git worktree remove` still asked a backend to delete a path nobody approved.
+function watchRemovals() {
+  const removals = [];
+  const original = gitLib.runArgvAsync;
+  gitLib.runArgvAsync = function wrapped(...args) {
+    const argv = Array.isArray(args[1]) ? args[1] : [];
+    if (argv[0] === 'worktree' && argv[1] === 'remove') {
+      removals.push({ argv: argv.slice(), cwd: args[2] && args[2].cwd });
+    }
+    return original.apply(this, args);
+  };
+  return { removals, restore: () => { gitLib.runArgvAsync = original; } };
+}
+
 // Every created-state this task calls "created": a branch, a checkout and a
 // registry row. Snapshotted whole so Esc that created anything fails.
 function createdState(root) {
@@ -1251,8 +1134,848 @@ function missingSessionFile(tag) {
   return path.join(track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-warp-${tag}-`))), 'missing.jsonl');
 }
 
-describe('T16: the panels write nothing until the user confirms (S17)', { concurrency: false }, () => {
-  test('opening the creating panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
+// ---------------------------------------------------------------------------
+// S1/S4: the warp popup reaches no worktree modification beyond the delete
+// REQUEST. The old `e` opened the full-screen worktree detail and deleted
+// issues/ODD associations there; that view was removed with the association,
+// so `e` is inert. `ctrl+d` (panel and extended list) asks to DELETE, and the
+// confirmation, the disclosure, the refusals and the removal are the
+// extension's — nothing a keypress alone can do.
+describe('S1/S4: the warp popup edits nothing, and `e` stays inert', { concurrency: false }, () => {
+  test('`e` opens no detail, asks nothing, writes nothing and leaves the popup in place', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('no-edit-key');
+      const target = addRegisteredWorktree(root, 'feat/edit-target');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [5], odd: 'w1-a' }).ok, true);
+      const before = createdState(root);
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['e', '\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+        assert.equal(driver.mounts(), 1, 'only the popup mounted: `e` opened no detail');
+        assert.deepEqual(built.confirms, [], 'no dialog was raised');
+        assert.deepEqual(watcher.kinds(), [], 'no creation and no registry write');
+        assert.deepEqual(createdState(root), before, 'the checkout and the registry are untouched');
+        assert.deepEqual(built.notes, [], 'an inert key is silent');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S1: opening and leaving the popup preserves a legacy stored association byte for byte', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makeRepo('legacy-association');
+      const target = addRegisteredWorktree(root, 'feat/legacy');
+      assert.equal(registryLib.updateWorktree(root, target, { issues: [5, 6], odd: 'w1-a' }).ok, true);
+      const stored = registryLib.readRegistry(root).worktrees.find((row) => row.path === target);
+      assert.deepEqual(stored.issues, [5, 6], 'the fixture really stores an association');
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x1b']]);
+        const built = wiredCtx(root, driver);
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+        assert.deepEqual(watcher.kinds(), [], 'the popup wrote nothing');
+        const after = registryLib.readRegistry(root).worktrees.find((row) => row.path === target);
+        assert.deepEqual(after, stored, 'the legacy association is preserved, never migrated or dropped');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S4 (feedback: «falta el atajo para eliminar worktree»): `ctrl+d` in the warp
+// panel and in the extended list asks to DELETE the focused checkout. What is
+// pinned here is the whole decision, observed from the command's outside:
+//   1. the question is ALWAYS asked, names the checkout, its branch and the
+//      pending changes it would lose (+lines/-lines), and gentle-shell's YOLO
+//      grant never waives it (the same grant does waive `worktree_close`'s own
+//      dialog for a clean checkout — that is the proof it was ON);
+//   2. a decline mutates nothing at all;
+//   3. confirming removes the checkout, keeps the branch and drops exactly
+//      that registry row;
+//   4. the principal and the checkout the session runs in are refused BEFORE
+//      any question is asked;
+//   5. evidence that moved while the dialog was open fails closed, because the
+//      human answered about a state that no longer exists.
+const NO_HERDR = () => path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-warp-delete');
+
+// A herdr stub that makes the filesystem change INSIDE the awaited
+// `herdr worktree list`. That child process is the longest window between an
+// identity check and the remover, so the swap landing there is deterministic:
+// the stub performs it, then exits non-zero so the close falls back to
+// `git worktree remove` — a remover that resolves the spelling it is given.
+//
+// Two shapes of replacement, because they defeat different checks:
+//   - `symlink`: the approved path becomes a link to another checkout, which a
+//     realpath comparison can see;
+//   - `move`: the approved directory is moved aside and ANOTHER detached
+//     checkout of the same commit is moved into its place — every string stays
+//     identical (same path, same realpath, not a link), so only the pinned
+//     device/inode pair tells the two directories apart.
+function makeSwappingHerdr({ target, aside, victim, mode = 'symlink' }) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-swap-herdr-')));
+  const bin = path.join(dir, 'herdr');
+  const script = path.join(dir, 'swap.sh');
+  const marker = path.join(dir, 'swapped');
+  const swapLines = mode === 'move'
+    ? ['mv "$SWAP_VICTIM" "$SWAP_TARGET"']
+    : ['ln -s "$SWAP_VICTIM" "$SWAP_TARGET"'];
+  fs.writeFileSync(script, [
+    '#!/bin/sh',
+    'set -e',
+    'mv "$SWAP_TARGET" "$SWAP_ASIDE"',
+    ...swapLines,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.writeFileSync(bin, [
+    '#!/bin/sh',
+    'if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ ! -f "$HERDR_SWAP_MARKER" ]; then',
+    '  : > "$HERDR_SWAP_MARKER"',
+    '  /bin/sh "$HERDR_SWAP_SCRIPT" || exit 1',
+    'fi',
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { bin, script, marker, dir };
+}
+
+// A herdr stub that ANSWERS the listing with one workspace for the target and
+// removes it through git when asked by workspace id, logging every argv. It is
+// what proves the reordered close keeps the Herdr-first removal intact.
+function makeListingHerdr({ root, target }) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-list-herdr-')));
+  const bin = path.join(dir, 'herdr');
+  const log = path.join(dir, 'argv.log');
+  fs.writeFileSync(log, '');
+  fs.writeFileSync(bin, [
+    '#!/bin/sh',
+    'printf \'%s\\n\' "$*" >> "$HERDR_LOG"',
+    'if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then',
+    '  printf \'{"result":{"worktrees":[{"path":"%s","open_workspace_id":"ws-target"}]}}\\n\' "$HERDR_TARGET"',
+    '  exit 0',
+    'fi',
+    'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+    '  git -C "$HERDR_REPO" worktree remove --force "$HERDR_REMOVE_PATH"',
+    '  exit $?',
+    'fi',
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { bin, log, dir };
+}
+
+describe('S4: the warp delete shortcut asks, discloses and revalidates', { concurrency: false }, () => {
+  test('ctrl+d asks one confirmation that names the losing lines, and a decline removes nothing', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-decline');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-decline');
+      // Two appended lines and one brand-new file: the disclosure must count
+      // LINES that would be lost, not files.
+      fs.appendFileSync(path.join(target, 'work.txt'), 'one\ntwo\n');
+      const before = createdState(root);
+      // The first row is the only other checkout (the session sits in the
+      // principal), so one `ctrl+d` targets it.
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: false });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1, 'exactly one question, never none and never two');
+      const [title, body] = built.confirms[0];
+      assert.equal(title, "Delete worktree 'feat-del-decline'?");
+      assert.match(body, new RegExp(`Delete worktree checkout at ${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} for branch 'feat/del-decline'`));
+      assert.match(body, /Pending changes: 1 file, \+2\/-0\./, `the pending lines are named: ${body}`);
+      assert.match(body, /keeps the branch/, 'the branch-kept contract travels with the question');
+
+      assert.deepEqual(createdState(root), before, 'a decline changed no branch, no checkout and no row');
+      assert.ok(fs.existsSync(target), 'the checkout is still on disk');
+      assert.ok(registryLib.findByPath(root, target), 'and still registered');
+      assert.deepEqual(built.notes, [['worktree delete cancelled: nothing was removed at ' + target + '.', 'info']],
+        'the answer is acknowledged and the loss is not claimed');
+      assert.equal(driver.mounts(), 2, 'the selector comes back with a freshly read listing');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a clean checkout is still asked under YOLO, which does waive the tool\'s own dialog', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    // The live session holds gentle-shell's YOLO grant for this test.
+    answerYolo('ON');
+    try {
+      const root = makeRepo('delete-yolo');
+      addMainBranch(root);
+      const waived = addRegisteredWorktree(root, 'feat/del-waived');
+      const target = addRegisteredWorktree(root, 'feat/del-yolo');
+      const { tools, commands } = await loadExtension();
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      built.ctx.hasUI = true;
+      // Proof the grant is ON: the tool's own dialog is waived for a CLEAN
+      // checkout, so no question is asked for it.
+      const closed = await tools.get('worktree_close').execute('close-1', { path: waived }, undefined, undefined, built.ctx);
+      assert.notEqual(closed.isError, true, JSON.stringify(closed));
+      assert.deepEqual(built.confirms, [], 'YOLO waived the tool dialog for a clean checkout');
+      assert.ok(!fs.existsSync(waived), 'and the tool removed that checkout');
+
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'the warp delete asked anyway: a keypress never borrows that grant');
+      assert.match(built.confirms[0][1], /^Delete worktree checkout at /);
+      assert.ok(!/Pending changes/.test(built.confirms[0][1]), 'a clean checkout names no pending changes');
+      assert.ok(!fs.existsSync(target), 'the approved removal happened');
+      assert.equal(registryLib.findByPath(root, target), null, 'its registry row is dropped');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del-yolo'),
+        'the branch is kept, exactly like every other close');
+      assert.deepEqual(built.notes, [['worktree deleted: feat-del-yolo · ' + target + "; the branch 'feat/del-yolo' is kept.", 'info']]);
+    } finally {
+      resetYolo();
+      restoreEnv();
+    }
+  });
+
+  test('confirming a dirty checkout discloses the lines it loses and forces exactly that removal', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-dirty');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-dirty');
+      fs.appendFileSync(path.join(target, 'work.txt'), 'one\ntwo\nthree\n');
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1);
+        assert.match(built.confirms[0][1], /Pending changes: 1 file, \+3\/-0\./);
+        assert.ok(!fs.existsSync(target), 'the checkout the human agreed to lose is removed');
+        assert.deepEqual(watcher.writes().map((event) => event.name), ['removeWorktreeByPath'],
+          'exactly one registry write: the drop that follows a verified removal');
+        assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del-dirty'), 'the branch survives');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('evidence that changed while the dialog was open is refused, never removed', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-toctou');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-toctou');
+      const driver = multiDriver([['\x04', '\x1b']]);
+      let asked = null;
+      const built = wiredCtx(root, driver, {
+        confirmImpl: (title, body) => {
+          asked = body;
+          // The human is answering about a CLEAN checkout; the work appears
+          // between the answer and the removal.
+          fs.writeFileSync(path.join(target, 'late.txt'), 'arrived late\n');
+          return true;
+        },
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.ok(!/Pending changes/.test(asked), `the human was shown a clean checkout: ${asked}`);
+      assert.ok(fs.existsSync(target), 'the checkout that gained work is NOT removed');
+      assert.ok(fs.existsSync(path.join(target, 'late.txt')), 'and the new file is still there');
+      assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /refusing to delete/);
+      assert.match(refusal, /changed while the confirmation was open/);
+      assert.match(refusal, /confirmed: no pending changes/, `the refusal names what the human was shown: ${refusal}`);
+      assert.match(refusal, /now: 1 file, \+1\/-0/, `and what is true now: ${refusal}`);
+      assert.deepEqual(built.notes.map(([, level]) => level), ['error']);
+      assert.equal(driver.mounts(), 2, 'the selector is still usable after a refusal');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('B1: a live branch that already differs from the registry row is not a refusal', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-branch-moved');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-registered');
+      // The checkout was moved to another branch AFTER it was registered, so
+      // the live branch and the registry row legitimately disagree. The warp
+      // listing offers the LIVE branch (sole claimant), and comparing it with
+      // the row used to refuse this deletion every single time.
+      git(target, ['checkout', '-b', 'feat/live-renamed']);
+      assert.equal(registryLib.findByPath(root, target).branch, 'feat/del-registered', 'the row keeps the old name');
+      assert.equal(git(target, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat/live-renamed', 'the checkout is on another branch');
+
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1, 'the question is asked, not pre-refused');
+      assert.ok(!built.notes.some(([, level]) => level === 'error'), `no refusal was reported: ${JSON.stringify(built.notes)}`);
+      assert.ok(!fs.existsSync(target), 'the approved removal happened');
+      assert.equal(registryLib.findByPath(root, target), null, 'and its row was dropped');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/live-renamed'), 'the live branch is kept');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('A1: identical +/- counts with different bytes are refused, never removed', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-content-swap');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-content');
+      fs.writeFileSync(path.join(target, 'work.txt'), 'one\n');
+      git(target, ['add', 'work.txt']);
+      git(target, ['commit', '-m', 'seed work']);
+      // +1/-1 pending, so the dialog names a real change size.
+      fs.writeFileSync(path.join(target, 'work.txt'), 'two\n');
+      const driver = multiDriver([['\x04', '\x1b']]);
+      let asked = null;
+      const built = wiredCtx(root, driver, {
+        confirmImpl: (title, body) => {
+          asked = body;
+          // The pending size is IDENTICAL (+1/-1); only the bytes differ.
+          fs.writeFileSync(path.join(target, 'work.txt'), 'three\n');
+          return true;
+        },
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.match(asked, /Pending changes: 1 file, \+1\/-1\./, 'the human was shown a real size');
+      assert.ok(fs.existsSync(target), 'a checkout whose bytes moved is NOT removed');
+      assert.equal(fs.readFileSync(path.join(target, 'work.txt'), 'utf8'), 'three\n', 'the newer content survives');
+      assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /its pending content changed/, `the refusal names the content, not the counts: ${refusal}`);
+      assert.match(refusal, /confirmed: 1 file, \+1\/-1, 1 ahead of main; now: 1 file, \+1\/-1, 1 ahead of main/,
+        'both readings agree on the size');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('A2: ignored files are disclosed in the question, and one that appears later aborts the delete', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-ignored');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-ignored');
+      fs.writeFileSync(path.join(target, '.gitignore'), '*.log\n');
+      git(target, ['add', '.gitignore']);
+      git(target, ['commit', '-m', 'ignore rules']);
+      fs.writeFileSync(path.join(target, 'build.log'), 'artifact\n');
+      // Nothing git tracks is pending, so the checkout reads CLEAN while the
+      // ignored file only exists here and would die with the checkout.
+      const driver = multiDriver([['\x04', '\x1b']]);
+      let asked = null;
+      const built = wiredCtx(root, driver, {
+        confirmImpl: (title, body) => {
+          asked = body;
+          fs.writeFileSync(path.join(target, 'late.log'), 'arrived late\n');
+          return true;
+        },
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.match(asked, /Ignored files \(deleted with the checkout\): build\.log\./, `the human is told: ${asked}`);
+      assert.ok(!/Pending changes/.test(asked), 'the tracked tree reads clean');
+      assert.ok(fs.existsSync(target), 'the checkout is NOT removed');
+      assert.ok(fs.existsSync(path.join(target, 'late.log')), 'and the ignored file that appeared survives');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /its ignored files changed/, `the refusal names the ignored files: ${refusal}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The reproduced high-severity race: the approved path is replaced, while the
+  // human is answering, by a symbolic link to a DIFFERENT checkout. Two DETACHED
+  // checkouts at the same commit are the worst case for this surface, because
+  // the one component that could reveal the swap (the live branch) is unknown
+  // on both sides, and the disclosure reads identically through the link. What
+  // must never happen is a removal aimed at a path that no longer names the
+  // checkout the human approved — `git worktree remove` resolves the spelling it
+  // is given, so that is another checkout's directory.
+  test('a checkout swapped for a symlink to another detached checkout during the dialog is refused before any removal', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-symlink-swap');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-symlink-swap');
+      // Detached: git reports no branch for it, so `live.branch` is null.
+      git(target, ['checkout', '--detach']);
+      // The other checkout an attacker would aim the removal at: a detached
+      // live checkout of the SAME commit, so every disclosure number matches.
+      const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-victim`);
+      track(victim);
+      git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+      const victimReal = fs.realpathSync(victim);
+      const aside = track(`${target}-swapped-aside`);
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        let asked = null;
+        const built = wiredCtx(root, driver, {
+          confirmImpl: (title, body) => {
+            asked = body;
+            // The swap lands between the question and the answer's use.
+            fs.renameSync(target, aside);
+            fs.symlinkSync(victimReal, target);
+            return true;
+          },
+        });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1, 'the human is asked once, about the real checkout');
+        assert.ok(asked.includes(target), `the question named the approved checkout: ${asked}`);
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.deepEqual(removalWatch.removals, [], `no removal may be attempted for an unapproved path: ${JSON.stringify(removalWatch.removals)}`);
+        assert.match(notes, /refusing to delete/, `the delete is refused, not attempted: ${notes}`);
+        assert.match(notes, /symbolic link/, `the refusal names the replacement: ${notes}`);
+        assert.match(notes, /nothing was removed/);
+        assert.deepEqual(built.notes.map(([, level]) => level), ['error'], 'one refusal, at error level');
+        // Nothing at all was destroyed: the other checkout is a live worktree
+        // with its own metadata, and the approved one is still where the swap
+        // put it.
+        assert.ok(fs.existsSync(path.join(victimReal, '.git')), 'the other checkout keeps its git metadata');
+        assert.ok(git(root, ['worktree', 'list', '--porcelain']).includes(victimReal), 'it is still a live worktree of this repository');
+        assert.ok(fs.lstatSync(target).isSymbolicLink(), 'the swapped path is untouched');
+        assert.ok(fs.existsSync(path.join(aside, '.git')), 'the approved checkout is untouched');
+        assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+        assert.equal(driver.mounts(), 2, 'the selector comes back after the refusal');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The same swap, one step earlier: the link is already in place when the
+  // question's reading is taken. Every component matches on both sides then
+  // (`live.branch` null, the disclosure read through the link), so the pin has
+  // to be the identity the SELECTOR listed — a live checkout's own realpath —
+  // and not whatever the path resolves to at question time.
+  test('a path swapped for a symlink before the question is refused against the identity the selector listed', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-symlink-preswap');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-symlink-preswap');
+      git(target, ['checkout', '--detach']);
+      const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-preswap-victim`);
+      track(victim);
+      git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+      const victimReal = fs.realpathSync(victim);
+      const aside = track(`${target}-pinned-aside`);
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        // The swap lands after the selector rendered its row and BEFORE the
+        // question's reading is taken: the row still names the approved path,
+        // while that path already resolves to the other checkout.
+        const driver = multiDriver([(view) => {
+          fs.renameSync(target, aside);
+          fs.symlinkSync(victimReal, target);
+          view.handleInput('\x04');
+        }]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.deepEqual(built.confirms, [], 'no question: the path is not the listed checkout any more');
+        assert.deepEqual(removalWatch.removals, [], `no removal may be attempted: ${JSON.stringify(removalWatch.removals)}`);
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.match(notes, /refusing to delete/, `the delete is refused: ${notes}`);
+        assert.match(notes, /symbolic link/, `the refusal names the replacement: ${notes}`);
+        assert.ok(fs.existsSync(path.join(victimReal, '.git')), 'the other checkout is untouched');
+        assert.ok(git(root, ['worktree', 'list', '--porcelain']).includes(victimReal), 'and still a live worktree');
+        assert.ok(registryLib.findByPath(root, target), 'the registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The reproduced high-severity race, one step LATER than the dialog: the
+  // swap lands while the removal resolves its Herdr workspace from
+  // `herdr worktree list`. That listing is a child process, so it is an await
+  // — the longest window between a check and the remover — and the approved
+  // path is a real, live checkout on both sides of it, which is why a check
+  // that runs BEFORE the listing cannot see the swap. What must hold is that
+  // no remover is launched at all once the path stopped naming the approved
+  // checkout; the deterministic trigger is the shim itself, so the swap lands
+  // inside that exact await and nowhere else.
+  test('a checkout swapped for a symlink while the removal listing is awaited is refused before any remover runs', async () => {
+    const root = makeRepo('delete-swap-at-listing');
+    addMainBranch(root);
+    const target = addRegisteredWorktree(root, 'feat/del-swap-listing');
+    // Detached, like the dialog cases: the live branch cannot reveal the swap.
+    git(target, ['checkout', '--detach']);
+    const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-listing-victim`);
+    track(victim);
+    git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+    const victimReal = fs.realpathSync(victim);
+    const aside = track(`${target}-listing-aside`);
+    const shim = makeSwappingHerdr({ target, aside, victim: victimReal });
+    setEnv(warpStateEnv({
+      HERDR_BIN_PATH: shim.bin,
+      HERDR_SWAP_MARKER: shim.marker,
+      HERDR_SWAP_SCRIPT: shim.script,
+      SWAP_TARGET: target,
+      SWAP_ASIDE: aside,
+      SWAP_VICTIM: victimReal,
+    }));
+    try {
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1, 'the human was asked once, about the real checkout');
+        assert.ok(fs.existsSync(shim.marker), 'the swap really landed inside the awaited listing');
+        assert.deepEqual(
+          removalWatch.removals,
+          [],
+          `no removal may be launched for a path that stopped naming the approved checkout: ${JSON.stringify(removalWatch.removals)}`,
+        );
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.match(notes, /refusing to close worktree for branch 'feat\/del-swap-listing'/, `the close refuses: ${notes}`);
+        assert.match(notes, /no longer resolves to the approved checkout/, `the refusal names the approved identity: ${notes}`);
+        assert.match(notes, /symbolic link/, `and the replacement it found: ${notes}`);
+        assert.ok(fs.existsSync(path.join(victimReal, '.git')), 'the other checkout keeps its git metadata');
+        assert.ok(git(root, ['worktree', 'list', '--porcelain']).includes(victimReal), 'it is still a live worktree of this repository');
+        assert.ok(fs.lstatSync(target).isSymbolicLink(), 'the swapped path is untouched');
+        assert.ok(fs.existsSync(path.join(aside, '.git')), 'the approved checkout is untouched');
+        assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The same window, with the replacement a realpath comparison CANNOT see: the
+  // approved directory is moved aside and another detached checkout of the same
+  // commit takes its exact path. The spelling, the resolved path and the kind of
+  // path are all identical afterwards, so the pin that answers this is the
+  // approved directory's own device/inode pair — and the removal is refused
+  // because the path no longer names the directory the human approved.
+  test('a checkout replaced by another directory at the same path while the listing is awaited is refused', async () => {
+    const root = makeRepo('delete-replace-at-listing');
+    addMainBranch(root);
+    const target = addRegisteredWorktree(root, 'feat/del-replace-listing');
+    git(target, ['checkout', '--detach']);
+    const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-replace-victim`);
+    track(victim);
+    git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+    const victimReal = fs.realpathSync(victim);
+    const aside = track(`${target}-replace-aside`);
+    const shim = makeSwappingHerdr({ target, aside, victim: victimReal, mode: 'move' });
+    setEnv(warpStateEnv({
+      HERDR_BIN_PATH: shim.bin,
+      HERDR_SWAP_MARKER: shim.marker,
+      HERDR_SWAP_SCRIPT: shim.script,
+      SWAP_TARGET: target,
+      SWAP_ASIDE: aside,
+      SWAP_VICTIM: victimReal,
+    }));
+    try {
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1, 'the human was asked once, about the real checkout');
+        assert.ok(fs.existsSync(shim.marker), 'the replacement landed inside the awaited listing');
+        assert.equal(fs.realpathSync(target), target, 'the path still resolves to itself: no link, no moved realpath');
+        assert.deepEqual(
+          removalWatch.removals,
+          [],
+          `no removal may be launched for a directory nobody approved: ${JSON.stringify(removalWatch.removals)}`,
+        );
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.match(notes, /refusing to close worktree for branch 'feat\/del-replace-listing'/, `the close refuses: ${notes}`);
+        assert.match(notes, /no longer the confirmed checkout/, `and names the replaced directory: ${notes}`);
+        assert.ok(fs.existsSync(path.join(target, '.git')), 'the replacement is untouched');
+        assert.ok(fs.existsSync(path.join(aside, '.git')), 'the approved checkout is untouched where the swap put it');
+        assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE for the reordered close: moving the listing ahead of the final
+  // check must not change the Herdr-first removal. With Herdr answering, the
+  // workspace is still resolved from that listing and the checkout is removed
+  // BY ID (never by a path spelling), the row drops and the branch survives.
+  test('the herdr path still resolves the workspace after the listing and removes by id', async () => {
+    const root = makeRepo('delete-herdr-path');
+    addMainBranch(root);
+    const target = addRegisteredWorktree(root, 'feat/del-herdr-path');
+    const shim = makeListingHerdr({ root, target });
+    setEnv(warpStateEnv({
+      HERDR_BIN_PATH: shim.bin,
+      HERDR_LOG: shim.log,
+      HERDR_TARGET: target,
+      HERDR_REPO: root,
+      HERDR_REMOVE_PATH: target,
+    }));
+    try {
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.ok(!fs.existsSync(target), 'the approved checkout is removed');
+      const calls = fs.readFileSync(shim.log, 'utf8').split('\n').filter((line) => line.length > 0);
+      const removeCall = calls.find((line) => line.startsWith('worktree remove'));
+      assert.ok(removeCall, `herdr was asked to remove the workspace: ${JSON.stringify(calls)}`);
+      assert.ok(removeCall.includes('--workspace ws-target'), `by workspace id: ${removeCall}`);
+      assert.ok(!removeCall.includes(target), `never the path spelling: ${removeCall}`);
+      assert.equal(registryLib.findByPath(root, target), null, 'the registry row is dropped');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del-herdr-path'), 'the branch is kept');
+      const notes = built.notes.map(([message]) => message).join('\n');
+      assert.match(notes, /worktree deleted: feat-del-herdr-path/, `the success names the checkout: ${notes}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE: the shared close the keyboard delete calls is ALSO the agent
+  // tool's removal. Its `path`/`force` behavior is unchanged by the identity
+  // pin, which only the keyboard path supplies.
+  test('worktree_close still removes exactly the checkout it names, keeping every other one', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('close-preserved');
+      addMainBranch(root);
+      const kept = addRegisteredWorktree(root, 'feat/close-kept');
+      const target = addRegisteredWorktree(root, 'feat/close-target');
+      fs.appendFileSync(path.join(target, 'work.txt'), 'pending line\n');
+      const removalWatch = watchRemovals();
+      try {
+        const built = wiredCtx(root, multiDriver([]));
+        const { tools } = await loadExtension();
+        const closed = await tools.get('worktree_close').execute('close-1', { path: target, force: true }, undefined, undefined, built.ctx);
+
+        assert.notEqual(closed.isError, true, JSON.stringify(closed));
+        assert.match(closed.content[0].text, /removed|closed/i, `the tool reports its outcome: ${closed.content[0].text}`);
+        assert.ok(!fs.existsSync(target), 'the named checkout is removed');
+        assert.ok(fs.existsSync(kept), 'the other checkout is untouched');
+        assert.equal(registryLib.findByPath(root, target), null, 'its registry row is dropped');
+        assert.ok(registryLib.findByPath(root, kept), 'the other row stays');
+        assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/close-target'), 'the branch is kept');
+        assert.equal(removalWatch.removals.length, 1, 'exactly one removal ran');
+        assert.deepEqual(removalWatch.removals[0].argv.slice(-2), ['--force', target], 'the same argv as before, --force from the caller');
+      } finally {
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('A2: a clean checkout whose ignored files are unreadable is refused before asking', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-ignored-unknown');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-ignored-unknown');
+      const before = createdState(root);
+      // A `.gitignore` rule that git itself cannot evaluate (an unreadable
+      // exclude file) is the realistic shape; here the whole ignored listing
+      // fails through a broken repository, so the read is unknown and the
+      // deletion must not be offered at all.
+      fs.rmSync(path.join(target, '.git'), { force: true });
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: an unknown reading is a refusal');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /could not be read|could not be fingerprinted|could not be listed/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the principal checkout is refused before any question is asked', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-principal');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-principal');
+      const before = createdState(root);
+      // The extended list is the only view that offers the principal row, and
+      // it is the first row there (and the row the panel was focused on).
+      const driver = multiDriver([['v', '\x04', '\x1b']]);
+      const built = wiredCtx(target, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: the refusal comes first');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /refusing to delete the principal checkout/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(root), 'the principal checkout still exists');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the checkout this session runs in is refused before any question is asked', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-current');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-current');
+      const before = createdState(root);
+      // The session lives in the agent checkout; the extended list offers it
+      // (row 1, principal first) so `ctrl+d` can name the ground it stands on.
+      const driver = multiDriver([['v', '\x1b[B', '\x04', '\x1b']]);
+      const built = wiredCtx(target, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: the session is not deleting its own checkout');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /the checkout this session is running in/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a live checkout the registry does not own is refused before any question is asked', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-unregistered');
+      addMainBranch(root);
+      // A real checkout nobody registered (the S14 discovery case): the warp
+      // list offers it, but only the registry can authorize a close, so this
+      // must never become a deletion candidate.
+      const stray = path.join(path.dirname(root), `${path.basename(root)}-wired-stray`);
+      track(stray);
+      git(root, ['worktree', 'add', '-b', 'feat/stray', stray, 'HEAD']);
+      const realStray = fs.realpathSync(stray);
+      const before = createdState(root);
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: an unowned checkout has no close path');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /does not own/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(realStray), 'the checkout is still on disk');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unreadable pending-change read refuses the delete instead of asking', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-unknown-evidence');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-unknown');
+      // A checkout whose git metadata is gone: it is still listed and still a
+      // directory, so the only thing that cannot be read is what is pending in
+      // it. That is exactly the case that must never be guessed.
+      fs.rmSync(path.join(target, '.git'), { force: true });
+      const before = createdState(root);
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: an unreadable disclosure is a refusal');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /its uncommitted changes could not be read/);
+      assert.match(refusal, /nothing was removed/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target), 'the checkout is still on disk');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a host that cannot ask is refused instead of removing anything', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-no-dialog');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-no-dialog');
+      const before = createdState(root);
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver);
+      // A destructive act is never performed on a host that cannot ask.
+      delete built.ctx.ui.confirm;
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.match(built.notes.map(([message]) => message).join('\n'), /cannot ask the confirmation a removal requires/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('T16: the panels write nothing until the user confirms (S17)', { concurrency: false }, () => {  test('opening the creating panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-open-create');
@@ -1260,16 +1983,17 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       const before = createdState(root);
       const watcher = watchMutations();
       try {
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           view.render(120); // the frame the user sees
           assert.equal(watcher.events.length, 0, 'drawing the create panel mutated nothing');
           view.handleInput('\x1b'); // cancel
         }]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 2, 'the popup then the create panel mounted');
+        // S7: the cancel returns to the selector (the third mount), where `esc`
+        // is the key that closes the flow. Nothing was written either way.
+        assert.equal(driver.mounts(), 3, 'the popup, the create panel, then the popup again');
         assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) created nothing and wrote nothing');
         assert.equal(watcher.writes().length, 0, 'zero registry writes');
         assert.equal(watcher.creations().length, 0, 'zero checkout creations');
@@ -1283,42 +2007,7 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('opening the editing panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('no-write-open-edit');
-      const target = addRegisteredWorktree(root, 'feat/real-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const before = createdState(root);
-      const registryFile = registryLib.registryPath(root);
-      const registryBytes = fs.readFileSync(registryFile, 'utf8');
-      const watcher = watchMutations();
-      try {
-        const driver = multiDriver([EDIT_KEYS, (view) => {
-          view.render(160);
-          assert.equal(watcher.events.length, 0, 'drawing the edit panel mutated nothing');
-          view.handleInput('\x1b'); // cancel
-        }, ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(driver.mounts(), 3, 'the popup, the edit panel, then the popup again');
-        assert.deepEqual(watcher.kinds(), [], 'opening (and cancelling) wrote nothing');
-        assert.equal(watcher.writes().length, 0, 'zero registry writes');
-        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
-        assert.deepEqual(createdState(root), before, 'no created state');
-        assert.equal(fs.readFileSync(registryFile, 'utf8'), registryBytes, 'the registry file is byte for byte unchanged');
-        assert.deepEqual(built.notes, [], 'a cancel is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('inside the creating panel navigating, toggling, filtering, paging and help each add no mutation', async () => {
+  test('inside the creating panel the inline type list, both fields and tab each add no mutation', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-create-keys');
@@ -1326,133 +2015,39 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
       const before = createdState(root);
       const watcher = watchMutations();
       try {
-        let cursorAfterPage = null;
-        let oddSelected = null;
-        let query = null;
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           const step = stepRecorder(view, watcher);
-          step('move from the type field to the name field', (v) => v.handleInput('\x1b[B'));
-          step('enter the Issues pane', (v) => v.handleInput('\r'));
-          step('navigate rows', (v) => v.handleInput('\x1b[B'));
-          assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
-          step('page the focused list', (v) => v.handleInput(']'));
-          cursorAfterPage = view.state.cursor.issues;
-          assert.ok(cursorAfterPage > 1, 'the page key moved the cursor to the next page');
-          step('toggle an issue', (v) => v.handleInput(' '));
-          assert.equal(view.state.selectedIssues.length, 1, 'the issue toggled');
-          step('switch to the Odd pane', (v) => v.handleInput('\t'));
-          step('toggle an odd document', (v) => v.handleInput(' '));
-          oddSelected = view.state.selectedOdd.length;
-          assert.equal(oddSelected, 1, 'the odd document toggled');
-          step('open the pane filter with a printable key', (v) => v.handleInput('w'));
-          step('type in the filter', (v) => v.handleInput('1'));
-          query = view.state.queries.odd;
-          assert.ok(query.length > 0, 'the filter received the typed text');
-          step('close the filter', (v) => v.handleInput('\x1b'));
+          step('move inside the inline type list', (v) => v.handleInput('\x1b[B'));
+          assert.equal(view.state.focus, 'type', 'the type list keeps the keyboard');
+          assert.equal(view.state.typeIndex, 1, 'down selects the next change type');
+          step('move back to the first type', (v) => v.handleInput('\x1b[A'));
+          assert.equal(view.state.typeIndex, 0, 'up selects the previous change type');
+          step('tab to the name field', (v) => v.handleInput('\t'));
+          assert.equal(view.state.focus, 'name', 'step 1 hands over to step 2');
+          step('type the change name', (v) => {
+            for (const char of 'panel-change') v.handleInput(char);
+          });
+          assert.equal(view.state.name, 'panel-change', 'the name field kept the typed value');
+          step('return to the type field', (v) => v.handleInput('\x1b[A'));
+          assert.equal(view.state.focus, 'type');
+          step('left reaches the name field', (v) => v.handleInput('\x1b[D'));
+          assert.equal(view.state.focus, 'name', 'left walks the two fields');
+          step('right returns to the type field', (v) => v.handleInput('\x1b[C'));
+          assert.equal(view.state.focus, 'type', 'right walks the two fields');
+          step('press an unbound key', (v) => v.handleInput('?'));
+          assert.equal(view.state.focus, 'name', '? starts the name instead of opening help');
+          assert.equal(view.state.name, 'panel-change?', 'the printable key lands in the name field');
           step('cancel the panel', (v) => v.handleInput('\x1b'));
           assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 10, 'every scripted interaction was measured');
+          assert.ok(step.steps.length >= 8, 'every scripted interaction was measured');
         }]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: manyIssues(20) }));
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
         assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
         assert.deepEqual(createdState(root), before, 'no branch, no checkout, no registry row');
         assert.deepEqual(built.notes, [], 'a cancel is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('inside the editing panel navigating, toggling, filtering, paging, help and typing in a frozen field each add no mutation', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('no-write-edit-keys');
-      const target = addRegisteredWorktree(root, 'feat/real-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const before = createdState(root);
-      const watcher = watchMutations();
-      try {
-        const driver = multiDriver([EDIT_KEYS, (view) => {
-          const step = stepRecorder(view, watcher);
-          step('move from the frozen type to the frozen name', (v) => v.handleInput('\x1b[B'));
-          step('type in the frozen name field', (v) => {
-            for (const char of 'zz') v.handleInput(char);
-          });
-          assert.equal(view.state.name, '', 'the frozen name field accepted no text');
-          step('enter the Issues pane', (v) => v.handleInput('\r'));
-          step('navigate rows', (v) => v.handleInput('\x1b[B'));
-          assert.ok(view.state.cursor.issues > 0, 'the row cursor moved');
-          step('page the focused list', (v) => v.handleInput(']'));
-          assert.ok(view.state.cursor.issues > 1, 'the page key moved the cursor to the next page');
-          step('toggle an unassigned issue', (v) => v.handleInput(' '));
-          assert.equal(view.state.selectedIssues.length, 2, 'exactly the toggled issue was added');
-          step('switch to the Odd pane', (v) => v.handleInput('\t'));
-          step('navigate the odd rows to an unassigned document', (v) => v.handleInput('\x1b[B'));
-          step('toggle an odd document', (v) => v.handleInput(' '));
-          assert.equal(view.state.selectedOdd.length, 2, 'exactly the toggled document was added');
-          step('open the pane filter with a printable key', (v) => v.handleInput('w'));
-          step('type in the filter', (v) => v.handleInput('1'));
-          assert.ok(view.state.queries.odd.length > 0, 'the filter received the typed text');
-          step('close the filter', (v) => v.handleInput('\x1b'));
-          step('cancel the panel', (v) => v.handleInput('\x1b'));
-          assert.deepEqual(step.steps.map(([, delta]) => delta), step.steps.map(() => 0), `every interaction added no mutation: ${JSON.stringify(step.steps)}`);
-          assert.ok(step.steps.length >= 13, 'every scripted interaction was measured');
-        }, ['\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        mod.setWarpCreateIssuesFetcher(async () => ({ ok: true, issues: manyIssues(20) }));
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(watcher.writes().length, 0, 'zero registry writes across every interaction');
-        assert.equal(watcher.creations().length, 0, 'zero checkout creations across every interaction');
-        assert.deepEqual(createdState(root), before, 'the assignments and every created state are untouched');
-        assert.deepEqual(built.notes, [], 'a cancel is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('confirming the edit is the FIRST mutation: exactly one registry write and no creation', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('first-mutation-edit');
-      const target = addRegisteredWorktree(root, 'feat/save-target');
-      assert.equal(registryLib.updateWorktree(root, target, { issues: [2], odd: ['w1-a'] }).ok, true);
-      const watcher = watchMutations();
-      try {
-        let confirmedAt = 0;
-        const driver = multiDriver([EDIT_KEYS, (view) => {
-          view.handleInput('\t');
-          view.handleInput(' '); // toggle #7 on
-          view.handleInput('\t');
-          view.handleInput('\x1b[B');
-          view.handleInput(' '); // toggle the second odd document on
-          assert.deepEqual(watcher.kinds(), [], 'every selection before the confirm wrote nothing');
-          confirmedAt = watcher.events.length;
-          view.handleInput('\x13'); // the explicit confirm
-        }, ['\x1b[B', '\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
-        await warpDef(commands).handler('', built.ctx);
-        assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
-        assert.deepEqual(watcher.kinds(), ['registry-write'], 'confirming is the first and only mutation');
-        assert.equal(watcher.writes().length, 1, 'editing performs exactly ONE registry write');
-        assert.equal(watcher.creations().length, 0, 'editing creates no checkout');
-        assert.equal(watcher.writes()[0].name, 'updateWorktree', 'the write goes through the registry entry point');
-        assert.equal(watcher.writes()[0].key, target, 'and targets the edited checkout');
-        assert.equal(driver.mounts(), 3, 'the selector reopened after the save');
-        assert.deepEqual(built.notes, [], 'a successful save is silent');
       } finally {
         watcher.restore();
       }
@@ -1465,21 +2060,25 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'first-mutation-thread' }));
     try {
       const root = makeRepo('first-mutation-create');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const before = createdState(root);
       const watcher = watchMutations();
       try {
         let confirmedAt = 0;
-        const driver = multiDriver([['\r'], (view) => {
-          view.handleInput('\x1b[B');
+        const driver = multiDriver([['c'], (view) => {
+          view.handleInput('\x1b[B'); // the inline type list moves to Bug fix
+          view.handleInput('\x1b[A'); // and back to Feature, the expected type
+          view.handleInput('\t'); // Tab hands the flow to the name field
           for (const char of 'nothing-yet') view.handleInput(char);
+          assert.equal(view.state.typeIndex, 0, 'the inline type list sits on Feature');
+          assert.equal(view.state.name, 'nothing-yet', 'the name field kept every character');
           assert.deepEqual(watcher.kinds(), [], 'navigating and typing before the confirm wrote nothing');
           confirmedAt = watcher.events.length;
-          view.handleInput('\x13'); // the explicit confirm
+          view.handleInput('enter'); // the explicit confirm key
         }]);
         const built = wiredCtx(root, driver);
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
         assert.deepEqual(watcher.kinds(), ['checkout-create', 'registry-write'], 'one creation then one write, in that order');
@@ -1490,8 +2089,9 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
         assert.ok(after.branches.includes('feat/nothing-yet'), `the derived branch exists (${after.branches})`);
         assert.equal(after.checkouts.length, before.checkouts.length + 1, 'the checkout was created');
         assert.ok(after.rows.some((row) => row.startsWith('feat/nothing-yet ')), 'the registry row was created');
-        assert.equal(built.switches.length, 1, 'the session warped into the new checkout');
-        assert.deepEqual(built.notes, [], 'creation then warp is silent');
+        // S7: the creation ends in the selector, never in an automatic warp.
+        assert.equal(built.switches.length, 0, 'S7: creating does not warp on its own');
+        assert.deepEqual(built.notes, [], 'creation is silent');
       } finally {
         watcher.restore();
       }
@@ -1500,24 +2100,27 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
     }
   });
 
-  test('a refused session preflight performs no mutation at all: no branch, no checkout, no write', async () => {
-    // A resolvable thread identity: without the preflight this fixture WOULD
-    // create, so a preflight that ran after the first mutation is caught.
+  // S7: the fork-source preflight existed ONLY because the creation used to
+  // end in a warp (a fork needs a session to fork from). Creation no longer
+  // warps, so a session Pi has not written to disk yet creates normally: the
+  // checkout and its registry row are the whole outcome.
+  test('creation needs no fork source: a session with no persisted file still creates (S7)', async () => {
     setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'refused-preflight-thread' }));
     try {
       const root = makeRepo('refused-preflight');
+      addMainBranch(root); // S2: a new worktree is born from local main
       addRegisteredWorktree(root, 'feat/one');
       const before = createdState(root);
       const watcher = watchMutations();
       try {
         const sessionFile = missingSessionFile('refused-sess');
         let confirmedAt = 0;
-        const driver = multiDriver([['\r'], (view) => {
+        const driver = multiDriver([['c'], (view) => {
           view.handleInput('\x1b[B');
           for (const char of 'refused-create') view.handleInput(char);
           confirmedAt = watcher.events.length;
-          view.handleInput('\x13'); // the explicit confirm
-        }]);
+          view.handleInput('enter'); // the explicit confirm key
+        }, ['\x1b']]);
         const built = makeWiredCtx({
           cwd: root,
           FakeSM: makeFakeSM([]),
@@ -1526,18 +2129,18 @@ describe('T16: the panels write nothing until the user confirms (S17)', { concur
           calls: [],
           mount: driver.mount,
         });
-        const { commands, mod } = await loadExtension();
-        panelSources(mod);
+        const { commands } = await loadExtension();
         await warpDef(commands).handler('', built.ctx);
         assert.equal(confirmedAt, 0, 'nothing was mutated before the confirm');
-        assert.deepEqual(watcher.kinds(), [], 'a refused preflight mutates nothing');
-        assert.equal(watcher.writes().length, 0, 'zero registry writes');
-        assert.equal(watcher.creations().length, 0, 'zero checkout creations');
-        assert.deepEqual(createdState(root), before, 'no branch, no checkout, no registry row');
-        assert.deepEqual(built.notes, [[
-          'warp: no persisted session for this session and nothing in memory to carry over; open or write the session first and retry',
-          'error',
-        ]], 'the refusal is reported instead of a half-made worktree');
+        assert.deepEqual(watcher.kinds(), ['checkout-create', 'registry-write'], 'one creation then one write, in that order');
+        const after = createdState(root);
+        assert.equal(after.branches.length, before.branches.length + 1, 'the branch was created');
+        assert.ok(after.branches.includes('fix/refused-create'), `the derived branch exists (${after.branches})`);
+        assert.equal(after.checkouts.length, before.checkouts.length + 1, 'the checkout was created');
+        assert.ok(after.rows.some((row) => row.startsWith('fix/refused-create ')), 'the registry row was created');
+        assert.equal(driver.mounts(), 3, 'the selector came back after the creation');
+        assert.deepEqual(built.switches, [], 'S7: and nothing was warped');
+        assert.deepEqual(built.notes, [], 'the creation is silent');
       } finally {
         watcher.restore();
       }
@@ -1631,7 +2234,7 @@ describe('S1: the selector paints before the facts, then enriches', { concurrenc
 
       const callsBeforeRender = factsCalls;
       const firstPaint = view.render(120).map(clean).join('\n');
-      assert.match(firstPaint, /create a worktree/, 'the first frame is usable');
+      assert.match(firstPaint, /Warp/, 'the first frame is usable');
       view.render(120);
       assert.equal(factsCalls, callsBeforeRender, 'render() performed no additional facts I/O');
       const before = view.state.checkouts.find((entry) => entry.path === target);
@@ -1645,6 +2248,489 @@ describe('S1: the selector paints before the facts, then enriches', { concurrenc
       view.handleInput('\x1b');
       await handler;
       assert.deepEqual(built.notes, [], 'Esc stays silent');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S2: creating from the panel asks about the INVOKING checkout's uncommitted
+// work. Copying is a choice the human makes at creation time — the new
+// checkout is either born empty from the commit or carries the pending work —
+// and the question is asked ONCE, before anything is created, so a cancel
+// leaves no branch, no checkout and no registry row. The answer travels as the
+// create path's own `changes` selection ('all' or 'none'), never as a second
+// copy implementation.
+// ---------------------------------------------------------------------------
+
+// A fixture whose checkout sits on local main with one tracked file modified
+// in the working tree and one untracked file pending.
+function makePendingChangeRepo(tag) {
+  const root = makeRepo(tag);
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\n');
+  git(root, ['add', 'a.txt']);
+  git(root, ['commit', '-m', 'a']);
+  // S2: the worktree is born from local main, so the committed file must be in
+  // main's tree for the pending change to apply.
+  git(root, ['branch', '-f', 'main', 'HEAD']);
+  fs.writeFileSync(path.join(root, 'a.txt'), 'one\ntwo\n');
+  fs.writeFileSync(path.join(root, 'b.txt'), 'fresh\n');
+  return root;
+}
+
+const panelTarget = (root, slug) => path.join(path.dirname(root), `${path.basename(root)}-worktrees`, slug);
+
+// Drive the real command: the selector opens, `c` opens the create panel, the
+// panel types `name` and confirms, and the RETURNED selector closes with Esc.
+// `mounts` is the observable number of overlays the run produced.
+async function driveCreateFlow({ root, name, beforeFlow }) {
+  const calls = [];
+  const FakeSM = makeFakeSM(calls);
+  const sessionFile = sessionFileIn();
+  const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+  const { commands, mod } = await loadExtension();
+  const mounts = [];
+  built.ctx.ui.custom = async (factory, options) => {
+    mounts.push(options);
+    const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('component did not settle')), 3000);
+      const done = (value) => { clearTimeout(timer); resolve(value); };
+      let view;
+      try {
+        view = factory(hostTui, plainTheme, {}, done);
+      } catch (err) {
+        clearTimeout(timer);
+        reject(err);
+        return;
+      }
+      const drive = () => {
+        try {
+          if (mounts.length === 1) {
+            view.handleInput('c'); // the create hotkey
+            return;
+          }
+          if (mounts.length === 2) {
+            view.handleInput('\t'); // Tab hands the flow to the name field
+            for (const char of name) view.handleInput(char);
+            view.handleInput('enter'); // enter asks to create it
+            return;
+          }
+          view.handleInput('\x1b'); // the returned selector closes: nothing chosen
+        } catch (err) {
+          clearTimeout(timer);
+          reject(err);
+        }
+      };
+      if (mounts.length === 1) drive();
+      else tick().then(drive);
+    });
+  };
+  if (typeof beforeFlow === 'function') beforeFlow(mod);
+  await warpDef(commands).handler('', built.ctx);
+  return { built, mounts, mod };
+}
+
+describe('S2: creating from the panel offers the pending changes', { concurrency: false }, () => {
+  test('a dirty checkout asks once, and "YES COPY" carries the pending work into the new checkout', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-copy-yes');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-pending-change');
+      track(path.dirname(target));
+      let asked = 0;
+      const { built, mounts } = await driveCreateFlow({
+        root,
+        name: 'pending-change',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; }),
+      });
+      // The question is asked once, and only the selector surfaces mount.
+      assert.equal(asked, 1, 'the pending work is reported and the human is asked');
+      assert.equal(mounts.length, 3, 'selector, create panel, selector: the question is not a third overlay');
+      // The pending work reached the new checkout, and the source keeps it.
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the tracked change travelled');
+      assert.equal(fs.readFileSync(path.join(target, 'b.txt'), 'utf8'), 'fresh\n', 'the untracked file travelled');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+      const row = registryLib.readRegistry(root).worktrees.find((entry) => entry.branch === 'feat/pending-change');
+      assert.ok(row, 'the created checkout is registered');
+      assert.deepEqual(built.switches, [], 'creating still warps nothing: the human picks afterwards');
+      assert.deepEqual(built.notes, [], 'nothing is reported: the question was the only interaction');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('"NO COPY" creates the checkout from the commit and copies nothing', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-copy-no');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-clean-change');
+      track(path.dirname(target));
+      let asked = 0;
+      const { mounts } = await driveCreateFlow({
+        root,
+        name: 'clean-change',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'no'; }),
+      });
+      assert.equal(asked, 1, 'the dirty checkout is reported');
+      assert.equal(mounts.length, 3, 'the selector returns after the creation');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\n', 'the checkout is born from the commit');
+      assert.equal(fs.existsSync(path.join(target, 'b.txt')), false, 'nothing was copied');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('cancelling the question creates nothing and returns to the selector', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-copy-cancel');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-uncopied-change');
+      track(path.dirname(target));
+      const before = createdState(root);
+      let asked = 0;
+      const { built, mounts } = await driveCreateFlow({
+        root,
+        name: 'uncopied-change',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return null; }),
+      });
+      assert.equal(asked, 1, 'the question was asked');
+      assert.equal(mounts.length, 3, 'closing the question hands the selector back');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.equal(fs.existsSync(target), false, 'the target path was never created');
+      assert.deepEqual(built.switches, [], 'nothing moved');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The question needs a REAL answer. A checkout whose pending changes cannot
+  // be read is NOT clean: creating anyway would silently leave the human's
+  // pending work behind right after they asked for a worktree. The creation
+  // therefore fails closed — one visible reason, no branch, no checkout, no
+  // registry row — and the selector comes back like every other closed flow.
+  // The failure is produced through git itself: a corrupt index breaks
+  // `git diff`/`git status` (the summary's reads) while `git worktree list`
+  // still answers, so the selector itself mounts normally.
+  test('an unreadable pending-change summary refuses the creation with a visible reason', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-summary-fail');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      fs.writeFileSync(path.join(root, '.git', 'index'), 'this is not a git index\n');
+      const before = createdState(root);
+      const target = panelTarget(root, 'feat-unreadable-change');
+      track(path.dirname(target));
+      const { built, mounts } = await driveCreateFlow({ root, name: 'unreadable-change' });
+      assert.equal(mounts.length, 3, 'the selector comes back instead of ending the flow');
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.equal(fs.existsSync(target), false, 'the target path was never created');
+      assert.deepEqual(built.switches, [], 'nothing moved');
+      const errors = built.notes.filter(([, level]) => level === 'error');
+      assert.equal(errors.length, 1, `exactly one visible refusal, got ${JSON.stringify(built.notes)}`);
+      const [message] = errors[0];
+      assert.equal(typeof message, 'string', 'the refusal carries text, never undefined');
+      assert.match(message, /pending change/i, `the reason names what could not be read: ${message}`);
+      assert.match(message, /nothing was created/, 'and states that nothing was written');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a clean checkout never asks and creates exactly as before', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-copy-clean');
+      addMainBranch(root); // S2: a new worktree is born from local main
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-clean-panel');
+      track(path.dirname(target));
+      let asked = 0;
+      const { mounts } = await driveCreateFlow({
+        root,
+        name: 'clean-panel',
+        beforeFlow: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; }),
+      });
+      assert.equal(asked, 0, 'a clean checkout never prompts');
+      assert.equal(mounts.length, 3, 'the selector returns after the creation');
+      assert.equal(fs.existsSync(target), true, 'the checkout was created');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The create flow returns to Warp as soon as the checkout path exists.
+//
+// The slow half of the creation hooks (dependency install, `codegraph init`)
+// is what made "confirm" feel like a hang: the selector could not come back
+// until an install had finished. The path is all the warp needs, so the setup
+// now runs in a managed background task and reports itself when it settles.
+// The pending-changes question is one step of this flow like the panel is, so
+// it mounts with the SAME bottom overlay — mounted bare it painted as a
+// fullscreen component in the middle of the flow. And the question is asked
+// ONCE per flow: a create that already took the answer hands it to the one
+// warp that follows, so the human is never asked the same thing twice (nor
+// offered a second copy the destination would refuse as an overlap).
+// ---------------------------------------------------------------------------
+describe('create flow: returns to Warp immediately and asks the copy question once', { concurrency: false }, () => {
+  // A `codegraph` that sleeps, then drops a marker: the marker's absence at
+  // the moment the selector returns is the observable proof of WHEN it ran.
+  function makeSlowCodegraph() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-cgslow-')));
+    const marker = path.join(dir, 'done');
+    fs.writeFileSync(
+      path.join(dir, 'codegraph'),
+      ['#!/bin/sh', 'sleep 0.3', `printf done > "${marker}"`, 'exit 0', ''].join('\n'),
+      { mode: 0o755 },
+    );
+    return { dir, marker };
+  }
+
+  // Drive the whole flow with one mount handler that decides each surface's
+  // keys: `c` on the selector, the name on the panel, the answer on the
+  // question (when it is a real mount) and a choice on the returned selector.
+  async function driveCreate({ root, name, asker, pickCreated }) {
+    const calls = [];
+    const FakeSM = makeFakeSM(calls);
+    const sessionFile = sessionFileIn();
+    const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+    const { commands, mod } = await loadExtension();
+    const mounts = [];
+    const rendered = [];
+    built.ctx.ui.custom = async (factory, options) => {
+      mounts.push(options);
+      const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('component did not settle')), 5000);
+        const done = (value) => { clearTimeout(timer); resolve(value); };
+        let view;
+        try {
+          view = factory(hostTui, plainTheme, {}, done);
+        } catch (err) {
+          clearTimeout(timer);
+          reject(err);
+          return;
+        }
+        rendered.push(clean(view.render(80).join('\n')));
+        const drive = () => {
+          try {
+            const at = mounts.length;
+            if (at === 1) {
+              view.handleInput('c'); // the create hotkey
+              return;
+            }
+            if (at === 2) {
+              view.handleInput('\t');
+              for (const char of name) view.handleInput(char);
+              view.handleInput('enter'); // confirm the creation
+              return;
+            }
+            // A REAL pending-changes question is its own overlay: answer it.
+            if (/YES COPY/.test(rendered[at - 1])) {
+              view.handleInput('\r'); // YES COPY
+              return;
+            }
+            // The returned selector: pick the created checkout, or leave.
+            if (pickCreated) {
+              const others = view.state.checkouts.filter((entry) => entry.path !== root);
+              const index = others.findIndex((entry) => entry.name === pickCreated);
+              if (index >= 0) {
+                for (let step = 0; step < index; step += 1) view.handleInput('\x1b[B');
+                view.handleInput('\r');
+                return;
+              }
+            }
+            view.handleInput('\x1b');
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+          }
+        };
+        if (mounts.length === 1) drive();
+        else tick().then(drive);
+      });
+    };
+    if (typeof asker === 'function') asker(mod);
+    await warpDef(commands).handler('', built.ctx);
+    return { built, mounts, rendered, mod };
+  }
+
+  test('the selector comes back before the setup finishes, and the setup reports itself after', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-bg');
+      addMainBranch(root);
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-slow-setup');
+      track(path.dirname(target));
+      const slow = makeSlowCodegraph();
+      setEnv({ PATH: `${slow.dir}${path.delimiter}${process.env.PATH || ''}` });
+      const { built, mounts, mod } = await driveCreate({ root, name: 'slow-setup' });
+      assert.equal(mounts.length, 3, 'selector, panel, selector: the flow returned without waiting');
+      assert.equal(fs.existsSync(target), true, 'the path the warp needs already exists');
+      assert.equal(fs.existsSync(slow.marker), false, 'the slow setup had NOT finished when the selector returned');
+      assert.deepEqual(built.notes, [], 'nothing is reported while the setup is still running');
+      await mod.awaitPendingCreationSetups();
+      assert.equal(fs.existsSync(slow.marker), true, 'the deferred setup still ran, in the background');
+      const reports = built.notes.filter(([message]) => /setup/i.test(String(message)));
+      assert.equal(reports.length, 1, `exactly one setup report, got ${JSON.stringify(built.notes)}`);
+      assert.match(String(reports[0][0]), /setup finished for feat\/slow-setup/, 'the report names the checkout');
+      assert.equal(reports[0][1], 'info');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the pending-changes question mounts as the same bottom overlay as the panel', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-question-overlay');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-overlay-change');
+      track(path.dirname(target));
+      const { mounts, rendered } = await driveCreate({ root, name: 'overlay-change' });
+      assert.equal(mounts.length, 4, 'selector, panel, question, selector');
+      const question = mounts[2];
+      assert.equal(question.overlay, true, 'the question is an overlay, never a bare fullscreen component');
+      assert.equal(question.overlayOptions.anchor, 'bottom-center', 'the same bottom geometry as Warp');
+      assert.equal(question.overlayOptions.width, '100%');
+      assert.equal(question.overlayOptions.margin, 0);
+      assert.match(rendered[2], /Uncommitted changes/, 'the question states what is at stake');
+      assert.match(rendered[2], /YES COPY/);
+      assert.match(rendered[2], /NO COPY/);
+      assert.equal(mounts[3].overlay, true, 'and the selector still returns as an overlay');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the answer still travels');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a create that already asked does not ask again when the created row is picked', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-no-repeat');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-repeat-change');
+      track(path.dirname(target));
+      let asked = 0;
+      const { built, mounts } = await driveCreate({
+        root,
+        name: 'repeat-change',
+        asker: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; }),
+        pickCreated: 'feat-repeat-change',
+      });
+      assert.equal(mounts.length, 3, 'selector, panel, selector: the question was asked once, not twice');
+      assert.equal(asked, 1, 'the same pending work is never offered twice in one flow');
+      assert.deepEqual(built.notes, [], `nothing failed: ${JSON.stringify(built.notes)}`);
+      assert.equal(built.switches.length, 1, 'the picked checkout is where the session went');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the copy made at creation is the one that counts');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A copy can fail PARTWAY: the helper lands some files and then reports the
+// failure together with what already landed ("N of M files already copied"),
+// which is the only honest state description. The warp's refusal must never
+// contradict that evidence with a blanket "nothing was overwritten" — the
+// destination really does hold the files this attempt put there — while it
+// keeps saying the one thing that IS always true (nothing was rolled back) and
+// the partial-copy warning itself.
+//
+// The partial state is produced through the same seam production uses: the
+// extension resolves its helpers from GENTLE_WORKTREE_LIB_DIR, so a shim module
+// delegates every read to the real helper and reports a copy that landed one
+// file before failing.
+// ---------------------------------------------------------------------------
+describe('handoff copy failure: the report matches what is really on disk', { concurrency: false }, () => {
+  function libDirWithPartialCopy({ landedFile, landedBytes, error }) {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-partial-lib-')));
+    for (const entry of fs.readdirSync(LIB_DIR)) {
+      if (!entry.endsWith('.js') || entry === 'worktree-changes.js') continue;
+      fs.symlinkSync(path.join(LIB_DIR, entry), path.join(dir, entry));
+    }
+    fs.writeFileSync(path.join(dir, 'worktree-changes.js'), [
+      "'use strict';",
+      `const real = require(${JSON.stringify(path.join(LIB_DIR, 'worktree-changes.js'))});`,
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      'module.exports = {',
+      '  ...real,',
+      '  async copyChanges(args) {',
+      `    fs.writeFileSync(path.join(args.to, ${JSON.stringify(landedFile)}), ${JSON.stringify(landedBytes)});`,
+      `    return { ok: false, error: ${JSON.stringify(error)} };`,
+      '  },',
+      '};',
+      '',
+    ].join('\n'));
+    return dir;
+  }
+
+  test('a partial copy is reported as partial, never as nothing written', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makePendingChangeRepo('handoff-partial');
+      const target = addRegisteredWorktree(root, 'feat/handoff-partial');
+      // The destination is born from HEAD (`a.txt` = 'one\n'), so the shim's
+      // landed `a.txt` is exactly the file this attempt wrote there.
+      const libDir = libDirWithPartialCopy({
+        landedFile: 'a.txt',
+        landedBytes: 'one\ntwo\n',
+        error: 'cannot copy changes: "blocked/second.txt" could not be written; '
+          + '1 of 2 files already copied ("a.txt"); the rest were not copied; '
+          + 'inspect the destination before retrying',
+      });
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+      const { mod } = await loadExtension();
+      // The loader pins GENTLE_WORKTREE_LIB_DIR to the real helpers, so the shim
+      // is installed after it: every helper call the warp makes resolves through
+      // the shim module, which delegates everything except `copyChanges`.
+      setEnv({ GENTLE_WORKTREE_LIB_DIR: libDir });
+      const out = await mod.executeWorktreeWarp('feat-handoff-partial', built.ctx, {
+        handoff: {
+          name: 'feat-handoff-partial',
+          target: fs.realpathSync(target),
+          from: root,
+          branch: 'feat/handoff-partial',
+          changes: { mode: 'all', paths: [] },
+        },
+      });
+      assert.equal(out.isError, true, `the failed copy refuses the move: ${out.text}`);
+      const text = String(out.text);
+      assert.match(text, /1 of 2 files already copied/, `the partial-copy warning survives verbatim: ${text}`);
+      assert.doesNotMatch(
+        text,
+        /nothing was overwritten\s*\n/,
+        `the refusal never makes an UNQUALIFIED "nothing was overwritten" claim when a file landed: ${text}`,
+      );
+      assert.match(text, /nothing was rolled back/, `it still states that nothing was undone: ${text}`);
+      assert.match(
+        text,
+        /nothing was overwritten beyond the files listed above/,
+        `and it scopes the safety claim to what really happened: ${text}`,
+      );
+      assert.match(text, /now holds 1 file: a\.txt/, `it names what the destination really holds: ${text}`);
+      assert.match(text, /b\.txt does not match the source byte for byte/, `and what is still missing: ${text}`);
+      assert.match(text, /recovery:/, 'and offers the recovery');
+      assert.deepEqual(built.switches, [], 'no session switch');
+      assert.deepEqual(calls, [], 'no fork either');
+      // The report matches the disk: the landed file is still there.
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the landed file stays on disk');
+      assert.equal(fs.existsSync(path.join(target, 'b.txt')), false, 'the missing file was never written');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
     } finally {
       restoreEnv();
     }

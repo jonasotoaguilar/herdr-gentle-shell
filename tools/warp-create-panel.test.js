@@ -1,17 +1,26 @@
 'use strict';
-// W4 (warp-popup S3,S4,S5,S7,S8): the SINGLE-PANEL worktree creation.
+// T4 (worktree-ui-feedback S4,S12,S15): the worktree CREATION and EDITING
+// panel.
 //
-// One component holds everything a creation needs at once: the change
-// type (with its sub-panel — there is no native dropdown in this host),
-// the change name with its live branch/path preview, and TWO content
-// panes: the active dataset (Issues or Odd) on the left and that row's
-// complete, read-only preview on the right (S11). Every test renders
-// headlessly at a fixed size and asserts that
-// every line is EXACTLY the requested width, and drives the component with
-// synthetic keys. The issue fetcher, the odd lister and both preview
-// readers are injected; two tests use the real seams (lib/gh-issues.js
-// through `setGhRunner`, lib/odd-docs.js + lib/odd-markdown.js on a temp
-// checkout) to prove the wiring, not a re-implementation.
+// Creating is the TABBED bottom flow a human reported as still being a
+// pop-up (S12), with the fields stacked together instead of tabbed (S7): a
+// preview of the REAL derived branch and path ABOVE, then `Type` and `Name` as
+// the two tabs of one strip, only the active field's content under them (the
+// type tab holds the inline list, the name tab the text field). The preview
+// stays BLANK (`-`) until both fields derive a real branch and path: an
+// untouched form is not an error, so nothing in the preview is painted red or
+// names a failure, while a refused submit still says exactly why.
+// `tab`/`shift+tab`/`←`/`→` move between the two tabs and `↑`/`↓` pick the
+// type; `enter` on the name creates. Only type and name exist: no Issues/Odd
+// selector, no association, no step counter. The component derives its own
+// compact content height (the host mounts it at the bottom), so a wrapped
+// surface never leaves slack rows. The Issues/Odd association panes, their
+// selection state and their previews are NOT part of this surface; they
+// survive only in the panel's editing mode, which the editing tests below
+// still drive. Every test renders headlessly and asserts that every line is
+// EXACTLY the requested width, and drives the component with synthetic
+// keys. The create tests use the real seams (`lib/gh-issues.js` through
+// `setGhRunner`) to prove the panel reads NO issue or odd source.
 
 const { test, describe, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -38,9 +47,10 @@ function scratchDir(tag) {
   return dir;
 }
 
-// A real repository: `validateBranch` runs `git check-ref-format` and the
-// path derivation reads the real repository identity, so the preview is
-// proven against the same helpers the create path uses.
+// A real repository: the path derivation reads the real repository identity
+// (memoized once per panel), so the preview is proven against the same helpers
+// the create path uses. The panel spawns no `git check-ref-format` (S1): that
+// authority belongs to the create path, which awaits it.
 function makeRepo() {
   const dir = scratchDir('repo');
   execFileSync('git', ['init', '-q', dir], { stdio: 'ignore' });
@@ -73,6 +83,18 @@ function boxLines(view, width, height) {
   return lines;
 }
 
+// S12: the create surface derives its own height, so the assertion is the
+// width of every line plus "no filler below the closing rule" instead of a
+// fixed frame size.
+function renderedLines(view, width) {
+  const lines = view.render(width);
+  assert.ok(lines.length > 0, 'the panel renders something');
+  for (const line of lines) {
+    assert.equal([...stripAnsi(line)].length, width, `line is not ${width} wide: ${JSON.stringify(line)}`);
+  }
+  return lines;
+}
+
 function findLine(lines, needle) {
   const line = lines.find((entry) => stripAnsi(entry).includes(needle));
   assert.ok(line !== undefined, `no line contains ${JSON.stringify(needle)}\n${lines.map(stripAnsi).join('\n')}`);
@@ -81,22 +103,6 @@ function findLine(lines, needle) {
 
 function allText(lines) {
   return lines.map(stripAnsi).join('\n');
-}
-
-// The Odd pane's row order as PAINTED: every odd row renders as
-// `[ ] <name>` (or `❯ [x] <name>` when focused and selected), so the
-// sequence a pane actually shows can be read back from the frame without
-// reaching into internal state.
-function oddRowOrder(lines, names) {
-  const out = [];
-  for (const line of lines) {
-    const text = stripAnsi(line);
-    for (const name of names) {
-      if (out.includes(name)) continue;
-      if (text.includes(`[ ] ${name}`) || text.includes(`[x] ${name}`)) out.push(name);
-    }
-  }
-  return out;
 }
 
 const DEFAULT_ISSUES = [
@@ -144,9 +150,18 @@ function openPanel(overrides = {}) {
   return { view, finished, reads };
 }
 
-// Focus shortcuts (the panel's own documented keys).
+// Focus shortcuts for the EDITING mode (the create panel has no panes).
+// Creating moves between its two fields with Tab/←/→ (S12), so this helper
+// uses the same key; the editing header keeps its own ↓ between fields.
 function focusName(view) {
-  view.handleInput('down'); // type -> name
+  view.handleInput('\t'); // type -> name
+}
+// Creation has ONE confirm key: `enter` on the Name field. Nothing here
+// presses `ctrl+s`, which the user reported as a duplicate of `enter` and which
+// now only saves the assignment panes in editing mode.
+function createNow(view) {
+  if (view.state.focus !== 'name') view.handleInput('\t');
+  view.handleInput('enter');
 }
 function focusIssues(view) {
   view.handleInput('\t');
@@ -162,45 +177,79 @@ function typeText(view, text) {
 }
 
 describe('the rendered panel', { concurrency: false }, () => {
-  test('shows the type and name fields, the live branch and path preview, the active dataset and its preview, and the footers', () => {
+  test('shows the preview above the Type|Name tabs, with only the active field under them', () => {
     const { view } = openPanel({ initialName: 'new-change' });
-    const lines = boxLines(view, 100, 24);
+    const lines = renderedLines(view, 100);
     const text = allText(lines);
+    const at = (needle) => lines.findIndex((line) => stripAnsi(line).includes(needle));
+    assert.match(text, /Type · Name/, 'the two fields are TABS, not two stacked rows (S7)');
     assert.match(text, /Type: Feature \(feat\)/, 'the conventional type with its human label');
-    assert.match(text, /Name: new-change/, 'the typed name');
+    assert.ok(!text.includes('Name:'), 'only the ACTIVE tab renders its field under the strip');
     findLine(lines, 'preview branch: feat/new-change');
     findLine(lines, `preview path: ${path.join(path.dirname(REPO), `${path.basename(REPO)}-worktrees`, 'feat-new-change')}`);
-    assert.match(text, /Issues 2/, 'the Issues tab names the dataset and its count');
-    assert.match(text, /Odd 2/, 'the Odd tab stays visible so the toggle is discoverable');
-    assert.match(text, /Preview/, 'the preview header');
-    assert.match(text, /#12 Crash on empty/, 'the first issue row');
-    assert.ok(!text.includes('[ ] alpha'), 'the inactive Odd list is not a second list column');
-    assert.match(text, /body of issue 12/, 'the focused row preview');
-    assert.match(text, /↑\/↓ fields & rows/, 'the footer names the arrow map');
-    assert.match(text, /←\/→ type \/ dataset/, 'the footer names the type and dataset keys');
-    assert.match(text, /Space select/, 'the footer names the selection key');
-    assert.match(text, /Tab dataset/, 'the footer names the dataset toggle');
+    assert.ok(at('preview branch:') < at('Type · Name'), 'the preview sits ABOVE the tabs');
+    assert.ok(at('preview path:') < at('Type · Name'), 'both preview rows sit above the tabs');
+    assert.ok(at('Type · Name') < at('Type: Feature'), 'the active field sits UNDER its tab strip');
+    for (const type of panel.CHANGE_TYPES) {
+      assert.ok(text.includes(`${type.label} (${type.id})`), `the type list is inline: ${type.id}`);
+    }
+    assert.ok(!text.includes('Step 1 of 2'), 'no step counter: the surface is the two fields');
+    assert.ok(!text.includes('Step 2 of 2'), 'no step counter on the name either');
+    assert.ok(!text.includes('Choose the change type'), 'the type is a list in place, not a second pop-up surface');
+    assert.match(text, /↑\/↓ type/, 'the footer names the type-selection keys');
     assert.match(text, /Enter confirm/, 'the footer names the confirm key');
-    assert.match(text, /Ctrl\+S create/, 'the keys footer names ctrl+s');
+    assert.ok(!/Ctrl\+S create/.test(text), 'the footer never advertises a duplicate create key');
     assert.match(text, /Esc cancel/, 'the keys footer names esc');
     assert.ok(!text.includes('? help'), 'the footer never advertises a help key');
+    // The Name tab is the name field alone: the type row and its list belong
+    // to the other tab and are not rendered under this one.
+    view.handleInput('\t');
+    const nameTab = allText(renderedLines(view, 100));
+    assert.match(nameTab, /Type · Name/, 'the tab strip stays visible');
+    assert.match(nameTab, /Name: new-change/, 'the Name tab renders the name field');
+    assert.ok(!nameTab.includes('Type: Feature'), 'the Type field belongs to the Type tab');
+    assert.ok(!nameTab.includes('Bug fix (fix)'), 'the inline type list is not shown under the Name tab');
   });
 
-  test('every line is exactly the requested width at several terminal sizes', () => {
-    for (const [width, height] of [[60, 18], [80, 24], [100, 24], [120, 30]]) {
+  test('every line is exactly the requested width and the surface ends at its own content', () => {
+    for (const [width, height] of [[40, 24], [60, 24], [80, 24], [100, 24], [120, 40]]) {
       const { view } = openPanel({ rowsAvailable: () => height });
-      boxLines(view, width, height);
+      const lines = renderedLines(view, width);
+      assert.ok(lines.length <= height, `${width}x${height}: the surface never exceeds the host budget`);
+      assert.ok(lines.length < height, `${width}x${height}: it derives its own height instead of filling the host rows`);
+      assert.match(stripAnsi(lines[lines.length - 1]), /^─+$/, `${width}x${height}: the closing rule is the last row`);
     }
+    // A short host windows the inline type list to the rows left over and
+    // still ends on its closing rule: no filler rows above or below.
+    const short = openPanel({ rowsAvailable: () => 18 });
+    const lines = renderedLines(short.view, 80);
+    assert.equal(lines.length, 18, 'a short host is filled exactly, never overflowed');
+    assert.match(stripAnsi(lines[lines.length - 1]), /^─+$/);
+    assert.ok(!allText(lines).includes('Revert (revert)'), 'the type list windows around the selection');
+  });
+
+  test('a host too short for the two fields says so in one line instead of overflowing', () => {
+    const { view } = openPanel({ rowsAvailable: () => 6 });
+    const lines = renderedLines(view, 60);
+    assert.equal(lines.length, 1, 'one honest row, never more than the host offers');
+    assert.match(stripAnsi(lines[0]), /New worktree .* enlarge the terminal/);
+    assert.equal(view.render(0).length, 0, 'a hostile width renders nothing');
+    // A refusal adds a row, so the same guard covers the tightest host that
+    // fits the fixed form plus its message.
+    const refused = openPanel({ rowsAvailable: () => 8 });
+    createNow(refused.view);
+    const tight = renderedLines(refused.view, 60);
+    assert.equal(tight.length, 1, 'the refusal never overflows a too-short host');
   });
 
   test('typing the name moves the branch and path preview live, character by character', () => {
     const { view } = openPanel();
     focusName(view);
     typeText(view, 'new');
-    let lines = boxLines(view, 100, 24);
+    let lines = renderedLines(view, 100);
     assert.match(findLine(lines, 'preview branch:').trim(), /feat\/new$/);
     typeText(view, '-change');
-    lines = boxLines(view, 100, 24);
+    lines = renderedLines(view, 100);
     findLine(lines, 'preview branch: feat/new-change');
     findLine(lines, 'preview path:');
     const preview = findLine(lines, 'preview path:');
@@ -208,75 +257,106 @@ describe('the rendered panel', { concurrency: false }, () => {
     assert.match(findLine(lines, 'Name:'), /Name: new-change▊/);
   });
 
-  test('an invalid name is shown as invalid instead of a derived branch', () => {
-    const { view } = openPanel();
-    const lines = boxLines(view, 100, 24);
-    const branch = findLine(lines, 'preview branch:');
-    assert.ok(branch.includes('✗'), 'the invalid state is marked');
-    assert.match(branch, /name is empty/);
-    assert.ok(!branch.includes('feat/worktree'), 'no fake branch is derived from an empty name');
-    const target = findLine(lines, 'preview path:');
-    assert.match(target, /✗ not derived/);
-    // A name with nothing slug-worthy is refused, not silently turned into `worktree`.
+  test('an incomplete form leaves the preview blank and neutral, never red (S7)', () => {
+    const { view, finished } = openPanel();
+    const lines = renderedLines(view, 100);
+    assert.equal(findLine(lines, 'preview branch:').trim(), 'preview branch: -', 'an empty name previews nothing yet');
+    assert.equal(findLine(lines, 'preview path:').trim(), 'preview path: -');
+    const text = allText(lines);
+    for (const noise of ['✗', 'name is empty', 'not derived', 'invalid', 'cannot create']) {
+      assert.ok(!text.includes(noise), `the untouched preview carries no ${JSON.stringify(noise)}\n${text}`);
+    }
+    assert.ok(!text.includes('feat/worktree'), 'no fake branch is derived from an empty name');
+    // A name with nothing slug-worthy is refused on SUBMIT, not painted into
+    // the preview while the user is still typing.
     focusName(view);
     typeText(view, '!!!');
-    assert.match(findLine(boxLines(view, 100, 24), 'preview branch:'), /name has no letters or digits/);
+    const typed = renderedLines(view, 100);
+    assert.equal(findLine(typed, 'preview branch:').trim(), 'preview branch: -', 'an underivable name stays blank');
+    assert.equal(findLine(typed, 'preview path:').trim(), 'preview path: -');
+    createNow(view);
+    assert.deepEqual(finished, [], 'an invalid name still never creates');
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
-  test('a git refusal of the derived branch is surfaced verbatim', () => {
+  // S1: the render path and the submit key BOTH stay free of the
+  // `check-ref-format` child. The preview derives a format-valid candidate from
+  // the pure helpers (so a derivable branch is previewed neutrally, never
+  // guessed at and never painted red) and the creation is handed on with the
+  // documented payload; the authoritative branch check runs in the create path
+  // (`worktree_create` → `validateBranchAsync`), which awaits it and refuses
+  // with its own message.
+  test('the panel never runs git branch validation: the create path owns `check-ref-format` (S1)', () => {
+    let validations = 0;
     const git = {
       slugifyBranch: () => '-bad',
-      validateBranch: (branch) => ({ ok: false, reason: `invalid branch name: ${branch}` }),
+      validateBranch: () => {
+        validations += 1;
+        return { ok: false, reason: 'the panel must never ask' };
+      },
       canonicalWorktreePath: () => '/nowhere',
     };
-    const { view } = openPanel({ git, initialName: 'x' });
-    assert.match(findLine(boxLines(view, 100, 24), 'preview branch:'), /invalid branch name: feat\/-bad/);
+    const { view, finished } = openPanel({ git, initialName: 'x' });
+    assert.equal(
+      findLine(renderedLines(view, 100), 'preview branch:').trim(),
+      'preview branch: feat/-bad',
+      'the preview derives the candidate locally instead of asking git while painting',
+    );
+    assert.ok(!allText(renderedLines(view, 100)).includes('cannot create'), 'a derivable candidate is never an error');
+    assert.equal(validations, 0, 'painting the preview spawns no validation child');
+    createNow(view);
+    assert.equal(validations, 0, 'submitting does not spawn one either: the create path validates');
+    assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'x' }], 'the documented payload is handed on');
+  });
+
+  test('a malformed name is still refused on submit, with its reason, and nothing is created', () => {
+    const { view, finished } = openPanel({ initialName: '!!!' });
+    assert.equal(findLine(renderedLines(view, 100), 'preview branch:').trim(), 'preview branch: -');
+    createNow(view);
+    assert.deepEqual(finished, [], 'an underivable name never creates');
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
   test('the name field renders a real placeholder and a cursor, and never treats the placeholder as the value', () => {
     const { view, finished } = openPanel();
     focusName(view);
-    let text = allText(boxLines(view, 100, 24));
+    let text = allText(renderedLines(view, 100));
     assert.match(text, /Name: ▊name-change/, 'the placeholder is ghost text after the caret');
     view.handleInput('n');
-    text = allText(boxLines(view, 100, 24));
+    text = allText(renderedLines(view, 100));
     assert.match(text, /Name: n▊/, 'the typed value replaces the ghost text');
     assert.ok(!text.includes('name-change'), 'the placeholder disappears once there is a value');
     // The placeholder is not a name: creating from it is refused.
     view.handleInput('\x7f');
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(finished, [], 'a ghost placeholder never creates anything');
-    assert.match(allText(boxLines(view, 100, 24)), /cannot create: name is empty/);
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name is empty/);
   });
 });
 
 describe('the type field', { concurrency: false }, () => {
-  test('enter opens the type sub-panel and a pick closes it and moves to the name', () => {
-    const { view } = openPanel();
-    view.handleInput('enter');
-    assert.equal(view.state.typePanelOpen, true, 'enter opens the sub-panel');
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Choose the change type/);
-    for (const type of panel.CHANGE_TYPES) {
-      assert.ok(text.includes(`${type.label} (${type.id})`), `the sub-panel lists ${type.id}`);
-    }
-    view.handleInput('down');
-    view.handleInput('enter');
-    assert.equal(view.state.typePanelOpen, false, 'picking closes the sub-panel');
-    assert.equal(view.state.focus, 'name', 'a pick moves focus to the name');
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Type: Bug fix \(fix\)/);
+  test('↑/↓ move the type selection in place and the preview follows live', () => {
+    const { view } = openPanel({ initialName: 'new-change' });
+    assert.equal(view.state.typeIndex, 0);
+    view.handleInput('\x1b[B'); // down
+    assert.equal(view.state.typeIndex, 1);
+    assert.equal(view.state.focus, 'type', 'picking a type never leaves the list');
+    assert.match(allText(renderedLines(view, 100)), /Type: Bug fix \(fix\)/);
+    assert.match(findLine(renderedLines(view, 100), 'preview branch:').trim(), /^preview branch: fix\/new-change$/);
+    assert.match(stripAnsi(renderedLines(view, 100).find((line) => stripAnsi(line).includes('Bug fix') && stripAnsi(line).includes('❯ '))), /Bug fix \(fix\)/, 'the selected row carries the marker');
+    view.handleInput('\x1b[A'); // up
+    assert.equal(view.state.typeIndex, 0);
+    view.handleInput('\x1b[A');
+    assert.equal(view.state.typeIndex, 0, 'the first type is a clamp');
+    for (let i = 0; i < panel.CHANGE_TYPES.length + 3; i += 1) view.handleInput('\x1b[B');
+    assert.equal(view.state.typeIndex, panel.CHANGE_TYPES.length - 1, 'the last type is a clamp');
   });
 
-  test('left/right cycle the type as a shortcut', () => {
-    const { view } = openPanel({ initialName: 'new-change' });
-    view.handleInput('right');
-    assert.match(findLine(boxLines(view, 100, 24), 'preview branch:').trim(), /^preview branch: fix\/new-change$/);
-    assert.match(allText(boxLines(view, 100, 24)), /Type: Bug fix \(fix\)/);
-    view.handleInput('left');
-    view.handleInput('left');
-    const last = panel.CHANGE_TYPES[panel.CHANGE_TYPES.length - 1];
-    assert.match(allText(boxLines(view, 100, 24)), new RegExp(`Type: ${last.label} \\(${last.id}\\)`));
+  test('a printable key on the type field starts the name instead of typing into a list', () => {
+    const { view } = openPanel();
+    view.handleInput('n');
+    assert.equal(view.state.focus, 'name', 'the typed character moves to the name field');
+    assert.equal(view.state.name, 'n', 'and is kept as its first character');
   });
 
   test('the type set and the branch format match the repository branch-pr convention', () => {
@@ -290,848 +370,479 @@ describe('the type field', { concurrency: false }, () => {
     const literal = line.slice(line.indexOf('= ') + 2).replace(/;\s*$/, '');
     const branchRe = new RegExp(literal.slice(1, literal.lastIndexOf('/')).replace(/\\\//g, '/'));
     const { view } = openPanel({ initialName: 'new-change' });
-    const branch = findLine(boxLines(view, 100, 24), 'preview branch:').trim().replace('preview branch: ', '');
+    const branch = findLine(renderedLines(view, 100), 'preview branch:').trim().replace('preview branch: ', '');
     assert.ok(branchRe.test(branch), `${branch} must match the skill's <type>/<slug> shape`);
   });
 });
 
-describe('the two panes', { concurrency: false }, () => {
-  test('both panes list their rows and the focused row preview is read on focus, once per row', () => {
-    const { view, reads } = openPanel();
-    assert.deepEqual(reads.issues, [12], 'the row in focus at open is read exactly once');
-    let lines = boxLines(view, 100, 24);
-    assert.match(allText(lines), /#12 Crash on empty/);
-    assert.match(allText(lines), /#7 Docs drift/);
-    assert.ok(!allText(lines).includes('[ ] alpha'), 'the Issues dataset is the only list rendered');
-    assert.match(allText(lines), /body of issue 12/);
-    focusIssues(view);
-    view.handleInput('down');
-    assert.deepEqual(reads.issues, [12, 7], 'the newly focused row is read');
-    lines = boxLines(view, 100, 24);
-    assert.match(allText(lines), /body of issue 7/, 'the preview follows the focused row');
-    assert.ok(!allText(lines).includes('body of issue 12'), 'the previous preview is not shown');
-    view.handleInput('up');
-    assert.deepEqual(reads.issues, [12, 7], 'a revisited row comes from the cache');
-    assert.match(allText(boxLines(view, 100, 24)), /body of issue 12/);
-    view.handleInput('\t'); // Issues dataset -> Odd dataset
-    assert.deepEqual(reads.odd, ['/odd/alpha.md'], 'the Odd row is read when its dataset becomes active');
-    assert.match(allText(boxLines(view, 100, 24)), /specs for alpha/);
+// S12: creating a worktree asks for exactly TWO things — the change type and
+// the change name — and then creates it. The Issues/Odd association panes,
+// their selection state, their keys and their previews belong to no part of
+// this surface any more.
+describe('S12: two fields, nothing else', { concurrency: false }, () => {
+  test('the panel has no Issues pane, no Odd pane, no pane tab and no preview column', () => {
+    const { view } = openPanel({ initialName: 'new-change' });
+    const text = allText(renderedLines(view, 120));
+    assert.ok(!text.includes('Issues'), `no Issues pane\n${text}`);
+    assert.ok(!text.includes('Odd'), `no Odd pane\n${text}`);
+    assert.ok(!text.includes('Preview'), `no preview column header\n${text}`);
+    assert.ok(!text.includes('Search Issues:') && !text.includes('Search Odd:'), `no pane filter row\n${text}`);
+    assert.ok(!text.includes('[ ] '), `no association rows\n${text}`);
+    assert.ok(!text.includes('[x] '), `no association rows\n${text}`);
+    assert.ok(!/selected: \d+ issue/.test(text), `no association counts line\n${text}`);
   });
 
-  test('the odd preview reads the document and renders it with the markdown renderer', () => {
-    const { view, reads } = openPanel();
+  test('the panel carries no pane or selection state at all', () => {
+    const { view } = openPanel();
+    for (const key of ['pane', 'filterOpen', 'queries', 'cursor', 'selectedIssues', 'selectedOdd', 'issues', 'odd']) {
+      assert.equal(key in view.state, false, `the create panel keeps no ${key} state`);
+    }
+    assert.deepEqual(Object.keys(view.state).sort(), ['focus', 'message', 'name', 'typeIndex']);
+  });
+
+  test('tab, shift+tab, ← and → move between the type list and the name field', () => {
+    const { view, finished } = openPanel({ initialName: 'new-change' });
+    assert.equal(view.state.focus, 'type');
     view.handleInput('\t');
-    view.handleInput('\t'); // issues -> odd
-    const text = allText(boxLines(view, 100, 24));
-    assert.deepEqual(reads.odd, ['/odd/alpha.md']);
-    assert.match(text, /specs for alpha/);
-    assert.match(text, /# alpha/, 'the injected renderer received the document text');
+    assert.equal(view.state.focus, 'name', 'tab reaches the name');
+    view.handleInput('\t');
+    assert.equal(view.state.focus, 'type', 'tab returns to the type');
+    view.handleInput('\x1b[C'); // right
+    assert.equal(view.state.focus, 'name', '→ reaches the name');
+    view.handleInput('\x1b[D'); // left
+    assert.equal(view.state.focus, 'type', '← returns to the type');
+    view.handleInput('\x1b[D');
+    assert.equal(view.state.focus, 'name', '← at the first field wraps to the name');
+    view.handleInput('\x1b[C');
+    assert.equal(view.state.focus, 'type', '→ at the last field wraps to the type');
+    view.handleInput('\x1b[Z'); // shift+tab
+    assert.equal(view.state.focus, 'name', 'shift+tab walks the fields back');
+    assert.deepEqual(finished, [], 'moving between fields never completes or cancels');
   });
 
-  test('the Odd pane renders the order it is handed, newest first, instead of re-sorting by label (S15, T14)', () => {
-    // lib/odd-docs.js hands these already newest-first and the first element
-    // is LAST alphabetically, so a pane that sorted by label would render it
-    // last instead of first. The preview is a constant so only the list
-    // column carries the document names.
-    const docs = [
-      { name: 'zulu', path: '/odd/zulu.md' },
-      { name: 'mike', path: '/odd/mike.md' },
-      { name: 'alpha-early', path: '/odd/alpha-early.md' },
-    ];
-    const { view } = openPanel({
-      pageSize: 10,
-      listOdd: () => ({ ok: true, docs: docs.map((entry) => ({ ...entry })) }),
-      readOddPreview: () => ({ ok: true, text: 'PREVIEW' }),
-      renderMarkdown: () => ['PREVIEW'],
-    });
-    focusOdd(view);
-    const order = oddRowOrder(boxLines(view, 100, 24), docs.map((entry) => entry.name));
-    assert.equal(order[0], 'zulu', 'the newest document (last alphabetically) is the first row');
-    assert.deepEqual(order, ['zulu', 'mike', 'alpha-early'], 'the whole pane keeps the handed order');
+  test('the two-field flow creates with the chosen type and name', () => {
+    const { view, finished } = openPanel();
+    let text = allText(renderedLines(view, 100));
+    assert.ok(!text.includes('cannot create'), 'nothing has been refused yet');
+    view.handleInput('\x1b[B'); // pick the second type
+    text = allText(renderedLines(view, 100));
+    assert.match(text, /Type: Bug fix \(fix\)/, 'the Type tab shows the picked type');
+    assert.deepEqual(finished, [], 'picking the type creates nothing yet');
+    view.handleInput('\t'); // reach the name
+    assert.equal(view.state.focus, 'name', 'tab hands the flow to the name');
+    text = allText(renderedLines(view, 100));
+    assert.match(text, /Name: ▊/, 'the Name tab renders the name field');
+    typeText(view, 'panel-change');
+    assert.deepEqual(finished, [], 'typing the name creates nothing yet');
+    view.handleInput('enter'); // confirm
+    assert.deepEqual(finished, [{ ok: true, type: 'fix', name: 'panel-change' }]);
   });
 
-  test('a document whose timestamp could not be read is listed last, never dropped or promoted', () => {
-    // lib/odd-docs.js places an unreadable-timestamp document after the
-    // readable ones; the pane must keep that position and the document.
-    const docs = [
-      { name: 'zulu', path: '/odd/zulu.md' },
-      { name: 'mike', path: '/odd/mike.md' },
-      { name: 'ghost', path: '/odd/ghost.md' },
-    ];
-    const { view } = openPanel({
-      pageSize: 10,
-      listOdd: () => ({ ok: true, docs: docs.map((entry) => ({ ...entry })) }),
-      readOddPreview: () => ({ ok: true, text: 'PREVIEW' }),
-      renderMarkdown: () => ['PREVIEW'],
-    });
-    focusOdd(view);
-    const order = oddRowOrder(boxLines(view, 100, 24), docs.map((entry) => entry.name));
-    assert.deepEqual(order, ['zulu', 'mike', 'ghost'], 'every document is listed in the source order');
-    assert.equal(order[order.length - 1], 'ghost', 'the unreadable one stays last, never promoted or dropped');
+  test('enter on the type field reaches the name without creating', () => {
+    const { view, finished } = openPanel();
+    view.handleInput('enter');
+    assert.equal(view.state.focus, 'name');
+    assert.deepEqual(finished, [], 'enter on the type only moves the flow on');
   });
 
-  test('paging moves the pane page and clamps at both ends', () => {
-    const issues = Array.from({ length: 5 }, (_, index) => ({ number: index + 1, title: `row ${index + 1}` }));
-    const { view } = openPanel({ pageSize: 3, fetchIssues: () => ({ ok: true, issues }) });
-    focusIssues(view);
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Issues 5 open .*page 1\/2/);
-    assert.ok(text.includes('#1 row 1'));
-    assert.ok(!text.includes('#4 row 4'), 'the second page stays off-screen');
-    view.handleInput(']');
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /page 2\/2/);
-    assert.ok(text.includes('#4 row 4'), '] turns to the second page');
-    assert.ok(!text.includes('#1 row 1'));
-    view.handleInput('pagedown');
-    assert.match(allText(boxLines(view, 100, 24)), /page 2\/2/, 'pagedown clamps at the last page');
-    view.handleInput('[');
-    view.handleInput('pageup');
-    assert.match(allText(boxLines(view, 100, 24)), /page 1\/2/, 'pageup and [ clamp at the first page');
-  });
-
-  test('an empty issue list still shows the Issues pane and says there are no open issues', () => {
-    const { view } = openPanel({ fetchIssues: () => ({ ok: true, issues: [] }) });
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Issues/);
-    assert.match(text, /no open issues/);
-    assert.match(text, /nothing to preview/);
-  });
-
-  test('no odd documents says so in the Odd pane', () => {
-    const { view } = openPanel({ listOdd: () => ({ ok: true, docs: [] }) });
-    focusOdd(view);
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Odd/);
-    assert.match(text, /no odd documents in this/);
-    assert.match(text, /checkout/);
-  });
-
-  test('gh unavailable says so in the Issues pane and creation still works', () => {
+  test('the created payload carries no issues and no odd fields, and ignores injected associations', () => {
     const { view, finished } = openPanel({
       initialName: 'new-change',
-      fetchIssues: () => ({ ok: false, error: 'gh CLI is not available' }),
+      initialIssues: [12],
+      initialOdd: '/odd/alpha.md',
     });
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /gh unavailable/);
-    assert.match(text, /gh CLI is not/);
-    assert.match(text, /available/);
-    view.handleInput('\x13');
-    assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change', issues: [], odd: [] }]);
+    createNow(view);
+    assert.equal(finished.length, 1);
+    assert.deepEqual(finished[0], { ok: true, type: 'feat', name: 'new-change' });
+    assert.deepEqual(Object.keys(finished[0]).sort(), ['name', 'ok', 'type'], 'no issues/odd/mode fields ride along');
   });
 
-  test('an odd listing failure says so instead of an empty pane', () => {
-    const { view } = openPanel({ listOdd: () => ({ ok: false, error: 'odd/tasks is unreadable' }) });
-    focusOdd(view);
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /cannot list odd/);
-    assert.match(text, /unreadable/);
-  });
-
-  test('a slow fetch renders a loading line and never blocks the frame', async () => {
-    let resolveIssues;
-    const pending = new Promise((resolve) => { resolveIssues = resolve; });
-    const { view } = openPanel({ fetchIssues: () => pending });
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /loading open issues/);
-    resolveIssues({ ok: true, issues: DEFAULT_ISSUES });
+  test('the injected issue and odd sources are never consulted: no listing, no preview read', async () => {
+    const calls = [];
+    const { view, reads } = openPanel({
+      fetchIssues: () => { calls.push('issues'); return { ok: true, issues: DEFAULT_ISSUES.map((row) => ({ ...row })) }; },
+      listOdd: () => { calls.push('odd'); return { ok: true, docs: DEFAULT_ODD.map((doc) => ({ ...doc })) }; },
+    });
     await flush();
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /#12 Crash on empty/);
-    assert.ok(!text.includes('loading open issues'));
-  });
-});
-
-describe('the pane filter (S6 rule)', { concurrency: false }, () => {
-  test('T opens the filter, printable keys and space go to the text, enter keeps it', () => {
-    const { view } = openPanel();
-    focusIssues(view);
-    view.handleInput('T');
-    assert.equal(view.state.filterOpen, true, 'T opens the filter');
-    assert.equal(view.state.queries.issues, '', 'the trigger key is not text');
-    typeText(view, 'crash');
-    assert.equal(view.state.queries.issues, 'crash');
-    view.handleInput(' '); // space is text once the filter is open
-    assert.equal(view.state.queries.issues, 'crash ', 'space goes to the filter text');
-    assert.deepEqual(view.state.selectedIssues, [], 'space does not toggle while filtering');
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /#12 Crash on empty/);
-    assert.ok(!text.includes('#7 Docs drift'), 'the filter narrows the list');
-    assert.match(text, /Search Issues: crash ▊/);
     view.handleInput('enter');
-    assert.equal(view.state.filterOpen, false, 'enter leaves the filter');
-    assert.equal(view.state.queries.issues, 'crash ', 'the filter is kept');
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('#7 Docs drift'), 'the narrowed list stays narrowed');
-    view.handleInput(' ');
-    assert.deepEqual(view.state.selectedIssues, [12], 'space toggles again once the filter is closed');
-  });
-
-  test('a printable key opens the filter, esc leaves it keeping the text, and paging still works', () => {
-    const { view } = openPanel({
-      pageSize: 1,
-      fetchIssues: () => ({ ok: true, issues: DEFAULT_ISSUES }),
-    });
-    focusIssues(view);
-    view.handleInput('d');
-    assert.equal(view.state.filterOpen, true, 'a printable key opens the filter');
-    assert.equal(view.state.queries.issues, '', 'the opening key is consumed');
-    typeText(view, 'docs');
-    assert.equal(view.state.queries.issues, 'docs');
-    view.handleInput('escape');
-    assert.equal(view.state.filterOpen, false, 'esc leaves the filter');
-    assert.equal(view.state.queries.issues, 'docs', 'esc keeps the filter');
-    let text = allText(boxLines(view, 100, 24));
-    assert.ok(text.includes('#7 Docs drift'));
-    assert.ok(!text.includes('#12 Crash on empty'));
-    // ↑/↓ keep navigating while the filter is open.
-    view.handleInput('T');
-    view.handleInput('down');
-    assert.equal(view.state.cursor.issues, 0, 'a one-row filtered list clamps the cursor');
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /no matches|#7 Docs drift/);
-    view.handleInput('\x7f');
-    view.handleInput('\x7f');
-    view.handleInput('\x7f');
-    view.handleInput('\x7f');
-    assert.equal(view.state.queries.issues, '', 'backspace edits the filter text');
-    text = allText(boxLines(view, 100, 24));
-    assert.ok(text.includes('#12 Crash on empty'), 'clearing the filter restores every row');
-  });
-});
-
-describe('selection and focus', { concurrency: false }, () => {
-  test('space toggles the selection in both panes', () => {
-    const { view, finished } = openPanel({ initialName: 'new-change' });
-    focusIssues(view);
-    view.handleInput(' ');
-    assert.deepEqual(view.state.selectedIssues, [12]);
-    assert.match(allText(boxLines(view, 100, 24)), /\[x\] #12 Crash on empty/);
-    view.handleInput('\t');
-    assert.equal(view.state.focus, 'odd', 'tab switches to the Odd pane');
-    view.handleInput(' ');
-    assert.deepEqual(view.state.selectedOdd, ['/odd/alpha.md']);
-    assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/);
-    view.handleInput(' ');
-    assert.deepEqual(view.state.selectedOdd, [], 'space toggles it back off');
-    view.handleInput(' ');
-    view.handleInput('\x13');
-    assert.deepEqual(finished, [{
-      ok: true,
-      type: 'feat',
-      name: 'new-change',
-      issues: [12],
-      odd: ['/odd/alpha.md'],
-    }]);
-  });
-
-  test('tab switches between the Issues and Odd panes, never back a step', () => {
-    const { view, finished } = openPanel();
-    view.handleInput('\t');
-    assert.equal(view.state.focus, 'issues', 'tab enters the Issues pane');
-    view.handleInput('\t');
-    assert.equal(view.state.focus, 'odd');
-    view.handleInput('\t');
-    assert.equal(view.state.focus, 'issues', 'tab toggles the two panes');
-    assert.deepEqual(finished, [], 'tab never completes or cancels');
-  });
-
-  test('left/right in the list switch the dataset without focusing a lateral field or the preview', () => {
-    const { view } = openPanel({ initialName: 'new-change' });
-    view.handleInput('\x1b[B'); // type -> name
-    view.handleInput('\x1b[B'); // name -> issues list
-    view.handleInput('\x1b[B'); // cursor -> #7
-    assert.match(allText(boxLines(view, 100, 24)), /❯ \[ \] #7 Docs drift/);
-    view.handleInput('\x1b[C'); // right -> Odd
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /❯ \[ \] alpha/, 'right selects the Odd dataset and keeps the list focused');
-    assert.ok(!text.includes('❯ Name:'), 'no lateral field or the preview gains focus');
-    assert.ok(!text.includes('❯ Type:'), 'the type field is not focused either');
-    view.handleInput('\x1b[B'); // odd cursor -> beta
-    view.handleInput('\x1b[D'); // left -> Issues
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /❯ \[ \] #7 Docs drift/, 'the Issues cursor survives the switch');
-    assert.ok(!text.includes('❯ Name:'));
-    view.handleInput('\x1b[C'); // right -> Odd again
-    assert.match(allText(boxLines(view, 100, 24)), /❯ \[ \] beta/, 'the Odd cursor survives the switch');
-  });
-});
-
-describe('the two content panes (S11, S20)', { concurrency: false }, () => {
-  test('renders the active dataset list beside its own preview, never a third list column', () => {
-    for (const [width, height] of [[80, 24], [80, 40], [160, 24], [160, 40]]) {
-      const { view } = openPanel({ rowsAvailable: () => height });
-      const lines = boxLines(view, width, height);
-      const text = allText(lines);
-      assert.match(text, /Issues 2/, 'the Issues tab names the dataset and its count');
-      assert.match(text, /Odd 2/, 'the Odd tab stays visible so the toggle is discoverable');
-      const focused = findLine(lines, '[ ] #12 Crash on empty');
-      assert.ok(focused.includes('#12 Issue 12'), 'the right side of the same row is that issue preview');
-      assert.ok(
-        focused.indexOf('#12 Issue 12') > focused.indexOf('[ ] #12 Crash on empty'),
-        'the preview sits to the right of the list',
-      );
-      assert.ok(!text.includes('[ ] alpha'), 'the inactive Odd list is not a third column');
-      assert.ok(!text.includes('[ ] beta'));
-      view.handleInput('\t'); // header -> Issues
-      view.handleInput('\t'); // Issues -> Odd dataset
-      const oddLines = boxLines(view, width, height);
-      const oddText = allText(oddLines);
-      const oddFocused = findLine(oddLines, '[ ] alpha');
-      assert.ok(!oddText.includes('[ ] #12 Crash on empty'), 'the Issues list yields the left pane');
-      assert.ok(!oddText.includes('[ ] #7 Docs drift'));
-      assert.ok(oddFocused.includes('# alpha'), 'the right side of the same row is the odd preview');
-      assert.ok(
-        oddFocused.indexOf('# alpha') > oddFocused.indexOf('[ ] alpha'),
-        'the odd preview sits to the right of the odd list',
-      );
-    }
-  });
-
-  test('Tab toggles the dataset preserving each cursor, filter and selection, and Space toggles only that dataset', () => {
-    const { view, finished } = openPanel({ initialName: 'new-change' });
-    focusIssues(view);
-    view.handleInput('down'); // Issues cursor -> #7
-    view.handleInput(' '); // select #7
-    assert.match(allText(boxLines(view, 100, 24)), /❯ \[x\] #7 Docs drift/);
-    view.handleInput('T');
-    typeText(view, 'docs'); // Issues filter -> #7 only
-    view.handleInput('enter'); // leave the filter, keeping it
-    let text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Search Issues: docs/);
-    assert.ok(!text.includes('#12 Crash on empty'), 'the Issues filter narrows its dataset');
-    view.handleInput('\t'); // toggle to Odd
-    text = allText(boxLines(view, 100, 24));
-    assert.ok(!text.includes('#7 Docs drift'), 'the inactive Issues list is gone');
-    assert.match(text, /\[ \] alpha/);
-    assert.match(text, /\[ \] beta/, 'the Odd dataset keeps its own unfiltered list');
-    view.handleInput('down'); // Odd cursor -> beta
-    view.handleInput(' '); // select beta
-    assert.match(allText(boxLines(view, 100, 24)), /❯ \[x\] beta/);
-    view.handleInput('\t'); // toggles back to Issues
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Search Issues: docs/, 'the Issues filter survived the toggle');
-    assert.match(text, /❯ \[x\] #7 Docs drift/, 'the Issues cursor and selection survived');
-    assert.match(text, /Issues 1\/2/, 'the inactive tab still reports its filtered count');
-    assert.ok(!text.includes('[ ] alpha'), 'the Odd list is not rendered while Issues is active');
-    view.handleInput('\t'); // back to Odd
-    assert.match(allText(boxLines(view, 100, 24)), /❯ \[x\] beta/, 'the Odd cursor and selection survived');
-    view.handleInput('\x13');
-    assert.deepEqual(finished, [{
-      ok: true, type: 'feat', name: 'new-change', issues: [7], odd: ['/odd/beta.md'],
-    }], 'toggling never drops either association set');
-  });
-
-  test('the vertical header and the requested arrow map reach every field, with raw key bytes (S21)', () => {
-    const { view, finished } = openPanel();
-    const lines = () => boxLines(view, 100, 24);
-    const UP = '\x1b[A';
-    const DOWN = '\x1b[B';
-    const RIGHT = '\x1b[C';
-    const LEFT = '\x1b[D';
-    const frame = () => lines().map(stripAnsi);
-    const typeAt = frame().findIndex((line) => line.includes('Type: Feature (feat)'));
-    const nameAt = frame().findIndex((line) => line.includes('Name:'));
-    const branchAt = frame().findIndex((line) => line.includes('preview branch:'));
-    assert.ok(typeAt >= 0 && nameAt > typeAt, 'Type sits ABOVE Name');
-    assert.ok(branchAt > nameAt, 'the preview summary sits beneath the two fields');
-    assert.ok(frame()[typeAt].includes('❯ Type:'), 'the type field starts focused');
-    view.handleInput(DOWN); // Type -> Name
-    assert.ok(findLine(lines(), 'Name:').includes('❯ Name:'), 'down reaches the name field');
-    typeText(view, 'new');
-    assert.match(allText(lines()), /Name: new▊/, 'typing still reaches the name');
-    view.handleInput(DOWN); // Name -> list
-    assert.ok(!findLine(lines(), 'Name:').includes('❯ Name:'), 'down leaves the header for the list');
-    assert.ok(findLine(lines(), '#12 Crash on empty').startsWith('❯ [ ] #12'));
-    view.handleInput(RIGHT); // list -> Odd dataset
-    assert.ok(findLine(lines(), '[ ] alpha').startsWith('❯ [ ] alpha'), 'right selects Odd');
-    view.handleInput(LEFT); // list -> Issues dataset
-    assert.ok(findLine(lines(), '#12 Crash on empty').startsWith('❯ [ ] #12'), 'left selects Issues');
-    view.handleInput(UP); // FIRST row -> Name
-    assert.ok(findLine(lines(), 'Name:').includes('❯ Name:'), 'up from the first row returns to Name');
-    assert.match(allText(lines()), /Name: new▊/, 'the typed name survives the trip');
-    view.handleInput(UP); // -> Type
-    assert.ok(findLine(lines(), 'Type: Feature (feat)').includes('❯ Type:'), 'another up reaches Type');
-    view.handleInput(RIGHT);
-    assert.match(allText(lines()), /Type: Bug fix \(fix\)/, 'right cycles the type');
-    view.handleInput(LEFT);
-    assert.match(allText(lines()), /Type: Feature \(feat\)/, 'left cycles it back');
-    view.handleInput(DOWN); // -> Name
-    view.handleInput(DOWN); // -> list
-    view.handleInput(DOWN); // cursor -> #7
-    assert.match(allText(lines()), /❯ \[ \] #7 Docs drift/);
-    view.handleInput(UP); // cursor -> #12, NOT the header
-    assert.ok(
-      findLine(lines(), '#12 Crash on empty').startsWith('❯ [ ] #12'),
-      'up moves the row before it leaves the list',
-    );
-    view.handleInput(UP); // first row -> Name
-    assert.ok(findLine(lines(), 'Name:').includes('❯ Name:'));
-    view.handleInput('escape');
-    assert.deepEqual(finished, [null], 'esc still cancels after navigating');
-  });
-
-  test('the filter is a dedicated Search row under the title, showing the active dataset and the query (S26)', () => {
-    const { view } = openPanel();
-    const frame = () => boxLines(view, 100, 24).map(stripAnsi);
-    let rows = frame();
-    const titleAt = rows.findIndex((line) => line.includes('New worktree'));
-    const searchAt = rows.findIndex((line) => line.includes('Search Issues:'));
-    const typeAt = rows.findIndex((line) => line.includes('Type: Feature (feat)'));
-    assert.ok(searchAt === titleAt + 1, 'the Search row sits directly under the title');
-    assert.ok(typeAt > searchAt, 'Type stays below the Search row (S21 header is preserved)');
-    assert.ok(!rows.some((line) => line.includes('filter:"')), 'nothing is buried in a dataset heading');
-    focusIssues(view);
-    view.handleInput('T');
-    typeText(view, 'docs');
-    rows = frame();
-    const searchLine = rows.find((line) => line.includes('Search Issues:'));
-    assert.ok(searchLine !== undefined, 'the dedicated row stays visible while filtering');
-    assert.match(searchLine, /Search Issues: docs▊/, 'the query is visible in the dedicated row');
-    view.handleInput('enter'); // keep the filter, leave the input
-    view.handleInput('\t'); // Issues -> Odd dataset
-    rows = frame();
-    assert.ok(rows.some((line) => line.includes('Search Odd:')), 'the row follows the active dataset');
-    assert.ok(!rows.some((line) => line.includes('Search Issues:')), 'only the active dataset is shown');
-    assert.ok(!rows.some((line) => line.includes('filter:"')), 'the query is never a heading suffix');
-    view.handleInput('\t'); // back to Issues
-    assert.match(frame().find((line) => line.includes('Search Issues:')), /Search Issues: docs/, 'the Issues query is kept');
-  });
-
-  test('the header carries the preview summary and the selected counts, and claims no branch/path before a valid name', () => {
-    const { view } = openPanel();
-    let lines = boxLines(view, 100, 24);
-    let text = allText(lines);
-    assert.match(findLine(lines, 'preview branch:').trim(), /✗ name is empty/, 'no branch is claimed yet');
-    assert.match(findLine(lines, 'preview path:').trim(), /✗ not derived/, 'no path is claimed yet');
-    assert.match(text, /selected: 0 issues · 0 odd/, 'the header starts with empty selected counts');
-    focusName(view);
+    view.handleInput('enter');
     typeText(view, 'new-change');
-    lines = boxLines(view, 100, 24);
-    text = allText(lines);
-    assert.match(text, /preview branch: feat\/new-change/);
-    findLine(lines, 'preview path:');
-    view.handleInput('\t'); // name -> Issues
-    view.handleInput(' '); // select #12
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /selected: 1 issue · 0 odd/, 'the header count follows the Issues selection');
-    view.handleInput('\t'); // -> Odd dataset
-    view.handleInput(' '); // select alpha
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /selected: 1 issue · 1 odd/, 'the header count follows the Odd selection');
-    view.handleInput(' '); // deselect alpha
-    assert.match(allText(boxLines(view, 100, 24)), /selected: 1 issue · 0 odd/, 'deselecting updates the header');
+    createNow(view);
+    assert.deepEqual(calls, [], 'neither source is asked for a list');
+    assert.deepEqual(reads, { issues: [], odd: [] }, 'no preview is ever read');
   });
 });
 
 describe('completion', { concurrency: false }, () => {
-  test('enter on the last field creates with the whole payload', () => {
+  test('enter on the name field creates with the two collected values', () => {
     const { view, finished } = openPanel();
-    // type: pick `fix` through the sub-panel
-    view.handleInput('enter');
-    view.handleInput('down');
-    view.handleInput('enter');
+    focusName(view);
     typeText(view, 'new-change');
-    view.handleInput('enter'); // name -> issues
-    assert.equal(view.state.focus, 'issues');
-    view.handleInput(' '); // select #12
-    view.handleInput('enter'); // issues -> odd
-    assert.equal(view.state.focus, 'odd');
-    view.handleInput(' '); // select alpha
-    view.handleInput('enter'); // last field -> create
-    assert.deepEqual(finished, [{
-      ok: true,
-      type: 'fix',
-      name: 'new-change',
-      issues: [12],
-      odd: ['/odd/alpha.md'],
-    }]);
+    view.handleInput('enter');
+    assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change' }]);
   });
 
   test('ctrl+s creates from any field, and fires exactly once', () => {
     const { view, finished } = openPanel({ cwd: REPO });
     focusName(view);
     typeText(view, 'new-change');
-    view.handleInput('\x13');
-    view.handleInput('\x13');
+    createNow(view);
+    createNow(view);
     assert.equal(finished.length, 1, 'completion fires exactly once');
-    assert.deepEqual(finished[0], { ok: true, type: 'feat', name: 'new-change', issues: [], odd: [] });
+    assert.deepEqual(finished[0], { ok: true, type: 'feat', name: 'new-change' });
   });
 
   test('creation is refused while the branch is invalid, and the reason is shown', () => {
     const { view, finished } = openPanel();
-    view.handleInput('\x13');
+    createNow(view);
     assert.deepEqual(finished, [], 'an empty name never creates');
-    assert.match(allText(boxLines(view, 100, 24)), /cannot create: name is empty/);
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name is empty/);
     focusName(view);
     typeText(view, 'new-change');
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('cannot create'), 'fixing the name clears the refusal');
-    view.handleInput('\x13');
+    assert.ok(!allText(renderedLines(view, 100)).includes('cannot create'), 'fixing the name clears the refusal');
+    createNow(view);
     assert.equal(finished.length, 1);
   });
 
-  test('esc cancels the whole creation with null, exactly once', () => {
-    const { view, finished } = openPanel();
-    view.handleInput('escape');
-    view.handleInput('escape');
-    assert.deepEqual(finished, [null]);
+  test('enter on an invalid name refuses with the same message instead of creating', () => {
+    const { view, finished } = openPanel({ initialName: '!!!' });
+    focusName(view);
+    view.handleInput('enter');
+    assert.deepEqual(finished, [], 'nothing is created');
+    assert.match(allText(renderedLines(view, 100)), /cannot create: name has no letters or digits/);
   });
 
-  test('esc unwinds the type sub-panel and the filter before cancelling', () => {
-    const { view, finished } = openPanel();
-    view.handleInput('enter');
-    view.handleInput('escape');
-    assert.equal(view.state.typePanelOpen, false);
-    assert.deepEqual(finished, [], 'closing the sub-panel does not cancel the creation');
-    focusIssues(view);
-    view.handleInput('T');
-    view.handleInput('escape');
-    assert.equal(view.state.filterOpen, false);
-    assert.deepEqual(finished, []);
-    view.handleInput('escape');
-    assert.deepEqual(finished, [null]);
+  test('cancel writes nothing and emits null exactly once, from either field', () => {
+    const fromType = openPanel();
+    fromType.view.handleInput('escape');
+    fromType.view.handleInput('escape');
+    assert.deepEqual(fromType.finished, [null]);
+
+    const fromName = openPanel({ initialName: 'typed-but-discarded' });
+    focusName(fromName.view);
+    typeText(fromName.view, '-more');
+    fromName.view.handleInput('escape');
+    assert.deepEqual(fromName.finished, [null], 'a typed name is discarded, never created');
   });
 
   test('there is no key-help overlay: the footer already carries every shortcut', () => {
     const { view } = openPanel();
-    const before = allText(boxLines(view, 100, 24));
     view.handleInput('?');
-    const after = allText(boxLines(view, 100, 24));
-    assert.equal(after, before, '? is not a binding any more: no overlay opens on the Type field');
-    assert.ok(!after.includes('close this help'), 'no key list replaces the panes');
+    const after = allText(renderedLines(view, 100));
+    assert.ok(!after.includes('close this help'), 'no key list replaces the content');
     assert.ok(!after.includes('? help'), 'the footer never advertises a help key');
-    assert.match(after, /#12 Crash on empty/, 'the pane keeps its rows');
+    assert.equal('help' in view.state, false, 'the surface keeps no help overlay state');
     assert.match(after, /Enter confirm/);
-    assert.match(after, /Ctrl\+S create/);
+    assert.ok(!/Ctrl\+S create/.test(after), 'the one create key is enter: no duplicate is advertised');
     assert.match(after, /Esc cancel/);
   });
 });
 
-describe('the default wiring (real libraries, injected process seams)', { concurrency: false }, () => {
-  test('issues and issue bodies come from lib/gh-issues.js', async () => {
+describe('the create panel never reads the issue or odd libraries (S6)', { concurrency: false }, () => {
+  test('no gh call and no odd document is listed or read with the real libraries in place', async () => {
     const seen = [];
-    ghIssues.setGhRunner((bin, argv) => {
+    ghIssues.setGhRunner((_bin, argv) => {
       seen.push(argv);
-      if (argv[1] === 'list') {
-        return {
-          status: 0,
-          stderr: '',
-          stdout: JSON.stringify([{
-            number: 5,
-            title: 'Fix the crash',
-            state: 'OPEN',
-            author: { login: 'ana' },
-            labels: [],
-            comments: [],
-            reactionGroups: [],
-            url: 'https://example.test/5',
-          }]),
-        };
-      }
-      if (argv[1] === 'view') {
-        return {
-          status: 0,
-          stderr: '',
-          stdout: JSON.stringify({
-            number: 5,
-            title: 'Fix the crash',
-            state: 'OPEN',
-            author: { login: 'ana' },
-            comments: [],
-            body: 'the complete body text',
-          }),
-        };
-      }
-      return { status: 1, stderr: 'unexpected', stdout: '' };
+      return { status: 1, stderr: 'the create panel must not call gh', stdout: '' };
     });
-    const { view } = openPanel({ fetchIssues: undefined, readIssuePreview: undefined, listOdd: () => ({ ok: true, docs: [] }) });
-    await flush();
-    view.handleInput('\t');
-    await flush();
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /#5 Fix the crash/, 'the issue list comes from gh issue list');
-    assert.match(text, /the complete body text/, 'the preview comes from gh issue view');
-    const lists = seen.filter((argv) => argv[1] === 'list');
-    assert.ok(lists.length >= 1, 'gh issue list ran');
-    assert.deepEqual(lists[0].slice(0, 4), ['issue', 'list', '--state', 'open']);
-    assert.ok(seen.some((argv) => argv[1] === 'view' && argv[2] === '5'), 'gh issue view 5 ran');
-    ghIssues.setGhRunner(null);
-  });
-
-  test('odd documents come from lib/odd-docs.js and render through lib/odd-markdown.js', async () => {
     const root = scratchDir('checkout');
     fs.mkdirSync(path.join(root, 'odd', 'tasks'), { recursive: true });
     fs.writeFileSync(path.join(root, 'odd', 'tasks', 'alpha.md'), '# Alpha\n\nSome specs.\n', 'utf8');
-    const git = {
-      slugifyBranch: (name) => String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree',
-      validateBranch: () => ({ ok: true, reason: null }),
-      canonicalWorktreePath: (cwd, branch) => path.join(cwd, '..', 'checkout-worktrees', branch.replace(/\//g, '-')),
-    };
-    const { view } = openPanel({
-      cwd: root,
-      git,
-      initialName: 'new-change',
-      listOdd: undefined,
-      readOddPreview: undefined,
-      renderMarkdown: undefined,
-      fetchIssues: () => ({ ok: true, issues: [] }),
-    });
-    await flush();
-    view.handleInput('\t');
-    view.handleInput('\t');
-    await flush();
-    const lines = boxLines(view, 100, 24);
-    const text = allText(lines);
-    assert.match(text, /alpha/, 'the document list comes from odd/tasks');
-    assert.match(text, /▌ Alpha/, 'the document renders through the odd markdown renderer');
-    assert.match(text, /Some specs\./);
+    try {
+      const { view, finished } = openPanel({
+        cwd: root,
+        initialName: 'new-change',
+        fetchIssues: undefined,
+        readIssuePreview: undefined,
+        listOdd: undefined,
+        readOddPreview: undefined,
+        renderMarkdown: undefined,
+      });
+      await flush();
+      const text = allText(renderedLines(view, 100));
+      assert.ok(!text.includes('alpha'), 'no odd document row is listed');
+      assert.ok(!text.includes('Fix the crash'), 'no issue row is listed');
+      createNow(view);
+      assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change' }], 'creation needs no source at all');
+      assert.deepEqual(seen, [], 'gh never ran');
+    } finally {
+      ghIssues.setGhRunner(null);
+    }
   });
 });
-
-describe('the editing mode (S13)', { concurrency: false }, () => {
-  function editPanel(overrides = {}) {
-    return openPanel({
+// S1: the worktree EDIT panel is gone with the association. The old seam
+// accepted `mode: 'edit'`, the checkout's `branch`/`path`, the preselected
+// `initialIssues`/`initialOdd` and the four association sources; none of them
+// is read any more, and the panel can only produce a creation.
+describe('S1: no worktree edit mode survives', { concurrency: false }, () => {
+  test('the edit options are ignored: the surface is the create flow and the payload is a creation', () => {
+    const { view, finished } = openPanel({
       mode: 'edit',
-      initialType: 'feat',
-      initialName: 'old-change',
       branch: 'feat/old-change',
       path: '/checkouts/feat-old-change',
-      ...overrides,
+      initialIssues: [2, 7],
+      initialOdd: '/checkouts/feat-old-change/odd/tasks/w1-a.md',
+      fetchIssues: () => { throw new Error('the panel must not read issues'); },
+      listOdd: () => { throw new Error('the panel must not list odd documents'); },
+      readIssuePreview: () => { throw new Error('the panel must not read an issue preview'); },
+      readOddPreview: () => { throw new Error('the panel must not read an odd preview'); },
+      renderMarkdown: () => { throw new Error('the panel must not render odd markdown'); },
+      initialName: 'new-change',
     });
-  }
-
-  test('renders the checkout type and name and its OWN branch/path, never a re-derivation', () => {
-    const checkout = scratchDir('checkout');
-    const { view } = editPanel({
-      // The real checkout: branch and name deliberately do NOT match what
-      // the create-time convention would derive from these two fields.
-      initialType: 'feat',
-      initialName: 'feat-odd-viewer',
-      branch: 'feat/odd-viewer',
-      path: checkout,
-      initialIssues: [12],
-      initialOdd: ['/odd/alpha.md'],
-    });
-    const lines = boxLines(view, 100, 24);
-    const text = allText(lines);
-    assert.match(text, /Type: Feature \(feat\)/);
-    assert.match(text, /Name: odd-viewer/, 'the name splits from the checkout branch');
-    assert.match(text, /\[frozen\]/, 'the frozen fields say so');
-    assert.ok(!text.includes('old-change▊'), 'a frozen name has no text caret');
-    findLine(lines, 'checkout branch: feat/odd-viewer');
-    findLine(lines, `checkout path: ${checkout}`);
-    assert.ok(!text.includes('feat/feat-odd-viewer'), 'the derived branch is never shown');
-    assert.ok(!text.includes('feat-feat-odd-viewer'), 'the derived path is never shown');
-    assert.match(text, /\[x\] #12 Crash on empty/, 'the assigned issue is pre-selected');
-    assert.ok(!text.includes('[x] alpha'), 'the Odd list is not a second list column');
-    focusOdd(view);
-    assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/, 'the assigned odd document is pre-selected');
-    assert.deepEqual(view.state.selectedIssues, [12]);
-    assert.deepEqual(view.state.selectedOdd, ['/odd/alpha.md']);
+    const text = allText(renderedLines(view, 100));
+    assert.ok(!text.includes('Edit worktree'), `no edit surface renders\n${text}`);
+    assert.ok(!text.includes('Issues') && !text.includes('Odd'), `no association pane renders\n${text}`);
+    assert.ok(!text.includes('Preview'), `no preview column renders\n${text}`);
+    assert.match(text, /New worktree/, 'the create surface renders instead');
+    createNow(view);
+    assert.deepEqual(finished, [{ ok: true, type: 'feat', name: 'new-change' }], 'the completion is a creation with no association');
+    for (const key of ['mode', 'issues', 'odd', 'branch', 'path']) {
+      assert.equal(key in finished[0], false, `the payload carries no ${key}`);
+    }
   });
 
-  test('a checkout whose branch is not conventional renders it without inventing a type', () => {
-    const checkout = scratchDir('checkout');
-    const { view } = editPanel({
-      initialType: 'feat',
-      initialName: 'feat-odd-viewer',
-      branch: 'main',
-      path: checkout,
-    });
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /checkout branch: main/);
-    assert.match(text, /Type: unavailable/, 'an unknowable type is shown as unavailable');
-    assert.match(text, /Name: main/, 'the field shows the branch the checkout actually has');
-    assert.ok(!text.includes('Feature (feat)'), 'the frozen type is never invented');
+  test('the panel keeps no pane, query or selection state even when the old options are passed', () => {
+    const { view } = openPanel({ mode: 'edit', initialIssues: [2], initialOdd: 'w1-a' });
+    assert.deepEqual(Object.keys(view.state).sort(), ['focus', 'message', 'name', 'typeIndex']);
   });
 
-  test('a missing branch or path renders as unavailable instead of a derived value', () => {
-    const { view } = openPanel({
-      mode: 'edit',
-      initialType: 'feat',
-      initialName: 'feat-odd-viewer',
-    });
-    const lines = boxLines(view, 100, 24);
-    const text = allText(lines);
-    findLine(lines, 'checkout branch: unavailable');
-    findLine(lines, 'checkout path: unavailable');
-    assert.match(text, /Type: unavailable/);
-    assert.match(text, /Name: unavailable/);
-    assert.ok(!text.includes('feat/feat-odd-viewer'), 'nothing is derived from the frozen fields');
-    assert.ok(!text.includes('-worktrees'), 'no derived worktree path is shown');
-  });
-
-  test('editing never refuses a branch or path that breaks the create-time convention', () => {
-    const { view, finished } = editPanel({
-      branch: 'main',
-      // A path that the create-time derivation would never produce (and
-      // that does not exist): editing must still open and save.
-      path: '/does/not/follow/feat-old-change',
-    });
-    assert.equal(view.state.message, '', 'editing shows no refusal');
-    view.handleInput('\x13');
-    assert.deepEqual(finished, [{ ok: true, mode: 'edit', type: null, name: 'main', issues: [], odd: [] }]);
-  });
-
-  test('freezing ignores printable input, backspace and the ←/→ cycle', () => {
-    const { view } = editPanel();
-    view.handleInput('down'); // type -> name
-    assert.equal(view.state.focus, 'name');
-    typeText(view, 'xyz');
-    view.handleInput('\x7f');
-    assert.equal(view.state.name, 'old-change', 'typing and backspace never touch the frozen name');
-    assert.match(allText(boxLines(view, 100, 24)), /Name: old-change/);
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('old-changexyz'));
-    // S21: ←/→ are inert on the frozen Name; `↑` is the way back to Type,
-    // where ←/→ still never cycle the frozen type.
-    view.handleInput('left');
-    assert.equal(view.state.focus, 'name', 'left on the frozen name moves no field');
-    view.handleInput('right');
-    assert.equal(view.state.focus, 'name', 'right on the frozen name moves no field');
-    view.handleInput('up');
-    assert.equal(view.state.focus, 'type');
-    view.handleInput('right');
-    assert.equal(view.state.typeIndex, 0, 'right on the frozen type never cycles');
-    assert.equal(view.state.focus, 'type');
-    view.handleInput('left');
-    assert.equal(view.state.typeIndex, 0, 'left on the frozen type never cycles');
-    const text = allText(boxLines(view, 100, 24));
-    assert.match(text, /Type: Feature \(feat\)/);
-    findLine(boxLines(view, 100, 24), 'checkout branch: feat/old-change');
-  });
-
-  test('the type sub-panel never opens in editing mode', () => {
-    const { view } = editPanel();
-    view.handleInput('enter');
-    assert.equal(view.state.typePanelOpen, false);
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('Choose the change type'));
-  });
-
-  test('the edit header carries the checkout summary and the preselected association counts', () => {
-    const { view } = editPanel({ initialIssues: [12], initialOdd: ['/odd/alpha.md'] });
-    let lines = boxLines(view, 100, 24);
-    let text = allText(lines);
-    findLine(lines, 'checkout branch: feat/old-change');
-    findLine(lines, 'checkout path: /checkouts/feat-old-change');
-    assert.match(text, /selected: 1 issue · 1 odd/, 'the header shows the preselected counts');
-    view.handleInput('\t'); // -> Issues dataset
-    view.handleInput(' '); // deselect #12
-    text = allText(boxLines(view, 100, 24));
-    assert.match(text, /selected: 0 issues · 1 odd/, 'the header count follows the edit toggle');
-  });
-
-  test('an empty pre-selection stays empty and saving carries the empty sets', () => {
-    const { view, finished } = editPanel({ initialIssues: [], initialOdd: [] });
-    assert.deepEqual(view.state.selectedIssues, []);
-    assert.deepEqual(view.state.selectedOdd, []);
-    assert.ok(!allText(boxLines(view, 100, 24)).includes('[x]'));
-    view.handleInput('\x13');
-    assert.deepEqual(finished, [{ ok: true, mode: 'edit', type: 'feat', name: 'old-change', issues: [], odd: [] }]);
-  });
-
-  test('a pre-selected row outside the visible page stays selected and toggling changes the saved sets', () => {
-    const issues = [
-      { number: 12, title: 'Crash on empty' },
-      { number: 7, title: 'Docs drift' },
-      { number: 3, title: 'Three' },
-    ];
-    const { view, finished } = editPanel({
-      pageSize: 1,
-      fetchIssues: () => ({ ok: true, issues }),
-      initialIssues: [3],
-      initialOdd: ['/odd/beta.md'],
-    });
-    assert.deepEqual(view.state.selectedIssues, [3]);
-    const text = allText(boxLines(view, 100, 24));
-    assert.ok(text.includes('#12 Crash on empty'), 'page 1 shows only the first row');
-    assert.ok(!text.includes('#3 Three'), 'the pre-selected row is off this page');
-    view.handleInput('\t'); // focus the Issues pane
-    view.handleInput(' '); // toggle #12 on
-    assert.deepEqual(view.state.selectedIssues, [3, 12]);
-    assert.match(allText(boxLines(view, 100, 24)), /\[x\] #12 Crash on empty/);
-    view.handleInput('\x13');
-    assert.deepEqual(finished, [{
-      ok: true, mode: 'edit', type: 'feat', name: 'old-change', issues: [3, 12], odd: ['/odd/beta.md'],
-    }]);
-  });
-
-  test('a stored odd assignment named by its relative path still marks its document', () => {
-    const { view, finished } = editPanel({ initialOdd: ['odd/tasks/alpha.md'] });
-    assert.deepEqual(view.state.selectedOdd, ['odd/tasks/alpha.md'], 'the caller value is preserved');
-    focusOdd(view);
-    assert.match(allText(boxLines(view, 100, 24)), /\[x\] alpha/);
-    view.handleInput('\x13');
-    assert.deepEqual(finished[0].odd, ['odd/tasks/alpha.md']);
-  });
-
-  test('enter on the last field saves the edit with the mode marker', () => {
-    const { view, finished } = editPanel({
-      initialType: 'fix',
-      branch: 'fix/old-change',
-      initialIssues: [12],
-      initialOdd: ['/odd/alpha.md'],
-    });
-    view.handleInput('\t'); // issues
-    view.handleInput(' '); // toggle #12 off
-    view.handleInput('enter'); // issues -> odd
-    assert.equal(view.state.focus, 'odd');
-    view.handleInput('enter'); // last field -> save
-    assert.deepEqual(finished, [{
-      ok: true, mode: 'edit', type: 'fix', name: 'old-change', issues: [], odd: ['/odd/alpha.md'],
-    }]);
-  });
-
-  test('esc cancels the edit with null and writes nothing', () => {
-    const { view, finished } = editPanel({ initialIssues: [12] });
-    view.handleInput('\t');
-    view.handleInput(' '); // a change the user then discards
-    view.handleInput('escape');
-    view.handleInput('escape');
-    assert.deepEqual(finished, [null]);
-  });
-
-  test('the filter and paging still work while editing, and there is no key-help overlay', () => {
-    const { view } = editPanel({ pageSize: 1 });
-    view.handleInput('\t'); // issues
-    view.handleInput('T');
-    assert.equal(view.state.filterOpen, true);
-    typeText(view, 'crash');
-    assert.equal(view.state.queries.issues, 'crash');
-    view.handleInput('escape');
-    assert.equal(view.state.filterOpen, false);
-    assert.equal(view.state.queries.issues, 'crash', 'the filter is kept');
-    view.handleInput(']');
-    assert.match(allText(boxLines(view, 100, 24)), /page \d\/\d/);
-    // Move back to the header so `?` is pressed on a focused field, not in
-    // a pane where a printable key opens the filter.
-    view.handleInput('up');
-    view.handleInput('up');
-    const before = allText(boxLines(view, 100, 24));
-    view.handleInput('?');
-    const after = allText(boxLines(view, 100, 24));
-    assert.equal(after, before, '? opens no overlay in editing mode either');
-    assert.ok(after.includes('[frozen]'), 'the frozen fields stay visible');
-    assert.ok(!after.includes('? help'), 'the footer never advertises a help key');
-    assert.match(after, /Enter save/);
-    assert.match(after, /Ctrl\+S save/);
-    assert.match(after, /Esc cancel/);
-  });
-
-  test('create mode keeps its editable fields, its sub-panel and its payload without a mode marker', () => {
-    const { view, finished } = openPanel({ initialName: 'new-change' });
-    view.handleInput('down'); // type -> name
-    typeText(view, '-2');
-    assert.equal(view.state.name, 'new-change-2', 'the create name is still editable');
-    view.handleInput('down'); // name -> issues
-    assert.equal(view.state.focus, 'issues');
-    view.handleInput('up'); // first row -> name
-    assert.equal(view.state.focus, 'name');
-    view.handleInput('up'); // -> type
-    assert.equal(view.state.focus, 'type');
-    view.handleInput('right');
-    assert.equal(view.state.typeIndex, 1, '←/→ still cycle the type while creating');
-    view.handleInput('\x13');
-    assert.equal(finished.length, 1);
-    assert.ok(!('mode' in finished[0]), 'a creation carries no mode marker');
-    assert.deepEqual(Object.keys(finished[0]).sort(), ['issues', 'name', 'odd', 'ok', 'type']);
+  test('the module names no association library and no association key legend', () => {
+    const code = fs.readFileSync(path.resolve(__dirname, '../lib/warp-create-panel.js'), 'utf8')
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('//'))
+      .join('\n');
+    for (const needle of ['gh-issues', 'odd-docs', 'odd-markdown', 'EDIT_KEYS', 'FILTER_KEYS', "mode: 'edit'", 'initialIssues', 'initialOdd', 'fetchIssues', 'listOdd']) {
+      assert.equal(code.includes(needle), false, `lib/warp-create-panel.js no longer names ${needle}`);
+    }
   });
 });
+
+describe('S7: Type|Name tabs and a neutral preview', { concurrency: false }, () => {
+  // A theme that records every role it is asked to paint, so "is it red?" is
+  // a fact about the painted output instead of a guess about copy.
+  function recordingPanel(overrides = {}) {
+    const roles = [];
+    const theme = {
+      fg: (role, text) => { roles.push(role); return text; },
+      bold: (text) => text,
+    };
+    return { roles, ...openPanel({ theme, ...overrides }) };
+  }
+
+  test('nothing in the preview is red or error copy until an actual submit is refused', () => {
+    const { view, roles } = recordingPanel();
+    renderedLines(view, 100);
+    assert.ok(!roles.includes('error'), `an untouched form paints no error role\n${roles.join(',')}`);
+    const text = allText(renderedLines(view, 100));
+    assert.ok(!text.includes('✗'), 'no error glyph in the preview');
+    assert.equal(findLine(renderedLines(view, 100), 'preview branch:').trim(), 'preview branch: -');
+    assert.equal(findLine(renderedLines(view, 100), 'preview path:').trim(), 'preview path: -');
+    // Half-filled is still neutral: a picked type with no name is not an error.
+    view.handleInput('\x1b[B');
+    renderedLines(view, 100);
+    assert.ok(!roles.includes('error'), 'a picked type alone is not an error');
+    // The refusal appears only after the user actually asks to create.
+    createNow(view);
+    const refused = renderedLines(view, 100);
+    assert.ok(roles.includes('error'), 'a refused submit is painted as an error');
+    assert.match(allText(refused), /cannot create: name is empty/);
+  });
+
+  test('the tabs hold one field each and keep both values while switching', () => {
+    const { view } = openPanel();
+    view.handleInput('\x1b[B'); // type: Bug fix
+    view.handleInput('\t'); // -> Name tab
+    typeText(view, 'tab-change');
+    let text = allText(renderedLines(view, 100));
+    assert.match(text, /Name: tab-change▊/);
+    assert.ok(!text.includes('Bug fix (fix)'), 'the type list belongs to the Type tab');
+    view.handleInput('\x1b[Z'); // shift+tab back to Type
+    text = allText(renderedLines(view, 100));
+    assert.match(text, /Type: Bug fix \(fix\)/, 'the picked type survived the round trip');
+    assert.ok(!text.includes('Name:'), 'the name field is not rendered under the Type tab');
+    view.handleInput('\x1b[C'); // -> back to the name
+    assert.equal(view.state.name, 'tab-change', 'the typed name survived too');
+    assert.match(allText(renderedLines(view, 100)), /Name: tab-change/);
+    view.handleInput('\x1b[D'); // -> Type
+    text = allText(renderedLines(view, 100));
+    for (const type of panel.CHANGE_TYPES) {
+      assert.ok(text.includes(`${type.label} (${type.id})`), `the type list is whole: ${type.id}`);
+    }
+    assert.match(findLine(renderedLines(view, 100), 'preview branch:').trim(), /^preview branch: fix\/tab-change$/);
+  });
+
+  test('a valid type and name preview the exact branch and path', () => {
+    const { view } = openPanel({ initialType: 'fix', initialName: 'new-change' });
+    const lines = renderedLines(view, 100);
+    findLine(lines, 'preview branch: fix/new-change');
+    const expected = path.join(path.dirname(REPO), `${path.basename(REPO)}-worktrees`, 'fix-new-change');
+    findLine(lines, `preview path: ${expected}`);
+    assert.ok(!allText(lines).includes('preview branch: -'), 'a derived branch replaces the blank preview');
+  });
+
+  test('cancel writes nothing and a confirmed creation fires exactly once', () => {
+    const cancelled = openPanel();
+    focusName(cancelled.view);
+    typeText(cancelled.view, 'discarded');
+    cancelled.view.handleInput('escape');
+    cancelled.view.handleInput('escape');
+    assert.deepEqual(cancelled.finished, [null], 'cancel emits null exactly once and nothing else');
+    assert.ok(!cancelled.finished.some((value) => value && value.ok === true), 'cancel never creates');
+
+    const confirmed = openPanel();
+    focusName(confirmed.view);
+    typeText(confirmed.view, 'new-change');
+    confirmed.view.handleInput('enter');
+    confirmed.view.handleInput('enter');
+    assert.deepEqual(
+      confirmed.finished,
+      [{ ok: true, type: 'feat', name: 'new-change' }],
+      'one creation, never a duplicate',
+    );
+  });
+});
+
+// S2: a key legend is ONE terminal row. The create panel used to spend two
+// rows on the same legend; a merged legend that does not fit is compacted
+// (short tokens, then the lowest-priority keys dropped), never clipped with
+// an ellipsis and never wrapped onto a second row.
+describe('S2: one-row key legends', { concurrency: false }, () => {
+  const WIDTHS = [40, 60, 80, 120];
+  const LEGEND = /Esc cancel|Ctrl\+S create/;
+
+  function legendRows(lines, marker) {
+    return lines.map(stripAnsi).filter((line) => marker.test(line));
+  }
+
+  test('the create legend owns exactly one row at every width', () => {
+    for (const width of WIDTHS) {
+      const { view } = openPanel();
+      const lines = renderedLines(view, width);
+      const legend = legendRows(lines, LEGEND);
+      assert.equal(legend.length, 1, `width ${width}: exactly one legend row, got ${legend.length}`);
+      assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+      assert.match(legend[0], /confirm/, `width ${width}: the confirm key survives`);
+      assert.match(legend[0], /Esc cancel/, `width ${width}: the cancel key survives`);
+      assert.ok(!legend[0].includes('Step'), `width ${width}: no step counter rides the footer`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S11: the create surface paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme — the footer's shortcut KEYS are
+// accent+bold and their descriptions muted, the panel title is accent+bold,
+// static labels are dim, a TITLE takes `customMessageLabel` (the Pi Agents view
+// title role) with weight, live
+// values are the normal text role, and a refusal is the error role — while an
+// untouched form paints no error at all.
+describe('S11: the shared palette', { concurrency: false }, () => {
+  const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
+
+  // A theme that RECORDS which role painted each string and paints every role
+  // with its own SGR code, so a rendered line can be read for the ROLE behind a
+  // token instead of trusting an eyeballed colour.
+  function recordingTheme() {
+    const calls = [];
+    const code = (role) => ROLE_SGR[role] ?? 95;
+    return {
+      calls,
+      fg(role, text) {
+        const value = String(text);
+        calls.push({ role, text: value });
+        return `\x1b[${code(role)}m${value}\x1b[0m`;
+      },
+      bold(text) {
+        const value = String(text);
+        calls.push({ role: 'bold', text: value });
+        return `\x1b[1m${value}\x1b[22m`;
+      },
+      bg(role, text) {
+        calls.push({ role: `bg:${role}`, text: String(text) });
+        return String(text);
+      },
+    };
+  }
+
+  test('the footer paints every key accent+bold and its description muted', () => {
+    const theme = recordingTheme();
+    const { view } = openPanel({ theme });
+    const legend = view.render(100).at(-2);
+    assert.match(legend, /\x1b\[1m\x1b\[96mtab\/←\/→\x1b\[0m\x1b\[22m\x1b\[90m fields/,
+      'the field key is accent+bold and its description muted');
+    assert.match(legend, /\x1b\[1m\x1b\[96m↑\/↓\x1b\[0m\x1b\[22m\x1b\[90m type/, 'so is the type key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mEnter\x1b\[0m\x1b\[22m\x1b\[90m confirm/, 'and the confirm key');
+    assert.match(legend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m cancel/, 'and the cancel key');
+    assert.match(legend, /\x1b\[34m · \x1b\[0m/, 'the entries are joined by the border role');
+    assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('Enter')),
+      'the key is bolded through the theme, never by a literal escape');
+    assert.ok(theme.calls.some((call) => call.role === 'muted' && call.text === ' confirm'),
+      'the description asks the injected theme for the muted role');
+  });
+
+  test('the title takes the secondary heading role, labels dim and live values ordinary text', () => {
+    const theme = recordingTheme();
+    const { view } = openPanel({ theme, initialName: 'palette-work' });
+    const lines = view.render(100);
+    const text = lines.map(stripAnsi).join('\n');
+    assert.match(lines[1], /\x1b\[1m\x1b\[33mNew worktree\x1b\[0m\x1b\[22m/,
+      'the panel title is the reference title role (dim), bold');
+    assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === 'New worktree'),
+      'the title never takes the button accent');
+    assert.match(findRaw(lines, 'preview branch:'), /\x1b\[2mpreview branch: \x1b\[0m\x1b\[39mfeat\/palette-work/,
+      'the static label is dim and the derived branch is ordinary text');
+    assert.match(findRaw(lines, 'preview path:'), /\x1b\[2mpreview path: \x1b\[0m\x1b\[39m/,
+      'so is the derived path');
+    assert.match(findRaw(lines, 'Type · Name'), /\x1b\[1m\x1b\[33mType\x1b\[0m\x1b\[22m/,
+      'the active tab label is a title');
+    assert.match(findRaw(lines, 'Type · Name'), /\x1b\[2mName\x1b\[0m/, 'the inactive tab is dim');
+    assert.match(findRaw(lines, 'Type: '), /\x1b\[2mType: \x1b\[0m\x1b\[39mFeature \(feat\)\x1b\[0m/,
+      'the picked type is ordinary text under a dim label');
+    assert.ok(!theme.calls.some((call) => call.role === 'error'), 'an untouched form paints no error role');
+    assert.ok(text.includes('preview branch: feat/palette-work'), 'the form is complete');
+  });
+
+  test('the name row paints its dim label and the typed value as ordinary text', () => {
+    const theme = recordingTheme();
+    const { view } = openPanel({ theme });
+    focusName(view);
+    typeText(view, 'typed');
+    assert.match(findRaw(view.render(100), 'Name:'), /\x1b\[2mName: \x1b\[0m\x1b\[39mtyped/,
+      'the label is dim and the typed name is ordinary text');
+  });
+
+  test('a refusal is the error role and the untouched placeholder stays dim', () => {
+    const theme = recordingTheme();
+    const { view } = openPanel({ theme });
+    assert.match(findRaw(view.render(100), 'preview branch:'), /\x1b\[2mpreview branch: \x1b\[0m\x1b\[2m-\x1b\[0m/,
+      'an underivable preview is dim, never an error');
+    createNow(view);
+    assert.match(findRaw(view.render(100), 'cannot create:'),
+      /\x1b\[91mcannot create: name is empty\x1b\[0m/, 'the refusal is painted as an error');
+  });
+
+  test('a hostile theme never breaks the form and keeps the keys readable', () => {
+    const hostile = {
+      fg() { throw new Error('no colour support'); },
+      bold() { throw new Error('no bold support'); },
+      bg() { throw new Error('no background support'); },
+    };
+    const { view } = openPanel({ theme: hostile, initialName: 'plain-form' });
+    const lines = view.render(100);
+    const text = allText(lines);
+    assert.match(text, /New worktree/, 'the title still renders');
+    assert.match(text, /preview branch: feat\/plain-form/, 'the preview still renders');
+    assert.match(text, /Type · Name/, 'the tabs still render');
+    assert.match(text, /tab\/←\/→ fields · ↑\/↓ type · Enter confirm · Esc cancel/, 'the legend still spells every key');
+    for (const line of lines) {
+      assert.equal([...stripAnsi(line)].length, 100, `line is not 100 wide: ${JSON.stringify(line)}`);
+    }
+  });
+});
+
+// A raw (painted) line, for the palette assertions above.
+function findRaw(lines, needle) {
+  const line = lines.find((entry) => stripAnsi(entry).includes(needle));
+  assert.ok(line !== undefined, `no line contains ${JSON.stringify(needle)}\n${lines.map(stripAnsi).join('\n')}`);
+  return line;
+}

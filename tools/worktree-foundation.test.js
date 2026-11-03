@@ -358,14 +358,14 @@ describe('worktree-registry', () => {
     const root = makeRepo('regrundtrip');
     const target = path.join(path.dirname(root), 'rt-wt');
     const written = registryLib.upsertWorktree(root, {
-      branch: 'feat/rt', path: target, thread: 'thread-1', issues: [35], odd: ['odd/tasks/x.md'],
+      branch: 'feat/rt', path: target, thread: 'thread-1', issues: [35], odd: 'odd/tasks/x.md',
     });
     assert.equal(written.ok, true);
     assert.equal(typeof written.entry.createdAt, 'string');
     assert.equal(typeof written.entry.updatedAt, 'string');
     assert.deepEqual({ ...written.entry, createdAt: 'T', updatedAt: 'T' }, {
       branch: 'feat/rt', path: target, thread: 'thread-1',
-      issues: [35], odd: ['odd/tasks/x.md'], createdAt: 'T', updatedAt: 'T',
+      issues: [35], odd: 'odd/tasks/x.md', createdAt: 'T', updatedAt: 'T',
     });
 
     const read = registryLib.readRegistry(root);
@@ -412,7 +412,7 @@ describe('worktree-registry', () => {
     assert.equal(typeof missing.error, 'string');
   });
 
-  test('addOddDoc associates docs idempotently', () => {
+  test('addOddDoc associates ONE document idempotently', () => {
     const root = makeRepo('regodd');
     registryLib.upsertWorktree(root, {
       branch: 'feat/odd', path: path.join(path.dirname(root), 'odd-wt'), thread: 't', issues: [3],
@@ -423,7 +423,7 @@ describe('worktree-registry', () => {
     const second = registryLib.addOddDoc(root, 'feat/odd', 'odd/tasks/a.md');
     assert.equal(second.ok, true);
     assert.equal(second.added, false);
-    assert.deepEqual(registryLib.findByBranch(root, 'feat/odd').odd, ['odd/tasks/a.md']);
+    assert.equal(registryLib.findByBranch(root, 'feat/odd').odd, 'odd/tasks/a.md');
     const missing = registryLib.addOddDoc(root, 'feat/nope', 'odd/tasks/a.md');
     assert.equal(missing.ok, false);
   });

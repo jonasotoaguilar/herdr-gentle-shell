@@ -906,3 +906,56 @@ describe('daemon resolver on explicit empty GENTLE (S15)', () => {
     }
   });
 });
+
+/* The diagnostics readers share the plugin state dir with the daemon, the
+   sidebar and the extension, so their known-file family must match: a stored
+   dir holding only the shared ODD/Issues toggle file must win over an empty
+   Herdr-injected dir, otherwise a stored DISABLED toggle reads as MISSING
+   there (missing means enabled). Legacy precedence stays pinned. */
+describe('diagnostics resolver known-file family', () => {
+  const diag = require('../herdr-plugin/lib/gentle-diagnostics.js');
+
+  function resolverSandbox(tag) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `gentle-diag-resolver-${tag}-`));
+    const xdg = path.join(root, 'xdg');
+    const stored = path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents');
+    const injected = path.join(root, 'injected-shell');
+    fs.mkdirSync(stored, { recursive: true });
+    fs.mkdirSync(injected, { recursive: true });
+    return { root, xdg, stored, injected, env: { XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected } };
+  }
+
+  it('a stored dir holding only the plugin-tools toggle wins over an empty injected dir', () => {
+    const fixture = resolverSandbox('tools');
+    try {
+      fs.writeFileSync(path.join(fixture.stored, 'gentle-plugin-tools.json'), '{"version":1,"odd":false,"issues":false}\n');
+      assert.equal(diag.resolveStateDir(fixture.env), fixture.stored);
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('a fresh install still converges on the injected dir', () => {
+    const fixture = resolverSandbox('fresh');
+    try {
+      assert.equal(diag.resolveStateDir(fixture.env), fixture.injected);
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('an explicit user override wins and is resolved to an absolute path', () => {
+    const fixture = resolverSandbox('explicit');
+    try {
+      fs.writeFileSync(path.join(fixture.stored, 'gentle-plugin-tools.json'), '{"version":1,"odd":false,"issues":false}\n');
+      fs.writeFileSync(path.join(fixture.injected, 'gentle-status.pid'), '123\n');
+      const explicit = path.join(fixture.root, 'explicit');
+      fs.mkdirSync(explicit, { recursive: true });
+      assert.equal(diag.resolveStateDir({ ...fixture.env, GENTLE_STATUS_STATE_DIR: explicit }), explicit);
+      const relative = path.relative(process.cwd(), explicit) || '.';
+      assert.equal(diag.resolveStateDir({ ...fixture.env, GENTLE_STATUS_STATE_DIR: relative }), explicit);
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+});

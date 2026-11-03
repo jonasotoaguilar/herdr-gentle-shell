@@ -494,7 +494,7 @@ function shippedVersion() {
   return pluginCheck.readShippedVersion(pluginCheck.defaultManifestPath());
 }
 
-function fireSessionStart(handlers, { json, exit = '0', notes } = {}) {
+function fireSessionStart(handlers, mod, { json, exit = '0', notes } = {}) {
   setEnv({
     HERDR_PLUGIN_CHECK_JSON: json,
     HERDR_PLUGIN_CHECK_EXIT: exit,
@@ -507,6 +507,10 @@ function fireSessionStart(handlers, { json, exit = '0', notes } = {}) {
     for (const handler of handlers.get('session_start') || []) {
       await handler({ reason: 'startup' }, ctx);
     }
+    // The plugin verdict is deliberately off the awaited startup path (nothing
+    // the session does next depends on it), so a caller that wants to observe
+    // it waits through the extension's own seam instead of guessing a delay.
+    await mod.awaitPendingStartupTasks();
   })();
 }
 
@@ -536,11 +540,11 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     });
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
+      const { handlers, mod } = await loadExtension();
       assert.ok((handlers.get('session_start') || []).length > 0, 'a session_start hook is registered');
       const json = listDoc([entry({ version: '9.9.9' })]);
-      await fireSessionStart(handlers, { json, notes });
-      await fireSessionStart(handlers, { json, notes });
+      await fireSessionStart(handlers, mod, { json, notes });
+      await fireSessionStart(handlers, mod, { json, notes });
       assert.equal(pluginAlerts(notes).length, 1, 'exactly one alert per session across two startups');
       const [message, level] = pluginAlerts(notes)[0];
       assert.equal(level, 'info');
@@ -564,8 +568,8 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     });
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: listDoc([entry({ version: shipped })]), notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: listDoc([entry({ version: shipped })]), notes });
       assert.equal(pluginAlerts(notes).length, 0, 'a healthy install notifies nothing');
     } finally {
       restoreEnv();
@@ -581,8 +585,8 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     });
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: '{}', notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: '{}', notes });
       assert.equal(pluginAlerts(notes).length, 0, 'no alert when Herdr is unavailable');
     } finally {
       restoreEnv();
@@ -599,8 +603,8 @@ describe('herdr-plugin-check wiring at session startup', { concurrency: false },
     });
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: '{}', exit: '1', notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: '{}', exit: '1', notes });
       assert.equal(pluginAlerts(notes).length, 0, 'no alert when the list call errors');
     } finally {
       restoreEnv();
@@ -831,8 +835,8 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
     setSidebarWorldEnv(fx);
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: listDoc([]), notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: listDoc([]), notes });
       const mode = JSON.parse(fs.readFileSync(path.join(fx.stateDir, 'gentle-sidebar-mode.json'), 'utf8'));
       assert.equal(mode.enabled, false, 'the option converged OFF through the panel writer');
       assert.deepEqual(
@@ -869,8 +873,8 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
     };
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: listDoc([entry({ version: shipped })]), notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: listDoc([entry({ version: shipped })]), notes });
       assert.equal(
         JSON.parse(fs.readFileSync(path.join(fx.stateDir, 'gentle-sidebar-mode.json'), 'utf8')).enabled,
         true,
@@ -893,8 +897,8 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
     const before = fs.readFileSync(fx.settingsPath, 'utf8');
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: listDoc([]), notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: listDoc([]), notes });
       assert.equal(
         JSON.parse(fs.readFileSync(path.join(fx.stateDir, 'gentle-sidebar-mode.json'), 'utf8')).enabled,
         false,
@@ -916,8 +920,8 @@ describe('herdr-plugin-check: startup auto-disable end to end (T1)', { concurren
     fs.chmodSync(fx.stateDir, 0o555);
     const notes = [];
     try {
-      const { handlers } = await loadExtension();
-      await fireSessionStart(handlers, { json: listDoc([]), notes });
+      const { handlers, mod } = await loadExtension();
+      await fireSessionStart(handlers, mod, { json: listDoc([]), notes });
       assert.equal(pluginAlerts(notes).length, 1);
       assert.ok(/could NOT be switched off/.test(pluginAlerts(notes)[0][0]), `honest outcome: ${pluginAlerts(notes)[0][0]}`);
       assert.ok(/still ON/.test(pluginAlerts(notes)[0][0]), `says it is still on: ${pluginAlerts(notes)[0][0]}`);

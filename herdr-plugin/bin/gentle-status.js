@@ -211,6 +211,10 @@ function herdrStateDir() {
 // stored dir does, the stored dir wins so pre-rename flags stay readable.
 // Fresh installs with no stored files converge on the injected dir.
 // GENTLE_STATUS_STATE_DIR (explicit user override) is always used as-is.
+// This family is IDENTICAL in the sidebar, diagnostics, worktree-mode and
+// state-extension resolvers. The daemon also WRITES here (pidfile, mode,
+// ledger), so a file it cannot see is a file whose dir it splits off: the
+// stored ODD/Issues toggle then reads as missing, i.e. enabled.
 const STATE_KNOWN_FILES = [
   'gentle-sidebar-mode.json',
   'gentle-moshi.json',
@@ -219,6 +223,7 @@ const STATE_KNOWN_FILES = [
   'gentle-interruptions.json',
   'installer-state',
   'gentle-worktree-mode.json',
+  'gentle-plugin-tools.json',
 ];
 
 function dirHasKnownFiles(dir) {
@@ -498,6 +503,34 @@ async function reportChunked(source, paneId, tokens) {
 
 const lastSent = new Map(); // paneId -> JSON of last published family
 
+/* ------------------------------------------------------------ trace */
+
+// S18: optional frame trace. The writer lives in the package's lib/ directory
+// one level above the plugin root (herdr-plugin/bin → ../..); a plugin
+// installed without it records nothing, and tracing never breaks a frame.
+// Activation is the GENTLE_PERF_TRACE environment variable and nothing else, so
+// this daemon reads the same shell-level switch as the extension: no flag file
+// is written, read or stat'ed here.
+let perfTraceModule;
+function perfTrace() {
+  if (perfTraceModule !== undefined) return perfTraceModule;
+  try {
+    perfTraceModule = require(path.join(__dirname, '..', '..', 'lib', 'perf-trace.js'));
+  } catch {
+    perfTraceModule = null;
+  }
+  return perfTraceModule;
+}
+
+function traceEnabled(trace) {
+  if (!trace) return false;
+  try {
+    return trace.isTraceEnabled(process.env) === true;
+  } catch {
+    return false;
+  }
+}
+
 // Single scoped sweeper (R3-orphan + R4-live-loop): the owned gentle_*
 // family only, cleared under this daemon's own source tag. Foreign tokens
 // (pi-tree, native, other plugins) are never touched. All sweep paths —
@@ -515,6 +548,10 @@ async function clearOwnedFamily(paneId) {
 }
 
 async function frame(state, opts = {}) {
+  // Off path: one environment check, no clock read, no object built.
+  const trace = perfTrace();
+  const tracing = traceEnabled(trace);
+  const started = tracing ? process.hrtime.bigint() : 0n;
   const now = Date.now();
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
@@ -619,6 +656,22 @@ async function frame(state, opts = {}) {
   if (opts.persistInterruptions === true) {
     try {
       await trackInterruptions(state, sightings, now);
+    } catch (error) {
+      logError(error);
+    }
+  }
+  // Counts only, never pane ids, cwd, tokens or their values: `panes` is the
+  // owned panes this frame reduced and `tokens` the token NAMES it published
+  // (0 when nothing changed or the native sidebar is selected).
+  if (tracing) {
+    let tokens = 0;
+    for (const job of publishJobs) tokens += Object.keys(job.patch).length;
+    try {
+      trace.traceEvent('daemon', {
+        ms: Number(process.hrtime.bigint() - started) / 1e6,
+        panes: Object.keys(sightings).length,
+        tokens,
+      }, process.env);
     } catch (error) {
       logError(error);
     }

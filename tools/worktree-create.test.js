@@ -1,6 +1,6 @@
 'use strict';
-// P2-S2 tests (test-first): `worktree_upsert` validation + creation WITHOUT
-// hooks, plus lib/worktree-issues.js issue verification.
+// P2-S2 tests (test-first): `worktree_create` validation + creation WITHOUT
+// hooks.
 //
 // Loading pattern mirrors tools/gentle-sidebar-toggle.test.js: the
 // TypeScript extension is plain JS under the hood (// @ts-nocheck, no type
@@ -61,24 +61,40 @@ function track(dir) {
   return dir;
 }
 
+// S3/L4: git-ignore rules decide link eligibility, so every fixture pins the
+// caller's global/system git config away. The host's own global ignore file
+// already names .pi/.claude/.agents, so leaving it in scope would let a test
+// prove the wrong thing.
+const GIT_ISOLATION = { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+
 function git(cwd, args, extraEnv) {
   const result = spawnSync('git', args, {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, ...(extraEnv || {}) },
+    env: { ...process.env, ...GIT_ISOLATION, ...(extraEnv || {}) },
   });
   assert.equal(result.status, 0, `git ${args.join(' ')} failed: ${result.stderr}`);
   return (result.stdout || '').trim();
 }
 
 // Fresh fixture repository with one empty commit.
+//
+// Every checkout a create builds lands under `<root>-worktrees/`, which is
+// tracked here too: the repo dir alone would leave the created worktrees (and
+// anything a real backend made beside them) behind in the temp root after the
+// suite. `expectedTarget` below is exactly one child of that directory.
 function makeRepo(tag) {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-create-${tag}-`)));
-  git(dir, ['init']);
-  git(dir, ['config', 'user.email', 'test@example.com']);
-  git(dir, ['config', 'user.name', 'Test']);
-  git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  const real = fs.realpathSync(dir);
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  git(real, ['init']);
+  git(real, ['config', 'user.email', 'test@example.com']);
+  git(real, ['config', 'user.name', 'Test']);
+  git(real, ['commit', '--allow-empty', '-m', 'init']);
+  // S2: new worktrees are born from LOCAL main, so every fixture that creates
+  // one needs that branch to exist (the create refuses without it).
+  git(real, ['branch', 'main', 'HEAD']);
+  return real;
 }
 
 // Stub `gh`: answers `issue view <n> --json ...` for the known issues,
@@ -162,6 +178,18 @@ function listWorktreePaths(root) {
     .map((line) => line.slice('worktree '.length));
 }
 
+// One snapshot of everything a create may write: branches, live checkouts and
+// registry rows. A refusal must leave all three identical.
+function createdState(root) {
+  const registry = require('../lib/worktree-registry.js');
+  const read = registry.readRegistry(root);
+  return {
+    branches: git(root, ['branch', '--format=%(refname:short)']).split('\n').filter(Boolean).sort(),
+    checkouts: listWorktreePaths(root).sort(),
+    rows: (read.ok ? read.worktrees : []).map((row) => `${row.branch} ${row.path}`).sort(),
+  };
+}
+
 function expectedTarget(root, slug) {
   return path.join(path.dirname(root), `${path.basename(root)}-worktrees`, slug);
 }
@@ -170,14 +198,67 @@ function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
 }
 
+// S12/T8 model-facing create text: ordered label rows built from the SAME
+// details the card reads. The exact cell contract is pinned by
+// tools/worktree-model-result.test.js; these suites pin order, identity and
+// associations. A known-empty association reads `-` (S6).
+// The create result appends one `warning:` row per summarized warning (a
+// dropped association, an adopted branch, a skipped Herdr step); the ordered
+// create rows always lead, so a warning can never displace them and none is
+// silently dropped.
+function assertCreatedText(text, details, expected) {
+  const rows = String(text).split('\n');
+  assert.deepEqual(rows.slice(0, expected.length), expected);
+  const warnings = Array.isArray(details && details.warnings) ? details.warnings : [];
+  assert.deepEqual(
+    rows.slice(expected.length),
+    warnings.map((warning) => `warning: ${warning}`),
+    'every summary warning follows the created rows exactly once',
+  );
+}
+
+// S7: the create text names the Registry write it actually performed — `new`
+// (the row did not exist), `replaced` (an existing row for this branch was
+// overwritten) or `appended` (a live checkout at another path kept the branch,
+// so the new row was recorded alongside it) — and `unchanged` for the
+// idempotent call that returns the checkout this thread already owns.
+function createdRows({ alreadyExists = false, name, branch, path: target, registered = 'new', codegraph = 'initialized', changes = false, copied = null }) {
+  const rows = [
+    alreadyExists ? `created: ${name} \u00B7 ${branch} \u00B7 already exists` : `created: ${name} \u00B7 ${branch}`,
+    `path: ${target}`,
+    `registered: ${registered}`,
+    `codegraph: ${codegraph}`,
+  ];
+  if (changes) rows.push('changes: already registered for this session');
+  if (copied !== null) rows.push(`copied: ${copied}`);
+  return rows;
+}
+
+// Deterministic creation-hook binary (S6): the create result reports the
+// CodeGraph status, so no test may depend on whether the developer happens to
+// have `codegraph` on PATH. The stub is prepended to PATH for every test and
+// exits 0, so `codegraph: initialized` is the honest default.
+const HOOK_BIN = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-create-hookbin-')));
+fs.writeFileSync(path.join(HOOK_BIN, 'codegraph'), ['#!/bin/sh', 'exit 0', ''].join('\n'), { mode: 0o755 });
+
 // Isolated mode state per test: missing file means enabled.
 function scratchModeEnv() {
   return { GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-mode-'))) };
 }
 
 const savedEnv = { ...process.env };
+// A leaked Herdr workspace is created the moment a test executes create with a
+// live `herdr` on PATH or in an inherited HERDR_BIN_PATH. Every test in this
+// file therefore runs against a binary that cannot exist unless that test
+// explicitly supplies its own stub — the extension then uses the plain git
+// fallback and Herdr is never spawned.
+const NO_HERDR_BIN = path.join(os.tmpdir(), 'definitely-not-a-herdr-binary');
 function setEnv(vars) {
   const env = 'GENTLE_STATUS_STATE_DIR' in vars ? vars : { ...vars, ...scratchModeEnv() };
+  if (!('HERDR_BIN_PATH' in env)) env.HERDR_BIN_PATH = NO_HERDR_BIN;
+  // The hook binary dir leads PATH so `codegraph init` is deterministic; a
+  // test that supplies its own PATH keeps its stubs after that prefix.
+  env.PATH = `${HOOK_BIN}${path.delimiter}${vars.PATH || process.env.PATH || ''}`;
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -221,22 +302,29 @@ function makeCtx({ repoRoot, thread = 'thread-1', hasUI = false, confirm = true 
 }
 
 async function callCreate(tools, params, ctx) {
-  const tool = tools.get('worktree_upsert');
-  assert.ok(tool, 'expected worktree_upsert to be registered');
-  return tool.execute('call-1', params, undefined, undefined, ctx);
+  const tool = tools.get('worktree_create');
+  assert.ok(tool, 'expected worktree_create to be registered');
+  // S4: `changes` is mandatory, so a creation test that cares about something
+  // else states the no-copy selection explicitly instead of omitting it.
+  const sent = params && params.changes !== undefined ? params : { ...(params || {}), changes: 'none' };
+  return tool.execute('call-1', sent, undefined, undefined, ctx);
 }
 
-describe('worktree_upsert', { concurrency: false }, () => {
-  test('registers exactly one tool with branch + issues + odd parameters', async () => {
+describe('worktree_create', { concurrency: false }, () => {
+  // S3/S4: two declared parameters and no more — the branch, and the pending
+  // changes selection the caller must send. `optional` is the plain-node Type
+  // double's mark for Optional(), so its absence is what makes the field
+  // mandatory: the runtime validates the declaration before execute runs.
+  test('registers exactly one tool with the branch and the required changes parameters', async () => {
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       const tools = await loadExtension();
-      assert.deepEqual([...tools.keys()], ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp']);
-      const params = tools.get('worktree_upsert').parameters;
-      assert.deepEqual(Object.keys(params.properties).sort(), ['branch', 'issues', 'odd']);
+      assert.deepEqual([...tools.keys()], ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp']);
+      const params = tools.get('worktree_create').parameters;
+      assert.deepEqual(Object.keys(params.properties).sort(), ['branch', 'changes']);
       assert.equal(params.properties.branch.type, 'string');
-      assert.equal(params.properties.issues.type, 'array');
-      assert.equal(params.properties.odd.type, 'string');
+      assert.ok(params.properties.changes, 'the changes selection is declared');
+      assert.notEqual(params.properties.changes.optional, true, 'changes is mandatory, not optional');
     } finally {
       restoreEnv();
     }
@@ -260,21 +348,20 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
       const target = expectedTarget(root, 'feat-create-ok');
-      const result = await callCreate(tools, { branch: 'feat/create-ok', issues: [35] }, ctx);
+      const result = await callCreate(tools, { branch: 'feat/create-ok' }, ctx);
 
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-create-ok · feat/create-ok',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-create-ok', branch: 'feat/create-ok', path: `${target}` }));
       assert.deepEqual(
-        {
-          path: result.details.path, branch: result.details.branch,
-          issues: result.details.issues, created: result.details.created,
-        },
-        { path: target, branch: 'feat/create-ok', issues: [35], created: true },
+        { path: result.details.path, branch: result.details.branch },
+        { path: target, branch: 'feat/create-ok' },
       );
+      // S1/S6: a create records and displays no association.
+      assert.equal('issues' in result.details, false, 'no issue association travels');
+      assert.equal('odd' in result.details, false, 'no odd association travels');
+      assert.equal('created' in result.details, false, 'the retired outcome field is gone');
+      assert.equal(result.details.alreadyExists, undefined, 'a real creation carries no already-exists marker');
+      assert.deepEqual(result.details.codegraph, { status: 'done', detail: '' }, 'the codegraph hook outcome is reported');
       // Creation hooks (S8) report their steps beside the creation facts.
       assert.equal(result.details.hooks.ok, true);
       assert.ok(Array.isArray(result.details.hooks.steps) && result.details.hooks.steps.length > 0);
@@ -287,7 +374,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const entry = registryLib.findByBranch(root, 'feat/create-ok');
       assert.deepEqual({ ...entry, createdAt: 'T', updatedAt: 'T' }, {
         branch: 'feat/create-ok', path: target, thread: 'thread-1',
-        issues: [35], odd: [], createdAt: 'T', updatedAt: 'T',
+        issues: [], odd: null, createdAt: 'T', updatedAt: 'T',
       });
       assert.equal(
         registryLib.registryPath(root),
@@ -327,24 +414,18 @@ describe('worktree_upsert', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      const first = await callCreate(tools, { branch: 'feat/repeat', issues: [35] }, ctx);
+      const first = await callCreate(tools, { branch: 'feat/repeat' }, ctx);
       const before = listWorktreePaths(root);
       assert.equal(before.length, 2);
 
-      const second = await callCreate(tools, { branch: 'feat/repeat', issues: [35] }, ctx);
+      const second = await callCreate(tools, { branch: 'feat/repeat' }, ctx);
       // The already-owned checkout says so in the same ordered shape:
-      // every line matches except the `· already exists` qualifier.
-      assert.deepEqual(resultText(second).split('\n'), [
-        'created: feat-repeat · feat/repeat · already exists',
-        `path: ${first.details.path}`,
-        'issues: 35',
-      ]);
-      assert.deepEqual(resultText(first).split('\n'), [
-        'created: feat-repeat · feat/repeat',
-        `path: ${first.details.path}`,
-        'issues: 35',
-      ]);
-      assert.equal(second.details.created, false);
+      // every line matches except the `· already exists` qualifier and the
+      // honest "no hook ran" CodeGraph status.
+      assert.deepEqual(resultText(second).split('\n'), createdRows({ alreadyExists: true, name: 'feat-repeat', branch: 'feat/repeat', path: `${first.details.path}`, registered: 'unchanged', codegraph: 'not initialized' }));
+      assert.deepEqual(resultText(first).split('\n'), createdRows({ name: 'feat-repeat', branch: 'feat/repeat', path: `${first.details.path}` }));
+      assert.equal(second.details.alreadyExists, true);
+      assert.deepEqual(second.details.codegraph, { status: 'absent', detail: '' }, 'the checkout really has no index');
       assert.equal(second.details.path, first.details.path);
       assert.deepEqual(listWorktreePaths(root), before, 'no second checkout is created');
       assert.equal(shimArgv(herdr.log).length, 1, 'herdr is not invoked again');
@@ -369,13 +450,13 @@ describe('worktree_upsert', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const first = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      const created = await callCreate(tools, { branch: 'feat/one', issues: [35] }, first.ctx);
+      const created = await callCreate(tools, { branch: 'feat/one' }, first.ctx);
 
       const second = makeCtx({ repoRoot: root, thread: 'thread-2' });
-      const other = await callCreate(tools, { branch: 'feat/two', issues: [7] }, second.ctx);
+      const other = await callCreate(tools, { branch: 'feat/two' }, second.ctx);
       assert.equal(other.isError, undefined);
       assert.notEqual(other.details.path, created.details.path);
-      assert.equal(other.details.created, true);
+      assert.equal(other.details.alreadyExists, undefined);
       assert.equal(listWorktreePaths(root).length, 3);
 
       const registryLib = require('../lib/worktree-registry.js');
@@ -402,7 +483,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root, thread: 'session-thread' });
-      const result = await callCreate(tools, { branch: 'feat/env-thread', issues: [35] }, ctx);
+      const result = await callCreate(tools, { branch: 'feat/env-thread' }, ctx);
       assert.equal(result.isError, undefined);
       const registryLib = require('../lib/worktree-registry.js');
       const entry = registryLib.findByBranch(root, 'feat/env-thread');
@@ -412,7 +493,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
     }
   });
 
-  test('S27: a branch already checked out with supplied issues updates instead of duplicating', async () => {
+  test('a branch already checked out by another thread is refused, never updated', async () => {
     const root = makeRepo('taken');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
@@ -428,22 +509,22 @@ describe('worktree_upsert', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const owner = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      await callCreate(tools, { branch: 'feat/taken', issues: [35] }, owner.ctx);
+      await callCreate(tools, { branch: 'feat/taken' }, owner.ctx);
       const before = listWorktreePaths(root);
       const callsBefore = shimArgv(herdr.log).length;
+      const registryLib = require('../lib/worktree-registry.js');
+      const rowBefore = registryLib.findByBranch(root, 'feat/taken');
 
-      // S27 create-or-update: the same branch with supplied fields is an
-      // update of the live checkout, never a second checkout and never
-      // the historical refusal.
+      // S1: the tool only creates. Another thread asking for the same branch
+      // is the historical refusal — never an update, and an association field
+      // it still sends changes nothing.
       const other = makeCtx({ repoRoot: root, thread: 'thread-2' });
-      const updated = await callCreate(tools, { branch: 'feat/taken', issues: [35] }, other.ctx);
-      assert.equal(updated.isError, undefined, `expected an update, got: ${resultText(updated)}`);
-      assert.equal(updated.details.created, false, 'an update never reports created:true');
-      assert.equal(updated.details.updated, true, 'an update reports updated:true');
+      const refused = await callCreate(tools, { branch: 'feat/taken', issues: [35], odd: 'odd/tasks/x.md' }, other.ctx);
+      assert.equal(refused.isError, true, `expected a refusal, got: ${resultText(refused)}`);
+      assert.match(resultText(refused), /already checked out/);
       assert.deepEqual(listWorktreePaths(root), before, 'no checkout is added');
       assert.equal(shimArgv(herdr.log).length, callsBefore, 'herdr is not invoked');
-      const registryLib = require('../lib/worktree-registry.js');
-      assert.deepEqual(registryLib.findByBranch(root, 'feat/taken').issues, [35], 'supplied issues stored');
+      assert.deepEqual(registryLib.findByBranch(root, 'feat/taken'), rowBefore, 'the stored row is untouched');
     } finally {
       restoreEnv();
     }
@@ -483,9 +564,10 @@ describe('worktree_upsert', { concurrency: false }, () => {
     }
   });
 
-  test('a nonexistent issue is refused with no mutation (supplied issues keep exact validation)', async () => {
+  test('a supplied issue or odd field is ignored: nothing is verified, nothing stored', async () => {
     const root = makeRepo('issues');
     const herdr = makeHerdrStub();
+    // A gh stub that only knows issue 35: a sent 424242 must never be read.
     const gh = makeGhStub([35]);
     const modeEnv = scratchModeEnv();
     setEnv({
@@ -499,18 +581,17 @@ describe('worktree_upsert', { concurrency: false }, () => {
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      const before = listWorktreePaths(root);
 
-      // S14: omission and emptiness no longer fail (covered by the S14
-      // suite above); only supplied issues are verified.
-      const ghost = await callCreate(tools, { branch: 'feat/ghost', issues: [424242] }, ctx);
-      assert.equal(ghost.isError, true);
-      assert.ok(resultText(ghost).includes('424242'), `names the number: ${resultText(ghost)}`);
-
-      assert.deepEqual(listWorktreePaths(root), before, 'no checkout is created');
-      assert.deepEqual(shimArgv(herdr.log), [], 'herdr is never invoked');
+      // S1/S6: the create takes the branch and nothing else. A stale caller
+      // that still sends an association is neither refused nor obeyed.
+      const result = await callCreate(tools, { branch: 'feat/ghost', issues: [424242], odd: 'odd/tasks/missing.md' }, ctx);
+      assert.equal(result.isError, undefined, `the create must not read an association: ${resultText(result)}`);
+      assert.equal('issues' in result.details, false);
+      assert.equal('odd' in result.details, false);
       const registryLib = require('../lib/worktree-registry.js');
-      assert.deepEqual(registryLib.readRegistry(root).worktrees, [], 'no registry entry');
+      const entry = registryLib.findByBranch(root, 'feat/ghost');
+      assert.deepEqual(entry.issues, [], 'no issue is recorded');
+      assert.equal(entry.odd, null, 'no odd document is recorded');
     } finally {
       restoreEnv();
     }
@@ -613,11 +694,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const result = await callCreate(tools, { branch: 'feat/no-ask', issues: [35, 7] }, ctx);
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(confirms.length, 0, 'ctx.ui.confirm is never called for a create');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-no-ask · feat/no-ask',
-        `path: ${target}`,
-        'issues: 35,7',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-no-ask', branch: 'feat/no-ask', path: `${target}`, issues: [35, 7] }));
       assert.ok(fs.existsSync(target), 'the checkout exists');
       const registryLib = require('../lib/worktree-registry.js');
       assert.equal(registryLib.readRegistry(root).worktrees.length, 1, 'the registry row is written');
@@ -646,17 +723,10 @@ describe('worktree_upsert', { concurrency: false }, () => {
       const target = expectedTarget(root, 'feat-fallback');
       const result = await callCreate(tools, { branch: 'feat/fallback', issues: [12] }, ctx);
       assert.equal(result.isError, undefined);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-fallback · feat/fallback',
-        `path: ${target}`,
-        'issues: 12',
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-fallback', branch: 'feat/fallback', path: `${target}`, issues: [12] }));
       assert.deepEqual(
-        {
-          path: result.details.path, branch: result.details.branch,
-          issues: result.details.issues, created: result.details.created,
-        },
-        { path: target, branch: 'feat/fallback', issues: [12], created: true },
+        { path: result.details.path, branch: result.details.branch },
+        { path: target, branch: 'feat/fallback' },
       );
       assert.equal(result.details.hooks.ok, true);
       // herdr was attempted first with fixed argv, then git did the work.
@@ -675,208 +745,7 @@ describe('worktree_upsert', { concurrency: false }, () => {
   });
 });
 
-describe('worktree-issues: verifyIssues', { concurrency: false }, () => {
-  test('verifies existing issues through a fixed gh argv', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('verify');
-    const gh = makeGhStub([35, 7]);
-    setEnv({ GH_BIN_PATH: gh, GENTLE_WORKTREE_THREAD: undefined });
-    try {
-      const result = issuesLib.verifyIssues([35, 7], { cwd: root });
-      assert.equal(result.ok, true);
-      assert.deepEqual(result.issues, [
-        { number: 35, title: 'Test issue 35', state: 'OPEN' },
-        { number: 7, title: 'Test issue 7', state: 'OPEN' },
-      ]);
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a missing or empty list fails telling the agent to create or assign an issue first', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('missing');
-    setEnv({ GH_BIN_PATH: makeGhStub([35]) });
-    try {
-      for (const numbers of [undefined, null, [], '35']) {
-        const result = issuesLib.verifyIssues(numbers, { cwd: root });
-        assert.equal(result.ok, false, `expected failure: ${JSON.stringify(numbers)}`);
-        assert.match(result.reason, /create or assign an issue first/i);
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a nonexistent issue fails naming that number', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('ghost');
-    setEnv({ GH_BIN_PATH: makeGhStub([35]) });
-    try {
-      const result = issuesLib.verifyIssues([424242], { cwd: root });
-      assert.equal(result.ok, false);
-      assert.ok(result.reason.includes('424242'), `names the number: ${result.reason}`);
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a missing gh binary fails closed with a clear reason', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('nogh');
-    setEnv({ GH_BIN_PATH: path.join(os.tmpdir(), 'definitely-not-a-gh-binary-xyz') });
-    try {
-      const result = issuesLib.verifyIssues([35], { cwd: root });
-      assert.equal(result.ok, false);
-      assert.ok(result.reason.length > 0);
-      assert.match(result.reason, /gh/i);
-    } finally {
-      restoreEnv();
-    }
-  });
-});
-
-describe('worktree-issues: verifyIssuesAsync (wizard/gitOnly path)', { concurrency: false }, () => {
-  // Programmable `gh` stub: GH_STUB_MODE selects the behavior so the
-  // SAME fake executable drives both the sync and the async verifier
-  // for a true differential (no mocks on this path).
-  function makeGhModeStub() {
-    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-gh-mode-')));
-    const bin = path.join(dir, 'gh');
-    const log = path.join(dir, 'argv.log');
-    fs.writeFileSync(
-      bin,
-      [
-        '#!/bin/sh',
-        'printf \'%s\\n\' "$*" >> "$GH_STUB_LOG"',
-        'if [ "$GH_STUB_MODE" = "auth" ]; then',
-        '  echo "To run gh, please first run gh auth login" >&2; exit 1',
-        'fi',
-        'if [ "$GH_STUB_MODE" = "slow" ]; then',
-        '  sleep 30',
-        'fi',
-        'if [ "$GH_STUB_MODE" = "garbage" ]; then',
-        '  echo "not json"; exit 0',
-        'fi',
-        'if [ "$1" = "issue" ] && [ "$2" = "view" ] && [ "$3" = "35" ]; then',
-        '  printf \'{"number":35,"title":"Test issue 35","state":"OPEN"}\\n\'; exit 0',
-        'fi',
-        'echo "could not resolve to an Issue" >&2; exit 1',
-        '',
-      ].join('\n'),
-      { mode: 0o755 },
-    );
-    return { bin, log };
-  }
-
-  test('the async export exists and matches sync on the same fake executable', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    assert.equal(typeof issuesLib.verifyIssuesAsync, 'function', 'async verifier exported');
-    assert.equal(typeof issuesLib.verifyIssues, 'function', 'sync verifier untouched');
-    const root = makeRepo('async-diff');
-    const stub = makeGhModeStub();
-    setEnv({ GH_BIN_PATH: stub.bin, GH_STUB_LOG: stub.log, GH_STUB_MODE: undefined });
-    try {
-      const sync = issuesLib.verifyIssues([35], { cwd: root });
-      const asyncResult = await issuesLib.verifyIssuesAsync([35], { cwd: root });
-      assert.deepEqual(asyncResult, sync, 'identical success shape');
-      assert.deepEqual(asyncResult.issues, [{ number: 35, title: 'Test issue 35', state: 'OPEN' }]);
-      const logged = fs.readFileSync(stub.log, 'utf8').trim().split('\n');
-      assert.deepEqual(logged, [
-        'issue view 35 --json number,title,state',
-        'issue view 35 --json number,title,state',
-      ], 'same fixed argv, never a shell string');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('differential on failures: not-found, auth, garbage keep sync codes and messages', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('async-diff-fail');
-    const stub = makeGhModeStub();
-    for (const [mode, code] of [['', 'not-found'], ['auth', 'gh-auth'], ['garbage', 'gh-output']]) {
-      setEnv({ GH_BIN_PATH: stub.bin, GH_STUB_LOG: stub.log, GH_STUB_MODE: mode === '' ? undefined : mode });
-      try {
-        const numbers = mode === 'garbage' ? [35] : [424242];
-        const sync = issuesLib.verifyIssues(numbers, { cwd: root });
-        const asyncResult = await issuesLib.verifyIssuesAsync(numbers, { cwd: root });
-        assert.equal(sync.ok, false);
-        assert.deepEqual(asyncResult, sync, `identical ${code} shape`);
-        assert.equal(asyncResult.code, code);
-      } finally {
-        restoreEnv();
-      }
-    }
-  });
-
-  test('the event loop advances while the async verifier awaits', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('async-heartbeat');
-    let beats = 0;
-    const timer = setInterval(() => { beats += 1; }, 25);
-    try {
-      const delayed = (bin, argv, runOpts) => new Promise((resolve) => {
-        setTimeout(() => resolve({
-          status: 0,
-          stdout: '{"number":35,"title":"Test issue 35","state":"OPEN"}',
-          stderr: '',
-          error: null,
-        }), 300);
-      });
-      const out = await issuesLib.verifyIssuesAsync([35], { cwd: root, ghBin: 'gh', runAsync: delayed });
-      assert.equal(out.ok, true);
-      assert.deepEqual(out.issues, [{ number: 35, title: 'Test issue 35', state: 'OPEN' }]);
-      assert.ok(beats >= 3, `the heartbeat advanced while awaiting (beats=${beats})`);
-    } finally {
-      clearInterval(timer);
-      restoreEnv();
-    }
-  });
-
-  test('a hanging gh becomes gh-timeout async, never a frozen wizard', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('async-hang');
-    const hanging = () => new Promise(() => {});
-    const out = await issuesLib.verifyIssuesAsync([35], { cwd: root, ghBin: 'gh', runAsync: hanging, timeoutMs: 50 });
-    assert.equal(out.ok, false);
-    assert.equal(out.code, 'gh-timeout');
-    assert.match(out.reason, /timed out verifying issue #35/);
-  });
-
-  test('classifier parity on injected outcomes: ENOENT, auth stderr, bad shape', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('async-class');
-    const runnerFor = (outcome) => async () => outcome;
-    const enoent = await issuesLib.verifyIssuesAsync([35], {
-      cwd: root, ghBin: 'gh', runAsync: runnerFor({ status: null, stdout: '', stderr: '', error: 'spawnSync gh ENOENT' }),
-    });
-    assert.deepEqual(enoent.code, 'gh-missing');
-    const auth = await issuesLib.verifyIssuesAsync([35], {
-      cwd: root, ghBin: 'gh',
-      runAsync: runnerFor({ status: 1, stdout: '', stderr: 'To run gh, please first run gh auth login', error: null }),
-    });
-    assert.deepEqual(auth.code, 'gh-auth');
-    const shape = await issuesLib.verifyIssuesAsync([35], {
-      cwd: root, ghBin: 'gh',
-      runAsync: runnerFor({ status: 0, stdout: '{"number":"x"}', stderr: '', error: null }),
-    });
-    assert.deepEqual(shape.code, 'gh-output');
-  });
-
-  test('input validation parity: missing and non-integer inputs fail identically', async () => {
-    const issuesLib = require('../lib/worktree-issues.js');
-    const root = makeRepo('async-input');
-    for (const numbers of [undefined, null, [], '35']) {
-      const sync = issuesLib.verifyIssues(numbers, { cwd: root });
-      const asyncResult = await issuesLib.verifyIssuesAsync(numbers, { cwd: root });
-      assert.deepEqual(asyncResult, sync, `identical input refusal: ${JSON.stringify(numbers)}`);
-      assert.match(asyncResult.reason, /create or assign an issue first/i);
-    }
-  });
-});
-
-describe('worktree_upsert never unregisters a live checkout (S14)', { concurrency: false }, () => {
+describe('worktree_create never unregisters a live checkout (S14)', { concurrency: false }, () => {
   test('a hand-written row carrying the created branch keeps its live checkout registered', async () => {
     const root = makeRepo('dupbranch');
     // A live checkout owned by another thread, registered under the branch
@@ -908,11 +777,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
       const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-new · feat/new',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-new', branch: 'feat/new', path: `${target}`, registered: 'appended' }));
       // The other checkout is still on disk, still listed, still registered.
       assert.ok(fs.existsSync(liveAbs), 'live checkout survives on disk');
       assert.ok(listWorktreePaths(root).includes(liveAbs), 'live checkout still listed by git');
@@ -970,11 +835,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
       const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-new · feat/new',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-new', branch: 'feat/new', path: `${target}`, registered: 'appended' }));
       const after = registryLib.readRegistry(root);
       assert.equal(after.ok, true);
       assert.ok(
@@ -994,7 +855,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
     }
   });
 
-  test('F2b: thread stale cleanup keeps an owned SYMLINK to a live checkout', async () => {
+  test('F2b: an owned SYMLINK row to a live checkout survives a create for another branch', async () => {
     const root = makeRepo('symlink-stale');
     const liveDir = path.join(path.dirname(root), `${path.basename(root)}-live`);
     track(liveDir);
@@ -1021,15 +882,21 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root, thread: 'creator' });
-      const result = await callCreate(tools, { branch: 'feat/whatever', issues: [35] }, ctx);
+      // S9/L32: the session owns `feat/owned`; asking for ANOTHER branch creates
+      // that branch instead of handing the owned checkout back.
+      const result = await callCreate(tools, { branch: 'feat/whatever' }, ctx);
       const text = resultText(result);
-      assert.equal(result.isError, undefined, `expected idempotent return, got: ${text}`);
-      assert.equal(result.details.created, false, 'no second checkout is created');
-      assert.equal(result.details.path, linkAbs, 'the owned symlink checkout is returned');
+      assert.equal(result.isError, undefined, `expected a fresh create, got: ${text}`);
+      assert.equal(result.details.alreadyExists, undefined, 'another branch is never reported as already existing');
+      assert.notEqual(result.details.path, linkAbs, 'and the owned checkout is never substituted');
       const after = registryLib.readRegistry(root);
       assert.ok(
         after.worktrees.some((entry) => entry.thread === 'creator' && entry.path === linkAbs),
-        `the owned symlink row survives: ${JSON.stringify(after.worktrees)}`,
+        `the owned symlink row survives the create: ${JSON.stringify(after.worktrees)}`,
+      );
+      assert.ok(
+        after.worktrees.some((entry) => entry.branch === 'feat/whatever' && entry.path === result.details.path),
+        'and the new checkout is registered alongside it',
       );
       assert.ok(fs.existsSync(liveAbs), 'live checkout survives on disk');
     } finally {
@@ -1072,11 +939,7 @@ describe('worktree_upsert never unregisters a live checkout (S14)', { concurrenc
       const result = await callCreate(tools, { branch: 'feat/new', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-new · feat/new',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-new', branch: 'feat/new', path: `${target}`, registered: 'appended' }));
       const after = registryLib.readRegistry(root);
       assert.ok(
         after.worktrees.some((entry) => entry.branch === 'feat/new' && path.resolve(entry.path) === liveAbs),
@@ -1122,13 +985,18 @@ describe('consolidated checkout liveness: ghost idempotency + conflict guard', {
       const text = resultText(second);
       assert.equal(second.isError, undefined, `expected fresh success, got: ${text}`);
       assert.notEqual(second.details.path, deadTarget, 'must not answer the missing path');
-      assert.equal(second.details.created, true, 'must create fresh, not created:false at a ghost');
+      assert.equal(second.details.alreadyExists, undefined, 'must create fresh, not created:false at a ghost');
       assert.ok(fs.existsSync(second.details.path), 'the new checkout exists on disk');
       const registryLib = require('../lib/worktree-registry.js');
-      const owned = registryLib.findByThread(root, 'thread-ghost');
-      assert.ok(owned, 'registry holds a row for the thread');
-      assert.equal(owned.path, second.details.path, 'registry holds the NEW row');
-      assert.ok(fs.existsSync(owned.path), 'registry row points at a real checkout');
+      const created = registryLib.findByBranch(root, 'feat/ghost-b');
+      assert.ok(created, 'registry holds a row for the requested branch');
+      assert.equal(created.path, second.details.path, 'registry holds the NEW row');
+      assert.ok(fs.existsSync(created.path), 'registry row points at a real checkout');
+      // S9/L32: the ghost row names ANOTHER branch, so it is never returned as
+      // this request's answer. It is this session's own dead row, so the create
+      // still cleans it up once the new checkout verifies (S14's stale-owned
+      // cleanup) — the assertion above proves the live row is the new one.
+      assert.equal(second.details.registered, 'new', 'the new row is reported as new');
     } finally {
       restoreEnv();
     }
@@ -1202,12 +1070,8 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
       const second = await callCreate(tools, { branch: 'feat/h1-same', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-h1' }).ctx);
       const text = resultText(second);
       assert.equal(second.isError, undefined, `expected stale-record recovery, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-h1-same · feat/h1-same',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
-      assert.equal(second.details.created, true, 'a fresh checkout is created, never created:false at a ghost');
+      assertCreatedText(text, second.details, createdRows({ name: 'feat-h1-same', branch: 'feat/h1-same', path: `${target}`, issues: [35] }));
+      assert.equal(second.details.alreadyExists, undefined, 'a fresh checkout is created, never created:false at a ghost');
       assert.ok(fs.existsSync(target), 'a real checkout is back on disk');
       assert.ok(listWorktreePaths(root).includes(target), 'git lists the new checkout');
       const registryLib = require('../lib/worktree-registry.js');
@@ -1228,8 +1092,11 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
       );
       assert.equal(closed.isError, undefined, `close must act on the new row, got: ${resultText(closed)}`);
       assert.deepEqual(resultText(closed).split('\n'), [
-        'removed: feat-h1-same · feat/h1-same',
-        'branch kept',
+        'outcome: removed',
+        'name: feat-h1-same',
+        'branch: feat/h1-same',
+        `path: ${target}`,
+        'branch state: kept',
       ]);
       assert.ok(!listWorktreePaths(root).includes(target), 'checkout removed');
     } finally {
@@ -1264,11 +1131,7 @@ describe('H1: a stale git record never blocks a create (prune + recover)', { con
       const result = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 'thread-new' }).ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected slug-collision recovery, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-foo · feat-foo',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-foo', branch: 'feat-foo', path: `${target}`, issues: [35] }));
       assert.ok(fs.existsSync(target), 'a real checkout is on disk');
       assert.ok(listWorktreePaths(root).includes(target), 'git lists the new checkout');
       const registryLib = require('../lib/worktree-registry.js');
@@ -1301,11 +1164,7 @@ describe('I1: one owner per path (slug-collision stale row)', { concurrency: fal
       // Thread t-owner creates feat/foo at the shared target path.
       const first = await callCreate(tools, { branch: 'feat/foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-owner' }).ctx);
       assert.equal(first.isError, undefined, `setup create failed: ${resultText(first)}`);
-      assert.deepEqual(resultText(first).split('\n'), [
-        'created: feat-foo · feat/foo',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(resultText(first), first.details, createdRows({ name: 'feat-foo', branch: 'feat/foo', path: `${target}`, issues: [35] }));
       // A keeper row for another path must survive untouched.
       const keeper = await callCreate(tools, { branch: 'feat/keeper', issues: [7] }, makeCtx({ repoRoot: root, thread: 't-keeper' }).ctx);
       assert.equal(keeper.isError, undefined);
@@ -1319,11 +1178,7 @@ describe('I1: one owner per path (slug-collision stale row)', { concurrency: fal
       const second = await callCreate(tools, { branch: 'feat-foo', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-other' }).ctx);
       const text = resultText(second);
       assert.equal(second.isError, undefined, `expected recovery, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-foo · feat-foo',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, second.details, createdRows({ name: 'feat-foo', branch: 'feat-foo', path: `${target}`, issues: [35] }));
       assert.ok(fs.existsSync(target), 'new checkout exists');
       // Exactly ONE registry row at that path: the one just created.
       const registryLib = require('../lib/worktree-registry.js');
@@ -1515,13 +1370,179 @@ describe('I3: non-directory occupant at the target', { concurrency: false }, () 
       fs.unlinkSync(target);
       const retry = await callCreate(tools, { branch: 'feat/blocked', issues: [35] }, makeCtx({ repoRoot: root, thread: 't-1' }).ctx);
       assert.equal(retry.isError, undefined, `retry succeeds, got: ${resultText(retry)}`);
-      assert.deepEqual(resultText(retry).split('\n'), [
-        'created: feat-blocked · feat/blocked',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(retry).split('\n'), createdRows({ name: 'feat-blocked', branch: 'feat/blocked', path: `${target}`, issues: [35] }));
       assert.ok(fs.existsSync(target) && fs.statSync(target).isDirectory(), 'checkout on disk');
       assert.deepEqual(listWorktreePaths(root).length, before.length + 1);
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S2: a new worktree is born from local main', { concurrency: false }, () => {
+  function stdMainEnv(herdr) {
+    const modeEnv = scratchModeEnv();
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      GENTLE_WORKTREE_THREAD: undefined,
+    };
+  }
+
+  // The invoking checkout sits on a feature branch with its own commit, and
+  // local `main` is one commit behind it. "Worktrees always start from main"
+  // means the new branch carries main's commit and NOT the invoking
+  // checkout's, and the base the backend receives is main's commit.
+  test('the base is the tip of local main, never the invoking checkout HEAD', async () => {
+    const root = makeRepo('main-base');
+    fs.writeFileSync(path.join(root, 'main.txt'), 'main\n');
+    git(root, ['add', 'main.txt']);
+    git(root, ['commit', '-m', 'on main']);
+    git(root, ['branch', '-f', 'main']);
+    git(root, ['checkout', '-b', 'feat/session']);
+    fs.writeFileSync(path.join(root, 'session.txt'), 'session\n');
+    git(root, ['add', 'session.txt']);
+    git(root, ['commit', '-m', 'session work']);
+    const mainSha = git(root, ['rev-parse', 'main']);
+    const sessionSha = git(root, ['rev-parse', 'HEAD']);
+    assert.notEqual(mainSha, sessionSha, 'the fixture distinguishes main from the invoking HEAD');
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-main' });
+      const target = expectedTarget(root, 'feat-from-main');
+      const result = await callCreate(tools, { branch: 'feat/from-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
+      assert.equal(git(target, ['rev-parse', 'HEAD']), mainSha, 'the checkout starts at local main');
+      assert.equal(git(target, ['log', '-1', '--format=%s']), 'on main', 'main\'s commit is the base');
+      assert.equal(fs.existsSync(path.join(target, 'session.txt')), false, 'the invoking checkout\'s work is not a base');
+      const [line] = shimArgv(herdr.log);
+      assert.ok(line.includes(`--base ${mainSha}`), `the backend receives main\'s commit: ${line}`);
+      assert.deepEqual(result.details.base, { source: 'main', ref: 'main', commit: mainSha }, 'the base is reported, not inferred');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // No local `main` (a plain `git init` repository, or one that renamed its
+  // trunk): the create still works and the base it used is reported honestly
+  // instead of being claimed as `main`.
+  // S2: local `main` is the ONLY base of a new branch. A repository without it
+  // refuses BEFORE anything is written — no branch, no checkout, no registry
+  // row, no backend call, no prune — and says exactly what to do, instead of
+  // silently seeding the new branch from whatever the invoking checkout has
+  // checked out.
+  test('a repository without local main refuses to create a new branch, mutating nothing', async () => {
+    const root = makeRepo('main-missing');
+    git(root, ['branch', '-m', 'main', 'trunk']); // no branch named main, only a trunk
+    fs.writeFileSync(path.join(root, 'head.txt'), 'head\n');
+    git(root, ['add', 'head.txt']);
+    git(root, ['commit', '-m', 'only commit']);
+    const before = createdState(root);
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-main-missing' });
+      const target = expectedTarget(root, 'feat-no-main');
+      const result = await callCreate(tools, { branch: 'feat/no-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, true, 'a missing local main is a refusal, not a silent fallback');
+      const text = resultText(result);
+      assert.match(text, /main/, `the refusal names the missing base: ${text}`);
+      assert.match(text, /nothing was created/, `the refusal states that nothing was written: ${text}`);
+      assert.deepEqual(createdState(root), before, 'no branch, no checkout and no registry row');
+      assert.equal(fs.existsSync(target), false, 'the target path was never created');
+      assert.deepEqual(shimArgv(herdr.log), [], 'no backend ran');
+      assert.equal('base' in result.details, false, 'no base is reported: nothing was created');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE (S9): the idempotent replay is a READ — it returns the checkout
+  // this session already owns — so it must keep answering even where a NEW
+  // branch could not be created (no local main). The base requirement only
+  // guards creation, never the "already exists" answer.
+  test('a repeat call for an owned checkout still answers already exists without local main', async () => {
+    const root = makeRepo('main-missing-repeat');
+    fs.writeFileSync(path.join(root, 'a.txt'), 'a\n');
+    git(root, ['add', 'a.txt']);
+    git(root, ['commit', '-m', 'work']);
+    git(root, ['branch', '-f', 'main', 'HEAD']);
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-repeat' });
+      const first = await callCreate(tools, { branch: 'feat/repeat-no-main' }, ctx);
+      assert.equal(first.isError, undefined, `expected success: ${resultText(first)}`);
+      git(root, ['branch', '-m', 'main', 'trunk']); // local main disappears afterwards
+      const second = await callCreate(tools, { branch: 'feat/repeat-no-main', changes: 'all' }, ctx);
+      assert.equal(second.isError, undefined, `a replay never needs a base: ${resultText(second)}`);
+      assert.equal(second.details.alreadyExists, true, 'the owned checkout is returned, not created');
+      assert.equal('base' in second.details, false, 'nothing was created, so no base is reported');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE (S20): adoption needs no base, so it keeps working in a
+  // repository that has no local `main` at all — the requirement above applies
+  // only to a branch that would be CREATED.
+  test('an adopted branch needs no local main and still checks out its own commit', async () => {
+    const root = makeRepo('adopt-no-main');
+    git(root, ['branch', '-m', 'main', 'trunk']);
+    git(root, ['checkout', '-b', 'feat/adopt-no-main']);
+    fs.writeFileSync(path.join(root, 'branch.txt'), 'branch\n');
+    git(root, ['add', 'branch.txt']);
+    git(root, ['commit', '-m', 'branch work']);
+    const branchSha = git(root, ['rev-parse', 'feat/adopt-no-main']);
+    git(root, ['checkout', 'trunk']); // the branch must not be checked out live
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-adopt-no-main' });
+      const target = expectedTarget(root, 'feat-adopt-no-main');
+      const result = await callCreate(tools, { branch: 'feat/adopt-no-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, undefined, `adoption needs no base: ${resultText(result)}`);
+      assert.equal(result.details.branchCreated, false, 'the existing branch was adopted');
+      assert.equal(git(target, ['rev-parse', 'HEAD']), branchSha, 'the adopted branch keeps its own commit');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE: adoption is untouched by the base change. An existing branch is
+  // checked out as-is (no `-b`, no base), so its own commit — not main's — is
+  // what the new checkout carries.
+  test('an adopted branch still carries its own commit, not main', async () => {
+    const root = makeRepo('main-adopt');
+    fs.writeFileSync(path.join(root, 'main.txt'), 'main\n');
+    git(root, ['add', 'main.txt']);
+    git(root, ['commit', '-m', 'on main']);
+    git(root, ['branch', '-f', 'main']);
+    git(root, ['checkout', '-b', 'feat/adopted-main']);
+    fs.writeFileSync(path.join(root, 'branch.txt'), 'branch\n');
+    git(root, ['add', 'branch.txt']);
+    git(root, ['commit', '-m', 'branch work']);
+    const branchSha = git(root, ['rev-parse', 'feat/adopted-main']);
+    git(root, ['checkout', 'master']);
+    const herdr = makeHerdrStub();
+    setEnv(stdMainEnv(herdr));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-adopt-main' });
+      const target = expectedTarget(root, 'feat-adopted-main');
+      const result = await callCreate(tools, { branch: 'feat/adopted-main', changes: 'none' }, ctx);
+      assert.equal(result.isError, undefined, `expected adoption success, got: ${resultText(result)}`);
+      assert.equal(result.details.branchCreated, false, 'the existing branch was adopted');
+      assert.equal(git(target, ['rev-parse', 'HEAD']), branchSha, 'the adopted branch keeps its own commit');
+      assert.equal(git(root, ['rev-parse', 'refs/heads/feat/adopted-main']), branchSha, 'the branch ref is never rewritten');
+      assert.equal(fs.existsSync(path.join(target, 'branch.txt')), true, 'the branch\'s work is in the checkout');
     } finally {
       restoreEnv();
     }
@@ -1623,13 +1644,30 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
   // the real runner so behavior is unchanged.
   function recordArgv() {
     const gitLib = require('../lib/worktree-git.js');
+    // S21: the interactive paths run their children on the async runner, so
+    // recording only the sync one would make the argv assertions below pass
+    // without ever seeing a real call. Both runners are recorded.
     const orig = gitLib.runArgv;
+    const origAsync = gitLib.runArgvAsync;
     const seen = [];
     gitLib.runArgv = (bin, args, opts) => {
       seen.push({ bin: String(bin), args: args.slice() });
       return orig(bin, args, opts);
     };
-    return { gitLib, orig, seen };
+    gitLib.runArgvAsync = (bin, args, opts) => {
+      seen.push({ bin: String(bin), args: args.slice() });
+      return origAsync(bin, args, opts);
+    };
+    return {
+      gitLib,
+      orig,
+      origAsync,
+      seen,
+      restore: () => {
+        gitLib.runArgv = orig;
+        gitLib.runArgvAsync = origAsync;
+      },
+    };
   }
 
   test('a branch created by hand is adopted: no -b, ref untouched, branchCreated:false + warning', async () => {
@@ -1648,12 +1686,8 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/adopted', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected adoption success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-adopted · feat/adopted',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
-      assert.equal(result.details.created, true);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-adopted', branch: 'feat/adopted', path: `${target}`, issues: [35] }));
+      assert.equal(result.details.alreadyExists, undefined);
       assert.equal(result.details.branchCreated, false, 'adoption reports branchCreated:false');
       assert.ok(
         (result.details.warnings || []).join('\n').includes('feat/adopted'),
@@ -1672,7 +1706,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
         `herdr worktree create never ran: ${JSON.stringify(shimArgv(herdr.log))}`,
       );
     } finally {
-      rec.gitLib.runArgv = rec.orig;
+      rec.restore();
       restoreEnv();
     }
   });
@@ -1691,11 +1725,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/fresh', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-fresh · feat/fresh',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(text.split('\n'), createdRows({ name: 'feat-fresh', branch: 'feat/fresh', path: `${target}`, issues: [35] }));
       assert.equal(result.details.branchCreated, true, 'a created branch reports branchCreated:true');
       assert.ok(
         shimArgv(herdr.log).some((line) => line.includes('worktree create')),
@@ -1705,10 +1735,12 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       assert.ok(createLine.includes('--branch feat/fresh'), `herdr create names the branch: ${createLine}`);
       // Herdr succeeded, so the git fallback never ran: no `worktree add`
       // in any git argv the tool itself invoked.
-      const gitArgs = rec.seen.filter((call) => call.bin === 'git').flatMap((call) => call.args);
-      assert.ok(!gitArgs.includes('worktree'), `no git worktree argv when herdr wins: ${JSON.stringify(gitArgs)}`);
+      // The listing reads are legitimate; the FALLBACK is what must not run.
+      const fallbacks = rec.seen.filter((call) => call.bin === 'git'
+        && call.args[0] === 'worktree' && call.args[1] === 'add');
+      assert.deepEqual(fallbacks, [], 'no git worktree add when herdr wins');
     } finally {
-      rec.gitLib.runArgv = rec.orig;
+      rec.restore();
       restoreEnv();
     }
   });
@@ -1727,11 +1759,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/open-ok', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-open-ok · feat/open-ok',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-open-ok', branch: 'feat/open-ok', path: `${target}`, issues: [35] }));
       assert.equal(result.details.branchCreated, false);
       assert.equal(result.details.herdrAssociated, true, 'the open association is reported');
       const opens = shimArgv(herdr.log).filter((line) => line.includes('worktree open'));
@@ -1760,11 +1788,7 @@ describe('S20: an existing branch is adopted, never created', { concurrency: fal
       const result = await callCreate(tools, { branch: 'feat/open-fail', issues: [35] }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `the checkout never depends on herdr, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-open-fail · feat/open-fail',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assertCreatedText(text, result.details, createdRows({ name: 'feat-open-fail', branch: 'feat/open-fail', path: `${target}`, issues: [35] }));
       assert.equal(result.details.branchCreated, false);
       assert.equal(result.details.herdrAssociated, false, 'the failed association is reported');
       assert.ok(
@@ -1832,11 +1856,7 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       fs.rmdirSync(target);
       const retry = await callCreate(tools, { branch: 'feat/occupied', issues: [35] }, ctx);
       assert.equal(retry.isError, undefined, `retry succeeds, got: ${resultText(retry)}`);
-      assert.deepEqual(resultText(retry).split('\n'), [
-        'created: feat-occupied · feat/occupied',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
+      assert.deepEqual(resultText(retry).split('\n'), createdRows({ name: 'feat-occupied', branch: 'feat/occupied', path: `${target}`, issues: [35] }));
     } finally {
       restoreEnv();
     }
@@ -1970,12 +1990,8 @@ describe('S22: any pre-existing entry at the target is refused before any backen
       assert.ok(fs.statSync(target).isDirectory(), 'the target exists on disk');
       const second = await callCreate(tools, { branch: 'feat/own', issues: [35] }, ctx);
       assert.equal(second.isError, undefined);
-      assert.deepEqual(resultText(second).split('\n'), [
-        'created: feat-own · feat/own · already exists',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
-      assert.equal(second.details.created, false, 'the own checkout returns created:false, never a refusal');
+      assert.deepEqual(resultText(second).split('\n'), createdRows({ alreadyExists: true, name: 'feat-own', branch: 'feat/own', path: `${target}`, registered: 'unchanged', codegraph: 'not initialized' }));
+      assert.equal(second.details.alreadyExists, true, 'the own checkout reports alreadyExists, never a refusal');
     } finally {
       restoreEnv();
     }
@@ -2079,7 +2095,7 @@ describe('F4: symlink occupant names its referent', { concurrency: false }, () =
   });
 });
 
-describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () => {
+describe('S1/S6: a create carries no association', { concurrency: false }, () => {
   function stdEnv14(herdr, gh, modeEnv) {
     return {
       GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
@@ -2092,7 +2108,7 @@ describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () =>
     };
   }
 
-  test('an omitted issues field allows create with issues:[]', async () => {
+  test('an omitted association creates the checkout and records nothing', async () => {
     const root = makeRepo('s14-omit');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
@@ -2106,12 +2122,8 @@ describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () =>
       const result = await callCreate(tools, { branch: 'feat/s14-omit' }, ctx);
       const text = resultText(result);
       assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-s14-omit · feat/s14-omit',
-        `path: ${target}`,
-      ]);
-      assert.deepEqual(result.details.issues, [], 'details carry issues:[]');
-      assert.ok(!listWorktreePaths(root).includes(target) || true, 'checkout state checked below');
+      assert.deepEqual(text.split('\n'), createdRows({ name: 'feat-s14-omit', branch: 'feat/s14-omit', path: `${target}` }));
+      assert.equal('issues' in result.details, false, 'no issue field travels');
       assert.deepEqual(listWorktreePaths(root).length, before.length + 1, 'one checkout is created');
       assert.deepEqual(require('../lib/worktree-registry.js').findByBranch(root, 'feat/s14-omit').issues, []);
     } finally {
@@ -2119,31 +2131,7 @@ describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () =>
     }
   });
 
-  test('an empty issues array allows create with issues:[]', async () => {
-    const root = makeRepo('s14-empty');
-    const herdr = makeHerdrStub();
-    const gh = makeGhStub([35]);
-    const modeEnv = scratchModeEnv();
-    setEnv(stdEnv14(herdr, gh, modeEnv));
-    try {
-      const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      const target = expectedTarget(root, 'feat-s14-empty');
-      const result = await callCreate(tools, { branch: 'feat/s14-empty', issues: [] }, ctx);
-      const text = resultText(result);
-      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      assert.deepEqual(text.split('\n'), [
-        'created: feat-s14-empty · feat/s14-empty',
-        `path: ${target}`,
-      ]);
-      assert.deepEqual(result.details.issues, [], 'details carry issues:[]');
-      assert.deepEqual(require('../lib/worktree-registry.js').findByBranch(root, 'feat/s14-empty').issues, []);
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('supplied issues keep exact validation: nonexistent and non-integer fail', async () => {
+  test('a supplied association is neither verified nor stored', async () => {
     const root = makeRepo('s14-supplied');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([35]);
@@ -2152,14 +2140,14 @@ describe('S14 optional issues on create (T7 RED)', { concurrency: false }, () =>
     try {
       const tools = await loadExtension();
       const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-1' });
-      const before = listWorktreePaths(root);
-      const ghost = await callCreate(tools, { branch: 'feat/s14-ghost', issues: [424242] }, ctx);
-      assert.equal(ghost.isError, true);
-      assert.ok(resultText(ghost).includes('424242'), `names the number: ${resultText(ghost)}`);
-      const bad = await callCreate(tools, { branch: 'feat/s14-bad', issues: ['35'] }, ctx);
-      assert.equal(bad.isError, true, 'a non-integer issue fails closed');
-      assert.deepEqual(listWorktreePaths(root), before, 'no checkout is created');
-      assert.deepEqual(shimArgv(herdr.log), [], 'herdr is never invoked');
+      // A nonexistent number and a non-integer used to be refusals; the tool no
+      // longer reads the field at all, so neither can block a create.
+      const ghost = await callCreate(tools, { branch: 'feat/s14-ghost', issues: [424242], odd: 'odd/tasks/missing.md' }, ctx);
+      assert.equal(ghost.isError, undefined, `an association must not refuse a create: ${resultText(ghost)}`);
+      const row = require('../lib/worktree-registry.js').findByBranch(root, 'feat/s14-ghost');
+      assert.deepEqual(row.issues, []);
+      assert.equal(row.odd, null);
+      assert.equal(shimArgv(herdr.log).length, 1, 'the create ran exactly one backend');
     } finally {
       restoreEnv();
     }
@@ -2191,12 +2179,8 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
       const target = expectedTarget(root, 'feat-s19-ok');
       const result = await callCreate(tools, { branch: 'feat/s19-ok', issues: [35] }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-s19-ok · feat/s19-ok',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
-      assert.equal(result.details.created, true);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-s19-ok', branch: 'feat/s19-ok', path: `${target}`, issues: [35] }));
+      assert.equal(result.details.alreadyExists, undefined);
     } finally {
       restoreEnv();
     }
@@ -2214,11 +2198,8 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
       const target = expectedTarget(root, 'feat-s19-plain');
       const result = await callCreate(tools, { branch: 'feat/s19-plain' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-s19-plain · feat/s19-plain',
-        `path: ${target}`,
-      ]);
-      assert.equal(result.details.created, true);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-s19-plain', branch: 'feat/s19-plain', path: `${target}` }));
+      assert.equal(result.details.alreadyExists, undefined);
     } finally {
       restoreEnv();
     }
@@ -2238,12 +2219,8 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
       const target = first.details.path;
       const second = await callCreate(tools, { branch: 'feat/s19-own', issues: [35] }, ctx);
       assert.equal(second.isError, undefined);
-      assert.deepEqual(resultText(second).split('\n'), [
-        'created: feat-s19-own · feat/s19-own · already exists',
-        `path: ${target}`,
-        'issues: 35',
-      ]);
-      assert.equal(second.details.created, false);
+      assert.deepEqual(resultText(second).split('\n'), createdRows({ alreadyExists: true, name: 'feat-s19-own', branch: 'feat/s19-own', path: `${target}`, registered: 'unchanged', codegraph: 'not initialized' }));
+      assert.equal(second.details.alreadyExists, true);
     } finally {
       restoreEnv();
     }
@@ -2253,9 +2230,10 @@ describe('S19: bounded create compact (agent text)', { concurrency: false }, () 
 describe('S46: the registry tolerates the stored older odd shape', { concurrency: false }, () => {
   const registryLib = require('../lib/worktree-registry.js');
 
-  // Hand-write a legacy registry file: the row predates the odd field
-  // (or carries it as the single-path string the public tool accepts),
-  // exactly what an older version stored.
+  // Hand-write a legacy registry file: the row predates the odd field, or
+  // carries the old `odd[]` array / the single-path string an older version
+  // stored. S8 keeps ONE document, so every legacy shape normalizes to a
+  // single path or null.
   function writeLegacyFile(root, row) {
     const file = registryLib.registryPath(root);
     fs.writeFileSync(file, `${JSON.stringify({ version: 1, worktrees: [row] }, null, 2)}\n`);
@@ -2268,34 +2246,34 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
     return { root, target: fs.realpathSync(target) };
   }
 
-  test('a row without odd reads as an empty list', async () => {
+  test('a row without odd reads as no association', async () => {
     const { root, target } = legacyRoot('read');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       writeLegacyFile(root, { branch: 'feat/legacy', path: target, thread: 't', issues: [3] });
       const read = registryLib.readRegistry(root);
       assert.equal(read.ok, true, `expected ok, got ${read.error}`);
-      assert.deepEqual(read.worktrees.map((row) => row.odd), [[]], 'missing odd normalizes to []');
+      assert.deepEqual(read.worktrees.map((row) => row.odd), [null], 'missing odd normalizes to null');
       assert.deepEqual(read.worktrees.map((row) => row.issues), [[3]], 'issues are untouched');
     } finally {
       restoreEnv();
     }
   });
 
-  test('a row with the single-path odd string reads as a one-element list', async () => {
+  test('a row with the single-path odd string reads as that one document', async () => {
     const { root, target } = legacyRoot('str');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
       writeLegacyFile(root, { branch: 'feat/legacy', path: target, thread: 't', issues: [], odd: 'odd/notes.md' });
       const read = registryLib.readRegistry(root);
       assert.equal(read.ok, true, `expected ok, got ${read.error}`);
-      assert.deepEqual(read.worktrees.map((row) => row.odd), [['odd/notes.md']]);
+      assert.deepEqual(read.worktrees.map((row) => row.odd), ['odd/notes.md']);
     } finally {
       restoreEnv();
     }
   });
 
-  test('upserting over a legacy row keeps its odd documents instead of crashing', async () => {
+  test('upserting over a legacy row stays single-document instead of crashing', async () => {
     const { root, target } = legacyRoot('upsert');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -2305,13 +2283,13 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
       });
       assert.equal(stored.ok, true, `expected ok, got ${stored.error}`);
       const reread = registryLib.readRegistry(root);
-      assert.deepEqual(reread.worktrees.map((row) => row.odd), [[]], 'normalized, never crashed');
+      assert.deepEqual(reread.worktrees.map((row) => row.odd), [null], 'normalized, never crashed');
     } finally {
       restoreEnv();
     }
   });
 
-  test('updating a legacy row writes arrays without crashing', async () => {
+  test('updating a legacy row writes ONE document without crashing', async () => {
     const { root, target } = legacyRoot('update');
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
     try {
@@ -2319,17 +2297,349 @@ describe('S46: the registry tolerates the stored older odd shape', { concurrency
       const updated = registryLib.updateWorktree(root, target, { issues: [4] });
       assert.equal(updated.ok, true, `expected ok, got ${updated.error}`);
       assert.deepEqual(updated.entry.issues, [4], 'the supplied field is replaced');
-      assert.deepEqual(updated.entry.odd, ['odd/notes.md'], 'the string shape survives as a list');
+      assert.equal(updated.entry.odd, 'odd/notes.md', 'the string shape survives as the one document');
+      // S8: associating another document REPLACES it — never a second one.
       const added = registryLib.addOddDoc(root, target, 'odd/other.md');
       assert.equal(added.ok, true, `expected ok, got ${added.error}`);
-      assert.deepEqual(added.entry.odd, ['odd/notes.md', 'odd/other.md']);
+      assert.equal(added.entry.odd, 'odd/other.md');
+      assert.equal(added.replaced, 'odd/notes.md', 'the replaced association is reported');
     } finally {
       restoreEnv();
     }
   });
 });
 
-describe('S50/T41 + S51/T42: create registers the checkout and links principal dot-dirs', { concurrency: false }, () => {
+describe('S1: a create publishes no association and destroys none', { concurrency: false }, () => {
+  const registryLib = require('../lib/worktree-registry.js');
+
+  function registryFile(root) {
+    return registryLib.registryPath(root);
+  }
+
+  // A registry written by an older version: one row carries the legacy
+  // `odd[]` list (plus a field this version does not model), and the create
+  // below addresses neither of them.
+  function writeLegacyNeighbour(root) {
+    const neighbour = {
+      branch: 'feat/hand-written',
+      path: path.join(path.dirname(root), `${path.basename(root)}-hand-written`),
+      thread: 'thread-hand',
+      issues: [9],
+      odd: ['odd/tasks/keep-a.md', 'odd/tasks/keep-b.md'],
+      note: 'kept verbatim',
+    };
+    fs.writeFileSync(registryFile(root), `${JSON.stringify({ version: 1, worktrees: [neighbour] }, null, 2)}\n`);
+    return neighbour;
+  }
+
+  test('the neighbouring legacy row keeps its documents and no ODD name reaches the result', async () => {
+    const root = makeRepo('create-legacy-neighbour');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const neighbour = writeLegacyNeighbour(root);
+      const tools = await loadExtension();
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch: 'feat/fresh', changes: 'none' }, undefined, undefined, makeCtx({ repoRoot: root, thread: 'thread-fresh' }).ctx,
+      );
+      const text = resultText(result);
+      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
+      assert.doesNotMatch(text, /odd\/|droppedOdd|ONE odd document/i, `no association content reaches the agent text: ${text}`);
+      assert.deepEqual(result.details.warnings, [], 'no warning is raised for a row nobody touched');
+      assert.equal('droppedOdd' in result.details, false, 'and no dropped-document list travels');
+      assert.equal(registryLib.findByBranch(root, 'feat/fresh').odd, null, 'the new checkout is created without an association');
+      const stored = JSON.parse(fs.readFileSync(registryFile(root), 'utf8')).worktrees
+        .find((row) => row.branch === neighbour.branch);
+      assert.deepEqual(stored, neighbour, 'every field of the untouched legacy row survives');
+      assert.equal(JSON.stringify(stored), JSON.stringify(neighbour), 'byte for byte, key order included');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S7: a create reports its registry write and the real CodeGraph index state', { concurrency: false }, () => {
+  // The requirement behind these cases: the create output omitted whether the
+  // checkout was actually recorded, and the idempotent path reported
+  // `codegraph: not run (existing checkout)` — an honest "no hooks ran" plus a
+  // fact the caller cannot use. The registry write outcome now travels as its
+  // own row, and the existing-checkout path reports the index the checkout
+  // REALLY has, read without running anything.
+  function writeIndex(root, slug) {
+    const target = expectedTarget(root, slug);
+    fs.mkdirSync(path.join(target, '.codegraph'), { recursive: true });
+    fs.writeFileSync(path.join(target, '.codegraph', 'codegraph.db'), 'index\n');
+    return target;
+  }
+
+  test('a new checkout reports the registry row it wrote', async () => {
+    const root = makeRepo('reg-new');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const tools = await loadExtension();
+      const result = await callCreate(tools, { branch: 'feat/reg-new' }, makeCtx({ repoRoot: root }).ctx);
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({
+        name: 'feat-reg-new', branch: 'feat/reg-new', path: result.details.path, registered: 'new',
+      }), 'the new row is reported as registered');
+      assert.equal(result.details.registered, 'new', 'and travels in details');
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.findByBranch(root, 'feat/reg-new').path, result.details.path, 'the row really exists');
+      assert.equal('created' in result.details, false, 'still no created/updated outcome');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an already-owned checkout reports no write and its real missing index', async () => {
+    const root = makeRepo('reg-absent');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const first = await callCreate(tools, { branch: 'feat/reg-absent' }, ctx);
+      assert.equal(first.isError, undefined, resultText(first));
+      assert.equal(fs.existsSync(path.join(first.details.path, '.codegraph')), false, 'the fixture has no index');
+      const second = await callCreate(tools, { branch: 'feat/reg-absent' }, ctx);
+      assert.equal(second.isError, undefined, resultText(second));
+      assert.deepEqual(resultText(second).split('\n'), createdRows({
+        alreadyExists: true, name: 'feat-reg-absent', branch: 'feat/reg-absent',
+        path: first.details.path, registered: 'unchanged', codegraph: 'not initialized',
+      }), 'the existing checkout reports the index it really lacks, not a bare not-run');
+      assert.deepEqual(second.details.registered, 'unchanged', 'the registry was not written again');
+      assert.deepEqual(second.details.codegraph, { status: 'absent', detail: '' }, 'the index state is a real reading');
+      assert.equal(second.details.alreadyExists, true, 'the no-op fact stays stated');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an already-owned checkout with an index reports it as initialized', async () => {
+    const root = makeRepo('reg-present');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      const first = await callCreate(tools, { branch: 'feat/reg-present' }, ctx);
+      assert.equal(first.isError, undefined, resultText(first));
+      const target = writeIndex(root, 'feat-reg-present');
+      const index = fs.readFileSync(path.join(target, '.codegraph', 'codegraph.db'), 'utf8');
+      const second = await callCreate(tools, { branch: 'feat/reg-present' }, ctx);
+      assert.equal(second.isError, undefined, resultText(second));
+      assert.deepEqual(resultText(second).split('\n'), createdRows({
+        alreadyExists: true, name: 'feat-reg-present', branch: 'feat/reg-present',
+        path: target, registered: 'unchanged', codegraph: 'initialized',
+      }), 'an existing index reads as initialized');
+      assert.deepEqual(second.details.codegraph, { status: 'present', detail: '' });
+      assert.equal(
+        fs.readFileSync(path.join(target, '.codegraph', 'codegraph.db'), 'utf8'),
+        index,
+        'the index is only read: nothing initializes, rewrites or removes it',
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a create over this branch\'s stale row reports the row it replaced', async () => {
+    const root = makeRepo('reg-replaced');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const registryLib = require('../lib/worktree-registry.js');
+      // A row written for this branch by an older run whose checkout is gone,
+      // at a path this create does not land on: the create overwrites it,
+      // which is a WRITE the caller must be told about — neither a brand-new
+      // row nor a no-op.
+      const deadPath = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, 'feat-reg-replaced-old');
+      fs.mkdirSync(path.dirname(deadPath), { recursive: true });
+      registryLib.upsertWorktree(root, {
+        branch: 'feat/reg-replaced', path: deadPath, thread: 'older-thread', issues: [], odd: null,
+      });
+      assert.equal(fs.existsSync(deadPath), false, 'the recorded checkout does not exist');
+      const tools = await loadExtension();
+      const result = await callCreate(tools, { branch: 'feat/reg-replaced' }, makeCtx({ repoRoot: root }).ctx);
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.notEqual(result.details.path, deadPath, 'the create lands on its own target, not the dead row');
+      assert.equal(result.details.registered, 'replaced', 'the overwrite is named as an overwrite');
+      assert.deepEqual(resultText(result).split('\n').slice(0, 4), createdRows({
+        name: 'feat-reg-replaced', branch: 'feat/reg-replaced', path: result.details.path, registered: 'replaced',
+      }), 'the create rows name the replacement');
+      const rows = registryLib.readRegistry(root).worktrees.filter((entry) => entry.branch === 'feat/reg-replaced');
+      assert.equal(rows.length, 1, 'the stale row is gone: one row for the branch');
+      assert.equal(rows[0].path, result.details.path, 'the surviving row is the checkout just created');
+      assert.equal(rows[0].thread, 'thread-1', 'and it belongs to the creating thread');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a create beside a live checkout claiming the branch reports the appended row', async () => {
+    const root = makeRepo('reg-appended');
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR });
+    try {
+      const registryLib = require('../lib/worktree-registry.js');
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root });
+      // A live checkout is recorded for the requested branch by hand, at its
+      // own path. The create cannot take that registration away from a live
+      // checkout, so it records its row ALONGSIDE it — an append, which the
+      // caller must be able to tell apart from a replacement.
+      const live = await callCreate(tools, { branch: 'feat/reg-live-owner' }, ctx);
+      assert.equal(live.isError, undefined, resultText(live));
+      registryLib.upsertWorktree(root, {
+        branch: 'feat/reg-appended', path: live.details.path, thread: 'hand-written', issues: [], odd: null,
+      });
+      const result = await callCreate(tools, { branch: 'feat/reg-appended' }, ctx);
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.equal(result.details.registered, 'appended', 'the appended row is named as an append');
+      assert.deepEqual(resultText(result).split('\n').slice(0, 4), createdRows({
+        name: 'feat-reg-appended', branch: 'feat/reg-appended', path: result.details.path, registered: 'appended',
+      }), 'the create rows name the append');
+      const rows = registryLib.readRegistry(root).worktrees.filter((entry) => entry.branch === 'feat/reg-appended');
+      assert.deepEqual(rows.map((entry) => entry.path).sort(), [live.details.path, result.details.path].sort(),
+        'both rows survive: the live checkout keeps its registration and the new one is recorded beside it');
+      assert.ok(
+        (result.details.warnings || []).some((warning) => warning.includes('kept the existing registration')),
+        `the kept registration is reported: ${JSON.stringify(result.details.warnings)}`,
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('fixture isolation: a create never reaches a live Herdr', { concurrency: false }, () => {
+  // The file's setEnv defaults HERDR_BIN_PATH to a path that cannot exist, so
+  // the extension refuses to spawn Herdr and uses the git fallback. Without
+  // that default the tests resolved the DEVELOPER's `herdr` from PATH and made
+  // real /tmp workspaces. This guard pins the default: a `herdr` placed on PATH
+  // must stay untouched.
+  test('a PATH `herdr` is never resolved or spawned by a create', async () => {
+    const root = makeRepo('no-live-herdr');
+    const binDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-herdr-sentinel-')));
+    const sentinel = path.join(binDir, 'spawned.log');
+    fs.writeFileSync(
+      path.join(binDir, 'herdr'),
+      ['#!/bin/sh', `printf 'spawned\\n' >> "${sentinel}"`, 'exit 1', ''].join('\n'),
+      { mode: 0o755 },
+    );
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+    });
+    try {
+      assert.equal(process.env.HERDR_BIN_PATH, NO_HERDR_BIN, 'the non-existent Herdr default is in force');
+      const tools = await loadExtension();
+      const result = await callCreate(tools, { branch: 'feat/no-live-herdr' }, makeCtx({ repoRoot: root }).ctx);
+      assert.equal(result.isError, undefined, `expected the git fallback to create: ${resultText(result)}`);
+      assert.equal(
+        fs.existsSync(sentinel),
+        false,
+        'the PATH `herdr` was never spawned: a live Herdr would have created a real workspace',
+      );
+      assert.equal(result.details.registered, 'new');
+      assert.ok(fs.existsSync(result.details.path), 'the checkout exists under the tracked worktrees dir');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S9: a session may own several worktrees', { concurrency: false }, () => {
+  // S9/L31: the session owns the worktrees it creates, and a SECOND branch is
+  // a second checkout — not a replay of the first one. The one-worktree-per-
+  // thread rule is gone; idempotency is keyed on the REQUEST (the same branch),
+  // and the one-owner-per-path guard still refuses a path that is taken.
+  function env(herdr, gh, modeEnv) {
+    return {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: modeEnv.GENTLE_STATUS_STATE_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      HERDR_SHIM_EXIT: undefined,
+      GH_BIN_PATH: gh,
+      GENTLE_WORKTREE_THREAD: undefined,
+    };
+  }
+
+  test('a second branch creates and registers a second checkout, and repeats stay idempotent', async () => {
+    const root = makeRepo('multi-branch');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(env(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-multi' });
+      const first = await callCreate(tools, { branch: 'feat/one' }, ctx);
+      assert.equal(first.isError, undefined, `first create failed: ${resultText(first)}`);
+      assert.equal(first.details.registered, 'new');
+
+      const second = await callCreate(tools, { branch: 'feat/two' }, ctx);
+      assert.equal(second.isError, undefined, `a second branch must create its own checkout: ${resultText(second)}`);
+      assert.equal(second.details.alreadyExists, undefined, 'the first checkout is never handed back for another branch');
+      assert.notEqual(second.details.path, first.details.path, 'a different target path');
+      assert.deepEqual(resultText(second).split('\n'), createdRows({
+        name: 'feat-two', branch: 'feat/two', path: second.details.path,
+        registered: 'new', codegraph: 'initialized',
+      }), 'the second create reports its own registry write and its own CodeGraph run');
+      assert.equal(second.details.codegraph.status, 'done', 'the new checkout is initialized');
+      assert.ok(fs.existsSync(second.details.path), 'the second checkout exists on disk');
+
+      const registryLib = require('../lib/worktree-registry.js');
+      const rows = registryLib.readRegistry(root).worktrees.filter((row) => row.thread === 'thread-multi');
+      assert.deepEqual(rows.map((row) => row.branch).sort(), ['feat/one', 'feat/two'], 'the session owns both checkouts');
+      assert.deepEqual(rows.map((row) => row.path).sort(), [first.details.path, second.details.path].sort());
+
+      // The SAME request is still idempotent: no second checkout, no second
+      // init, no duplicate row and no write at all.
+      const before = fs.readFileSync(registryLib.registryPath(root), 'utf8');
+      const again = await callCreate(tools, { branch: 'feat/two' }, ctx);
+      assert.equal(again.isError, undefined, resultText(again));
+      assert.equal(again.details.alreadyExists, true, 'the same branch hands its checkout back');
+      assert.equal(again.details.registered, 'unchanged', 'and reports that nothing was written');
+      assert.equal(again.details.path, second.details.path);
+      assert.equal(again.details.codegraph.status, 'absent', 'the fixture hook built no index, so that is what it reports');
+      assert.equal(fs.readFileSync(registryLib.registryPath(root), 'utf8'), before, 'no duplicate row, no write');
+      assert.equal(
+        registryLib.readRegistry(root).worktrees.filter((row) => row.thread === 'thread-multi').length,
+        2,
+        'the session still owns exactly two rows',
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('one owner per path still refuses a second branch that flattens to the same target', async () => {
+    const root = makeRepo('multi-slug');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([35]);
+    const modeEnv = scratchModeEnv();
+    setEnv(env(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 'thread-multi' });
+      const first = await callCreate(tools, { branch: 'feat/slug-collision' }, ctx);
+      assert.equal(first.isError, undefined, `first create failed: ${resultText(first)}`);
+      // `feat/slug_collision` flattens to the same slug, so it would land on the
+      // same absolute path: the live checkout there wins and the create refuses
+      // instead of adopting or duplicating it.
+      const second = await callCreate(tools, { branch: 'feat/slug_collision' }, ctx);
+      assert.equal(second.isError, true, `expected the occupant refusal, got: ${resultText(second)}`);
+      assert.match(resultText(second), /pick another branch|already a live worktree/i);
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(
+        registryLib.readRegistry(root).worktrees.filter((row) => row.thread === 'thread-multi').length,
+        1,
+        'the refused create records nothing',
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S50/T41 + S3/L4: create registers the checkout and links git-ignored principal entries', { concurrency: false }, () => {
   function symlinksLib() {
     return require('../lib/worktree-symlinks.js');
   }
@@ -2347,7 +2657,31 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       HERDR_SHIM_EXIT: undefined,
       GH_BIN_PATH: gh,
       GENTLE_WORKTREE_THREAD: undefined,
+      ...GIT_ISOLATION,
     };
+  }
+
+  // Import the stubbed extension copy a second time, for tests that drive the
+  // command route through the exported `executeWorktreeCreate`.
+  async function loadModule() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-ext-s3-')));
+    const copy = path.join(dir, 'gentle-worktree-tools.mjs');
+    fs.writeFileSync(copy, stubbed);
+    return import(pathToFileURL(copy).href);
+  }
+
+  function gitIsolatedEnv() {
+    return { ...process.env, ...GIT_ISOLATION };
+  }
+
+  // S3/L4 fixture: every named entry exists in the principal and the repo's
+  // own .gitignore ignores it, which is the only eligibility signal.
+  function writeIgnoredEntries(root, names) {
+    fs.writeFileSync(path.join(root, '.gitignore'), `${names.map((n) => `${n}/`).join('\n')}\n`);
+    for (const name of names) {
+      fs.mkdirSync(path.join(root, name), { recursive: true });
+      fs.writeFileSync(path.join(root, name, 'note.md'), `# ${name}\n`);
+    }
   }
 
   function makeRegisterCtx({ repoRoot, thread, outcome, failWith }) {
@@ -2397,12 +2731,8 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.deepEqual(calls, [['session_worktree_register', { path: target }]], 'exactly one registration for the created checkout');
       const lines = resultText(result).split('\n');
-      assert.deepEqual(lines, [
-        'created: feat-t41-ok \u00b7 feat/t41-ok',
-        `path: ${target}`,
-        'changes: already registered for this session',
-      ]);
-      assert.equal(result.details.created, true);
+      assert.deepEqual(lines, createdRows({ name: 'feat-t41-ok', branch: 'feat/t41-ok', path: `${target}`, changes: true }));
+      assert.equal(result.details.alreadyExists, undefined);
     } finally {
       restoreEnv();
     }
@@ -2421,10 +2751,7 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       const result = await callCreate(tools, { branch: 'feat/t41-absent' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.deepEqual(calls, [], 'never attempted');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t41-absent \u00b7 feat/t41-absent',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-t41-absent', branch: 'feat/t41-absent', path: `${target}` }));
     } finally {
       restoreEnv();
     }
@@ -2445,11 +2772,8 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       const result = await callCreate(tools, { branch: 'feat/t41-fail' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.equal(calls.length, 1, 'attempted once');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t41-fail \u00b7 feat/t41-fail',
-        `path: ${target}`,
-      ]);
-      assert.equal(result.details.created, true);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-t41-fail', branch: 'feat/t41-fail', path: `${target}` }));
+      assert.equal(result.details.alreadyExists, undefined);
     } finally {
       restoreEnv();
     }
@@ -2470,10 +2794,7 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
       const result = await callCreate(tools, { branch: 'feat/t41-throw' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.equal(calls.length, 1, 'attempted once');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t41-throw \u00b7 feat/t41-throw',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-t41-throw', branch: 'feat/t41-throw', path: `${target}` }));
     } finally {
       restoreEnv();
     }
@@ -2500,72 +2821,156 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
     }
   });
 
-  test('any one tracked entry blocks every symlink and the output stays silent', async () => {
-    const root = makeRepo('t42-gate');
+  // S3/L4 final selection ("Las cuatro como symlinks hacia main"): the four
+  // principal entries are LINKED into the new checkout only when git ignores
+  // them there. Nothing is copied; the env-file copy keeps its own contract.
+  test('S3: the agent tool links every git-ignored principal entry, never copies it', async () => {
+    const root = makeRepo('s3-links');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
-    fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.agents', 'config.json'), '{}\n');
-    fs.mkdirSync(path.join(root, '.claude'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.claude', 'settings.json'), '{}\n');
-    fs.mkdirSync(path.join(root, '.odd'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.odd', 'notes.md'), '# notes\n');
-    git(root, ['add', '-f', '.agents']);
-    git(root, ['commit', '-m', 'track agents']);
+    const names = ['.agents', '.pi', '.claude', 'odd'];
+    writeIgnoredEntries(root, names);
+    fs.writeFileSync(path.join(root, '.env'), 'SECRET=1\n');
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 't-t42-gate' });
-      const target = expectedTarget(root, 'feat-t42-gate');
-      const result = await callCreate(tools, { branch: 'feat/t42-gate' }, ctx);
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-links' });
+      const target = expectedTarget(root, 'feat-s3-links');
+      const result = await callCreate(tools, { branch: 'feat/s3-links' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      for (const name of ['.agents', '.claude', '.odd']) {
-        assert.equal(isSymlink(path.join(target, name)), false, `${name} must not be a symlink`);
+      assertCreatedText(
+        resultText(result),
+        result.details,
+        createdRows({ name: 'feat-s3-links', branch: 'feat/s3-links', path: `${target}` }),
+      );
+      for (const name of names) {
+        const link = path.join(target, name);
+        assert.equal(isSymlink(link), true, `${name} is a symlink`);
+        assert.equal(fs.readlinkSync(link), path.join(root, name), `${name} points at the principal entry`);
+        assert.equal(fs.readFileSync(path.join(link, 'note.md'), 'utf8'), `# ${name}\n`, `${name} resolves to the principal bytes`);
+        assert.equal(isSymlink(path.join(root, name)), false, `${name} source stays a real directory`);
       }
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t42-gate \u00b7 feat/t42-gate',
-        `path: ${target}`,
-      ], 'no line is added in any branch');
+      // The env-file copy keeps its own contract, unchanged.
+      assert.equal(fs.readFileSync(path.join(target, '.env'), 'utf8'), 'SECRET=1\n');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.ok(linkStep, `link step reported: ${JSON.stringify(steps.map((s) => s.name))}`);
+      assert.equal(linkStep.status, 'done');
+      const copyStep = steps.find((s) => s.name === 'copy-unversioned');
+      for (const name of names) {
+        assert.ok(!String(copyStep.detail).includes(name), `no directory copy of ${name}: ${copyStep.detail}`);
+      }
+      assert.equal(result.details.hooks.ok, true);
+      assert.deepEqual(result.details.hooks.warnings, []);
     } finally {
       restoreEnv();
     }
   });
 
-  test('with nothing tracked, existing principal entries become symlinks, silently', async () => {
-    const root = makeRepo('t42-links');
+  test('S3: the command create route (gitOnly/principalLayout) links the same entries', async () => {
+    const root = makeRepo('s3-command');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
-    fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.agents', 'config.json'), '{}\n');
-    fs.mkdirSync(path.join(root, '.odd'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.odd', 'notes.md'), '# notes\n');
+    const names = ['.agents', '.pi', '.claude', 'odd'];
+    writeIgnoredEntries(root, names);
+    setEnv(stdEnvT(herdr, gh, modeEnv));
+    try {
+      const mod = await loadModule();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-command' });
+      const target = expectedTarget(root, 'feat-s3-command');
+      const result = await mod.executeWorktreeCreate(
+        { branch: 'feat/s3-command', changes: 'none' },
+        ctx,
+        { gitOnly: true, principalLayout: true },
+      );
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      for (const name of names) {
+        const link = path.join(target, name);
+        assert.equal(isSymlink(link), true, `${name} is a symlink on the command path`);
+        assert.equal(fs.readlinkSync(link), path.join(root, name), `${name} points at the principal entry`);
+        assert.equal(isSymlink(path.join(root, name)), false, `${name} source stays a real directory`);
+      }
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.ok(linkStep, `link step reported: ${JSON.stringify(steps.map((s) => s.name))}`);
+      assert.equal(linkStep.status, 'done');
+      const copyStep = steps.find((s) => s.name === 'copy-unversioned');
+      for (const name of names) {
+        assert.ok(!String(copyStep.detail).includes(name), `no directory copy of ${name}: ${copyStep.detail}`);
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S3: an untracked entry git does not ignore is not linked', async () => {
+    const root = makeRepo('s3-notignored');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([]);
+    const modeEnv = scratchModeEnv();
+    const names = ['.agents', '.pi', '.claude', 'odd'];
+    for (const name of names) {
+      fs.mkdirSync(path.join(root, name), { recursive: true });
+      fs.writeFileSync(path.join(root, name, 'note.md'), `# ${name}\n`);
+    }
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 't-t42-links' });
-      const target = expectedTarget(root, 'feat-t42-links');
-      const result = await callCreate(tools, { branch: 'feat/t42-links' }, ctx);
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-notignored' });
+      const target = expectedTarget(root, 'feat-s3-notignored');
+      const result = await callCreate(tools, { branch: 'feat/s3-notignored' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
-      for (const name of ['.agents', '.odd']) {
-        const link = path.join(target, name);
-        assert.equal(isSymlink(link), true, `${name} is a symlink`);
-        assert.equal(fs.readlinkSync(link), path.join(root, name), `${name} points at the principal entry`);
-        assert.ok(fs.statSync(link).isDirectory(), `${name} resolves to a directory`);
+      for (const name of names) {
+        assert.equal(fs.existsSync(path.join(target, name)), false, `${name} is not linked into the worktree`);
+        assert.equal(fs.lstatSync(path.join(root, name)).isDirectory(), true, `${name} source stays untouched`);
       }
-      assert.equal(fs.existsSync(path.join(target, '.claude')), false, 'a missing source creates nothing');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t42-links \u00b7 feat/t42-links',
-        `path: ${target}`,
-      ], 'no line is added for created symlinks');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.equal(linkStep.status, 'skipped');
+      assert.match(String(linkStep.detail), /not git-ignored/);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('S3: a tracked entry arrives with the checkout instead of a link', async () => {
+    const root = makeRepo('s3-tracked');
+    const herdr = makeHerdrStub();
+    const gh = makeGhStub([]);
+    const modeEnv = scratchModeEnv();
+    fs.writeFileSync(path.join(root, '.gitignore'), '.agents/\n');
+    fs.mkdirSync(path.join(root, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.agents', 'config.json'), '{"tracked":true}\n');
+    fs.writeFileSync(path.join(root, '.agents', 'extra.json'), '{"ignored":true}\n');
+    git(root, ['add', '-f', '.agents/config.json']);
+    git(root, ['commit', '-m', 'track agents config']);
+    // S2: the checkout is born from LOCAL main, so the tracked entry has to be
+    // part of main's tree to arrive with it.
+    git(root, ['branch', '-f', 'main', 'HEAD']);
+    setEnv(stdEnvT(herdr, gh, modeEnv));
+    try {
+      const tools = await loadExtension();
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-tracked' });
+      const target = expectedTarget(root, 'feat-s3-tracked');
+      const result = await callCreate(tools, { branch: 'feat/s3-tracked' }, ctx);
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      const entry = path.join(target, '.agents');
+      assert.equal(isSymlink(entry), false, 'the checkout entry stays a real directory');
+      assert.equal(fs.readFileSync(path.join(entry, 'config.json'), 'utf8'), '{"tracked":true}\n');
+      assert.equal(fs.existsSync(path.join(entry, 'extra.json')), false, 'an ignored extra is never brought along');
+      assert.equal(fs.existsSync(path.join(root, '.agents', 'extra.json')), true, 'the source keeps its ignored extra');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const linkStep = steps.find((s) => s.name === 'link-principal-entries');
+      assert.match(String(linkStep.detail), /tracked/);
     } finally {
       restoreEnv();
     }
   });
 
   test('a dangling source never becomes a symlink', async () => {
-    const root = makeRepo('t42-dangling');
+    const root = makeRepo('s3-dangling');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
@@ -2573,31 +2978,68 @@ describe('S50/T41 + S51/T42: create registers the checkout and links principal d
     setEnv(stdEnvT(herdr, gh, modeEnv));
     try {
       const tools = await loadExtension();
-      const { ctx } = makeCtx({ repoRoot: root, thread: 't-t42-dangling' });
-      const target = expectedTarget(root, 'feat-t42-dangling');
-      const result = await callCreate(tools, { branch: 'feat/t42-dangling' }, ctx);
+      const { ctx } = makeCtx({ repoRoot: root, thread: 't-s3-dangling' });
+      const target = expectedTarget(root, 'feat-s3-dangling');
+      const result = await callCreate(tools, { branch: 'feat/s3-dangling' }, ctx);
       assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
       assert.equal(fs.existsSync(path.join(target, '.agents')), false, 'no symlink points at a missing target');
-      assert.deepEqual(resultText(result).split('\n'), [
-        'created: feat-t42-dangling \u00b7 feat/t42-dangling',
-        `path: ${target}`,
-      ]);
+      assert.deepEqual(resultText(result).split('\n'), createdRows({ name: 'feat-s3-dangling', branch: 'feat/s3-dangling', path: `${target}` }));
     } finally {
       restoreEnv();
     }
   });
 
-  test('lib: an existing destination entry is replaced by the symlink', async () => {
-    const principal = makeRepo('sym-src');
+  test('lib: LINK_NAMES is exactly the four requested names', () => {
+    assert.deepEqual(symlinksLib().LINK_NAMES, ['.agents', '.pi', '.claude', 'odd']);
+  });
+
+  test('lib: an occupied destination is preserved, never removed', () => {
+    const principal = makeRepo('sym-occupy');
     const worktree = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sym-dst-')));
-    fs.mkdirSync(path.join(principal, '.agents'), { recursive: true });
-    fs.writeFileSync(path.join(principal, '.agents', 'config.json'), '{}\n');
-    fs.writeFileSync(path.join(worktree, '.agents'), 'stale occupant\n');
-    const applied = symlinksLib().applyWorktreeSymlinks({ principalRoot: principal, worktreePath: worktree });
-    assert.deepEqual(applied.skippedTracked, []);
-    assert.deepEqual(applied.created, ['.agents']);
-    assert.equal(isSymlink(path.join(worktree, '.agents')), true);
-    assert.equal(fs.readlinkSync(path.join(worktree, '.agents')), path.join(principal, '.agents'));
+    fs.writeFileSync(path.join(principal, '.gitignore'), 'odd/\n');
+    fs.mkdirSync(path.join(principal, 'odd'), { recursive: true });
+    fs.writeFileSync(path.join(principal, 'odd', 'notes.md'), '# notes\n');
+    fs.writeFileSync(path.join(worktree, 'odd'), 'stale occupant\n');
+    const applied = symlinksLib().applyWorktreeSymlinks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      env: gitIsolatedEnv(),
+    });
+    assert.deepEqual(applied.created, [], 'nothing was linked over the occupant');
+    assert.ok(
+      applied.skipped.some((s) => s.includes('odd') && /target exists/.test(s)),
+      `occupant is reported: ${JSON.stringify(applied.skipped)}`,
+    );
+    assert.equal(isSymlink(path.join(worktree, 'odd')), false);
+    assert.equal(fs.readFileSync(path.join(worktree, 'odd'), 'utf8'), 'stale occupant\n');
+    assert.equal(fs.readFileSync(path.join(principal, 'odd', 'notes.md'), 'utf8'), '# notes\n');
+  });
+
+  test('lib: an existing correct link is idempotent (no write, reported as existing)', () => {
+    const principal = makeRepo('sym-idem');
+    fs.writeFileSync(path.join(principal, '.gitignore'), 'odd/\n');
+    fs.mkdirSync(path.join(principal, 'odd'), { recursive: true });
+    fs.writeFileSync(path.join(principal, 'odd', 'notes.md'), '# notes\n');
+    const worktree = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-sym-idem-')));
+    const first = symlinksLib().applyWorktreeSymlinks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      env: gitIsolatedEnv(),
+    });
+    assert.deepEqual(first.created, ['odd']);
+    assert.deepEqual(first.existing, []);
+    const before = fs.lstatSync(path.join(worktree, 'odd'));
+    const second = symlinksLib().applyWorktreeSymlinks({
+      principalRoot: principal,
+      worktreePath: worktree,
+      env: gitIsolatedEnv(),
+    });
+    const after = fs.lstatSync(path.join(worktree, 'odd'));
+    assert.deepEqual(second.existing, ['odd'], 'the correct link is recognised');
+    assert.deepEqual(second.created, ['odd'], 'the link is still in place');
+    assert.equal(after.ino, before.ino, 'the link was not recreated');
+    assert.equal(after.mtimeMs, before.mtimeMs, 'no write happened on the second call');
+    assert.equal(fs.readlinkSync(path.join(worktree, 'odd')), path.join(principal, 'odd'));
   });
 
   test('lib: the register helper only calls an actually available tool', async () => {
@@ -2642,6 +3084,9 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
     fs.writeFileSync(path.join(root, 'package-lock.json'), '{}\n');
     git(root, ['add', 'package-lock.json']);
     git(root, ['commit', '-m', 'add npm marker']);
+    // S2: the fresh checkout is born from LOCAL main, so the npm marker must be
+    // in main's tree for the hooks to see it.
+    git(root, ['branch', '-f', 'main', 'HEAD']);
     // Slow FAKE npm on PATH (bounded ~200ms, no network, no live managers).
     const binDir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-npmslow-')));
     fs.writeFileSync(path.join(binDir, 'npm'), '#!/bin/sh\nsleep 0.2\nexit 0\n', { mode: 0o755 });
@@ -2665,7 +3110,7 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
       const timer = setInterval(() => { beats += 1; }, 10);
       let result;
       try {
-        const pending = mod.executeWorktreeCreate({ branch: 'feat/gitonly-async' }, ctx, { gitOnly: true, principalLayout: true });
+        const pending = mod.executeWorktreeCreate({ branch: 'feat/gitonly-async', changes: 'none' }, ctx, { gitOnly: true, principalLayout: true });
         await new Promise((resolve) => setTimeout(resolve, 100));
         assert.ok(beats > 0, `heartbeat advanced while gitOnly hooks pending (beats=${beats})`);
         result = await pending;
@@ -2677,20 +3122,22 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
       assert.deepEqual(resultText(result).split('\n'), [
         'created: feat-gitonly-async · feat/gitonly-async',
         `path: ${target}`,
+        'registered: new',
+        'codegraph: initialized',
       ], 'exact success text preserved (no token filler)');
       const steps = (result.details && result.details.hooks && result.details.hooks.steps) || [];
       const names = steps.map((s) => s.name);
       assert.ok(names.includes('copy-unversioned'), 'copy step kept');
       assert.ok(names.some((n) => n.startsWith('install:')), 'install step kept, never silently skipped');
       assert.ok(names.includes('codegraph-init'), 'codegraph step kept');
-      assert.deepEqual(names, [...names].sort((a, b) => 0) && names, 'order preserved (copy, installs, codegraph)');
+      assert.deepEqual(names, [...names].sort(() => 0), 'order preserved (copy, installs, codegraph)');
       assert.ok(fs.existsSync(target), 'checkout exists after hooks settle (warp-after-hooks ordering)');
     } finally {
       restoreEnv();
     }
   });
   test('missing async helper fails safe before slow work with a useful error, never blocking sync', async () => {
-    const root = makeRepo('gitonly-noasync');
+    makeRepo('gitonly-noasync');
     const herdr = makeHerdrStub();
     const gh = makeGhStub([]);
     const modeEnv = scratchModeEnv();
@@ -2703,7 +3150,7 @@ describe('S63 gitOnly create uses async hooks (T49)', { concurrency: false }, ()
       GENTLE_WORKTREE_THREAD: undefined,
     });
     try {
-      const mod = await loadModule();
+      await loadModule();
       // Simulate an older hooks lib without the async twin by deleting it
       // on the required instance (libRequire cache) is not reachable here,
       // so assert the contract directly: the gitOnly route throws a concise

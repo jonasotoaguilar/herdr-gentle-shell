@@ -28,7 +28,7 @@
 // annotations), so the test copies it to a temporary .mjs path with the
 // package import lines stubbed and import()s it with a fake `pi` object.
 
-const { test, describe, after } = require('node:test');
+const { test, describe, after, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -93,8 +93,8 @@ function restoreEnv() {
 }
 
 function scratchStateEnv() {
-  // A scratch agent dir too: the performance rows read and write
-  // `<agent-dir>/settings.json`, and no test may touch the real one.
+  // A scratch agent dir too: the moshi exclusion and the whole panel write
+  // under Pi's agent home, and no test may touch the real one.
   return {
     GENTLE_STATUS_STATE_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-state-'))),
     GENTLE_PI_AGENT_HOME: undefined,
@@ -258,6 +258,14 @@ function modeBytes() {
   }
 }
 
+function pluginToolsBytes() {
+  try {
+    return fs.readFileSync(modeLib().pluginToolsPath(process.env), 'utf8');
+  } catch {
+    return null;
+  }
+}
+
 describe('customize command registration', { concurrency: false }, () => {
   test('the command is registered under the exact name while enabled', async () => {
     const modeEnv = scratchStateEnv();
@@ -287,14 +295,27 @@ describe('customize command registration', { concurrency: false }, () => {
     }
   });
 
-  test('the three old commands are gone and the two new ones are registered (S7)', async () => {
+  test('the old toggles are gone and the removed worktree command never registers', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const hadSlot = setSlot(undefined);
     try {
       modeLib().writeMode(true, process.env);
       const { commands } = await loadExtension();
-      assert.ok(!commands.has('herdr-gentle:worktree'), 'the worktree toggle is removed outright (S7)');
+      // S1/S5: `/herdr-gentle:worktree` was the mode-toggle command for the
+      // association editor. Worktrees carry no association any more, and the
+      // association editor, the full-screen detail and the delete view were
+      // removed with it (S4), so nothing registers that name.
+      assert.ok(!commands.has('herdr-gentle:worktree'),
+        `the removed command never registers, got ${JSON.stringify([...commands.keys()])}`);
+      // The old mode verbs stay dead: the surviving customize command refuses
+      // them and leaves the mode file byte-identical, so a disabled mode can
+      // never be flipped from a toggle verb.
+      const modeBefore = modeBytes();
+      const { ctx: detailCtx, notes: detailNotes } = makeCtx();
+      await customizeDef(commands).handler('enabled', detailCtx);
+      assert.deepEqual(detailNotes, [['Unknown option "enabled". Use /herdr-gentle:customize or /herdr-gentle:customize status.', 'error']], 'the removed toggle verbs are refused');
+      assert.equal(modeBytes(), modeBefore, 'a toggle verb never writes the mode');
       assert.ok(commands.has('herdr-gentle:warp'), 'warp stays registered');
       assert.ok(commands.has('herdr-gentle:customize'), 'customize stays registered');
     } finally {
@@ -348,7 +369,7 @@ describe('customize panel', { concurrency: false }, () => {
         'CATEGORIES',
         'Herdr Sidebar',
         'Moshi notifications',
-        'Worktree tools',
+        'Plugin tools',
         'Gentle (this extension)',
         'publishes agent state and SessionChanges from Gentle',
         'Native Herdr',
@@ -369,12 +390,15 @@ describe('customize panel', { concurrency: false }, () => {
         assert.ok(seen().includes(copy), `panel copy missing: ${copy}`);
       }
       component.handleInput('down');
+      // The grouped Plugin tools section carries the three independent
+      // toggles, each row naming its own stored state.
       for (const copy of [
-        'Worktree tools',
-        'Enabled',
+        'Plugin tools',
+        'Worktree tools · Enabled',
+        'ODD command · Enabled',
+        'Issues command · Enabled',
         'agents can create, list, close, warp between and open sessions in agent worktrees',
-        'Disabled',
-        'Preview · Enabled',
+        'Preview · Worktree tools',
       ]) {
         assert.ok(seen().includes(copy), `panel copy missing: ${copy}`);
       }
@@ -519,7 +543,7 @@ describe('customize panel', { concurrency: false }, () => {
     }
   });
 
-  test('worktree Disabled writes the mode file and reloads after notify when the tools are registered', async () => {
+  test('flipping Worktree tools off writes the mode file and reloads after notify when the tools are registered', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const { slot } = stubSlot();
@@ -530,19 +554,20 @@ describe('customize panel', { concurrency: false }, () => {
       installTuiLoader(mod, async () => stubTui);
       const host = makeHostTui();
       const { ctx, notes, seq } = makeCtx({
-        // sidebar -> moshi -> worktree, values pane, down to Disabled, Enter.
+        // sidebar -> moshi -> Plugin tools, values pane on the worktree row.
         customImpl: async (factory, options) => {
           assert.deepEqual(options.overlayOptions, { anchor: 'center', width: '70%', minWidth: 60, maxHeight: '85%' });
-          const { result } = await driveContract(factory, host, ['down', 'down', 'right', 'down', 'enter']);
-          assert.deepEqual(result, { categoryId: 'worktree', valueId: 'disabled' }, 'Enter resolves done() with the choice');
+          const { result } = await driveContract(factory, host, ['down', 'down', 'right', 'enter']);
+          assert.deepEqual(result, { categoryId: 'plugin-tools', valueId: 'worktree' }, 'Enter resolves done() with the toggle');
           assert.equal(modeBytes(), '{"version":1,"enabled":true}\n', 'nothing is written while the overlay is still up');
           assert.equal(notes.length, 0, 'nothing is notified while the overlay is still up');
           return result;
         },
       });
       await customizeDef(commands).handler('', ctx);
-      assert.equal(modeBytes(), '{"version":1,"enabled":false}\n', 'choosing Disabled writes the mode file');
+      assert.equal(modeBytes(), '{"version":1,"enabled":false}\n', 'the flip writes the legacy mode file');
       assert.equal(notes.length, 1, 'exactly one notification');
+      assert.equal(notes[0][0], 'Worktree tools disabled. Reloading now to apply the change.');
       assert.ok(!notes[0][0].includes('/reload'), 'the panel never asks the user to run /reload');
       assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload'], 'notify runs before the reload');
     } finally {
@@ -551,64 +576,109 @@ describe('customize panel', { concurrency: false }, () => {
     }
   });
 
-  test('worktree Enabled while already registered writes the file but does not reload', async () => {
+  test('flipping ODD command writes only its own key of the plugin tools file and reloads', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
     const { slot } = stubSlot();
     const hadSlot = setSlot(slot);
     try {
       modeLib().writeMode(true, process.env);
+      modeLib().writePluginTools({ odd: true, issues: true }, process.env);
+      const before = modeBytes();
       const { commands, mod } = await loadExtension();
       installTuiLoader(mod, async () => stubTui);
       const host = makeHostTui();
       const { ctx, notes, seq } = makeCtx({
-        // worktree is already the active row (Enabled); Enter applies it.
-        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'enter'])).result,
+        // Plugin tools values pane: worktree, then ODD.
+        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'down', 'enter'])).result,
       });
       await customizeDef(commands).handler('', ctx);
-      assert.equal(modeBytes(), '{"version":1,"enabled":true}\n', 'the mode file is still written');
-      assert.equal(notes.length, 1);
-      assert.ok(!notes[0][0].includes('/reload'), 'no /reload instruction');
-      assert.ok(!seq.includes('reload'), 'already-registered state needs no reload');
+      assert.equal(modeBytes(), before, 'the legacy worktree flag is untouched');
+      assert.equal(pluginToolsBytes(), '{"version":1,"odd":false,"issues":true}\n', 'only the ODD key flipped');
+      assert.equal(notes[0][0], 'ODD command disabled. Reloading now to apply the change.');
+      assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload']);
     } finally {
       setSlot(hadSlot);
       restoreEnv();
     }
   });
 
-  test('loaded while disabled, worktree Enabled reloads to register and Disabled does not', async () => {
+  test('flipping Issues command leaves the ODD value alone', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      modeLib().writePluginTools({ odd: false, issues: true }, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx, notes } = makeCtx({
+        // Plugin tools values pane, third row = Issues command.
+        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'down', 'down', 'enter'])).result,
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(pluginToolsBytes(), '{"version":1,"odd":false,"issues":false}\n', 'the ODD value is preserved');
+      assert.equal(notes[0][0], 'Issues command disabled. Reloading now to apply the change.');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('a flip that lands on the runtime registration writes the file but does not reload', async () => {
+    // Loaded with ODD disabled, so the runtime registered no ODD command; the
+    // stored flag is then flipped out of band. The panel's flip back to
+    // Disabled matches the runtime, so no rebuild is needed.
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      modeLib().writePluginTools({ odd: false, issues: true }, process.env);
+      const { commands, mod } = await loadExtension();
+      modeLib().writePluginTools({ odd: true, issues: true }, process.env);
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx, notes, seq } = makeCtx({
+        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'down', 'enter'])).result,
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(pluginToolsBytes(), '{"version":1,"odd":false,"issues":true}\n', 'the file is written');
+      assert.equal(notes[0][0], 'ODD command disabled.');
+      assert.ok(!seq.includes('reload'), 'a registration that already matches needs no reload');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('either direction reloads when the runtime registration must change', async () => {
     // Carried over from the removed mode-command suite: the
-    // `enabled !== toolsRegistered` predicate in the other direction.
-    for (const pick of ['enabled', 'disabled']) {
+    // `enabled !== runtime registration` predicate in both directions.
+    for (const loaded of ['enabled', 'disabled']) {
       const modeEnv = scratchStateEnv();
       setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
       const { slot } = stubSlot();
       const hadSlot = setSlot(slot);
       try {
-        modeLib().writeMode(false, process.env);
+        modeLib().writeMode(loaded === 'enabled', process.env);
         const { commands, mod } = await loadExtension();
         installTuiLoader(mod, async () => stubTui);
         const host = makeHostTui();
-        // worktree rows: Enabled first, Disabled second; loaded disabled
-        // means the cursor starts on Disabled.
-        const keys = pick === 'enabled'
-          ? ['down', 'down', 'right', 'up', 'enter']
-          : ['down', 'down', 'right', 'enter'];
         const { ctx, notes, seq } = makeCtx({
-          customImpl: async (factory) => (await driveContract(factory, host, keys)).result,
+          customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'enter'])).result,
         });
         await customizeDef(commands).handler('', ctx);
         assert.equal(
           modeBytes(),
-          pick === 'enabled' ? '{"version":1,"enabled":true}\n' : '{"version":1,"enabled":false}\n',
-          'the mode file is written either way',
+          loaded === 'enabled' ? '{"version":1,"enabled":false}\n' : '{"version":1,"enabled":true}\n',
+          'the flip writes the mode file either way',
         );
         assert.equal(notes.length, 1);
-        if (pick === 'enabled') {
-          assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload'], 'enabling an unregistered runtime reloads after notify');
-        } else {
-          assert.ok(!seq.includes('reload'), 'repeating the unregistered state needs no reload');
-        }
+        assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload'], 'a registration change reloads after notify');
       } finally {
         setSlot(hadSlot);
         restoreEnv();
@@ -759,7 +829,7 @@ describe('customize panel', { concurrency: false }, () => {
       const { ctx, notes, seq } = makeCtx();
       await customizeDef(commands).handler('status', ctx);
       assert.equal(notes.length, 1);
-      assert.equal(notes[0][0], 'customize status: sidebar=gentle moshi=off worktree=enabled');
+      assert.equal(notes[0][0], 'customize status: sidebar=gentle moshi=off worktree=enabled odd=enabled issues=enabled');
       assert.equal(modeBytes(), before, 'status writes nothing');
       assert.ok(!seq.includes('reload'), 'status never reloads');
     } finally {
@@ -798,7 +868,7 @@ describe('customize fallback menu', { concurrency: false }, () => {
       modeLib().writeMode(true, process.env);
       const { commands, mod } = await loadExtension();
       installTuiLoader(mod, async () => { throw new Error('no such module'); });
-      const answers = ['Worktree tools', 'Disabled'];
+      const answers = ['Plugin tools', 'Worktree tools · Enabled'];
       const { ctx, notes, selects, customs, seq } = makeCtx({
         customImpl: async () => { throw new Error('custom must not be called without helpers'); },
         selectImpl: () => answers.shift(),
@@ -863,6 +933,213 @@ describe('customize fallback menu', { concurrency: false }, () => {
       assert.equal(modeBytes(), before, 'cancel writes nothing');
       assert.equal(notes.length, 0, 'cancel notifies nothing');
       assert.ok(!seq.includes('reload'), 'cancel never reloads');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The grouped "Plugin tools" section: one category with THREE independent
+// toggles — Worktree tools, ODD command, Issues command. Each toggle persists
+// on its own (the worktree flag keeps its legacy file and bytes; ODD and Issues
+// share one file with their own keys), flips on Enter, and reloads only when the
+// runtime's own registration must change. A runtime that could not be reloaded
+// still refuses the invocation, so a toggle never silently keeps working.
+// ---------------------------------------------------------------------------
+describe('customize Plugin tools section', { concurrency: false }, () => {
+  async function openPluginPanel() {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const { ctx, customs } = makeCtx({ customImpl: async () => {} });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(customs.length, 1, 'expected exactly one custom() call');
+      const opened = openComponent(customs[0][0], makeHostTui());
+      return { ...opened, cleanup: () => { setSlot(hadSlot); restoreEnv(); } };
+    } catch (err) {
+      setSlot(hadSlot);
+      restoreEnv();
+      throw err;
+    }
+  }
+
+  test('the section lists the three toggles with their stored state', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      modeLib().writePluginTools({ odd: false, issues: true }, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx, notes } = makeCtx({
+        customImpl: async (factory) => {
+          const { component, done } = openComponent(factory, host);
+          component.handleInput('down');
+          component.handleInput('down');
+          const text = component.render(100).join('\n');
+          for (const copy of [
+            'Plugin tools',
+            'Worktree tools · Enabled',
+            'ODD command · Disabled',
+            'Issues command · Enabled',
+            'Preview · Worktree tools',
+          ]) {
+            assert.ok(text.includes(copy), `panel copy missing: ${copy}`);
+          }
+          assert.equal(done(), 'pending');
+          component.handleInput('escape');
+          return done();
+        },
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(notes.length, 0, 'reading the section writes and notifies nothing');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('a malformed plugin tools file fails closed: both commands stay unregistered and read Disabled', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      fs.writeFileSync(path.join(process.env.GENTLE_STATUS_STATE_DIR, 'gentle-plugin-tools.json'), '{"version":1,"odd":"yes"}\n');
+      const { commands, mod } = await loadExtension();
+      assert.ok(!commands.has('herdr-gentle:odd'), 'a malformed file never registers the ODD command');
+      assert.ok(!commands.has('herdr-gentle:issues'), 'a malformed file never registers the Issues command');
+      assert.ok(commands.has('herdr-gentle:customize'), 'the panel always stays registered');
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx } = makeCtx({
+        customImpl: async (factory) => {
+          const { component, done } = openComponent(factory, host);
+          component.handleInput('down');
+          component.handleInput('down');
+          const text = component.render(100).join('\n');
+          assert.ok(text.includes('ODD command · Disabled'), 'malformed state reads Disabled');
+          assert.ok(text.includes('Issues command · Disabled'), 'malformed state reads Disabled');
+          component.handleInput('escape');
+          return done();
+        },
+      });
+      await customizeDef(commands).handler('', ctx);
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('disabling ODD without a reload refuses the invocation and says when it applies', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      // The panel degrades to the plain menu here, and this ctx has no
+      // reload: the registration cannot be rebuilt in this session.
+      installTuiLoader(mod, async () => { throw new Error('no TUI here'); });
+      const answers = ['Plugin tools', 'ODD command · Enabled'];
+      const { ctx, notes, seq } = makeCtx({ selectImpl: () => answers.shift() });
+      delete ctx.reload;
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(pluginToolsBytes(), '{"version":1,"odd":false,"issues":true}\n', 'the flip is persisted');
+      assert.equal(notes[0][0], 'ODD command disabled. The change applies from the next session.');
+
+      // The stale runtime still holds the command: invoking it must refuse
+      // instead of opening the viewer.
+      const oddCtx = makeCtx({ customImpl: async () => { throw new Error('the viewer must not open'); } });
+      await commands.get('herdr-gentle:odd').handler('', oddCtx.ctx);
+      assert.equal(oddCtx.customs.length, 0, 'a disabled command opens nothing');
+      assert.deepEqual(
+        oddCtx.notes,
+        [['odd command is disabled; open /herdr-gentle:customize and apply the Plugin tools ODD command toggle to enable it', 'error']],
+      );
+      assert.ok(!seq.includes('reload'));
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('disabling the ODD command keeps the automatic capture handlers registered', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const hadSlot = setSlot(undefined);
+    try {
+      modeLib().writeMode(true, process.env);
+      modeLib().writePluginTools({ odd: false, issues: true }, process.env);
+      const { commands, handlers } = await loadExtension();
+      assert.ok(!commands.has('herdr-gentle:odd'), 'only the command is unregistered');
+      assert.ok(Array.isArray(handlers.get('tool_call')) && handlers.get('tool_call').length > 0,
+        'the automatic ODD capture keeps observing tool calls');
+      assert.ok(Array.isArray(handlers.get('tool_result')) && handlers.get('tool_result').length > 0,
+        'the automatic ODD capture keeps observing tool results');
+      assert.ok(Array.isArray(handlers.get('session_start')) && handlers.get('session_start').length > 0,
+        'unrelated startup work still runs');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('the headless fallback menu reaches the three toggles', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => { throw new Error('no TUI here'); });
+      const answers = ['Plugin tools', 'Worktree tools · Enabled'];
+      const { ctx, notes, selects, seq } = makeCtx({ selectImpl: () => answers.shift() });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(selects.length, 2, 'category then toggle');
+      assert.deepEqual(selects[1][1], [
+        'Worktree tools · Enabled',
+        'ODD command · Enabled',
+        'Issues command · Enabled',
+      ], 'the fallback carries the same three toggles');
+      assert.equal(modeBytes(), '{"version":1,"enabled":false}\n', 'the fallback writes through the same path');
+      assert.equal(notes[0][0], 'Worktree tools disabled. Reloading now to apply the change.');
+      assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload']);
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('Reset returns ODD and Issues to Enabled through the same writers', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      modeLib().writePluginTools({ odd: false, issues: false }, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => { throw new Error('no TUI here'); });
+      const answers = ['Reset', 'Reset every option to its default'];
+      const { ctx, notes } = makeCtx({ selectImpl: () => answers.shift() });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(pluginToolsBytes(), '{"version":1,"odd":true,"issues":true}\n', 'both commands return to their default');
+      assert.equal(modeBytes(), '{"version":1,"enabled":true}\n', 'the worktree default is unchanged');
+      assert.equal(notes[0][0], 'Defaults saved.');
     } finally {
       setSlot(hadSlot);
       restoreEnv();
@@ -1010,7 +1287,7 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
       for (const line of lines) assert.equal(visible(line), 50, 'every narrow row still fits');
       assert.equal(dividerColumn(lines), null, 'no inner divider in single-pane mode');
       const text = lines.map(stripAnsi).join('\n');
-      assert.ok(text.includes('Herdr Sidebar') && text.includes('Worktree tools'), 'categories stay navigable');
+      assert.ok(text.includes('Herdr Sidebar') && text.includes('Plugin tools'), 'categories stay navigable');
     } finally {
       cleanup();
     }
@@ -1040,6 +1317,25 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
     }
   });
 
+  // S2: the key legend is ONE terminal row at every width. A legend that does
+  // not fit the card is compacted (short tokens, then the lowest-priority keys
+  // dropped) instead of ellipsis-clipped, so the close key never disappears.
+  test('the key legend owns exactly one row at every width', async () => {
+    const { component, cleanup } = await openPanel();
+    try {
+      for (const width of [40, 60, 80, 120]) {
+        const lines = component.render(width);
+        for (const line of lines) assert.equal(visible(line), width, `width ${width}: every row stays cell-exact`);
+        const legend = lines.map(stripAnsi).filter((line) => /Esc close|esc close/.test(line));
+        assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+        assert.ok(!legend[0].includes('…'), `width ${width}: compacted, never ellipsis-clipped: ${legend[0]}`);
+        assert.match(legend[0], /close/, `width ${width}: the close key survives`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   test('the card paints through the injected theme instead of hardcoding escapes', async () => {
     const modeEnv = scratchStateEnv();
     setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
@@ -1058,7 +1354,10 @@ describe('customize two-column card geometry', { concurrency: false }, () => {
       assert.equal(settled, 'pending');
       const lines = component.render(80);
       assert.ok(lines.length > 0, 'themed render produces rows');
-      for (const role of ['border', 'accent', 'muted']) {
+      // S11: every role the panel names comes from the shared palette — the
+      // frame/divider (border), the title and keys (accent), the descriptions
+      // and counts (muted) and the static labels (dim).
+      for (const role of ['border', 'accent', 'muted', 'dim']) {
         assert.ok(roles.includes(role), `theme.fg paints the ${role} role`);
       }
       for (const line of lines) assert.ok(!line.includes('\x1b'), 'injected theme adds no escapes of its own here');
@@ -1157,7 +1456,7 @@ describe('customize label-only rows with focused preview', { concurrency: false 
 });
 
 describe('worktree registration under an injected state dir (S15)', { concurrency: false }, () => {
-  const WORKTREE_TOOLS = ['worktree_upsert', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
+  const WORKTREE_TOOLS = ['worktree_create', 'worktree_list', 'worktree_close', 'worktree_session_open', 'worktree_warp'];
 
   // A sandbox XDG state home plus an injected (new-id) dir. A stored flag
   // means <sandbox>/herdr/plugins/herdr-gentle-agents holds the mode file.
@@ -1251,7 +1550,7 @@ describe('worktree registration under an injected state dir (S15)', { concurrenc
       const { ctx, notes } = makeCtx();
       await customizeDef(commands).handler('status', ctx);
       assert.equal(notes.length, 1);
-      assert.equal(notes[0][0], 'customize status: sidebar=gentle moshi=off worktree=disabled');
+      assert.equal(notes[0][0], 'customize status: sidebar=gentle moshi=off worktree=disabled odd=enabled issues=enabled');
     } finally {
       setSlot(hadSlot);
       restoreEnv();
@@ -1266,22 +1565,22 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
   // stays the whole story: the copy names the session and warp coverage,
   // enabled registers exactly the five tools, disabled registers none, and
   // every disabled-path refusal keeps its exact bytes.
-  const FOUR = ['worktree_close', 'worktree_upsert', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
+  const FOUR = ['worktree_close', 'worktree_create', 'worktree_list', 'worktree_session_open', 'worktree_warp'];
   const REFUSAL =
-    'worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them';
-  const ENABLED_DETAIL = 'agents can create, list, close, warp between and open sessions in agent worktrees';
+    'worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them';
+  const ENABLED_DETAIL = 'agents can create, list, close, warp between and open sessions in agent worktrees; the warp command follows this toggle';
 
   function textOf(result) {
     return (result.content || []).map((part) => part.text || '').join('\n');
   }
 
-  test('the Enabled row names the session coverage in its exact bytes', async () => {
-    // Byte pin on the switch's own copy: one short line, same shape as
-    // the other detail strings. (The panel render path asserting this
+  test('the Worktree tools toggle names the session coverage in its exact bytes', async () => {
+    // Byte pin on the toggle's own copy: one short detail line, same shape
+    // as the other detail strings. (The panel render path asserting this
     // copy is visible lives in the customize panel test above.)
     const line =
-      '{ id: "enabled", label: "Enabled", detail: "agents can create, list, close, warp between and open sessions in agent worktrees" }';
-    assert.equal(srcText.split(line).length - 1, 1, 'the Enabled worktree row keeps its exact copy');
+      'detail: "agents can create, list, close, warp between and open sessions in agent worktrees; the warp command follows this toggle",';
+    assert.equal(srcText.split(line).length - 1, 1, 'the Worktree tools toggle keeps its exact copy');
     assert.ok(ENABLED_DETAIL.includes('open sessions'), 'the coverage names opening sessions');
     assert.ok(ENABLED_DETAIL.includes('warp'), 'the coverage names the warp capability');
   });
@@ -1336,7 +1635,7 @@ describe('single Worktree tools switch covers the session and warp tools (S21, T
       // refusal is the whole observable effect.
       modeLib().writeMode(false, process.env);
       const calls = [
-        ['worktree_upsert', { branch: 'feat/off' }],
+        ['worktree_create', { branch: 'feat/off' }],
         ['worktree_list', {}],
         ['worktree_close', { branch: 'feat/off' }],
         ['worktree_session_open', { worktree: 'feat-off' }],
@@ -1439,207 +1738,76 @@ describe('customize key consistency (K1/K3)', { concurrency: false }, () => {
 });
 
 // ---------------------------------------------------------------------------
-// customize-perf-rows (perf-switches S2-S6, T1-T4): the three performance rows.
-//
-// Contract under test (observable behavior only — the bytes of
-// `<agent-dir>/settings.json`, the notified text, whether ctx.reload ran, and
-// what the panel renders; never internal function names):
-// - the panel carries a fourth category with three rows, all OFF with no
-//   settings file, and opening it writes nothing;
-// - each row's footer note states what it improves AND what it worsens with
-//   its SYNTHETIC measured numbers, while the full measured detail sits
-//   behind the help key;
-// - row 2 writes the single key `expandRecentToolOutput`, row 3 the single
-//   key `incrementalSearchCorpus`, row 1 both `heightIndex` and
-//   `evictOffscreenLines`;
-// - a fused row whose keys disagree reads PARTIAL and normalizes both keys on
-//   the next toggle, never claiming they were already equal;
-// - an unreadable or malformed settings file is left byte-identical and the
-//   row says nothing changed.
+// S22: the panel has no Performance section at all. Its categories are sidebar,
+// moshi, worktree and reset — in that order — and no performance row, no
+// optimisation switch and no trace toggle is reachable from it. The trace is
+// switched on by the GENTLE_PERF_TRACE environment variable instead (S24), so
+// nothing in this panel may name it.
 // ---------------------------------------------------------------------------
+describe('customize has no performance category (S22)', { concurrency: false }, () => {
+  const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Plugin tools', 'Reset'];
 
-function perfLib() {
-  return require('../lib/customize-perf-rows.js');
-}
+  test('the card offers exactly four categories and names no performance option', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_PERF_TRACE: undefined, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    const customs = [];
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const { ctx } = makeCtx({
+        customImpl: async (factory) => { customs.push(factory); },
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(customs.length, 1, 'the panel opened');
 
-function perfSettingsFile(env) {
-  return path.join(env.PI_CODING_AGENT_DIR, 'settings.json');
-}
+      const host = makeHostTui();
+      const { component, done } = openComponent(customs[0], host);
+      const seen = () => component.render(100).map((line) => String(line)).join('\n');
 
-function writePerfSettings(env, doc) {
-  fs.mkdirSync(path.dirname(perfSettingsFile(env)), { recursive: true });
-  fs.writeFileSync(perfSettingsFile(env), `${JSON.stringify(doc, null, 2)}\n`);
-}
+      for (let index = 0; index < CATEGORY_TITLES.length; index += 1) {
+        assert.ok(seen().includes(`▸ ${CATEGORY_TITLES[index]}`), `focused category ${index} is ${CATEGORY_TITLES[index]}`);
+        component.handleInput('down');
+      }
+      assert.ok(seen().includes('▸ Herdr Sidebar'), 'the fourth entry wraps back to the first category');
+      assert.equal(done(), 'pending', 'walking the categories never applies anything');
 
-function readPerfSettings(env) {
-  return JSON.parse(fs.readFileSync(perfSettingsFile(env), 'utf8'));
-}
-
-// One flattened view of the card: assertions about copy survive the wrapping
-// the panel applies to notes and help lines.
-function flatCard(component, width = 100) {
-  return component.render(width).map((line) => String(line)).join('\n').replace(/\s+/g, ' ');
-}
-
-// Drive the REAL panel through the command: `inputs` are the navigation keys,
-// `inspect` renders the state they reached, and `confirm` is the key that
-// finishes the overlay and reaches the single apply path exactly like a user's
-// Enter would.
-async function runPanel({ env, inputs = [], inspect, confirm = null }) {
-  setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...env });
-  const hadSlot = setSlot(stubSlot().slot);
-  const host = makeHostTui();
-  try {
-    modeLib().writeMode(true, process.env);
-    const { commands, mod } = await loadExtension();
-    installTuiLoader(mod, async () => stubTui);
-    let component = null;
-    const { ctx, notes, seq } = makeCtx({
-      customImpl: async (factory) => {
-        const opened = openComponent(factory, host);
-        component = opened.component;
-        for (const input of inputs) component.handleInput(input);
-        if (typeof inspect === 'function') inspect(component);
-        if (confirm !== null) component.handleInput(confirm);
-        return opened.done() === 'pending' ? null : opened.done();
-      },
-    });
-    await customizeDef(commands).handler('', ctx);
-    return { component, notes, seq, host };
-  } finally {
-    setSlot(hadSlot);
-    restoreEnv();
-  }
-}
-
-// sidebar, moshi, worktree, performance: three downs reach the perf category.
-const TO_PERF = ['down', 'down', 'down'];
-const TO_PERF_ROW_2 = [...TO_PERF, 'right', 'down'];
-const TO_PERF_ROW_3 = [...TO_PERF, 'right', 'down', 'down'];
-
-describe('customize performance rows', { concurrency: false }, () => {
-  test('the three switches read OFF with no settings file, and opening the panel writes nothing', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF });
-    const text = flatCard(component);
-    for (const copy of [
-      'Performance',
-      'Height index + eviction · OFF',
-      'Recent tool output expansion · OFF',
-      'Incremental search corpus · OFF',
-    ]) {
-      assert.ok(text.includes(copy), `panel copy missing: ${copy}`);
+      const card = seen();
+      assert.ok(!/Performance/i.test(card), 'no performance category, row or trace toggle is rendered');
+      assert.ok(!/trace/i.test(card), 'the trace is not advertised from the panel');
+      assert.ok(!/optimis|optimiz/i.test(card), 'no optimisation wording survives');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
     }
-    assert.ok(!text.includes('→ Height index'), 'three independent switches claim no single active value');
-    assert.equal(fs.existsSync(perfSettingsFile(env)), false, 'opening the panel writes no settings file');
   });
 
-  test('the fused row states behaviour, benefit and tradeoff in plain language', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF });
-    const text = flatCard(component);
-    assert.ok(text.includes('Caches row heights and unloads far rows'), 'behaviour is stated');
-    assert.ok(text.includes('repaint faster with less memory'), 'the benefit is stated');
-    assert.ok(text.includes('stale height until you scroll back'), 'the tradeoff is stated');
-    assert.ok(!/\d+\.\d+|\bMB\b|SYNTHETIC/.test(text), 'no benchmark apparatus in the UI');
+  test('the headless fallback menu offers the same four categories and nothing else', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_PERF_TRACE: undefined, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => null);
+      const { ctx, notes, selects } = makeCtx({ selectImpl: () => null });
+      await customizeDef(commands).handler('', ctx);
+      assert.deepEqual(selects[0][1], CATEGORY_TITLES, 'the category menu carries exactly these four entries');
+      assert.deepEqual(notes, [], 'cancelling writes and notifies nothing');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
   });
 
-  test('the recent-output row states its cost: a stub is not searchable and not copyable', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
-    const text = flatCard(component);
-    assert.ok(text.includes('Preview · Recent tool output expansion · OFF'));
-    assert.ok(text.includes('Collapses older tool output to expandable stubs'), 'behaviour is stated');
-    assert.ok(text.includes('long transcripts stay compact'), 'the benefit is stated');
-    assert.ok(text.includes('not searchable or copyable until you expand'), 'the cost is stated plainly');
-    assert.ok(!/\d+\.\d+|\bMB\b|SYNTHETIC/.test(text), 'no benchmark apparatus in the UI');
-  });
-
-  test('? shows no benchmark detail: the panel is unchanged', async () => {
-    const env = scratchStateEnv();
-    const { component } = await runPanel({ env, inputs: TO_PERF_ROW_2 });
-    const footer = flatCard(component);
-    component.handleInput('?');
-    assert.equal(flatCard(component), footer, '? changes nothing on the panel');
-    assert.ok(!footer.includes('load 5.7-6.4'), 'no benchmark apparatus is reachable');
-  });
-
-  test('Enter on the recent-output row writes the single key, keeps other settings and reloads', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { theme: 'gentle', expandRecentToolOutput: false });
-    const { notes, seq } = await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', expandRecentToolOutput: true });
-    assert.deepEqual(notes, [[
-      'Recent tool output expansion enabled. Reloading now to apply the change.',
-      'info',
-    ]]);
-    assert.deepEqual(seq, [
-      'notify:Recent tool output expansion enabled. Reloading now to apply the change.',
-      'reload',
-    ], 'the panel closes, then the notice, then the reload');
-  });
-
-  test('Enter again turns the mode off and writes nothing else', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { theme: 'gentle', expandRecentToolOutput: true });
-    const { notes } = await runPanel({ env, inputs: TO_PERF_ROW_2, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', expandRecentToolOutput: false });
-    assert.deepEqual(notes, [[
-      'Recent tool output expansion disabled. Reloading now to apply the change.',
-      'info',
-    ]]);
-  });
-
-  test('the search row writes its own single key and no other', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { theme: 'gentle' });
-    await runPanel({ env, inputs: TO_PERF_ROW_3, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { theme: 'gentle', incrementalSearchCorpus: true });
-  });
-
-  test('the fused row writes both keys and reads PARTIAL while they disagree', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: false });
-    const { notes } = await runPanel({
-      env,
-      inputs: TO_PERF,
-      inspect: (component) => {
-        const text = flatCard(component);
-        assert.ok(text.includes('Height index + eviction · PARTIAL'), 'a mixed state is reported as partial');
-        assert.ok(!text.includes('Height index + eviction · ON'), 'it never claims the keys were already equal');
-      },
-      confirm: 'enter',
-    });
-    assert.deepEqual(readPerfSettings(env), { heightIndex: true, evictOffscreenLines: true }, 'both keys normalize to one value');
-    assert.deepEqual(notes, [[
-      'Height index + eviction enabled. Both keys were out of step and now match. Reloading now to apply the change.',
-      'info',
-    ]]);
-  });
-
-  test('the fused row turns both keys off together', async () => {
-    const env = scratchStateEnv();
-    writePerfSettings(env, { heightIndex: true, evictOffscreenLines: true, theme: 'gentle' });
-    await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
-    assert.deepEqual(readPerfSettings(env), { heightIndex: false, evictOffscreenLines: false, theme: 'gentle' });
-  });
-
-  test('a malformed settings file is left byte-identical and the row says nothing changed', async () => {
-    const env = scratchStateEnv();
-    fs.mkdirSync(env.PI_CODING_AGENT_DIR, { recursive: true });
-    fs.writeFileSync(perfSettingsFile(env), '{ "heightIndex": tru');
-    const { notes, seq } = await runPanel({ env, inputs: TO_PERF, confirm: 'enter' });
-    assert.equal(fs.readFileSync(perfSettingsFile(env), 'utf8'), '{ "heightIndex": tru');
-    assert.equal(notes.length, 1);
-    assert.match(notes[0][0], /^Height index \+ eviction not changed\. /);
-    assert.match(notes[0][0], /invalid JSON/, 'the reason names the real obstacle');
-    assert.ok(!seq.includes('reload'), 'a failed write never reloads');
-  });
-
-  test('the headless fallback menu reaches the same rows and writes the same key', async () => {
-    const env = scratchStateEnv();
-    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...env });
-    const hadSlot = setSlot(stubSlot().slot);
+  test('the reset summary names only the options this package owns', async () => {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, GENTLE_PERF_TRACE: undefined, ...modeEnv });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
     try {
       modeLib().writeMode(true, process.env);
       const { commands, mod } = await loadExtension();
@@ -1648,40 +1816,555 @@ describe('customize performance rows', { concurrency: false }, () => {
       const { ctx, notes } = makeCtx({
         selectImpl: (title, options) => {
           picked.push([title, options]);
-          return title === 'Customize · Herdr Gentle Shell' ? 'Performance' : options[1];
+          return title === 'Customize · Herdr Gentle Shell' ? 'Reset' : options[0];
         },
       });
       await customizeDef(commands).handler('', ctx);
-      assert.equal(picked[0][1][3], 'Performance', 'the category keeps its place in the fallback menu');
-      assert.deepEqual(picked[1][1], [
-        'Height index + eviction · OFF',
-        'Recent tool output expansion · OFF',
-        'Incremental search corpus · OFF',
-      ], 'every fallback row carries its own state');
-      assert.deepEqual(readPerfSettings(env), { expandRecentToolOutput: true }, 'the fallback writes the single key');
-      assert.deepEqual(notes, [[
-        'Recent tool output expansion enabled. Reloading now to apply the change.',
-        'info',
-      ]]);
+      assert.deepEqual(picked[0][1], CATEGORY_TITLES, 'the reset is reached as its own category');
+      assert.deepEqual(
+        notes,
+        [['Nothing to reset: sidebar, moshi, worktree, odd and issues already match their defaults.', 'info']],
+        'the all-default run names the three options and no performance switch',
+      );
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S11/T9: the customize panel paints through the ONE shared palette
+// (lib/tui-paint.js) with the injected theme, exactly like the warp panel, the
+// create flow, odd and issues — a shortcut KEY (a BUTTON) is accent+bold and its
+// description muted, a TITLE (the panel title, a section heading) takes the
+// Agents view's own title role, a static label is dim, a choice is ordinary
+// text, a position count is muted and the frame plus its divider are the border
+// role. S13/S16: the panel keeps three levels apart — secondary titles, primary
+// buttons and normal rows — so it does not paint every row in the accent. Focus
+// stays visible through its own marks (▸/→) and the selected row's own band, the
+// legend still owns ONE row at every width, and a hostile theme still renders
+// every row in plain text.
+describe('S11: the shared palette', { concurrency: false }, () => {
+  const ROLE_SGR = { accent: 96, customMessageLabel: 33, muted: 90, dim: 2, border: 34, error: 91, text: 39, mdHeading: 35 };
+
+  function stripAnsi(line) {
+    return String(line).replace(/\x1b\[[0-9;]*m/g, '').replace(/\x1b\]8;;.*?\x07/g, '');
+  }
+
+  // The real host measures a PAINTED line by its visible columns, so the
+  // palette assertions below install an ANSI-aware helper instead of the
+  // plain codepoint counter the untouched stubs use.
+  const ansiStubTui = {
+    ...stubTui,
+    visibleWidth: (text) => [...stripAnsi(String(text))].length,
+    truncateToWidth: (text, width) => {
+      const chars = [...stripAnsi(String(text))];
+      return chars.length > width ? chars.slice(0, width).join('') : String(text);
+    },
+  };
+
+  // A theme that RECORDS which role painted each string and paints every role
+  // with its own SGR code, so a rendered line can be read for the ROLE behind a
+  // token instead of trusting an eyeballed colour.
+  function recordingTheme() {
+    const calls = [];
+    const code = (role) => ROLE_SGR[role] ?? 95;
+    return {
+      calls,
+      fg(role, text) {
+        const value = String(text);
+        calls.push({ role, text: value });
+        return `\x1b[${code(role)}m${value}\x1b[0m`;
+      },
+      bold(text) {
+        const value = String(text);
+        calls.push({ role: 'bold', text: value });
+        return `\x1b[1m${value}\x1b[22m`;
+      },
+      bg(role, text) {
+        calls.push({ role: `bg:${role}`, text: String(text) });
+        return String(text);
+      },
+    };
+  }
+
+  function findRaw(lines, needle) {
+    const line = lines.find((entry) => stripAnsi(entry).includes(needle));
+    assert.ok(line !== undefined, `no line contains ${JSON.stringify(needle)}\n${lines.map(stripAnsi).join('\n')}`);
+    return line;
+  }
+
+  async function openThemedPanel(theme) {
+    const modeEnv = scratchStateEnv();
+    setEnv({ GENTLE_WORKTREE_LIB_DIR: LIB_DIR, ...modeEnv });
+    const { slot } = stubSlot({ sidebarRead: 'gentle', moshiRead: 'off' });
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => ansiStubTui);
+      const { ctx, customs } = makeCtx({ customImpl: async () => {} });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(customs.length, 1, 'expected exactly one custom() call');
+      const opened = openComponent(customs[0][0], makeHostTui());
+      const component = customs[0][0](makeHostTui().tui, theme, {}, () => {});
+      assert.equal(opened.done(), 'pending');
+      return { component, cleanup: () => { setSlot(hadSlot); restoreEnv(); } };
+    } catch (err) {
+      setSlot(hadSlot);
+      restoreEnv();
+      throw err;
+    }
+  }
+
+  test('the footer paints every key accent+bold and its description muted', async () => {
+    const theme = recordingTheme();
+    const { component, cleanup } = await openThemedPanel(theme);
+    try {
+      const legend = findRaw(component.render(80), 'Esc close');
+      assert.match(legend, /\x1b\[1m\x1b\[96m←\/→\x1b\[0m\x1b\[22m\x1b\[90m or Tab panes\x1b\[0m/,
+        'the pane key is accent+bold and its description muted');
+      assert.match(legend, /\x1b\[1m\x1b\[96m↑\/↓\x1b\[0m\x1b\[22m\x1b\[90m or j\/k move\x1b\[0m/,
+        'so is the movement key');
+      assert.match(legend, /\x1b\[1m\x1b\[96mEnter\x1b\[0m\x1b\[22m\x1b\[90m apply\x1b\[0m/,
+        'and the apply key');
+      assert.match(legend, /\x1b\[1m\x1b\[96mEsc\x1b\[0m\x1b\[22m\x1b\[90m close\x1b\[0m/,
+        'and the close key');
+      assert.match(legend, /\x1b\[34m · \x1b\[0m/, 'the entries are joined by the border role');
+      assert.ok(theme.calls.some((call) => call.role === 'bold' && call.text.includes('Enter')),
+        'the key is bolded through the theme, never by a literal escape');
+      assert.ok(theme.calls.some((call) => call.role === 'muted' && call.text === ' apply'),
+        'the description asks the injected theme for the muted role');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('the title is the reference dim title role, the label dim, the choice ordinary text and the count muted', async () => {
+    const theme = recordingTheme();
+    const { component, cleanup } = await openThemedPanel(theme);
+    try {
+      const lines = component.render(80);
+      const top = findRaw(lines, 'Customize · Herdr Gentle Shell');
+      assert.match(top, /\x1b\[1m\x1b\[33mCustomize · Herdr Gentle Shell\x1b\[0m\x1b\[22m/,
+        'the panel title is the Agents view title role, bold');
+      assert.ok(theme.calls.some((call) => call.role === 'customMessageLabel' && call.text === 'Customize · Herdr Gentle Shell'),
+        'the title asks the injected theme for the title role');
+      assert.ok(!theme.calls.some((call) => call.role === 'accent' && call.text === 'Customize · Herdr Gentle Shell'),
+        'the title never takes the button accent');
+      assert.match(top, /\x1b\[1m\x1b\[96mesc\x1b\[0m\x1b\[22m/, 'the esc hint on that row is a button key');
+      const heading = findRaw(lines, 'CATEGORIES');
+      assert.match(heading, /\x1b\[2mCATEGORIES\x1b\[0m/, 'the section label is dim');
+      assert.match(heading, /\x1b\[1m\x1b\[33mHerdr Sidebar\x1b\[0m\x1b\[22m/, 'the section heading is a title');
+      assert.match(heading, /\x1b\[90m1\/2\x1b\[0m/, 'the position count is muted');
+      const row = findRaw(lines, 'Gentle (this extension)');
+      assert.match(row, /\x1b\[39m {2}→ Gentle \(this extension\)\x1b\[0m/, 'a choice is ordinary text');
+      assert.ok(!/\x1b\[96m/.test(row), 'an unselected choice is never painted with the button accent');
+      const preview = findRaw(lines, 'Preview · Gentle');
+      assert.match(preview, /\x1b\[2mPreview\x1b\[0m\x1b\[2m · \x1b\[0m\x1b\[39mGentle \(this extension\)\x1b\[0m/,
+        'the preview label is dim and the focused label it names is ordinary text');
+      const detail = findRaw(lines, 'publishes agent state and SessionChanges');
+      assert.match(detail, /\x1b\[90mpublishes agent state and SessionChanges from Gentle\x1b\[0m/,
+        'the description under the preview is muted');
+      assert.match(lines[0], /^\x1b\[34m╭/, 'the frame is painted with the border role');
+      assert.match(findRaw(lines, 'Herdr Sidebar'), /\x1b\[34m│\x1b\[0m/, 'the pane divider is the border role');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('focus markers survive the palette', async () => {
+    // A theme that paints no background has to keep focus readable through the
+    // ▸ mark, and a theme that does paint one shows the selected band instead.
+    const markerTheme = {
+      fg: (role, text) => `\x1b[${ROLE_SGR[role] ?? 95}m${String(text)}\x1b[0m`,
+      bold: (text) => `\x1b[1m${String(text)}\x1b[22m`,
+    };
+    const bandTheme = recordingTheme();
+    const markers = await openThemedPanel(markerTheme);
+    try {
+      const bands = await openThemedPanel(bandTheme);
+      try {
+        const focusedCategory = findRaw(markers.component.render(80), '▸ Herdr Sidebar');
+        assert.match(focusedCategory, /\x1b\[96m▸ /, 'the focused category keeps its accent ▸ mark');
+        markers.component.handleInput('right');
+        const text = markers.component.render(80).map(stripAnsi).join('\n');
+        assert.ok(text.includes('▸ → Gentle (this extension)'), 'the focused value keeps both ▸ and its → active mark');
+        bandTheme.calls.length = 0;
+        const banded = bands.component.render(80);
+        assert.ok(banded.length > 0, 'the background theme renders the same rows');
+        const bandCalls = bandTheme.calls.filter((call) => call.role === 'bg:selectedBg');
+        assert.ok(bandCalls.length > 0, 'a background theme paints the focused row as a band');
+        assert.ok(bandCalls.some((call) => call.text.includes('Herdr Sidebar')), 'the band carries the focused category');
+      } finally {
+        bands.cleanup();
+      }
+    } finally {
+      markers.cleanup();
+    }
+  });
+
+  test('the painted legend still owns exactly one row at every width', async () => {
+    const theme = recordingTheme();
+    const { component, cleanup } = await openThemedPanel(theme);
+    try {
+      for (const width of [40, 60, 80, 120]) {
+        const lines = component.render(width);
+        for (const line of lines) {
+          assert.equal([...stripAnsi(line)].length, width, `width ${width}: every row stays cell-exact`);
+        }
+        const legend = lines.filter((line) => /Esc close|esc close/.test(stripAnsi(line)));
+        assert.equal(legend.length, 1, `width ${width}: exactly one footer row, got ${legend.length}`);
+        assert.ok(!stripAnsi(legend[0]).includes('…'), `width ${width}: compacted, never ellipsis-clipped`);
+        assert.match(stripAnsi(legend[0]), /close/, `width ${width}: the close key survives`);
+        assert.match(legend[0], /\x1b\[1m\x1b\[96mEsc\x1b\[0m/, `width ${width}: the surviving close key keeps the key role`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('a hostile theme never breaks the panel and keeps every key readable', async () => {
+    const hostile = {
+      fg() { throw new Error('no colour support'); },
+      bold() { throw new Error('no bold support'); },
+      bg() { throw new Error('no background support'); },
+    };
+    const { component, cleanup } = await openThemedPanel(hostile);
+    try {
+      const lines = component.render(80);
+      for (const line of lines) {
+        assert.equal([...stripAnsi(line)].length, 80, `line is not 80 wide: ${JSON.stringify(line)}`);
+      }
+      const text = lines.map(stripAnsi).join('\n');
+      assert.ok(text.includes('Customize · Herdr Gentle Shell'), 'the title still renders');
+      assert.ok(text.includes('←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close'),
+        'the legend still spells every key');
+      assert.ok(text.includes('Preview · Gentle (this extension)'), 'the preview still renders');
+      assert.ok(text.includes('▸ Herdr Sidebar'), 'focus still renders through its mark');
+      for (const line of lines) assert.ok(!line.includes('\x1b'), 'a hostile theme adds no escapes');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plugin tools: split state and concurrent flips (extension side).
+//
+// The stored pair of toggles can exist in TWO directories — the Herdr-injected
+// state dir and the stored pre-rename dir. These tests pin the user-visible
+// contract of the fix in lib/worktree-mode.js:
+//  * a flip writes the copy that exists, never a second one beside it (the old
+//    behavior created a second, ENABLED copy that shadowed a stored Disabled
+//    toggle — fail open);
+//  * two copies that disagree refuse the flip with an actionable diagnostic
+//    and write neither file;
+//  * `customize status` never reports a Disabled toggle without the reason.
+// ---------------------------------------------------------------------------
+const STORED_SEGMENT = path.join('herdr', 'plugins', 'herdr-gentle-agents');
+
+// A sandbox where the Herdr-injected dir and the stored dir are genuinely
+// different, so both locations of the toggle file are reachable.
+function splitStateEnv() {
+  const root = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-split-')));
+  const xdg = path.join(root, 'xdg');
+  const stored = path.join(xdg, STORED_SEGMENT);
+  const injected = path.join(root, 'injected-shell');
+  fs.mkdirSync(stored, { recursive: true });
+  fs.mkdirSync(injected, { recursive: true });
+  return {
+    root,
+    stored,
+    injected,
+    env: {
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      GENTLE_STATUS_STATE_DIR: undefined,
+      XDG_STATE_HOME: xdg,
+      HERDR_PLUGIN_STATE_DIR: injected,
+      GENTLE_PI_AGENT_HOME: undefined,
+      PI_CODING_AGENT_DIR: track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-split-agent-'))),
+    },
+  };
+}
+
+function toolsBody(odd, issues) {
+  return `{"version":1,"odd":${odd},"issues":${issues}}\n`;
+}
+
+function seedTools(dir, odd, issues) {
+  fs.writeFileSync(path.join(dir, 'gentle-plugin-tools.json'), toolsBody(odd, issues));
+}
+
+function toolsBytesOf(dir) {
+  try {
+    return fs.readFileSync(path.join(dir, 'gentle-plugin-tools.json'), 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+describe('plugin tools split state (extension)', { concurrency: false }, () => {
+  test('a flip writes the existing stored copy and never a second one', async () => {
+    const fixture = splitStateEnv();
+    setEnv(fixture.env);
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      seedTools(fixture.stored, false, true);
+      fs.writeFileSync(path.join(fixture.injected, 'gentle-status.pid'), '424242\n');
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx, notes, seq } = makeCtx({
+        // Plugin tools values pane: worktree, then ODD.
+        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'down', 'enter'])).result,
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(true, true), 'the existing copy was updated in place');
+      assert.equal(toolsBytesOf(fixture.injected), null, 'no shadow copy was created in the injected dir');
+      assert.equal(notes.length, 1, 'exactly one notification');
+      assert.equal(notes[0][0], 'ODD command enabled. Reloading now to apply the change.');
+      assert.deepEqual(seq, [`notify:${notes[0][0]}`, 'reload']);
     } finally {
       setSlot(hadSlot);
       restoreEnv();
     }
   });
 
-  test('a host setting description never reaches the UI', async () => {
-    const lib = perfLib();
-    const filler = 'Filler sentence that only exists to overflow the footer area. '.repeat(3);
-    lib.setDescriptions({ heightIndex: `Pi benchmark 3.36 -> 1.84 ms. ${filler}APPENDIX-TAIL.` });
+  test('a flip updates both copies when they already agree, and says so', async () => {
+    const fixture = splitStateEnv();
+    setEnv(fixture.env);
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
     try {
-      const env = scratchStateEnv();
-      const { component } = await runPanel({ env, inputs: TO_PERF });
-      const footer = flatCard(component);
-      assert.ok(!footer.includes('APPENDIX-TAIL'), 'the host description is ignored');
-      assert.ok(!/3\.36|\bms\b/.test(footer), 'no host benchmark text reaches the UI');
-      assert.ok(footer.includes('Caches row heights and unloads far rows'), 'the concise pinned copy renders');
+      seedTools(fixture.stored, true, true);
+      seedTools(fixture.injected, true, true);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx, notes } = makeCtx({
+        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'down', 'enter'])).result,
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(false, true));
+      assert.equal(toolsBytesOf(fixture.injected), toolsBody(false, true), 'the pair stays identical');
+      assert.match(notes[0][0], /^ODD command disabled\./);
+      assert.ok(notes[0][0].includes('stored in 2 places'), `the notification names both copies: ${notes[0][0]}`);
+      assert.ok(notes[0][0].includes(path.join(fixture.stored, 'gentle-plugin-tools.json')), 'it names the stored copy');
+      assert.ok(notes[0][0].includes(path.join(fixture.injected, 'gentle-plugin-tools.json')), 'it names the injected copy');
     } finally {
-      lib.setDescriptions({});
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('a conflicting pair refuses the flip with a diagnostic and writes nothing', async () => {
+    const fixture = splitStateEnv();
+    setEnv(fixture.env);
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      seedTools(fixture.stored, false, true);
+      seedTools(fixture.injected, true, true);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => stubTui);
+      const host = makeHostTui();
+      const { ctx, notes, seq } = makeCtx({
+        customImpl: async (factory) => (await driveContract(factory, host, ['down', 'down', 'right', 'down', 'enter'])).result,
+      });
+      await customizeDef(commands).handler('', ctx);
+      assert.equal(notes.length, 1, 'exactly one notification');
+      assert.equal(notes[0][1], 'error', 'the refusal is an error, never a success message');
+      assert.match(notes[0][0], /could not write/i);
+      assert.match(notes[0][0], /different values/i, 'the diagnostic says what is wrong');
+      assert.ok(notes[0][0].includes(path.join(fixture.stored, 'gentle-plugin-tools.json')), 'it names the stored copy');
+      assert.ok(notes[0][0].includes(path.join(fixture.injected, 'gentle-plugin-tools.json')), 'it names the injected copy');
+      assert.match(notes[0][0], /nothing was changed/i);
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(false, true), 'the stored copy is byte-identical');
+      assert.equal(toolsBytesOf(fixture.injected), toolsBody(true, true), 'the injected copy is byte-identical');
+      assert.ok(!seq.includes('reload'), 'a refused flip never reloads');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('customize status names the conflict instead of reporting a bare Disabled', async () => {
+    const fixture = splitStateEnv();
+    setEnv(fixture.env);
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      seedTools(fixture.stored, false, true);
+      seedTools(fixture.injected, true, true);
+      const { commands } = await loadExtension();
+      const { ctx, notes } = makeCtx({});
+      await customizeDef(commands).handler('status', ctx);
+      assert.equal(notes.length, 1);
+      assert.match(notes[0][0], /^customize status: .*odd=disabled/);
+      assert.match(notes[0][0], /different values/i, 'the line carries the reason');
+      assert.ok(notes[0][0].includes(path.join(fixture.stored, 'gentle-plugin-tools.json')));
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(false, true), 'status writes nothing');
+      assert.equal(toolsBytesOf(fixture.injected), toolsBody(true, true), 'status writes nothing');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plugin tools: a flip writes EVERY copy of the toggle document, so it can stop
+// half-way, and it OVERWRITES a copy that does not parse. Both are real states
+// the panel has to report truthfully:
+//  * a copy that already holds the new value makes "nothing was changed" a lie,
+//    so a half-applied flip names what landed, what was left untouched and that
+//    the pair now disagrees (which reads as Disabled);
+//  * a repaired copy discarded whatever the user had in it, so its path is
+//    named instead of the overwrite staying silent.
+// ---------------------------------------------------------------------------
+
+// A lib dir whose `worktree-mode.js` re-exports the real module but replaces
+// ONE writer, so a half-applied flip can be provoked deterministically. The
+// failure cannot be injected with permissions: both copies are written from one
+// writable sandbox under one set of locks, so the OS never fails the second
+// write. The substitute therefore lands the canonical copy through the REAL
+// writer (with the injected duplicate hidden), restores that duplicate
+// untouched — exactly the on-disk state a failed second write leaves — and
+// raises the library's documented `plugin_tools_write_partial` error with its
+// `failed`/`written` fields. What is under test is the extension's report.
+function partialWriteLibDir() {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-partial-lib-')));
+  for (const entry of fs.readdirSync(LIB_DIR)) {
+    if (entry === 'worktree-mode.js') continue;
+    fs.symlinkSync(path.join(LIB_DIR, entry), path.join(dir, entry));
+  }
+  const shim = [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    `const real = require(${JSON.stringify(path.join(LIB_DIR, 'worktree-mode.js'))});`,
+    "async function halfWrite(patch, options) {",
+    "  const env = (options && options.env) || process.env;",
+    "  const legacy = real.pluginToolsFiles(env).slice(1);",
+    "  const saved = legacy.map((file) => ({ file, raw: fs.existsSync(file) ? fs.readFileSync(file) : null }));",
+    "  for (const entry of saved) fs.rmSync(entry.file, { force: true });",
+    "  try {",
+    "    await real.updatePluginTools(patch, options);",
+    "  } finally {",
+    "    for (const entry of saved) if (entry.raw) fs.writeFileSync(entry.file, entry.raw);",
+    "  }",
+    "  return saved.map((entry) => entry.file);",
+    "}",
+    "module.exports = {",
+    "  ...real,",
+    "  async updatePluginTools(patch, options) {",
+    "    const untouched = await halfWrite(patch, options);",
+    "    const env = (options && options.env) || process.env;",
+    "    const failed = untouched[0] || null;",
+    "    const err = new Error(`could not write the plugin tools state ${failed}: EACCES: permission denied`);",
+    "    err.code = 'plugin_tools_write_partial';",
+    "    err.failed = failed;",
+    "    err.written = [real.pluginToolsPath(env)];",
+    "    throw err;",
+    "  },",
+    "};",
+  ].join('\n');
+  fs.writeFileSync(path.join(dir, 'worktree-mode.js'), shim);
+  return dir;
+}
+
+describe('plugin tools half-applied flip and repair (extension)', { concurrency: false }, () => {
+  test('a half-applied flip names the copy that already changed, never "nothing was changed"', async () => {
+    const fixture = splitStateEnv();
+    setEnv({ ...fixture.env, GENTLE_WORKTREE_LIB_DIR: partialWriteLibDir() });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      seedTools(fixture.stored, true, true);
+      seedTools(fixture.injected, true, true);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => { throw new Error('no TUI here'); });
+      const answers = ['Plugin tools', 'ODD command · Enabled'];
+      const { ctx, notes, seq } = makeCtx({ selectImpl: () => answers.shift() });
+      await customizeDef(commands).handler('', ctx);
+
+      const storedFile = path.join(fixture.stored, 'gentle-plugin-tools.json');
+      const injectedFile = path.join(fixture.injected, 'gentle-plugin-tools.json');
+      assert.equal(notes.length, 1, 'exactly one notification');
+      const [text, level] = notes[0];
+      assert.equal(level, 'error', 'a half-applied flip is an error, never a success');
+      assert.match(text, /half applied/i, 'the verdict says the flip only half landed');
+      assert.ok(!/nothing was changed/i.test(text), `a copy DID change, so that sentence is false: ${text}`);
+      assert.ok(text.includes(storedFile), 'the copy that already holds the new value is named');
+      assert.ok(text.includes(injectedFile), 'the copy left untouched is named');
+      assert.match(text, /disable/i, 'it says the toggle now reads Disabled');
+      // The message describes the state that is really on disk.
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(false, true), 'the first copy holds the new value');
+      assert.equal(toolsBytesOf(fixture.injected), toolsBody(true, true), 'the second copy was left untouched');
+      assert.ok(!seq.includes('reload'), 'a half-applied flip never reloads');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('a flip that repairs an unreadable duplicate names the path it overwrote', async () => {
+    const fixture = splitStateEnv();
+    setEnv(fixture.env);
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      seedTools(fixture.stored, true, true);
+      const injectedFile = path.join(fixture.injected, 'gentle-plugin-tools.json');
+      fs.writeFileSync(injectedFile, '{"version":1,"odd":true}\n');
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => { throw new Error('no TUI here'); });
+      const answers = ['Plugin tools', 'ODD command · Enabled'];
+      const { ctx, notes } = makeCtx({ selectImpl: () => answers.shift() });
+      await customizeDef(commands).handler('', ctx);
+
+      const text = notes[0][0];
+      assert.match(text, /^ODD command disabled\./, 'the flip itself succeeded');
+      assert.ok(text.includes(injectedFile), `the repaired copy is named explicitly: ${text}`);
+      assert.match(text, /did not parse/i, 'it says why the copy was rewritten');
+      assert.match(text, /discarded/i, 'it says what repairing it cost');
+      assert.equal(toolsBytesOf(fixture.injected), toolsBody(false, true), 'the repaired copy now agrees');
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(false, true));
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
+    }
+  });
+
+  test('a reset whose plugin tools write half landed is not reported as a clean no-op', async () => {
+    const fixture = splitStateEnv();
+    setEnv({ ...fixture.env, GENTLE_WORKTREE_LIB_DIR: partialWriteLibDir() });
+    const { slot } = stubSlot();
+    const hadSlot = setSlot(slot);
+    try {
+      modeLib().writeMode(true, process.env);
+      seedTools(fixture.stored, false, false);
+      seedTools(fixture.injected, false, false);
+      const { commands, mod } = await loadExtension();
+      installTuiLoader(mod, async () => { throw new Error('no TUI here'); });
+      const answers = ['Reset', 'Reset every option to its default'];
+      const { ctx, notes } = makeCtx({ selectImpl: () => answers.shift() });
+      await customizeDef(commands).handler('', ctx);
+
+      const text = notes[0][0];
+      assert.match(text, /^Partial reset: /);
+      assert.ok(!/Nothing was changed\./i.test(text), `a copy DID change, so that sentence is false: ${text}`);
+      assert.match(text, /half applied/i, 'the summary names the half-applied write');
+      assert.ok(text.includes(path.join(fixture.stored, 'gentle-plugin-tools.json')), 'the copy that changed is named');
+      assert.ok(text.includes(path.join(fixture.injected, 'gentle-plugin-tools.json')), 'the copy left untouched is named');
+      assert.equal(toolsBytesOf(fixture.stored), toolsBody(true, true), 'the first copy holds the new value');
+      assert.equal(toolsBytesOf(fixture.injected), toolsBody(false, false), 'the second copy was left untouched');
+    } finally {
+      setSlot(hadSlot);
+      restoreEnv();
     }
   });
 });

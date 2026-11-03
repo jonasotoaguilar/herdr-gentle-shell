@@ -71,7 +71,14 @@ function makeRepo(tag) {
   git(dir, ['config', 'user.email', 'test@example.com']);
   git(dir, ['config', 'user.name', 'Test']);
   git(dir, ['commit', '--allow-empty', '-m', 'init']);
-  return fs.realpathSync(dir);
+  // S2: a new worktree is born from LOCAL main, so the fixture needs it.
+  git(dir, ['branch', 'main', 'HEAD']);
+  const real = fs.realpathSync(dir);
+  // The tool builds its checkouts beside the fixture root
+  // (`<root>-worktrees/<slug>`), so that sibling directory is tracked too:
+  // otherwise every created worktree outlives the suite in the temp root.
+  track(path.join(path.dirname(real), `${path.basename(real)}-worktrees`));
+  return real;
 }
 
 function setEnv(vars) {
@@ -106,19 +113,20 @@ async function loadExtension() {
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
   const tools = new Map();
+  const commands = new Map();
   const handlers = new Map();
   const pi = {
     registerTool: (tool) => { tools.set(tool.name, tool); },
-    registerCommand: () => {},
+    registerCommand: (name, def) => { commands.set(name, def); },
     on: (event, handler) => {
       if (!handlers.has(event)) handlers.set(event, []);
       handlers.get(event).push(handler);
       return () => {};
     },
   };
-  const factory = (await import(pathToFileURL(copy).href)).default;
-  factory(pi);
-  return { tools, handlers };
+  const mod = await import(pathToFileURL(copy).href);
+  mod.default(pi);
+  return { tools, commands, handlers, mod };
 }
 
 function makeCtx(cwd, thread = 'thread-1') {
@@ -134,7 +142,7 @@ function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
 }
 
-function addRegistered(root, branch, { thread = 'thread-1', issues = [], odd = [] } = {}) {
+function addRegistered(root, branch, { thread = 'thread-1', issues = [], odd = null } = {}) {
   const slug = branch.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree';
   const target = path.join(path.dirname(root), `${path.basename(root)}-ou-${slug}`);
   try { fs.rmSync(target, { recursive: true, force: true }); } catch {}
@@ -158,12 +166,15 @@ function addUnregistered(root, branch) {
   return fs.realpathSync(target);
 }
 
-describe('T18/S25: list carries the auto-detected odd document', { concurrency: false }, () => {
-  test('a worktree with odd/*.md lists it in text and details with the path', async () => {
+describe('S1: list publishes no ODD association and no document inventory', { concurrency: false }, () => {
+  test('available documents stay unread: neither text nor details carries an association', async () => {
     const root = makeRepo('list-odd');
     setEnv(stdEnv());
     try {
-      const target = addRegistered(root, 'feat/odd-list');
+      // The registry row keeps its legacy association; the checkout also holds
+      // a document of its own. S1 removed the association from every worktree
+      // surface, so the listing publishes neither and scans nothing.
+      const target = addRegistered(root, 'feat/odd-list', { odd: 'odd/tasks/stored.md' });
       fs.mkdirSync(path.join(target, 'odd'), { recursive: true });
       fs.writeFileSync(path.join(target, 'odd', 'notes.md'), '# notes\n');
       const { tools } = await loadExtension();
@@ -173,63 +184,64 @@ describe('T18/S25: list carries the auto-detected odd document', { concurrency: 
       const row = result.details.worktrees.find((item) => item.branch === 'feat/odd-list');
       assert.ok(row, 'row present in details');
       assert.ok(path.isAbsolute(row.path), 'details keeps the absolute checkout path');
-      assert.ok(Array.isArray(row.odd) && row.odd.length > 0, `row carries odd docs: ${JSON.stringify(row)}`);
-      assert.ok(row.odd.some((o) => String(o).includes('notes.md')), `odd names notes.md: ${JSON.stringify(row.odd)}`);
+      for (const key of ['odd', 'assignedOdd', 'issues', 'droppedOdd']) {
+        assert.equal(Object.hasOwn(row, key), false, `details publish no ${key}: ${JSON.stringify(row)}`);
+      }
       const line = text.split('\n').find((l) => l.includes('feat/odd-list'));
-      assert.ok(line && line.includes('notes.md'), `agent text carries the odd doc: ${text}`);
+      // S6: the row is the identity plus an informative state — this checkout is
+      // registered and live, so neither `agent` nor `live` earns a cell.
+      assert.equal(line, `feat-odd-list · feat/odd-list · ${target}`);
+      assert.doesNotMatch(text, /notes\.md|stored\.md/, 'neither the inventory nor the association document reaches the text');
+      assert.doesNotMatch(text, /issues=|odd=|assignedOdd|available odd/i, `no association cell or key: ${text}`);
+      // Legacy data preservation: the stored association is untouched.
+      const registryLib = require('../lib/worktree-registry.js');
+      assert.equal(registryLib.findByBranch(root, 'feat/odd-list').odd, 'odd/tasks/stored.md');
     } finally {
       restoreEnv();
     }
   });
 });
 
-describe('T19/S26: create accepts an optional validated odd path', { concurrency: false }, () => {
-  test('a supplied odd file is stored with the registration', async () => {
+describe('S1/S6: a create never takes an odd document', { concurrency: false }, () => {
+  test('a supplied odd path — one document, a list, or a missing file — is ignored', async () => {
     const root = makeRepo('create-odd');
     setEnv(stdEnv());
     try {
       const doc = path.join(root, 'odd-doc.md');
       fs.writeFileSync(doc, '# doc\n');
-      const { tools } = await loadExtension();
-      const result = await tools.get('worktree_upsert').execute(
-        'c1', { branch: 'feat/with-odd', odd: doc }, undefined, undefined, makeCtx(root, 'thread-odd-1'),
-      );
-      const text = resultText(result);
-      assert.equal(result.isError, undefined, `expected success, got: ${text}`);
-      const entry = require('../lib/worktree-registry.js').findByBranch(root, 'feat/with-odd');
-      assert.ok(entry, 'registered');
-      assert.ok(Array.isArray(entry.odd) && entry.odd.length > 0, `odd stored: ${JSON.stringify(entry)}`);
-      assert.ok(path.isAbsolute(result.details.path), 'create output keeps the checkout path');
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('a missing odd file fails closed with no checkout and no row', async () => {
-    const root = makeRepo('create-odd-bad');
-    setEnv(stdEnv());
-    try {
+      const second = path.join(root, 'second-odd.md');
+      fs.writeFileSync(second, '# second\n');
       const missing = path.join(root, 'no-such-odd.md');
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_upsert').execute(
-        'c1', { branch: 'feat/bad-odd', odd: missing }, undefined, undefined, makeCtx(root, 'thread-odd-2'),
-      );
-      assert.equal(result.isError, true, 'missing odd is refused');
-      assert.match(resultText(result), /odd/i, 'the refusal names odd');
-      assert.equal(require('../lib/worktree-registry.js').findByBranch(root, 'feat/bad-odd'), null, 'no row written');
+      const registryLib = require('../lib/worktree-registry.js');
+      // One document, a list of them and a path that does not exist all take
+      // the same route: the tool reads the branch and nothing else.
+      for (const [branch, odd] of [
+        ['feat/with-odd', doc],
+        ['feat/list-odd', [doc, second]],
+        ['feat/bad-odd', missing],
+      ]) {
+        const result = await tools.get('worktree_create').execute(
+          'c1', { branch, odd, changes: 'none' }, undefined, undefined, makeCtx(root, `thread-${branch}`),
+        );
+        const text = resultText(result);
+        assert.equal(result.isError, undefined, `${branch}: an odd field must not refuse a create: ${text}`);
+        assert.equal('odd' in result.details, false, `${branch}: no odd field travels`);
+        const entry = registryLib.findByBranch(root, branch);
+        assert.ok(entry, `${branch}: registered`);
+        assert.equal(entry.odd, null, `${branch}: no document is stored`);
+      }
     } finally {
       restoreEnv();
     }
   });
 });
 
-describe('T19/S27+S31: create updates an existing worktree instead of duplicating', { concurrency: false }, () => {
-  test('supplied issues/odd overwrite; omitted fields stay untouched', async () => {
+describe('S1: a create never updates an existing worktree', { concurrency: false }, () => {
+  test('another thread asking for a live branch is refused and the stored row is untouched', async () => {
     const root = makeRepo('create-update');
     setEnv(stdEnv());
     try {
-      // The existing checkout lives at the agreed sibling layout, exactly
-      // as a real create would have placed it.
       const branch = 'feat/upd';
       const slug = 'feat-upd';
       const target = path.join(path.dirname(root), `${path.basename(root)}-worktrees`, slug);
@@ -238,31 +250,20 @@ describe('T19/S27+S31: create updates an existing worktree instead of duplicatin
       const realTarget = fs.realpathSync(target);
       const registryLib = require('../lib/worktree-registry.js');
       assert.equal(registryLib.upsertWorktree(root, {
-        branch, path: realTarget, thread: 'thread-upd', issues: [1], odd: [],
+        branch, path: realTarget, thread: 'thread-upd', issues: [1], odd: null,
       }).ok, true);
+      const before = registryLib.findByBranch(root, branch);
       const doc = path.join(root, 'upd-odd.md');
       fs.writeFileSync(doc, '# u\n');
       const { tools } = await loadExtension();
-      // Omit issues, supply odd: issues stay, odd is set.
-      const first = await tools.get('worktree_upsert').execute(
-        'c1', { branch, odd: doc }, undefined, undefined, makeCtx(root, 'thread-other'),
+      // An association field and a foreign thread change nothing: there is no
+      // update path, so this is the historical refusal.
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch, odd: doc, issues: [2], changes: 'none' }, undefined, undefined, makeCtx(root, 'thread-other'),
       );
-      assert.equal(first.isError, undefined, `update succeeds, got: ${resultText(first)}`);
-      assert.equal(first.details.created, false, 'an update never reports created:true');
-      assert.equal(first.details.updated, true, 'an update reports updated:true');
-      assert.equal(first.details.path, realTarget, 'the checkout path is reported');
-      let entry = registryLib.findByBranch(root, branch);
-      assert.deepEqual(entry.issues, [1], 'omitted issues untouched');
-      assert.ok(entry.odd.length > 0, 'supplied odd stored');
-      assert.equal(entry.path, realTarget, 'the path is never rewritten');
-      // Supply empty issues: removal is the same operation as replacement.
-      const second = await tools.get('worktree_upsert').execute(
-        'c2', { branch, issues: [] }, undefined, undefined, makeCtx(root, 'thread-other'),
-      );
-      assert.equal(second.isError, undefined, `empty update succeeds, got: ${resultText(second)}`);
-      entry = registryLib.findByBranch(root, branch);
-      assert.deepEqual(entry.issues, [], 'empty issues removes');
-      assert.ok(entry.odd.length > 0, 'omitted odd untouched');
+      assert.equal(result.isError, true, `expected the refusal, got: ${resultText(result)}`);
+      assert.match(resultText(result), /already checked out/);
+      assert.deepEqual(registryLib.findByBranch(root, branch), before, 'the stored row is untouched');
     } finally {
       restoreEnv();
     }
@@ -346,44 +347,154 @@ describe('T21/S29+S32: close and session_open resolve name first then path', { c
   });
 });
 
-describe('T22/S30: the odd detector is inactive in the principal checkout', { concurrency: false }, () => {
-  test('events from the principal assign nothing even as worktree odd/ grows', async () => {
+describe('S1: the tool pipeline records no association, from either context', { concurrency: false }, () => {
+  // The pipeline hook used to associate the first `odd/` document a worktree
+  // touched (plus a bounded re-scan of the worktree's `odd/`). S1 removed the
+  // association from every worktree surface, so the hook now only names the
+  // session — which is covered by tools/worktree-odd-capture.test.js. Here the
+  // worktree row must stay association-free no matter how much `odd/` grows.
+  test('events from the principal and from a worktree assign nothing', async () => {
     const root = makeRepo('detector-bound');
     setEnv(stdEnv());
     try {
       const target = addRegistered(root, 'feat/det');
+      const registryLib = require('../lib/worktree-registry.js');
+      const before = fs.readFileSync(registryLib.registryPath(root), 'utf8');
       const { handlers } = await loadExtension();
       const calls = handlers.get('tool_call') || [];
       assert.ok(calls.length > 0, 'a tool_call subscription exists');
-      // A new doc appears in the worktree while the session runs in principal.
+      // A new document appears in the worktree while the session runs.
       fs.mkdirSync(path.join(target, 'odd'), { recursive: true });
       fs.writeFileSync(path.join(target, 'odd', 'later.md'), '# later\n');
-      for (const handler of calls) {
-        const value = await handler(
-          { toolName: 'read', args: { path: path.join(root, 'odd', 'later.md') } },
-          makeCtx(root),
-        );
-        assert.equal(value, undefined, 'the handler never blocks the pipeline');
+      for (const cwd of [root, target]) {
+        for (const handler of calls) {
+          const value = await handler(
+            { toolName: 'read', args: { path: path.join(target, 'odd', 'later.md') } },
+            makeCtx(cwd),
+          );
+          assert.equal(value, undefined, 'the handler never blocks the pipeline');
+        }
       }
-      const entry = require('../lib/worktree-registry.js').findByBranch(root, 'feat/det');
-      assert.deepEqual(entry.odd, [], 'no detection and no assignment from the principal session');
-      // The same event inside the worktree still captures.
-      for (const handler of calls) {
-        await handler(
-          { toolName: 'read', args: { path: path.join(target, 'odd', 'later.md') } },
-          makeCtx(target),
-        );
-      }
-      const after = require('../lib/worktree-registry.js').findByBranch(root, 'feat/det');
-      assert.ok(after.odd.length > 0, 'detection stays active inside agent worktrees');
+      assert.equal(registryLib.findByBranch(root, 'feat/det').odd, null, 'no detection and no assignment, anywhere');
+      assert.equal(
+        fs.readFileSync(registryLib.registryPath(root), 'utf8'),
+        before,
+        'the registry was never written by the pipeline',
+      );
     } finally {
       restoreEnv();
     }
   });
 });
 
-describe('T23/S31: the principal is editable but never created or removed', { concurrency: false }, () => {
-  test('updating the principal branch writes its record without creating a checkout', async () => {
+describe('S1: the ODD and issues viewers hand the view no write path', { concurrency: false }, () => {
+  // Both viewers used to receive a `saveAssignment` callback (guarded by
+  // `assignmentEnabled`) that wrote the checkout's `odd`/`issues` field into
+  // the worktree registry. S1 removed the association, so those callbacks are
+  // gone: the view is given no way to write and the registry stays untouched.
+  const stubTui = {
+    visibleWidth: (text) => [...String(text)].length,
+    truncateToWidth: (text, width) => {
+      const chars = [...String(text)];
+      return chars.length > width ? chars.slice(0, Math.max(0, width - 1)).join('') + '…' : String(text);
+    },
+    matchesKey: (key, name) => key === name,
+    isKeyRelease: () => false,
+  };
+
+  function captureViewModule(moduleName, factoryName) {
+    const lib = require(`../lib/${moduleName}`);
+    const original = lib[factoryName];
+    const holder = { options: null };
+    lib[factoryName] = (options) => {
+      holder.options = options;
+      return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+    };
+    return { holder, restore: () => { lib[factoryName] = original; } };
+  }
+
+  function viewCtx(cwd) {
+    const notes = [];
+    return {
+      notes,
+      ctx: {
+        cwd,
+        hasUI: true,
+        sessionManager: { getSessionId: () => 'thread-1' },
+        ui: {
+          notify: (message, level) => notes.push([message, level]),
+          custom: async (factory) => {
+            factory({ terminal: { rows: 24 }, requestRender: () => {} }, {}, {}, () => {});
+            return null;
+          },
+        },
+      },
+    };
+  }
+
+  test('/herdr-gentle:odd opens its view with no save callback and writes nothing', async () => {
+    const root = makeRepo('viewer-odd');
+    setEnv(stdEnv());
+    try {
+      const target = addRegistered(root, 'feat/viewer-odd', { odd: 'odd/tasks/kept.md' });
+      fs.mkdirSync(path.join(target, 'odd', 'tasks'), { recursive: true });
+      fs.writeFileSync(path.join(target, 'odd', 'tasks', 'readme.md'), '# readme\n');
+      const registryLib = require('../lib/worktree-registry.js');
+      const before = fs.readFileSync(registryLib.registryPath(root), 'utf8');
+      const { commands, mod } = await loadExtension();
+      mod.setOddTuiLoader(async () => stubTui);
+      const capture = captureViewModule('odd-view.js', 'createOddView');
+      try {
+        await commands.get('herdr-gentle:odd').handler('', viewCtx(target).ctx);
+      } finally {
+        capture.restore();
+      }
+      const options = capture.holder.options;
+      assert.ok(options, 'the viewer was opened');
+      assert.equal(Object.hasOwn(options, 'saveAssignment'), false, 'no association write path is handed over');
+      assert.equal(Object.hasOwn(options, 'assignmentEnabled'), false, 'and no write gate either');
+      assert.equal(
+        fs.readFileSync(registryLib.registryPath(root), 'utf8'),
+        before,
+        'the registry is untouched by opening the viewer',
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('/herdr-gentle:issues opens its view with no save callback and writes nothing', async () => {
+    const root = makeRepo('viewer-issues');
+    setEnv(stdEnv());
+    try {
+      const target = addRegistered(root, 'feat/viewer-issues', { issues: [7] });
+      const registryLib = require('../lib/worktree-registry.js');
+      const before = fs.readFileSync(registryLib.registryPath(root), 'utf8');
+      const { commands, mod } = await loadExtension();
+      mod.setIssuesTuiLoader(async () => stubTui);
+      const capture = captureViewModule('issues-view.js', 'createIssuesView');
+      try {
+        await commands.get('herdr-gentle:issues').handler('', viewCtx(target).ctx);
+      } finally {
+        capture.restore();
+      }
+      const options = capture.holder.options;
+      assert.ok(options, 'the viewer was opened');
+      assert.equal(Object.hasOwn(options, 'saveAssignment'), false, 'no association write path is handed over');
+      assert.equal(Object.hasOwn(options, 'assignmentEnabled'), false, 'and no write gate either');
+      assert.equal(
+        fs.readFileSync(registryLib.registryPath(root), 'utf8'),
+        before,
+        'the registry is untouched by opening the viewer',
+      );
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('S1: the principal checkout is never edited by a create', { concurrency: false }, () => {
+  test('the principal branch is refused as already checked out and writes no record', async () => {
     const root = makeRepo('principal-edit');
     setEnv(stdEnv());
     try {
@@ -391,14 +502,18 @@ describe('T23/S31: the principal is editable but never created or removed', { co
       const doc = path.join(root, 'p-odd.md');
       fs.writeFileSync(doc, '# p\n');
       const { tools } = await loadExtension();
-      const result = await tools.get('worktree_upsert').execute(
-        'c1', { branch, odd: doc }, undefined, undefined, makeCtx(root, 'thread-p'),
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch, odd: doc, changes: 'none' }, undefined, undefined, makeCtx(root, 'thread-p'),
       );
-      assert.equal(result.isError, undefined, `principal update succeeds, got: ${resultText(result)}`);
-      assert.equal(result.details.created, false, 'the principal is never created by this tool');
-      const entry = require('../lib/worktree-registry.js').findByBranch(root, branch);
-      assert.ok(entry, 'its registration record is created on demand');
-      assert.equal(fs.realpathSync(entry.path), root, 'the record points at the principal checkout');
+      // The principal is already a live checkout of that branch, so the create
+      // refuses instead of recording anything against it.
+      assert.equal(result.isError, true, `expected the refusal, got: ${resultText(result)}`);
+      assert.match(resultText(result), /already checked out/);
+      assert.equal(
+        require('../lib/worktree-registry.js').findByBranch(root, branch),
+        null,
+        'no record is created for the principal',
+      );
     } finally {
       restoreEnv();
     }
