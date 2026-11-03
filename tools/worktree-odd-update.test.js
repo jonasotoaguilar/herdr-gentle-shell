@@ -465,7 +465,14 @@ describe('S1: the ODD and issues viewers hand the view no write path', { concurr
 
   test('/herdr-gentle:issues opens its view with no save callback and writes nothing', async () => {
     const root = makeRepo('viewer-issues');
-    setEnv(stdEnv());
+    // The command probes `gh api user` before it opens the reader, so the
+    // host's own gh — absent or unauthenticated on CI — must not decide this
+    // assertion. A fake gh on PATH keeps the gate honest and the test hermetic.
+    const bin = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-ou-gh-')));
+    const fakeGh = path.join(bin, 'gh');
+    fs.writeFileSync(fakeGh, '#!/bin/sh\ncase "$1 $2" in\n"api user") echo \'{"login":"ci-fixture"}\'; exit 0;;\n"repo view") echo \'{"nameWithOwner":"ci/fixture"}\'; exit 0;;\nesac\nexit 1\n');
+    fs.chmodSync(fakeGh, 0o755);
+    setEnv({ ...stdEnv(), PATH: `${bin}:${process.env.PATH ?? ''}` });
     try {
       const target = addRegistered(root, 'feat/viewer-issues', { issues: [7] });
       const registryLib = require('../lib/worktree-registry.js');
