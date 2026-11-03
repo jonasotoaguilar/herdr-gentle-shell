@@ -17,15 +17,18 @@
 // worktree is left out (S4c, reconciled in L2) and never when everything
 // fits; the legend is exactly ONE row (S2); S5 rows are the checkout NAMES
 // alone (the branch lives in a data line, never repeated on the row); a data
-// line carries branch, the change size as LINE COUNTS (`changes +A −D`, S16),
+// line carries branch, the change size as LINE COUNTS (S16: bare `+A −D`,
+// because the sign already says what the number is — the label survives only
+// where the counts are unreadable, as `changes unavailable`),
 // `↑N ↓M` and both ages, omits a measured zero for the change size and for
 // each of `↑`/`↓`, and says `unavailable` — never `0` — for a fact it cannot
 // read, while an unreadable AGE is the brief `—` and never the caller's prose
 // reason (S15: the reason stays in the data). S1/S4: a worktree carries no
-// issue or ODD association any more and the panel keeps no edit or delete
-// view, so the line names neither association (a legacy registry value never
-// reaches it), `e` and `ctrl+d` are NOT bindings and no legend advertises
-// them; the facts are read for the current and the
+// issue or ODD association any more and the panel keeps no edit view, so the
+// line names neither association (a legacy registry value never
+// reaches it) and `e` is NOT a binding; `ctrl+d` asks to delete the focused
+// checkout, in both views, and both legends advertise it (the extension owns
+// the confirmation and every refusal); the facts are read for the current and the
 // focused checkout, at most once each, and render() performs no I/O; `c`
 // opens the create flow instead of owning a list row (S6) while `v`,
 // `enter`, `r` and `esc` keep their meanings; `esc` steps back one level from
@@ -111,7 +114,7 @@ const DEFAULT_FACTS = { branch: 'feat/alpha', changes: { added: 2, deleted: 1 },
 const LEGACY_FACTS = { ...DEFAULT_FACTS, issues: [12], assignedOdd: 'odd/tasks/w1-a.md', odd: ['w1-a', 'w2-b'] };
 // The same facts rendered, so an assertion names the behaviour, not the
 // formatter's punctuation.
-const DEFAULT_LINE = 'branch feat/alpha · changes +2 −1 · ↑1 · created 28d ago · modified —';
+const DEFAULT_LINE = 'branch feat/alpha · +2 −1 · ↑1 · created 28d ago · modified —';
 // S15: the two ages are the facts that carry a prose reason when they are
 // unreadable, so a compact preview line names them with a dash instead of
 // repeating that explanation. The reason itself stays in the data.
@@ -213,7 +216,7 @@ describe('bottom panel layout (S3, S4)', () => {
     assert.equal(rows[5], '  feat-alpha');
     assert.equal(rows[6], '  fix-beta');
     assert.equal(rows[7], DEFAULT_LINE, 'the focused worktree\'s data line follows the list');
-    assert.equal(rows[8], '↑↓ move · enter choose · c create · r reload · esc close', 'one legend row, with no `v all` while nothing is hidden and no retired edit key');
+    assert.equal(rows[8], '↑↓ move · enter choose · c create · ctrl+d delete · r reload · esc close', 'one legend row, with no `v all` while nothing is hidden, the delete key, and no retired edit key');
     assert.match(lines[9], /^╰─+╯$/, 'the frame is closed');
     assert.equal(lines.length, 10, 'the frame fills its computed height exactly');
   });
@@ -328,7 +331,7 @@ describe('current worktree data line (S4a)', () => {
 
 describe('focused checkout facts (S4d, S9)', () => {
   const BASE = { branch: 'main', changes: { added: 12, deleted: 3 }, ahead: 1, behind: 2, createdAt: '2026-01-05T00:00:00.000Z', lastActivity: '2026-02-28T00:00:00.000Z' };
-  const FULL = 'branch main · changes +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
+  const FULL = 'branch main · +12 −3 · ↑1 ↓2 · created 1mo ago · modified 1d ago';
 
   test('the focused checkout reports branch, the change-size line counts, ahead/behind and created-at', async () => {
     const { view } = await opened({ facts: () => BASE });
@@ -366,7 +369,7 @@ describe('focused checkout facts (S4d, S9)', () => {
       const { view } = await opened({ facts: () => facts });
       const line = panel(view, WIDE).focusData;
       assert.ok(line.includes(expected), `${field} renders "${expected}": ${line}`);
-      assert.ok(!/↑0|↓0|changes \+0/.test(line), `a missing number is never 0: ${line}`);
+      assert.ok(!/↑0|↓0|\+0 −0/.test(line), `a missing number is never 0: ${line}`);
     }
   });
 
@@ -377,16 +380,35 @@ describe('focused checkout facts (S4d, S9)', () => {
 
   test('a one-sided ahead shows only ↑N, and a one-sided behind only ↓M', async () => {
     const aheadOnly = await opened({ facts: () => ({ ...BASE, behind: 0 }) });
-    assert.equal(panel(aheadOnly.view, WIDE).focusData, 'branch main · changes +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(aheadOnly.view, WIDE).focusData, 'branch main · +12 −3 · ↑1 · created 1mo ago · modified 1d ago');
     const behindOnly = await opened({ facts: () => ({ ...BASE, ahead: 0 }) });
-    assert.equal(panel(behindOnly.view, WIDE).focusData, 'branch main · changes +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
+    assert.equal(panel(behindOnly.view, WIDE).focusData, 'branch main · +12 −3 · ↓2 · created 1mo ago · modified 1d ago');
   });
 
   test('the change size is the tracked and untracked LINE counts, never a file count', async () => {
     const { view } = await opened({ facts: () => ({ ...BASE, changes: { added: 4, deleted: 1 } }) });
     const line = panel(view, WIDE).focusData;
-    assert.ok(line.includes('changes +4 −1'), `the line counts render: ${line}`);
+    assert.ok(line.includes('+4 −1'), `the line counts render: ${line}`);
+    assert.ok(!line.includes('changes +'), `the sign already says what the number is: ${line}`);
     assert.ok(!/files|uncommitted/.test(line), `no file count survives: ${line}`);
+  });
+
+  test('the change size drops its label, and keeps it only where the counts cannot be read', async () => {
+    // S16 (feedback): `+A −D` already says what the number is, so the word
+    // before it was noise. An UNREADABLE size still needs the label, or
+    // `unavailable` would not say which fact is missing.
+    const known = await opened({ facts: () => ({ ...BASE, changes: { added: 7, deleted: 2 } }) });
+    const knownLine = panel(known.view, WIDE).focusData;
+    assert.ok(knownLine.includes('· +7 −2 ·'), `the bare counts render: ${knownLine}`);
+    assert.ok(!/changes \+/.test(knownLine), `no label before readable counts: ${knownLine}`);
+
+    const unknown = await opened({ facts: () => ({ ...BASE, changes: null }) });
+    assert.ok(panel(unknown.view, WIDE).focusData.includes('· changes unavailable ·'), 'unknown keeps an intelligible label');
+
+    const fileCountOnly = await opened({ facts: () => ({ ...BASE, changes: { files: 3 } }) });
+    const fileCountLine = panel(fileCountOnly.view, WIDE).focusData;
+    assert.ok(fileCountLine.includes('changes unavailable'), `a bare file count is not a size: ${fileCountLine}`);
+    assert.ok(!/\+\d/.test(fileCountLine), 'and it never becomes a made-up count');
   });
 
   test('an unavailable value still renders where its zero would have been omitted', async () => {
@@ -739,7 +761,7 @@ describe('S9: no redundant help overlay', () => {
 
   test('the legends name every shortcut and never advertise ? help', async () => {
     const { view } = await opened();
-    assert.equal(panel(view, WIDE).legend, '↑↓ move · enter choose · c create · r reload · esc close');
+    assert.equal(panel(view, WIDE).legend, '↑↓ move · enter choose · c create · ctrl+d delete · r reload · esc close');
     assert.ok(!panel(view, WIDE).legend.includes('?'), 'no generic help hint in the panel legend');
 
     // S4c: the offer row and its key appear together, only when a worktree
@@ -753,7 +775,7 @@ describe('S9: no redundant help overlay', () => {
 
     view.handleInput('v');
     const { rows } = screen(view);
-    assert.equal(rows[18], '↑↓ move · pgUp/pgDn page · enter warp · r reload · esc back');
+    assert.equal(rows[18], '↑↓ move · pgUp/pgDn page · enter warp · ctrl+d delete · r reload · esc back');
     assert.ok(!rows[18].includes('?'), 'no generic help hint in the list legend');
   });
 });
@@ -1021,44 +1043,66 @@ describe('S2: one-row key legends', () => {
   });
 });
 
-// S4: the panel keeps NO delete view and no edit view. Ctrl+C/D-style
-// keyboard deletion is gone with lib/warp-delete-confirm.js, so `ctrl+d` (in
-// every spelling a host might deliver) resolves nothing, changes no state and
-// is never advertised, on any row and at any width.
-describe('S4: no delete binding in the panel or the extended list', () => {
-  test('ctrl+d resolves nothing from a checkout row, in either raw or named spelling', async () => {
-    const { view, results } = await opened();
-    view.handleInput('down');
-    assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'a checkout row is focused');
-    const before = JSON.parse(JSON.stringify(view.state));
-    view.handleInput('\x04');
-    view.handleInput('ctrl+d');
-    assert.deepEqual(results, [], 'no delete marker is ever produced');
-    assert.deepEqual(view.state, before, 'and nothing changes');
+// S4: the panel and the extended list both ask to DELETE the focused
+// checkout with `ctrl+d`. The component only names the request — the
+// extension owns the confirmation, the evidence and every refusal — so what
+// is pinned here is that the exact focused path travels in the marker, that
+// nothing else resolves (the offer row, an empty list), and that both
+// legends advertise the key while the search footer keeps its own meaning
+// for `delete`.
+describe('S4: ctrl+d asks to delete the focused checkout', () => {
+  test('ctrl+d on a checkout row resolves the delete request for that exact path', async () => {
+    for (const spelling of ['\x04', 'ctrl+d']) {
+      const { view, results } = await opened();
+      view.handleInput('down');
+      assert.match(panel(view).worktrees[1], /^▸ feat-alpha$/, 'a checkout row is focused');
+      view.handleInput(spelling);
+      assert.deepEqual(results, [{ delete: '/w/feat-alpha' }], `${JSON.stringify(spelling)} names the focused path`);
+    }
   });
 
-  test('ctrl+d in the extended list resolves nothing either', async () => {
+  test('ctrl+d on the offer row and on an empty panel resolves nothing', async () => {
+    const many = [
+      { name: 'cur', path: '/w/cur', branch: 'feat/cur' },
+      ...Array.from({ length: 8 }, (_, index) => ({ name: `wt-${index + 1}`, path: `/w/wt-${index + 1}`, branch: `feat/wt-${index + 1}` })),
+    ];
+    const offered = await opened({ checkouts: many, current: { name: 'cur', path: '/w/cur' } });
+    for (let i = 0; i < 5; i += 1) offered.view.handleInput('down');
+    assert.match(panel(offered.view).viewAll || '', /^▸ view all worktrees$/, 'the offer row is focused');
+    offered.view.handleInput('ctrl+d');
+    assert.deepEqual(offered.results, [], 'the offer row is not a checkout to delete');
+
+    const empty = await opened({ checkouts: [CURRENT], current: { name: CURRENT.name, path: CURRENT.path } });
+    empty.view.handleInput('ctrl+d');
+    assert.deepEqual(empty.results, [], 'an empty panel has nothing to delete');
+  });
+
+  test('ctrl+d in the extended list names the focused row and stays inert while the filter is open', async () => {
     const { view, results } = await opened();
     view.handleInput('v');
+    // The list is every checkout, principal first: main, the current one, then
+    // the rest — so the focused row after two moves is feat-alpha.
     view.handleInput('down');
-    const before = { listCursor: view.state.listCursor, filter: view.state.filter, view: view.state.view };
+    view.handleInput('down');
     view.handleInput('\x04');
-    view.handleInput('ctrl+d');
-    assert.deepEqual(results, [], 'the list speaks no delete marker');
-    assert.deepEqual({ listCursor: view.state.listCursor, filter: view.state.filter, view: view.state.view }, before);
+    assert.deepEqual(results, [{ delete: '/w/feat-alpha' }], 'the list speaks the same marker');
+
+    const searching = await opened();
+    searching.view.handleInput('v');
+    searching.view.handleInput('T');
+    const before = { listCursor: searching.view.state.listCursor, filter: searching.view.state.filter, view: searching.view.state.view };
+    searching.view.handleInput('ctrl+d');
+    assert.deepEqual(searching.results, [], 'while typing, ctrl+d deletes nothing');
+    assert.deepEqual({ listCursor: searching.view.state.listCursor, filter: searching.view.state.filter, view: searching.view.state.view }, before);
   });
 
-  test('no legend ever advertises a delete key, at any width', async () => {
-    for (const width of [40, 60, 80, 120]) {
+  test('both legends advertise the delete key at every width it fits', async () => {
+    for (const width of [80, 120]) {
       const { view } = await opened();
-      for (let row = 0; row < panel(view, width).worktrees.length; row += 1) {
-        const legend = panel(view, width).legend;
-        assert.ok(!/ctrl\+d|delete/i.test(legend), `width ${width} row ${row}: no delete token: ${legend}`);
-        view.handleInput('down');
-      }
+      assert.match(panel(view, width).legend, /ctrl\+d delete/, `width ${width}: the panel names it`);
       view.handleInput('v');
       const { lines } = screen(view, width);
-      assert.ok(!/ctrl\+d|delete/i.test(lines[lines.length - 2]), `width ${width}: the list legend names no delete key`);
+      assert.match(lines[lines.length - 2], /ctrl\+d delete/, `width ${width}: and so does the extended list`);
     }
   });
 
@@ -1084,7 +1128,7 @@ describe('S1: no issue or ODD association is rendered', () => {
 
   test('the rendered line carries no association, even when the facts do', () => {
     const facts = line({ ...BASE, issues: [76, 77], assignedOdd: 'odd/tasks/alpha.md', odd: ['alpha', 'beta'] });
-    assert.equal(facts, 'branch feat/x · changes +1 −0 · ↑1 · created 28d ago · modified —');
+    assert.equal(facts, 'branch feat/x · +1 −0 · ↑1 · created 28d ago · modified —');
     for (const word of ['issues', 'odd', 'alpha', 'beta', '#76']) {
       assert.ok(!facts.includes(word), `no association in the line (${word}): ${facts}`);
     }
@@ -1209,7 +1253,7 @@ describe('S11: the shared palette', () => {
     const { view } = await opened({ theme: hostile });
     const { lines, rows } = screen(view, WIDE);
     assert.match(lines[0], /^╭─ Warp ─+ esc ─╮$/, 'the title line still renders without colour');
-    assert.match(rows[rows.length - 2], /↑↓ move · enter choose · c create · r reload · esc close/,
+    assert.match(rows[rows.length - 2], /↑↓ move · enter choose · c create · ctrl\+d delete · r reload · esc close/,
       'the legend still spells every key and its words');
     assert.equal(rows[4], '▸ main · use the local project', 'the focus marker survives monochrome');
     view.handleInput('v');

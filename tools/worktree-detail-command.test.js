@@ -1,19 +1,18 @@
 'use strict';
 // worktree-ui-redesign S1/S4/S5/S9/S8b/S12 wiring tests, as the extension
-// actually reaches the warp popup.
+// actually reaches the warp popup, plus the S4 delete shortcut.
 //
 // S1/S4 removed the worktree edit panel, the full-screen worktree detail and
-// the keyboard delete view together with the issue/ODD association: a
-// worktree is no longer modified from the warp popup. This file pins that
-// public surface from the outside — the overlays the host receives, the
-// component that mounted, the keys it reads, and the writes that reach the
-// real modules:
+// the issue/ODD association: a worktree is never MODIFIED from the warp popup.
+// This file pins that public surface from the outside — the overlays the host
+// receives, the component that mounted, the keys it reads, and the writes that
+// reach the real modules:
 // - `e` on a focused row opens nothing at all: no edit popup, no detail, no
 //   second mount, and not one registry or checkout change;
-// - `ctrl+d` is inert too: no confirmation, no close, nothing removed, and
-//   the panel stays up until `esc`;
-// - the panel legend advertises only the surviving keys (`c create`, `v all`,
-//   `r reload`, `esc close`) and never `e edit` or `ctrl+d delete`;
+// - `ctrl+d` asks ONE confirmation (feedback: the shortcut was missing), and a
+//   decline removes nothing — a keypress never deletes on its own;
+// - the panel legend advertises the surviving keys (`c create`, `v all`,
+//   `r reload`, `esc close`) plus `ctrl+d delete`, and never `e edit`;
 // - the extension exposes no worktree detail or warp-close seam any more, and
 //   `/herdr-gentle:worktree` is never registered (S5);
 // - `worktree_list` orders the principal first, then the session's own
@@ -223,7 +222,7 @@ function stubGh() {
   });
 }
 
-describe('S1/S4: the warp popup only warps or creates', { concurrency: false }, () => {
+describe('S1/S4: the warp popup edits nothing', { concurrency: false }, () => {
   test('`e` on the focused row opens nothing and changes nothing', async () => {
     setEnv(stdEnv());
     try {
@@ -250,32 +249,37 @@ describe('S1/S4: the warp popup only warps or creates', { concurrency: false }, 
     }
   });
 
-  test('`ctrl+d` on the focused row is inert: it never asks and never deletes', async () => {
+  test('`ctrl+d` on the focused row asks one confirmation and, declined, deletes nothing', async () => {
     setEnv(stdEnv());
     try {
-      const root = makeRepo('delete-inert');
+      const root = makeRepo('delete-asks');
       const target = addRegisteredWorktree(root, 'feat/del-one');
       stubGh();
       const { commands } = await loadExtension();
       const checkoutsBefore = git(root, ['worktree', 'list', '--porcelain']);
+      const registryBefore = fs.readFileSync(registryLib.registryPath(root));
       // The first panel row is the agent worktree (the session sits in the
-      // principal), so this is the row the old delete binding used to target.
-      const built = scriptedCtx({ cwd: root, confirm: true, steps: [['\x04', '\x1b']] });
+      // principal), so this is the row the delete binding targets. The human
+      // answers NO, and nothing may move.
+      const built = scriptedCtx({ cwd: root, confirm: false, steps: [['\x04', '\x1b']] });
 
       await commands.get('herdr-gentle:warp').handler('', built.ctx);
 
-      assert.deepEqual(built.confirms, [], 'no confirmation is ever asked');
-      assert.equal(built.mounts.length, 1, 'nothing reopened: the panel simply stayed up');
-      assert.deepEqual(built.notes, [], 'and nothing is claimed');
+      assert.equal(built.confirms.length, 1, 'exactly one question was asked');
+      assert.equal(built.confirms[0][0], "Delete worktree 'feat-del-one'?");
+      assert.match(built.confirms[0][1], /This removes the checkout but keeps the branch\./);
       assert.equal(git(root, ['worktree', 'list', '--porcelain']), checkoutsBefore, 'no checkout disappeared');
       assert.ok(fs.existsSync(target), 'the checkout still exists');
       assert.ok(registryLib.findByPath(root, target), 'its registry row is untouched');
+      assert.deepEqual(fs.readFileSync(registryLib.registryPath(root)), registryBefore, 'no registry write');
+      assert.deepEqual(built.notes, [['worktree delete cancelled: nothing was removed at ' + target + '.', 'info']],
+        'and the answer is acknowledged without claiming a loss');
     } finally {
       restoreEnv();
     }
   });
 
-  test('the panel legend names the surviving keys and never edit or delete', async () => {
+  test('the panel legend names the delete key and never the removed edit key', async () => {
     setEnv(stdEnv());
     try {
       const root = makeRepo('legend');
@@ -297,10 +301,9 @@ describe('S1/S4: the warp popup only warps or creates', { concurrency: false }, 
       assert.match(frame, /c create/, 'creating is still advertised');
       assert.match(frame, /v all/, 'the extended-list offer is still advertised');
       assert.match(frame, /r reload/, 'reloading is still advertised');
+      assert.match(frame, /ctrl\+d delete/, 'the delete shortcut is advertised');
       assert.match(frame, /esc close/, 'closing is still advertised');
       assert.doesNotMatch(frame, /e edit/, 'the removed edit binding is never advertised');
-      assert.doesNotMatch(frame, /ctrl\+d/, 'the removed delete binding is never advertised');
-      assert.doesNotMatch(frame, /delete/i, 'no delete token survives anywhere in the panel');
     } finally {
       restoreEnv();
     }

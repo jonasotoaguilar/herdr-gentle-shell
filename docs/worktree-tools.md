@@ -17,8 +17,14 @@ tool draws its own native compact/expandable card (`lib/worktree-card.js`
 through `renderShell: "self"`): one git-branch glyph (⎇) and the
 warning theme role — the closest documented role to git orange, since the
 Pi theme schema exposes no orange — on the opening rule, the `ctrl+o to
-expand`/`to collapse` hint and the evidence-backed duration right-aligned
-on the closing rule. Collapsed bodies identify the action and outcome only:
+expand`/`to collapse` hint right-aligned on that SAME opening rule (the
+card's top, where the eye starts), and the evidence-backed duration
+alone right-aligned on the closing rule. The two corners carry one fact
+each: the hint says how to open the card, the bottom-right says how long
+the call took — `NNNms` under a second, `N.Ns` above it. The duration is
+read only from the host's `ToolRenderContext.durationMs`, so a card with no
+lifecycle timing evidence shows a bare closing rule and never a fabricated
+or placeholder time. Collapsed bodies identify the action and outcome only:
 create states ONLY its status row (`status: created`, or
 `status: already existed` for the requested branch that was already there —
 S8); list says `listed: N checkouts` without inferring the current checkout
@@ -56,9 +62,78 @@ and body, and every row painted behind the tone background (`toolSuccessBg`
 for info/success, `toolPendingBg` for warning, `toolErrorBg` for error —
 `customMessageBg` is used nowhere in gentle-shell), re-armed after every inner
 reset; a theme without the role, or a width under 10, keeps the outlined
-card, and the duration rides the closing rule only when it fits, never as a
-placeholder dash. The agent-facing text stays precise and
+card; the hint rides the heading band's right edge, and the duration rides the
+closing rule only when it fits, never as a placeholder dash. The agent-facing
+text stays precise and
 short; the longer prose lives in `details` and the expanded view.
+
+## Expanding a card: keyboard, click, and the host mouse contract
+
+`ctrl+o` (`app.tools.expand`) is the key path and stays the single source of
+truth: it toggles the transcript's expanded state, both card renderers are
+re-invoked with it, and the hint flips between `to expand` and `to collapse` as
+the body swaps between the compact rows and the formatted detail. The card
+itself keeps no expansion state, so nothing can drift from the host's flag.
+
+Clicking the hint is supported through an OPT-IN seam in
+`lib/worktree-card.js`: `createWorktreeCardRenderer(tool, { …, toggleExpanded })`
+and `createWarpMessageRenderer({ …, toggleExpanded })` accept a callback, and
+only when it is injected does the returned component expose a `handleMouse`.
+The callback is the host's own toggle (both methods are part of the extension
+UI contract, `getToolsExpanded()`/`setToolsExpanded()`), and the extension
+wires it to the CURRENT session's `ctx.ui`:
+
+- A render hook receives theme plus `ToolRenderContext` only — never an
+  `ExtensionContext` — and the message renderer is registered at load, before
+  any session exists. So `extensions/gentle-worktree-tools.ts` remembers the
+  session's `ui` handle on `session_start` and drops it on `session_shutdown`,
+  and the injected callback reads that handle when the click arrives, calling
+  `ui.setToolsExpanded(!ui.getToolsExpanded())`.
+- Nothing outlives its session. The handle is replaced on every session start,
+  so a card re-rendered after a switch toggles the session that is live, never
+  a context the runtime has already invalidated; `ctrl+o` and a click therefore
+  drive the same flag and cannot disagree.
+- A session with no usable UI injects nothing, so those cards keep exactly the
+  previous component (`render`/`invalidate`, no `handleMouse`) and stay
+  keyboard-only: `hasUI: false` (json/print mode), or a `ui` missing either
+  expansion method (an older host or a test double). With the seam present the
+  rendered bytes are unchanged, which is what makes this safe to inject only
+  when there is something to toggle.
+
+The seam's shape is dictated by how the installed host routes mouse input:
+
+- Both host shells DO reach a renderer component. Tool cards: `MouseRegion`
+  wraps the call and result components (`renderShell: "self"` included) and
+  dispatches to its child first. Message cards: `CustomMessageComponent` is a
+  `Container`, and containers forward a mouse event to the child component
+  with a row offset (`pi-tui` `Container.handleMouse`).
+- A click is delivered to the component that CLAIMED the press. `tui-alt-screen`
+  records `mousePressTarget` from the press dispatch result and, on release at
+  the same cell, synthesizes a `click` retargeted to that exact component — so
+  the press must return `{ handled: true }` or the click never arrives. The
+  card's press reply is `{ handled: true, render: false }`: it claims the
+  gesture without a repaint, keeping the row it just measured valid.
+- The card claims ONLY the hint's own cells — the rectangle is read back from
+  the rendered line it was drawn on, so it follows the real geometry (float
+  heading band, `outputPad` margin, wrapped heading) — and only for a LEFT
+  `press`/`click`. The toggle fires on the click, never on the press. Every
+  other event (right/middle button, wheel, move, drag, release, any cell
+  outside the hint, a narrow card that dropped the hint) returns `undefined`,
+  so outside the hint the host's own behavior is untouched: its `MouseRegion`
+  toggle, text selection and OSC 8 links work exactly as before. On the hint
+  cells themselves the card is the only responder — the host region does not
+  toggle a second time — and a press there does not start a text selection.
+- A card with no rendered hint advertises no click region at all, which is why
+  a still-running call is keyboard-only until it settles and why a card too
+  narrow to show the hint cannot be clicked open.
+
+Mode limitation, stated plainly: Pi routes mouse events to components only in
+fullscreen mode (`tuiMode: "fullscreen"`, the default; see `docs/tui.md`).
+Regular mode leaves mouse input to the terminal because the terminal owns
+scrollback, so a click there scrolls or selects text instead of toggling a card
+— and nothing in a renderer can change that. In every mode `ctrl+o` works, and
+the rendered card is byte-identical whether or not the toggle callback is
+injected.
 
 The registered tool result text is built from the SAME `details` object by
 `lib/worktree-model-result.js` (`formatWorktreeModelResult`): ordered
@@ -679,9 +754,16 @@ The principal checkout is recovered from the shared common dir (for a
 normal repository, `<principal>/.git` is the common dir), not assumed
 from the caller's checkout.
 
-## Mode switch (`/herdr-gentle:customize` — `Worktree tools` rows)
+## Mode switch (`/herdr-gentle:customize` — `Plugin tools` section)
 
-`Enabled` / `Disabled` in the customize panel flip the shared mode file. The old
+The panel's `Plugin tools` section groups three independent toggles:
+`Worktree tools`, `ODD command` and `Issues command`. Each row names its stored
+value (`Worktree tools · Enabled` / `· Disabled`) and `Enter` flips that one
+toggle; the other two are never touched. The section applies to the registered
+command and tool surfaces only — automatic ODD naming (see "ODD writes: session
+naming only") keeps running whatever the `ODD command` row says.
+
+The `Worktree tools` row flips the shared mode file. The old
 `/herdr-gentle:worktree` is removed entirely: worktrees are no longer
 modified, so neither its mode verbs nor its fullscreen detail have a job
 left. `customize status` is the read-only replacement for the old status
@@ -702,8 +784,105 @@ plugin state directory — `GENTLE_STATUS_STATE_DIR`, else
 sidebar's. Missing means **enabled**; malformed never enables.
 
 Gating is two-level: at load, the tools and `/herdr-gentle:warp` register
-only when the mode reads enabled. Customize stays registered so the mode can
-be flipped back. ODD and Issues are always read-only with respect to worktree
+only when the mode reads enabled, and `/herdr-gentle:odd` and
+`/herdr-gentle:issues` follow their own toggles the same way. Customize stays
+registered so every toggle can be flipped back. The two commands' toggles live
+in `gentle-plugin-tools.json` (`{version: 1, odd: boolean, issues: boolean}`)
+beside the mode file, at a canonical path every session computes identically
+(the next section spells out why it is not the mode file's precedence): missing
+means **enabled** (both commands were registered unconditionally before the
+toggles existed) and malformed never enables either one. Both files go through
+the same guarded writer, so a symlinked or non-regular path is refused and
+nothing is followed.
+
+### The canonical toggle file and its duplicate
+
+Herdr injects a state dir (`HERDR_PLUGIN_STATE_DIR`) while an upgraded install
+keeps the stored `herdr-gentle-agents` dir, so the toggle document can exist in
+both. Its **canonical** location is the one every session computes identically,
+plain Pi or Herdr: `GENTLE_STATUS_STATE_DIR` when it is set (which keeps its
+documented scope of one location), else the stored
+`$XDG_STATE_HOME/herdr/plugins/herdr-gentle-agents` dir. The mode file keeps its
+own precedence untouched, but this document deliberately does **not** consult
+`HERDR_PLUGIN_STATE_DIR` when choosing the canonical path: a plain Pi session
+cannot discover an arbitrary injected dir, and a missing toggle file means
+enabled, so a copy written only there would silently re-enable a command the
+user disabled. Every writer therefore guarantees the canonical path.
+
+Reads cover **every** location that holds the document, so a stored copy with
+the toggles **disabled** can never be shadowed by an injected dir that holds
+only unrelated state and then read as missing — missing means enabled, and that
+fail-open is exactly the bug this replaces. Writes cover the canonical path
+(created when no copy exists at all) plus every other copy that already exists
+— never a third location, and never the legacy worktree file. The outcomes:
+
+- **one copy** — it is authoritative for reading *and* writing: a flip rewrites
+  that file and never creates a second copy beside it;
+- **two copies that agree** — a flip rewrites **both**, so a duplicate pair
+  cannot diverge, and the notification names every path it wrote. Two copies
+  are never silently collapsed into one, and neither is deleted;
+- **two copies that disagree** — the disagreeing keys read as **disabled**, the
+  panel row and `customize status` carry a diagnostic naming both files with
+  their two values, and a flip of such a key is **refused**: nothing is written
+  to either file. That judgement is deliberately narrow so a duplicate never
+  freezes a command nobody disputed: only the keys the flip actually changes
+  can block it, and a flip of an undisputed key still lands — each copy keeps
+  its own value for the disputed one, so the flip never guesses which of the two
+  values the user meant. The fix is the user's: make the copies identical, or
+  delete the one they do not want, then flip again;
+- **a copy that does not parse** holds no information, so the parseable copy
+  decides and the next flip **repairs** the unreadable one. Repairing discards
+  whatever that file held, so the notification names the path it overwrote and
+  says the contents were discarded; when no copy parses, both toggles fail
+  closed exactly as a single malformed file always did.
+
+A write covers every copy, so it can stop half-way. A half-applied flip is
+reported as what it is, never as a clean no-op: the notification names the
+copies that already hold the new value and the copy left untouched, says the
+pair now disagrees (so the toggle reads Disabled until it agrees again) and
+keeps the cause; only a failure that really wrote nothing says
+`nothing was changed`.
+
+### Flipping a toggle from two sessions at once
+
+A flip is a **read-merge-write of one key**, never a write of a snapshot taken
+before the read. Serialization covers **every path a flip writes**, one lock
+file (`gentle-plugin-tools.lock`) per candidate state dir: the canonical dir's
+lock — the one every session computes identically — plus the lock beside every
+legacy copy that exists and is rewritten in the same flip. A lock per
+*resolved* dir serialized nothing that mattered: a plain Pi session held the
+stored dir's lock while a Herdr session held the injected dir's, both took
+their snapshot from the same shared copy, and one flip was lost. With the set
+covered, two sessions flipping `ODD command` and `Issues command` at the same
+time keep **both** flips: the second waits, then merges its one key into the
+state the first left behind.
+
+The locks are taken in **one global order** — lexicographic by the resolved
+absolute path of each directory, identical in every process because the paths
+are — and released in reverse, so a session only ever waits on the next path in
+that order and no two sessions can wait on each other. The deadline is shared
+across the whole set, so a flip never waits longer than it always did (2 s).
+Waiting is asynchronous — the locks are polled with a short, jittered
+`setTimeout` delay and never block the event loop (no `Atomics.wait`, no
+synchronous sleep), so the UI keeps painting while a session waits.
+
+A lock is only ever removed on evidence that its owner is gone: the payload
+names a pid and a host, and a lock is broken only when it belongs to **this**
+host and that pid is provably dead. Age alone never breaks a lock, and a lock
+this process cannot read or parse is never deleted — the flip fails instead
+with the lock path, its holder and the sentence `Nothing was changed — retry in
+a moment. If no other session is running, delete that lock file.` A lock judged
+abandoned is moved aside and its token compared with the one that was judged:
+if a fresh owner created the path inside that window, the fresh lock is linked
+back rather than stolen. Ownership of the whole set is re-checked immediately
+before every copy is written, so a session whose lock was taken over aborts
+instead of losing an update. The boundary: sessions that share any path contend
+on that path's lock, and the canonical dir is the path every session shares, so
+a plain Pi session and a Herdr session always contend there. Sessions that
+resolve a *different* canonical dir (a different `XDG_STATE_HOME`, or a
+different explicit `GENTLE_STATUS_STATE_DIR`) hold genuinely separate state and
+contend on nothing — that is two stores, not two views of one.
+ODD and Issues are always read-only with respect to worktree
 associations, and no worktree surface assigns them any more: the worktree
 detail (formerly reached from the warp's `e`) and the create panel's editing
 mode were removed with the association, so the mode gates creation, close,
@@ -717,15 +896,23 @@ names the session from an ODD write; it records no association (see "ODD
 writes: session naming only").
 At execution, each worktree tool re-reads the mode and fails with
 `worktree tools are disabled; open /herdr-gentle:customize and apply the
-Worktree tools Enabled row to enable them` when disabled. One switch covers
+Plugin tools Worktree tools toggle to enable them` when disabled, and
+`/herdr-gentle:warp` refuses the same way. One switch covers
 all five tools — create, list, close, warp, and session open share the same gate
 and the same registration, with no separate session toggle; the panel's
-`Enabled` row names that coverage outright (`agents can create, list, close,
-warp between and open sessions in agent worktrees`). Registration
+`Worktree tools` row names that coverage outright (`agents can create, list,
+close, warp between and open sessions in agent worktrees; the warp command
+follows this toggle`). Registration
 changes reload the extension runtime automatically when the registration
-must change; `customize status` reports mode state, whether the tools are
-registered in this session, and whether a reload ran, e.g. `customize
-status: sidebar=gentle moshi=off worktree=enabled`.
+must change; `customize status` reports the mode and the two command
+toggles, e.g. `customize status: sidebar=gentle moshi=off worktree=enabled
+odd=enabled issues=enabled`.
+When the host cannot reload (`ctx.reload` is absent or refuses), the toggles
+still hold: every gated surface re-reads the stored flag on invocation, so a
+disabled `/herdr-gentle:odd` or `/herdr-gentle:issues` refuses to open and a
+disabled worktree surface refuses to act even though the runtime still holds
+its old registration. The notification then says the change applies from the
+next session instead of claiming a reload happened.
 
 ### Herdr plugin version check at startup
 
@@ -780,8 +967,14 @@ therefore also clears its Pi `settings.json` exclusion, and the sidebar reset
 lets its Herdr `config.toml` managed rows and ownership marker converge
 exactly as choosing `Gentle` would. Per-option outcomes are reported: a full
 run notifies `Defaults saved.`; a failure notifies `Partial reset: <option>
-changed|unchanged, …`, naming the failed option as unchanged together with
-its reason, and a run where nothing succeeds says nothing was changed. When
+changed|unchanged, …`, naming the failed option as unchanged together with its
+reason. A run where nothing succeeds says `Nothing was changed.` — but only
+when no write truly landed anything: a plugin-tools write that **half landed**
+is reported as `Half applied` instead, naming the copies that already hold the
+new value, the copy left untouched, and the fact that the pair now disagrees
+(the toggle reads Disabled until it agrees); a duplicate copy the run
+**repaired** is named by path with the note that its previous contents were
+discarded. When
 every option already matches the default that applies in the current state the row
 notifies `Nothing to reset: the sidebar is already OFF by default, and moshi
 and worktree already match their defaults.` and writes
@@ -967,8 +1160,9 @@ alike. Every label on a data line is English (`branch`, `changes`, `created`,
 `modified`). The current worktree's line reads the same
 way as the focused one (S4a). The principal checkout comes first among destinations when it is not current.
 Other rows are ordered by readable activity, newest first; unavailable activity
-sorts after known activity. The panel warps and creates and nothing else: there is no
-edit key and no delete key.
+sorts after known activity. The panel warps and creates, and it DELETES only through the confirmation
+below: `Ctrl+D` on an eligible row requests a delete, and a keypress alone
+removes nothing. There is no edit key.
 
 There is no fullscreen worktree detail any more, and no `e` that opens one.
 Worktrees no longer receive issues or ODD documents, so the surface that
@@ -1015,7 +1209,15 @@ written, the panel's creation offers the invoking checkout's pending work
 (S2/S3): a dirty checkout asks the same `YES COPY` / `NO COPY` question the
 warp asks (`Esc`/`Ctrl+C` cancels the creation with nothing written), and the
 answer becomes the create path's `changes` selection — `"all"` or `"none"` —
-so the transfer, its preflight and its refusals stay in one place. A clean
+so the transfer, its preflight and its refusals stay in one place. The question
+is a step of this flow like the panel is, so it mounts with the same bottom
+overlay (`bottom-center`, full width, no margin): mounted bare it painted as a
+fullscreen component in the middle of the flow. It is also asked ONCE per flow:
+the create remembers that the human answered, and the ONE warp that follows it —
+and only when it targets the checkout that create made — reuses that answer
+instead of asking again. Without that, the same pending work would be offered
+twice, and a second copy would be refused by the destination as an overlap the
+human cannot resolve. A clean
 checkout asks nothing. Only a POSITIVE "nothing pending" answer skips the
 question: when the pending-change summary cannot be read (a broken index, an
 unreadable `git status`/`git diff`, a missing helper) the creation FAILS CLOSED —
@@ -1032,7 +1234,54 @@ where the session goes,
 including that new row; only that pick warps, and `esc` on the returned selector
 moves nothing. A cancel is not a way out of the flow: it discards the form (no
 branch, no checkout, no registry row, no notification) and reopens the selector,
-which is what "volver a warp" asks for. Because creation no longer ends in a warp, it needs no fork
+which is what "volver a warp" asks for.
+
+The selector comes back as soon as the PATH exists, not when the checkout is
+finished: the slow half of the creation hooks — dependency install by detected
+stack and `codegraph init` — used to be awaited, so a confirmed create sat
+behind a package manager and read as a hang. It is now handed to a managed
+background task (`backgroundHooks`), which is the interactive create's route
+only: the `worktree_create` tool still awaits its hooks, because its result is
+the agent's only report. What the flow guarantees about the background task:
+
+- **Nothing is skipped.** The same phases run, through one `setup()` callable
+  the hooks library returns; a second call returns the same promise, so a retry
+  can never install twice.
+- **The copy is never backgrounded.** The selected pending changes are copied
+  inside the create and awaited, and the setup starts only AFTER that copy
+  settles: a `codegraph init` writing into the destination while the copy
+  preflights it would read as a destination overlap and turn a good copy into a
+  reported failure. The human therefore never switches into a checkout that is
+  missing the work they asked to carry.
+- **Nothing is orphaned and nothing is swallowed.** Every task is tracked until
+  it settles, each settles into exactly ONE report, and the task never rejects.
+  A failure is reported at `error` level with the failing step and its reason,
+  plus the fact that the checkout stays usable; a setup where at least one step
+  COMPLETED reports what ran at `info`. `awaitPendingCreationSetups` is the seam
+  that waits for the last one.
+- **A no-op setup reports nothing.** Every deferred step can be skipped (no
+  lockfile detected, `codegraph` not on PATH), and a run where no step completed
+  has nothing to announce: announcing `setup finished` there was a success toast
+  for work that never happened, and the interactive create showed it on every
+  such checkout. Silence therefore means exactly "nothing ran, nothing failed" —
+  a failed step, a failed outcome or any warning is still reported, and it is
+  checked FIRST, so no failure can be suppressed by the no-op rule. The create's
+  own text keeps the honest `pending` line either way.
+- **The create's own answer stays honest.** The result names the setup as
+  pending (`setupPending`, a `pending` step per deferred phase, and
+  `codegraph: pending (setup runs in the background)`) instead of claiming an
+  init it has not seen; `codegraph: initialized` is reported only by a create
+  that really ran it.
+
+A refused copy never overstates what happened either. The shared transfer can
+fail PARTWAY and reports the files that already landed (`N of M files already
+copied`); the create says the pending changes `were NOT copied in full`, and the
+warp's refusal scopes its safety sentence to `nothing was rolled back and
+nothing was overwritten beyond the files listed above`. Neither path ever claims
+an unqualified "nothing was overwritten" when the destination holds files the
+attempt put there.
+
+Because creation no longer ends in a warp, it needs no fork
 source: a session Pi has not written to disk yet creates normally instead of
 being refused by a session preflight. A creation carries no `issues`
 and no `odd` on the create call — the row is born without an association —
@@ -1052,6 +1301,56 @@ Cancellation or an unavailable confirmation UI deletes nothing. An explicit Yes
 then invokes the guarded close once; only positive dirty evidence adds
 `force: true`. This keyboard confirmation is not waived by the separately
 invoked agent close tool's permission policy.
+
+The checkout's IDENTITY is pinned, because a path is a pointer and a removal
+resolves it. Every row the selector offers is a live checkout's own realpath,
+so that value is the approved identity: it is compared before the question is
+asked, compared again with the reading taken after the answer, and carried into
+the shared close, which re-reads it immediately before any remover runs. A path
+replaced by a symbolic link to another checkout — the dangerous shape, because
+two `detached` checkouts can present an identical disclosure (unknown live
+branch, same counts, same bytes) — is refused with the link and the checkout it
+now resolves to named, before and after the answer alike, and no remover is
+invoked. `git worktree remove` resolves the spelling it is given, so without
+this pin a swapped path would name a checkout nobody approved; a change to any
+other part of the reading is refused the same way, naming what moved.
+
+The pin is the DIRECTORY, not just its spelling: the approved reading also
+records the `dev`/`ino` pair of the object at that path, and the close requires
+it to still match. A realpath comparison cannot see the one swap that keeps
+every string identical — the approved checkout moved aside and a different
+directory put at the same path — while an inode cannot be reused by another
+directory. A path that is itself a symbolic link is refused too, since every
+offered row is a realpath. If the identity of the directory cannot be read, the
+delete is refused rather than downgraded to the weaker check.
+
+WHO CHECKS LAST IS THE PROTECTION. The close resolves the Herdr workspace from
+`herdr worktree list` BEFORE its final identity read, because that listing is a
+child process: it is an await, and an await is the longest window a swap gets
+between a check and the remover. A reproduced race replaced the approved path
+with a symbolic link to another detached checkout exactly while that listing
+ran, after the check that used to sit above it, and the remover was launched
+naming the other checkout. Now the listing resolves first and the identity check
+is the LAST thing before the remover is launched, with no await between the two.
+
+Limitation, stated rather than papered over: the check and the removal cannot be
+one atomic act. `git worktree remove` and `herdr worktree remove` take a path (or
+a workspace id) and resolve it in ANOTHER process, and neither Node nor the
+filesystem offers a handle-based "remove this exact directory" (no
+`openat`/`O_NOFOLLOW` removal, no compare-and-swap), so a swap landing between
+the final check and the remover's own `stat` is still possible. What is closed:
+every await-sized window, plus any replacement of the path (a link, or a
+different directory at the same path, caught by the pinned inode). An attacker
+must now win a race measured in microseconds inside another process instead of
+one measured in an arbitrarily slow child. Nor is a backend's own validation a
+substitute: git 2.56 refuses a symlinked spelling because the checkout's `.git`
+does not point back to the admin directory that spelling implies, which is
+incidental to this surface and not present in every remover or version — the
+Herdr route removes by workspace id, so a test asserts the refusal here happens
+with NO remover launched at all, before any backend gets a say. A remover that
+deletes any checkout
+other than the target is still caught afterwards and reported (see the vanished
+comparison above), with the registry entry kept.
 Only a REGISTERED agent worktree is deletable — the principal checkout,
 the current checkout and an unregistered live checkout are safe no-ops,
 and the `view all worktrees` row is not a checkout. The project's live checkouts are discovered at session startup
@@ -1070,7 +1369,7 @@ slug is also `principal` makes that name ambiguous too.
 Success text is the two-line compact `moved: <name> · <branch>` / `to: <name> · <branch>`, both read from the checkout's CURRENT branch and head in git (a stale registry row never shows); warping to the checkout
 the session already runs in returns `worktree warp: <name> (already there)`
 (the text is byte-identical) and changes nothing and shows nothing — no fork,
-no switch, no OSC-7, no notification, no message, no record write (R1). Exactly ONE visible confirmation exists per real first move: the fork's styled card — one short notice naming the new checkout (`Worktree warp: now in <path> (branch '<branch>').`). A resume switches silently (R2: the recorded session already carries its notice, so re-entering appends no copy); already-there warps show nothing at all, and cancelled switches (the host never runs the session callback for those) and refusals send none. A target whose path does not exist or is not a checkout of this repository fails closed before any fork or notice (`no live checkout for "<name>" at <path>`, naming `git worktree list`). The command itself stays silent on success (no duplicate notification), and the notice renders as a styled card — not Pi's default `[worktree-warp]` block — through the `worktree-warp` message renderer the extension registers. The card carries the shared branch glyph, the capitalised label `Warp · moved`, and the compact ordered name-only lines `moved: <source name>` / `to: <target name>` (no branch, no path on either row) read from the message details; expanded (ctrl+o) it appends exactly `path: now in "<current absolute path>"` and `branch: now in "<current branch>"` in that order, never the prose notice. In the expanded form nothing is cut: long lines wrap to the inner width, and only the compact row may clip. Its tone is the documented `warning` role: the installed Pi theme schema exposes no orange role, so warning (yellow in the built-in themes) is the closest documented match for git-orange. Like the tool cards it follows gentle-shell's float recipe: full-width rows in one-column transparent margins with a blank padding row above the heading and between heading and body, every row painted behind `toolPendingBg` (the tone-table role for warning; `customMessageBg` is used nowhere in gentle-shell) and re-armed after every inner reset — a theme without the role, or a width under 10, keeps the outlined card. Refusals and cancellations send no card, so only failures notify. Fork vs resume is a filtered-point comparison (S43): the point of a session is its ACTIVE branch — the live leaf's `parentId` path exactly as `getBranch(leaf)` walks it, never all append-only entries (an abandoned leg after a branch-off does not count) — filtered to entries that are not our own bookkeeping, and it still travels on the records for inspection. Bookkeeping is exactly four proven shapes: the `custom` warp marker, the `custom_message` warp notice the switched-to session sends (it persists through the runtime's message entry, which is why the old filter re-forked every warp back), the `custom` session-worktree registration entry startup appends, and every `session_info` checkout rename. Anything else — user/assistant/tool entries, model/thinking changes, unknown custom shapes — is session content and counts, so a fresh fork's filtered point still equals its source's. The leaf of a session file is recovered the way the runtime itself does (its index keeps the last entry's id; no separate leaf pointer is persisted). Every transition records BOTH sides at their post-transition points read FRESH — the destination file as re-read after the switch (the file the live runtime kept appending to, never the stale pre-switch manager and never copied from the source) and the session file just left, each its OWN point — and a warp resumes the destination file only when that record names an absolute session file that still exists AND the destination file's actual point equals the current session's point (same content, no fork, no notice); a checkout with no usable record, an unreadable destination, or a different point because real work happened, forks. Limitation: a model or thinking-level change counts as content (it changes the effective session), so a hop across one forks; concurrent warps may each fork with the last writer winning. Every fork branches from the highest identical ancestor: the warp climbs the session tree's `parentSession` chain while each ancestor's filtered point equals the current session's and forks from the highest such ancestor (bounded, failing safe to the last good file), so an untouched fork yields a sibling of the first fork while an advanced session yields its own child. Because a sibling fork was cut from the ancestor, the current leaf (a notice or rename the fork appended later) is not in it: positioning then falls back to the deepest non-bookkeeping entry of the current active branch, which the climb guarantees the fork holds. Each fork is renamed through `SessionManager.open(path).appendSessionInfo(name)` to carry its checkout (the session's original name — its first `session_info` entry, else the current name, else the checkout label alone — + " · " + the checkout name written once, never on resume, never rewritten when already there). Work written after a visit stays in the thread where it was written: warping back later resumes each checkout's own session instead of copying the new work over. A missing, corrupt, or stale record (its
+no switch, no OSC-7, no notification, no message, no record write (R1). Exactly ONE visible confirmation exists per real first move: the fork's styled card — one short notice naming the new checkout (`Worktree warp: now in <path> (branch '<branch>').`). A resume switches silently (R2: the recorded session already carries its notice, so re-entering appends no copy); already-there warps show nothing at all, and cancelled switches (the host never runs the session callback for those) and refusals send none. A target whose path does not exist or is not a checkout of this repository fails closed before any fork or notice (`no live checkout for "<name>" at <path>`, naming `git worktree list`). The command itself stays silent on success (no duplicate notification), and the notice renders as a styled card — not Pi's default `[worktree-warp]` block — through the `worktree-warp` message renderer the extension registers. The card carries the shared branch glyph, the capitalised label `Warp · moved`, and the compact ordered name-only lines `moved: <source name>` / `to: <target name>` (no branch, no path on either row) read from the message details; expanded (ctrl+o) it appends exactly `path: now in "<current absolute path>"` and `branch: now in "<current branch>"` in that order, never the prose notice. The expand hint right-aligns on the card's heading row (`⎇ Warp · moved`) and the closing rule stays empty, exactly like the tool cards; a click on those hint cells toggles the transcript through the same opt-in `toggleExpanded` seam the tool cards use (see "Expanding a card" above), so its keyboard path stays `ctrl+o`. In the expanded form nothing is cut: long lines wrap to the inner width, and only the compact row may clip. Its tone is the documented `warning` role: the installed Pi theme schema exposes no orange role, so warning (yellow in the built-in themes) is the closest documented match for git-orange. Like the tool cards it follows gentle-shell's float recipe: full-width rows in one-column transparent margins with a blank padding row above the heading and between heading and body, every row painted behind `toolPendingBg` (the tone-table role for warning; `customMessageBg` is used nowhere in gentle-shell) and re-armed after every inner reset — a theme without the role, or a width under 10, keeps the outlined card. Refusals and cancellations send no card, so only failures notify. Fork vs resume is a filtered-point comparison (S43): the point of a session is its ACTIVE branch — the live leaf's `parentId` path exactly as `getBranch(leaf)` walks it, never all append-only entries (an abandoned leg after a branch-off does not count) — filtered to entries that are not our own bookkeeping, and it still travels on the records for inspection. Bookkeeping is exactly four proven shapes: the `custom` warp marker, the `custom_message` warp notice the switched-to session sends (it persists through the runtime's message entry, which is why the old filter re-forked every warp back), the `custom` session-worktree registration entry startup appends, and every `session_info` checkout rename. Anything else — user/assistant/tool entries, model/thinking changes, unknown custom shapes — is session content and counts, so a fresh fork's filtered point still equals its source's. The leaf of a session file is recovered the way the runtime itself does (its index keeps the last entry's id; no separate leaf pointer is persisted). Every transition records BOTH sides at their post-transition points read FRESH — the destination file as re-read after the switch (the file the live runtime kept appending to, never the stale pre-switch manager and never copied from the source) and the session file just left, each its OWN point — and a warp resumes the destination file only when that record names an absolute session file that still exists AND the destination file's actual point equals the current session's point (same content, no fork, no notice); a checkout with no usable record, an unreadable destination, or a different point because real work happened, forks. Limitation: a model or thinking-level change counts as content (it changes the effective session), so a hop across one forks; concurrent warps may each fork with the last writer winning. Every fork branches from the highest identical ancestor: the warp climbs the session tree's `parentSession` chain while each ancestor's filtered point equals the current session's and forks from the highest such ancestor (bounded, failing safe to the last good file), so an untouched fork yields a sibling of the first fork while an advanced session yields its own child. Because a sibling fork was cut from the ancestor, the current leaf (a notice or rename the fork appended later) is not in it: positioning then falls back to the deepest non-bookkeeping entry of the current active branch, which the climb guarantees the fork holds. Each fork is renamed through `SessionManager.open(path).appendSessionInfo(name)` to carry its checkout (the session's original name — its first `session_info` entry, else the current name, else the checkout label alone — + " · " + the checkout name written once, never on resume, never rewritten when already there). Work written after a visit stays in the thread where it was written: warping back later resumes each checkout's own session instead of copying the new work over. A missing, corrupt, or stale record (its
 session file is gone) forks once more and overwrites the record; a corrupt
 record never fails the warp. The record lives in its own repo-scoped file
 `<git-common-dir>/pi-warp-sessions.json` (beside `pi-worktrees.json`, never
@@ -1470,6 +1769,26 @@ Two sync children remain by design, and neither can stretch to a timeout
 freeze: the memoized `git rev-parse` identity probe (~20 ms, once per
 directory — and once per open create panel), and the Herdr reconcile that only
 runs when the session closes its OWN checkout after warping out of it.
+
+### The interactive create does not wait for setup
+
+A responsive event loop was not enough on its own: the create still AWAITED a
+dependency install and `codegraph init`, so the selector came back minutes
+after the human confirmed — the wait was honest but it was still a wait. The
+path is all the warp needs, so the interactive create (`backgroundHooks`, the
+warp panel's route only) returns once the checkout, its registry row and the
+pending copy are settled, and hands install/codegraph to a tracked background
+task that reports itself when it settles. The agent tool is deliberately
+unchanged: its result is the agent's only report, so `worktree_create` still
+awaits its hooks and still returns the settled steps.
+`tools/worktree-hooks.test.js` pins the deferred contract (file steps inline,
+`pending` rows, one `setup()` that runs once and never rejects), and
+`tools/worktree-create-tool.test.js` plus `tools/warp-selector.test.js` pin the
+return-before-setup behaviour with a `codegraph` shim that sleeps and drops a
+marker — plus the ONE report each settled task produces, that a failed setup
+reaches the human as an error without failing the create, and that a run in
+which no step completed reports nothing at all instead of a no-op success
+toast.
 
 ## Registry and identity reads (S22)
 

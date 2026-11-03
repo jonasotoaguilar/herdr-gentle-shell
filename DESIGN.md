@@ -194,7 +194,7 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 |---|---|---|
 | `agent_start` / `isIdle=false` (main actively working, incl. 0 active subs) | `gentle_work_v1=<hash>:0:<exp>` + `gentle_orchestrating_v1=<hash>:<exp>` (root marker while main actively works) + clear `herdr:blocked` labels | `gentle` (machine key `orchestrating`) while the principal session actively works, even with zero subagents |
 | TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total; the consumer renders the oldest role plus this total in parentheses only when above one) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | oldest running role word (known short word or unknown sanitized name), else generic `gentle` (no delegation — a single delegate carries no suffix; a fresh root marker reduces to `orchestrating` only with no delegation active |
-| `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt`, plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
+| `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt` dialog spans (`kind` other than `custom` — a panel or overlay such as the agents view, ODD viewer, changes view or design canvas never counts, because opening a panel is navigation, not a question), plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
 | Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` with `reviewerRunAcknowledged: true` in the runtime args; `correctionLines` (native planning, never a reviewer), forecast-only calls, `gentle_review` (any operation), `gentle_review_scope`, and all sidebar/hook signals never enter — unknown legacy shapes stay dark (conservative) | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label. Bounded approximation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today |
 | agent error / task failed / transport failure | `herdr:blocked` label `error:<code>` | `blocked` (machine key `error`) |
 | `agent_settled` + 0 active subs | `gentle_work_v1=<hash>:0:<exp>`; clear `blocked` labels | `done` |
@@ -665,7 +665,7 @@ worktree any more: a worktree is created and listed, never modified.
 Enrichment applies to the mounted viewer; closed-view outcomes cannot
 authorize registry writes. The viewers retain one-row shortcut legends rather
 than a duplicate `?` overlay. ODD and Issues
-remain registered with Worktree tools disabled. Warp is registered only with Worktree tools enabled. The sidebar and Moshi actions stay inline in
+follow their own `Plugin tools` toggles (`ODD command`, `Issues command`) and stay registered with `Worktree tools` disabled. Warp is registered only with `Worktree tools` enabled. The sidebar and Moshi actions stay inline in
 the producer extension (`extensions/gentle-herdr-state.ts`) and are
 reached through one in-process provider slot,
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
@@ -824,9 +824,9 @@ list, not silent.
 
 Agent-callable worktrees: `worktree_create` / `worktree_list` /
 `worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
-listed in the Pi package's `pi.extensions`), plus the `Worktree tools`
-rows of `/herdr-gentle:customize` (`Enabled` / `Disabled`, plus read-only
-`customize status`). Surface is
+listed in the Pi package's `pi.extensions`), plus the `Plugin tools ·
+Worktree tools` toggle of `/herdr-gentle:customize` (`Enabled` / `Disabled`,
+plus the read-only `customize status`). Surface is
 extension tools via `pi.registerTool()` — codemode is a QuickJS sandbox
 with no filesystem, network, or timers and adds no tools, so it cannot
 implement this; it may call these tools. Normative detail (parameters,
@@ -898,15 +898,22 @@ replaced.
 
 ### Mode gate
 
-The `Worktree tools` rows of `/herdr-gentle:customize` flip a shared mode
-file (`gentle-worktree-mode.json`,
-`{version:1,enabled:boolean}`) in the plugin state directory, default
-enabled, malformed failing closed. Gating is two-level — load-time
-registration plus per-execution re-read — and the panel itself always
-stays registered so the mode can be flipped back. Registration changes
+The `Plugin tools` section of `/herdr-gentle:customize` groups three
+independent toggles. `Worktree tools` flips a shared mode file
+(`gentle-worktree-mode.json`, `{version:1,enabled:boolean}`) in the plugin state
+directory, default enabled, malformed failing closed. `ODD command` and `Issues
+command` share `gentle-plugin-tools.json`
+(`{version:1,odd:boolean,issues:boolean}`) in the same directory, both default
+enabled, malformed failing closed on both; they gate the registered commands
+only, never the automatic ODD naming. Gating is two-level — load-time
+registration plus per-invocation re-read — and the panel itself always
+stays registered so every toggle can be flipped back. Registration changes
 reload the extension runtime automatically when the registration must
-change (`enabled !== toolsRegistered`, i.e. enabling while the runtime
-loaded disabled or vice versa), which `customize status` reports. Create never
+change (the requested value differs from what this load registered, i.e.
+enabling while the runtime loaded disabled or vice versa), which `customize
+status` reports; without a reload the gated invocation still refuses, so the
+toggle holds and the notification says it applies from the next session.
+Create never
 prompts — a create touches no existing data; close prompts when the host
 offers dialog UI, waived under gentle-shell YOLO only for a checkout proven
 clean. Warp keyboard deletion is separate: it always prompts, even under YOLO,

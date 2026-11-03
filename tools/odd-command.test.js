@@ -110,15 +110,20 @@ async function loadExtension() {
   const copy = path.join(dir, 'gentle-worktree-tools.mjs');
   fs.writeFileSync(copy, stubbed);
   const commands = new Map();
+  const handlers = new Map();
   const pi = {
     registerTool: () => {},
     registerCommand: (name, def) => { commands.set(name, def); },
-    on: () => () => {},
+    on: (event, handler) => {
+      if (!handlers.has(event)) handlers.set(event, []);
+      handlers.get(event).push(handler);
+      return () => {};
+    },
   };
   process.env.GENTLE_WORKTREE_LIB_DIR = LIB_DIR;
   const mod = await import(pathToFileURL(copy).href);
   mod.default(pi);
-  return { commands, mod };
+  return { commands, handlers, mod };
 }
 
 const stubTui = {
@@ -166,6 +171,18 @@ function openComponent(factory, host) {
   assert.equal(typeof component.handleInput, 'function');
   assert.equal(typeof component.invalidate, 'function');
   return { component, done: () => settled };
+}
+
+// S21: the interactive listing is awaited, so a frame that depends on a fresh
+// listing is polled to its settled text instead of read after one tick.
+async function waitForFrame(frame, pattern, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const text = frame();
+    if (pattern.test(text)) return text;
+    if (Date.now() > deadline) return text;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 describe('/herdr-gentle:odd', () => {
@@ -225,8 +242,9 @@ describe('/herdr-gentle:odd', () => {
     assert.ok(!frame().includes('gamma'), 'the new document is not there yet');
     fs.writeFileSync(path.join(root, 'odd', 'tasks', 'gamma.md'), '# gamma\n\n## Specs\nS1. third rule\n');
     component.handleInput('r');
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    const reloaded = frame();
+    // S21: the reload goes through the AWAITED listing, so the outcome lands when
+    // the checkout's Git reads answer instead of inside the key handler.
+    const reloaded = await waitForFrame(frame, /r reloaded/);
     assert.match(reloaded, /2 documents/, 'r re-reads odd/tasks from disk through the command wiring');
     assert.match(reloaded, /gamma/, 'the document written while the view was open appears');
     assert.match(reloaded, /r reloaded/, 'S9: the footer names the reload outcome');
@@ -896,5 +914,227 @@ const timer = setInterval(() => {
 
   test('the editor keeps the terminal, and Escape closes the view only afterwards', { skip: SKIP }, async () => {
     await runScenario();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S21 («se traba a veces» / «se demora mucho en cargar»): /odd is an
+// INTERACTIVE path, so the command must never read the checkout through a
+// `spawnSync` listing before the overlay exists. The open paints the cheap
+// local scan at once, the git-ranked order is awaited OFF the event loop and
+// applied to the live view when it lands, and `r` re-lists the same way.
+//
+// The listing is injected at the module boundary the command requires
+// (`lib/odd-docs.js`, reached through GENTLE_WORKTREE_LIB_DIR), so a slow
+// history walk is simulated DETERMINISTICALLY: nothing here waits on a real
+// sleeping git, and no assertion depends on machine speed.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd interactive listing (S21)', () => {
+  const oddDocsLib = require('../lib/odd-docs.js');
+
+  function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  async function waitFor(predicate, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (predicate()) return true;
+      if (Date.now() > deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  // Replace the async listing for the duration of one test: each call takes
+  // the next response (a promise to wait on, or a settled listing).
+  function stubAsyncListing(responses) {
+    const original = oddDocsLib.listOddDocsAsync;
+    const calls = [];
+    oddDocsLib.listOddDocsAsync = (root) => {
+      calls.push(root);
+      const next = responses.length > 0 ? responses.shift() : Promise.resolve({ ok: true, docs: [] });
+      return next;
+    };
+    return { calls, restore: () => { oddDocsLib.listOddDocsAsync = original; } };
+  }
+
+  function docEntry(root, name, body) {
+    return { name, file: `${name}.md`, path: path.join(root, 'odd', 'tasks', `${name}.md`), body };
+  }
+
+  const plain = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+
+  test('the overlay opens from the local scan and takes the git order when it lands', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({
+      docs: {
+        'alpha.md': '# settings\n\nS1. shared rule\n',
+        'beta.md': '# notes\n\nS2. unique note\n',
+      },
+    });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    const settle = deferred();
+    const listing = stubAsyncListing([settle.promise]);
+    try {
+      let component = null;
+      const { ctx, customs } = makeCtx({
+        cwd: root,
+        customImpl: async (factory) => {
+          component = openComponent(factory, host).component;
+          return null;
+        },
+      });
+      await def.handler('', ctx);
+      assert.equal(customs.length, 1, 'the overlay opens without waiting for the history walk');
+      assert.equal(listing.calls.length, 1, 'the git-ranked listing is started for the open view');
+      const frame = () => plain(component.render(80).join('\n'));
+      const first = frame();
+      assert.equal(first.indexOf('beta') < first.indexOf('alpha'), true, 'the cheap scan order paints first');
+      assert.match(first, /S2\. unique note/, 'the focused document is already readable in that first frame');
+
+      // The ranked answer arrives: alpha was committed last, so it moves up.
+      settle.resolve({ ok: true, docs: [docEntry(root, 'alpha'), docEntry(root, 'beta')] });
+      const settled = await waitFor(() => frame().indexOf('alpha') < frame().indexOf('beta'));
+      assert.equal(settled, true, 'the git-ranked order replaces the cheap one');
+      const after = frame();
+      assert.match(after, /S2\. unique note/, 'the reader keeps reading the same document across the settle');
+      assert.match(after, /✎ Odd · 2 documents/, 'no document is lost while the order settles');
+    } finally {
+      listing.restore();
+    }
+  });
+
+  test('the command never reads the checkout through the synchronous listing', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n\nS1. first rule\n' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    const original = oddDocsLib.listOddDocs;
+    oddDocsLib.listOddDocs = () => { throw new Error('the interactive path must not spawnSync a listing'); };
+    try {
+      let component = null;
+      const { ctx, notes } = makeCtx({
+        cwd: root,
+        customImpl: async (factory) => {
+          component = openComponent(factory, host).component;
+          return null;
+        },
+      });
+      await def.handler('', ctx);
+      assert.ok(component, 'the overlay still opens over the checkout');
+      assert.match(plain(component.render(80).join('\n')), /alpha/, 'and it lists the document');
+      assert.deepEqual(notes, [], 'nothing was reported as unreadable');
+    } finally {
+      oddDocsLib.listOddDocs = original;
+    }
+  });
+
+  test('r re-lists through the asynchronous listing and reports it once it lands', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: { 'alpha.md': '# alpha\n\nS1. first rule\n' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(20);
+    const opened = { ok: true, docs: oddDocsLib.listOddDocs(root).docs };
+    const reloaded = deferred();
+    const listing = stubAsyncListing([Promise.resolve(opened), reloaded.promise]);
+    try {
+      let component = null;
+      const { ctx } = makeCtx({
+        cwd: root,
+        customImpl: async (factory) => {
+          component = openComponent(factory, host).component;
+          return null;
+        },
+      });
+      await def.handler('', ctx);
+      const frame = () => plain(component.render(80).join('\n'));
+      assert.match(frame(), /✎ Odd · 1 documents/, 'the view opens over the one document');
+
+      component.handleInput('r');
+      // The press returns at once: the reload is awaited, never a blocking read
+      // inside the key handler, and no outcome is claimed before it answers.
+      assert.ok(!frame().includes('zeta'), 'the reload has not landed yet');
+      assert.ok(!/r reloaded/.test(frame()), 'and the footer does not claim it did');
+
+      reloaded.resolve({ ok: true, docs: [docEntry(root, 'alpha'), docEntry(root, 'zeta')] });
+      const done = await waitFor(() => /r reloaded/.test(frame()));
+      assert.equal(done, true, 'the footer reports the reload once the listing answers');
+      const after = frame();
+      assert.match(after, /2 documents/, 'r re-lists through the asynchronous listing');
+      assert.match(after, /zeta/, 'the document the listing returned appears');
+    } finally {
+      listing.restore();
+    }
+  });
+
+  test('a checkout without documents answers from the local scan and starts no listing', async () => {
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    const root = makeRepo({ docs: {} });
+    mod.setOddTuiLoader(async () => stubTui);
+    const host = makeHostTui(12);
+    const listing = stubAsyncListing([Promise.resolve({ ok: true, docs: [docEntry(root, 'ghost')] })]);
+    try {
+      const { ctx, customs, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+      await def.handler('', ctx);
+      assert.equal(customs.length, 0, 'no overlay when there is nothing to read');
+      assert.deepEqual(listing.calls, [], 'nothing to rank, so no history walk is started at all');
+      assert.deepEqual(notes, [['No odd documents under odd/tasks/ in this checkout.', 'info']], 'the same one line as before');
+    } finally {
+      listing.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The ODD command is one of the three "Plugin tools" toggles. It gates the
+// COMMAND only: the automatic ODD capture (the tool_call/tool_result observers
+// that name a session) keeps running whether the command is on or off, and a
+// runtime that could not be reloaded still refuses the invocation.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:odd Plugin tools toggle', { concurrency: false }, () => {
+  function pluginTools(state) {
+    const fsx = fs;
+    fsx.writeFileSync(
+      path.join(process.env.GENTLE_STATUS_STATE_DIR, 'gentle-plugin-tools.json'),
+      `${JSON.stringify({ version: 1, ...state })}\n`,
+    );
+  }
+
+  test('a disabled ODD command registers no command but keeps the automatic capture', async () => {
+    pluginTools({ odd: false, issues: true });
+    const { commands, handlers } = await loadExtension();
+    assert.ok(!commands.has('herdr-gentle:odd'), 'the disabled command is not registered');
+    assert.ok(commands.has('herdr-gentle:customize'), 'the panel stays registered so it can be flipped back');
+    assert.ok(handlers.get('tool_call').length > 0, 'automatic capture still observes tool calls');
+    assert.ok(handlers.get('tool_result').length > 0, 'automatic capture still observes tool results');
+    // Restore the shared default the rest of the file relies on.
+    pluginTools({ odd: true, issues: true });
+  });
+
+  test('a disabled command invoked through a stale runtime refuses and opens nothing', async () => {
+    pluginTools({ odd: true, issues: true });
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:odd');
+    assert.ok(def, 'registered at load while enabled');
+    pluginTools({ odd: false, issues: true });
+    const root = makeRepo({ docs: { alpha: '# Alpha' } });
+    mod.setOddTuiLoader(async () => stubTui);
+    const { ctx, customs, selects, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+    await def.handler('', ctx);
+    assert.equal(customs.length, 0, 'no overlay');
+    assert.deepEqual(selects, [], 'no fallback menu either');
+    assert.deepEqual(notes, [[
+      'odd command is disabled; open /herdr-gentle:customize and apply the Plugin tools ODD command toggle to enable it',
+      'error',
+    ]]);
+    pluginTools({ odd: true, issues: true });
   });
 });

@@ -388,6 +388,12 @@ function codegraphStatus(hooks) {
   const step = steps.find((entry) => entry && entry.name === 'codegraph-init');
   if (!step) return { status: 'not-run', detail: 'the creation hooks did not run' };
   if (step.status === 'done') return { status: 'done', detail: '' };
+  // The interactive create hands the slow setup to a background task, so the
+  // honest fact at return time is "not yet", never a claimed init.
+  if (step.status === 'pending') {
+    const detail = typeof step.detail === 'string' && step.detail.length > 0 ? step.detail : 'setup runs in the background';
+    return { status: 'pending', detail };
+  }
   if (step.status === 'skipped') {
     const detail = typeof step.detail === 'string' && step.detail.length > 0 ? step.detail : 'skipped';
     return { status: 'skipped', detail };
@@ -425,6 +431,8 @@ function codegraphLine(codegraph) {
     case 'skipped':
     case 'failed':
       return `codegraph: not initialized (${codegraph.detail})`;
+    case 'pending':
+      return `codegraph: pending (${codegraph.detail})`;
     case 'not-run':
       return `codegraph: not run (${codegraph.detail})`;
     default:
@@ -504,8 +512,69 @@ function resolveWorktreeCardHelpers() {
   return worktreeCardAutoHelpers;
 }
 
+// Click-to-expand host wiring (docs/worktree-tools.md, "Expanding a card").
+// The card's toggle seam is INJECTED, never baked in, because a render hook
+// receives theme plus ToolRenderContext and never an ExtensionContext. So the
+// extension remembers the CURRENT session's UI handle here, and the injected
+// callback reads it when the click arrives. That is also what keeps a card
+// from outliving its session: `session_start` replaces the handle and
+// `session_shutdown` drops it, so a card re-rendered after a switch toggles
+// the live session and never a context the runtime already invalidated.
+let worktreeCardUi = null;
+
+// Only a UI that publishes BOTH expansion methods is a toggle target. A
+// no-UI mode (`hasUI: false`, json/print) or a host double without the pair
+// resolves to null, which is what keeps those cards keyboard-only.
+function usableWorktreeCardUi(ctx) {
+  try {
+    const c = ctx && typeof ctx === "object" ? ctx : null;
+    if (!c || c.hasUI === false) return null;
+    const ui = c.ui;
+    if (!ui || typeof ui.getToolsExpanded !== "function" || typeof ui.setToolsExpanded !== "function") return null;
+    return ui;
+  } catch {
+    return null;
+  }
+}
+
+// Session lifecycle hooks. Named and idempotent, so a reload, a session
+// replacement and an early shutdown all converge on the same state.
+function rememberWorktreeCardUi(event, ctx) {
+  worktreeCardUi = usableWorktreeCardUi(ctx);
+}
+
+function forgetWorktreeCardUi() {
+  worktreeCardUi = null;
+}
+
+// The toggle the card calls on a hint click: the host's OWN flag, read fresh
+// and flipped, so `ctrl+o` and a click can never disagree. A UI that throws is
+// contained by the card's seam, so this never breaks the transcript.
+function toggleWorktreeCardExpanded() {
+  const ui = worktreeCardUi;
+  if (!ui) return;
+  ui.setToolsExpanded(!ui.getToolsExpanded());
+}
+
+// The card dependency object: the resolved helpers plus the host toggle when a
+// session UI can take it. Memoized by helpers identity AND seam availability,
+// so the per-identity card cache below still hits on every frame instead of
+// rebuilding a card per render.
+let worktreeCardDepsCache = null;
+
+function worktreeCardDeps() {
+  const base = resolveWorktreeCardHelpers() || undefined;
+  const seamed = worktreeCardUi !== null;
+  const cached = worktreeCardDepsCache;
+  if (!cached || cached.base !== base || cached.seamed !== seamed) {
+    const deps = seamed ? { ...(base || {}), toggleExpanded: toggleWorktreeCardExpanded } : base;
+    worktreeCardDepsCache = { base, seamed, deps };
+  }
+  return worktreeCardDepsCache.deps;
+}
+
 function worktreeCardFor(toolName) {
-  const helpers = resolveWorktreeCardHelpers() || undefined;
+  const helpers = worktreeCardDeps();
   if (!worktreeCardCache || worktreeCardCache.helpers !== helpers) {
     worktreeCardCache = { helpers, cards: new Map() };
   }
@@ -601,6 +670,99 @@ async function resolveCreateBase(runGit, repo) {
   return null;
 }
 
+// The INTERACTIVE create (the warp panel) returns to the selector as soon as
+// the checkout path exists: the SLOW half of the creation hooks — dependency
+// install, `codegraph init` — is what made a confirmed create feel like a hang,
+// because a package manager can run for minutes. `backgroundHooks` hands that
+// half to this managed background task instead of awaiting it, so the path the
+// warp needs is usable immediately and the setup finishes behind it.
+//
+// Nothing is skipped and nothing is orphaned:
+//   - the hooks library still runs both phases (through the `setup()` callable
+//     it returns), so the checkout is set up exactly as before;
+//   - every task is tracked here until it settles, and
+//     `awaitPendingCreationSetups` is the seam a test (or a shutdown path) uses
+//     to wait for the last one;
+//   - each task settles into exactly ONE report, so a failure reaches the human
+//     instead of vanishing into a detached promise, and the task itself never
+//     rejects (nothing is left unobserved).
+const creationSetups = new Set();
+
+// Fold a child's stderr into one escape-free line, the same shape every
+// summary row uses, so a multi-line failure cannot break the notification.
+function setupReportLine(text) {
+  return String(text ?? '')
+    .replace(/\x1b\[[0-9;]*m|\x1b\]8;;.*?\x07/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// The one report a settled setup produces: what ran on success, and the reasons
+// on failure — plus the fact that the checkout stays usable either way.
+//
+// A run in which NO step completed reports NOTHING. Every step can be skipped
+// (no lockfile detected, `codegraph` not on PATH), and a "setup finished" toast
+// there announces work that never happened — the no-op success the interactive
+// create used to show on every such checkout. Failures are never suppressed by
+// that rule: a failed step, a failed outcome or any warning is reported first
+// and returns, so silence can only ever mean "nothing ran, nothing failed".
+function reportCreationSetup({ branch, target, outcome, notify }) {
+  if (typeof notify !== 'function') return;
+  const steps = outcome && Array.isArray(outcome.steps) ? outcome.steps : [];
+  const failed = steps.filter((step) => step && step.status === 'failed');
+  const done = steps.filter((step) => step && step.status === 'done');
+  const uninformedFailure = !!(outcome && outcome.ok === false);
+  const label = (step) => {
+    const name = String(step.name || 'setup');
+    if (name === 'codegraph-init') return 'codegraph initialized';
+    return setupReportLine(name.replace(/^install:/, 'install '));
+  };
+  const warnings = outcome && Array.isArray(outcome.warnings) ? outcome.warnings : [];
+  if (failed.length > 0 || uninformedFailure || warnings.length > 0) {
+    const reasons = warnings.length > 0 ? warnings : failed.map((step) => `${step.name} failed`);
+    const reasonText = reasons.map(setupReportLine).filter((line) => line.length > 0).join('; ');
+    notify(
+      `warp: setup for ${branch} finished with problems: ${reasonText.length > 0 ? reasonText : 'the setup reported a failure'} — the checkout at ${target} is usable`,
+      'error',
+    );
+    return;
+  }
+  if (done.length === 0) return;
+  notify(`warp: setup finished for ${branch}: ${done.map(label).join(', ')}`, 'info');
+}
+
+// Start (and track) the deferred setup. The returned task never rejects: a
+// throwing phase is reported as a failed setup, never as an unhandled rejection.
+function startCreationSetup({ run, branch, target, notify }) {
+  const task = (async () => {
+    let outcome;
+    try {
+      outcome = await run();
+    } catch (err) {
+      const message = `creation setup failed: ${(err && err.message) || err}`;
+      outcome = { ok: false, steps: [{ name: 'setup', status: 'failed', detail: message }], warnings: [message] };
+    }
+    try {
+      reportCreationSetup({ branch, target, outcome, notify });
+    } catch {
+      // Reporting is the last step of a settled task: a hostile notify never
+      // leaves the task unobserved or the tracking set dirty.
+    }
+  })();
+  creationSetups.add(task);
+  const forget = () => { creationSetups.delete(task); };
+  task.then(forget, forget);
+  return task;
+}
+
+// Resolves once every tracked setup has settled. Exported for tests and for a
+// shutdown path that must not leave a child running behind it.
+async function awaitPendingCreationSetups() {
+  while (creationSetups.size > 0) {
+    await Promise.all(Array.from(creationSetups));
+  }
+}
+
 // Core of `worktree_create`: validation (S2, S3) then herdr-first creation
 // with a git fallback. Exported for unit tests; the registered tool calls
 // it with the live Pi context. It only ever CREATES: the branch plus the
@@ -620,6 +782,12 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // a hanging child aborts on its bound instead of freezing the
   // interactive session on the main thread.
   const gitOnly = !!(opts && opts.gitOnly === true);
+  // `backgroundHooks` is the INTERACTIVE create's speed contract: the checkout
+  // plus its registry row are all the warp needs, so the slow half of the hooks
+  // (install, codegraph) is handed to a tracked background task instead of
+  // being awaited. The AGENT tool never sets it — its result is the agent's only
+  // report, so the hooks must have settled before that result is returned.
+  const backgroundHooks = !!(opts && opts.backgroundHooks === true);
   // S21: BOTH routes are interactive (the tool handler and the create
   // panel), so both wait for their children on the async runner. The
   // security property is unchanged: fixed argv arrays, values as separate
@@ -640,7 +808,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them",
       { state: modeState ? modeState.state : "unknown", branch },
     );
   }
@@ -1289,6 +1457,9 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // hook, is reported inside `details.hooks`, and the exact success text
   // stays unchanged. A failed step stays visible via steps + warnings.
   let hooks = { ok: true, steps: [], warnings: [] };
+  // The deferred half of the hooks, when the caller asked for it: it is started
+  // AFTER the pending-change copy, never before (see (i4)).
+  let deferredSetup = null;
   try {
     const hooksLib = libRequire("worktree-hooks.js");
     // The principal checkout owns the shared sources. repo.root is the
@@ -1321,7 +1492,16 @@ async function executeWorktreeCreate(params, ctx, opts) {
         runAsync: runHooksAsync,
         ...(opts && opts.signal ? { signal: opts.signal } : {}),
         ...(opts && Number.isFinite(opts.killGraceMs) && opts.killGraceMs > 0 ? { killGraceMs: opts.killGraceMs } : {}),
+        ...(backgroundHooks ? { deferSetup: true } : {}),
       });
+      // The deferred phases travel as a callable, never as a step list: the
+      // steps the create REPORTS are the ones that really ran plus one honest
+      // `pending` row per deferred phase.
+      if (hooks && typeof hooks.setup === 'function') {
+        deferredSetup = hooks.setup;
+        const { setup: _deferred, ...summary } = hooks;
+        hooks = summary;
+      }
     } else {
       hooks = hooksLib.runCreationHooks({
         principalRoot,
@@ -1370,6 +1550,26 @@ async function executeWorktreeCreate(params, ctx, opts) {
         paths: Array.isArray(outcome.copied) ? outcome.copied.slice() : [],
       };
     }
+  }
+
+  // (i4) The deferred half of the hooks (install, codegraph) starts HERE —
+  // after the copy, never before it. A `codegraph init` writing into the
+  // destination while the copy preflights it would read as a destination
+  // overlap and turn a good copy into a reported failure, so the copy is the
+  // last awaited step and the setup runs behind it. The create returns as soon
+  // as the copy settles (or fails, and says so): the setup's own outcome is
+  // reported by `reportCreationSetup`, never swallowed and never awaited here.
+  let setupPending = false;
+  if (deferredSetup !== null) {
+    setupPending = true;
+    startCreationSetup({
+      run: deferredSetup,
+      branch,
+      target,
+      notify: (opts && typeof opts.notify === 'function')
+        ? opts.notify
+        : (ctx && ctx.ui && typeof ctx.ui.notify === 'function' ? (message, level) => ctx.ui.notify(message, level) : null),
+    });
   }
 
   // (j) Terse success text (S9), whichever backend performed the creation.
@@ -1421,6 +1621,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
   // S7: the registry-write fact sits right after the identity rows, before the
   // hook fact: it is the tool's own bookkeeping and must never be inferred.
   const successText = [createSuccessText(branch, target, false), `registered: ${registeredOutcome}`, codegraphLine(codegraph)].filter((line) => typeof line === "string" && line.length > 0);
+  if (setupPending) successText.push("setup: running in the background (install, codegraph)");
   if (changesRegistered) successText.push("changes: already registered for this session");
   // S3/S4: what the copy actually did, in the same `N files, +A/-B` shape the
   // rest of the worktree surface uses. A clean selection adds no row.
@@ -1445,6 +1646,7 @@ async function executeWorktreeCreate(params, ctx, opts) {
     pruned: prunedStale,
     replacedRows: replacedRows.map((r) => ({ branch: r.branch, path: r.path })),
     changesRegistered,
+    ...(setupPending ? { setupPending: true } : {}),
     // S2: the base is reported only when one was used — an ADOPTED branch is
     // checked out as-is, so it has no base to name.
     ...(baseInfo !== null ? { base: baseInfo } : {}),
@@ -1459,7 +1661,10 @@ async function executeWorktreeCreate(params, ctx, opts) {
     // creation back — a created checkout is never silently removed (S2).
     return errorResult(
       `${createSuccessText(branch, target, false)}\n`
-      + `worktree created at ${target} but the pending changes were NOT copied: ${copyError}`,
+      // "not in full" is the only claim the evidence supports: a copy that
+      // failed partway leaves the files it landed in the destination (its own
+      // error counts them), so the result may never say the copy did not happen.
+      + `worktree created at ${target} but the pending changes were NOT copied in full: ${copyError}`,
       { ...successDetails, copyError },
       true,
     );
@@ -1566,7 +1771,7 @@ async function executeWorktreeList(params, ctx) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_list" },
     );
   }
@@ -2611,7 +2816,7 @@ async function executeWorktreeClose(params, ctx, opts) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_close" },
     );
   }
@@ -2779,6 +2984,49 @@ async function executeWorktreeClose(params, ctx, opts) {
     );
   }
 
+  // The warp keyboard delete pins the identity it approved (`opts.expectedReal`,
+  // the realpath the selector listed) and this function re-checks it — once
+  // before any pre-removal side effect, and again immediately before a remover
+  // is invoked. Without that, a path replaced by a symbolic link while the
+  // human answered would be handed to `git worktree remove`, which resolves the
+  // spelling it is given and would name ANOTHER checkout. No tool reaches this:
+  // `worktree_close` calls this function without options.
+  const expectedReal = opts && typeof opts.expectedReal === "string" && opts.expectedReal.length > 0
+    ? opts.expectedReal
+    : null;
+  // The approved DIRECTORY, pinned beyond its spelling: `dev`/`ino` name the
+  // object a removal would destroy. A realpath comparison alone cannot see a
+  // path replaced by a DIFFERENT directory at that same path — the spelling and
+  // the resolved path are identical, the object is not — so the warp delete
+  // pins the inode and this function re-reads it here.
+  const expectedPin = expectedReal !== null && opts && opts.expectedPin && typeof opts.expectedPin === "object"
+    ? opts.expectedPin
+    : null;
+  const pinDev = expectedPin && typeof expectedPin.dev === "number" ? expectedPin.dev : null;
+  const pinIno = expectedPin && typeof expectedPin.ino === "number" ? expectedPin.ino : null;
+  const identityRefusal = () => {
+    const fresh = warpDeleteIdentity(target, repo.root);
+    const realMatches = fresh.real !== null && fresh.real === expectedReal;
+    // Every offered row is a live checkout's own realpath, never a link, so a
+    // path that IS one now is a spelling nobody approved whatever it resolves to.
+    const notALink = fresh.link === false;
+    const sameDirectory = pinDev === null || pinIno === null
+      ? true
+      : (fresh.dev === pinDev && fresh.ino === pinIno);
+    if (realMatches && notALink && sameDirectory) return null;
+    let why;
+    if (!realMatches) why = `it now resolves to ${warpIdentityWords(fresh)}`;
+    else if (!notALink) why = `its path is now ${warpIdentityWords(fresh)}`;
+    else why = "the directory at that path is no longer the confirmed checkout (the path names a different directory)";
+    return `refusing to close worktree for branch '${branch}': ${target} no longer resolves to the approved checkout ${JSON.stringify(expectedReal)} (${why}); the checkout and the registry were left untouched`;
+  };
+  if (expectedReal !== null) {
+    const refusal = identityRefusal();
+    if (refusal !== null) {
+      return errorResult(refusal, { branch, path: target, force, removed: false });
+    }
+  }
+
   // Approval when the host offers dialog UI; non-interactive modes
   // proceed without it. A refusal mutates nothing and keeps the entry.
   //
@@ -2791,7 +3039,16 @@ async function executeWorktreeClose(params, ctx, opts) {
   // pending changes is never waived, YOLO or not — the branch survives either
   // way and uncommitted work does not. Nothing here ever forces: force still
   // comes only from the caller's params.
-  if (ctx && ctx.hasUI) {
+  //
+  // `opts.approved === true` means the CALLER already asked its own question
+  // about exactly this checkout with its own disclosure — that is the warp
+  // selector's keyboard delete, which never consults YOLO at all
+  // (`warpDeleteCheckout`). It suppresses the second dialog only: every check
+  // above and below, the live-session protections and the removal itself are
+  // unchanged, and no tool can reach this flag because `worktree_close` calls
+  // this function without options.
+  const alreadyApproved = !!(opts && opts.approved === true);
+  if (ctx && ctx.hasUI && !alreadyApproved) {
     const canAsk = ctx.ui && typeof ctx.ui.confirm === "function";
     let approved = false;
     if (canAsk) {
@@ -2855,6 +3112,14 @@ async function executeWorktreeClose(params, ctx, opts) {
   // separate elements (herdr rejects --flag=value). Never
   // --trust-repository: trusting a repository is a human decision these
   // tools never take. `--force` only when the caller asked for it.
+  //
+  // ORDER IS PART OF THE PROTECTION, not an implementation detail. This
+  // listing is a child process, so it is an await, and an await is the
+  // longest window a swap gets between an identity check and a remover: a
+  // reproduced race replaced the approved path with a symbolic link to another
+  // detached checkout exactly while this listing ran, after the check that
+  // used to sit above it. So the listing resolves FIRST, and the final check
+  // runs after it with NO await between that check and the spawn below.
   let removedBy = null;
   let removeError = null;
   let workspace = null;
@@ -2867,6 +3132,32 @@ async function executeWorktreeClose(params, ctx, opts) {
   if (listed.status === 0) {
     workspace = herdrWorkspaceId(listed.stdout, resolvedTarget, effectiveRoot);
   }
+
+  // The last possible check before a backend is asked to delete anything: the
+  // pre-removal sequence above may have warped a session and reconciled a
+  // workspace, and the listing just above is itself an await. Both are exactly
+  // the windows a swap exploits, so this check is the LAST thing that runs
+  // before the remover is launched — no await stands between the two.
+  //
+  // LIMITATION, stated rather than papered over: `git worktree remove` and
+  // `herdr worktree remove` take a path (or a workspace id) and resolve it in
+  // ANOTHER process, so the check and the removal cannot be one atomic act —
+  // there is no handle-based removal available here (no `openat`/`O_NOFOLLOW`
+  // "remove this exact directory") and the filesystem offers no
+  // compare-and-swap. A swap landing between this check and the remover's own
+  // `stat` is
+  // therefore not impossible. What is closed: every await-sized window, plus
+  // any replacement of the path (a link, or a different directory at the same
+  // path caught by the pinned inode), so an attacker must win a race measured
+  // in microseconds inside another process instead of one measured in an
+  // arbitrarily slow child.
+  if (expectedReal !== null) {
+    const refusal = identityRefusal();
+    if (refusal !== null) {
+      return errorResult(refusal, { branch, path: target, force, removed: false });
+    }
+  }
+
   if (workspace) {
     const removeParams = { workspace };
     if (force) removeParams.force = true;
@@ -3629,7 +3920,7 @@ async function executeWorktreeSessionOpen(params, ctx, watcherOptions) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_session_open" },
     );
   }
@@ -4150,7 +4441,11 @@ async function warpHandoffCopyChanges({ git, fromCheckout, targetCwd, changes })
       { git },
     );
   } catch (err) {
-    return { error: `cannot copy changes: ${(err && err.message) || err} (nothing was copied, warped or switched)` };
+    // A THROWN copy is not evidence that nothing was written: the failure may
+    // have struck after a write landed. The report therefore claims only what is
+    // certainly true — the session stays where it is — and sends the human to
+    // the destination before retrying.
+    return { error: `cannot copy changes: ${(err && err.message) || err} (the session stays where it is; inspect the destination before retrying)` };
   }
   if (!copied || copied.ok !== true) {
     return { error: (copied && copied.error) || 'cannot copy changes' };
@@ -4542,7 +4837,7 @@ async function executeWorktreeWarpTool(params, ctx, opts) {
   }
   if (!modeState || modeState.enabled !== true) {
     return errorResult(
-      "worktree tools are disabled; open /herdr-gentle:customize and apply the Worktree tools Enabled row to enable them",
+      "worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them",
       { state: modeState ? modeState.state : "unknown", tool: "worktree_warp" },
     );
   }
@@ -5431,6 +5726,7 @@ async function askWarpDirtyChoice(ctx, summaryLine, opts) {
             },
             done,
           }),
+          WARP_QUESTION_OVERLAY,
         );
       } catch {
         return null;
@@ -5488,6 +5784,12 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
   // and refuses otherwise. An ordinary invocation (a human typing
   // `/herdr-gentle:warp <name>`) carries none.
   const handoff = normalizeWarpHandoff(options.handoff);
+  // A create from the SAME flow already asked the pending-changes question and
+  // applied the answer, so this move reuses that answer instead of asking the
+  // same question twice: nothing is copied here (a second copy would be refused
+  // by the destination as an overlap) and nothing is asked. Only the flow that
+  // owns the answer sets it, and only for the checkout that create made.
+  const skipDirtyPrompt = options.skipDirtyPrompt === true;
   const name = typeof rawName === "string" ? rawName.trim() : "";
   if (name === "") {
     return warpFail(
@@ -5652,17 +5954,19 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
     return warpFail(`${text}\n\n${handoffCopyLanding()}\n${tail}`, { ...details, ...handoffCopyDetails() });
   };
   if (!handoff) {
-    const dirtyGate = await warpMaybeCopyDirty({
-      ctx, git, fromCheckout: dirtyFrom, targetCwd, options: opts,
-    });
-    if (dirtyGate && dirtyGate.cancelled === true) {
-      return warpFail(
-        `worktree warp: ${name} cancelled (the session stays in ${fromCwd})`,
-        { name, alreadyThere: false, cancelled: true },
-      );
-    }
-    if (dirtyGate && typeof dirtyGate.error === 'string') {
-      return warpFail(dirtyGate.error, { name, alreadyThere: false, cancelled: false });
+    if (skipDirtyPrompt !== true) {
+      const dirtyGate = await warpMaybeCopyDirty({
+        ctx, git, fromCheckout: dirtyFrom, targetCwd, options: opts,
+      });
+      if (dirtyGate && dirtyGate.cancelled === true) {
+        return warpFail(
+          `worktree warp: ${name} cancelled (the session stays in ${fromCwd})`,
+          { name, alreadyThere: false, cancelled: true },
+        );
+      }
+      if (dirtyGate && typeof dirtyGate.error === 'string') {
+        return warpFail(dirtyGate.error, { name, alreadyThere: false, cancelled: false });
+      }
     }
   } else if (handoff.changes && handoff.changes.mode !== 'none') {
     const copyGate = await warpHandoffCopyChanges({
@@ -5684,12 +5988,16 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
       if (proof.ok === true && proof.applied === true) {
         handoffCopy = { copied: proof.identical.slice(), skipped: true };
       } else if (proof.ok === true) {
-        // Nothing was proven byte for byte, so the copy is NOT skipped and
-        // nothing is overwritten. The message says what the destination actually
-        // holds — and, separately, which selected files could not be READ, since
-        // an unreadable file is not evidence of an absent one.
+        // Nothing was proven byte for byte, so the copy is NOT skipped. The
+        // message says what the destination actually holds — and, separately,
+        // which selected files could not be READ, since an unreadable file is
+        // not evidence of an absent one. The first line is the copy's own error,
+        // which counts any file that DID land (a copy can fail partway), so the
+        // safety line below is chosen by that evidence and never promises
+        // "nothing was written" while the destination holds files this attempt
+        // put there.
         const held = proof.identical.length > 0
-          ? `${targetCwd} already holds ${warpCopyFilesSummary(proof.identical).line}; `
+          ? `${targetCwd} now holds ${warpCopyFilesSummary(proof.identical).line}; `
           : '';
         const problems = [];
         if (proof.differing.length > 0) {
@@ -5700,7 +6008,15 @@ async function executeWorktreeWarp(rawName, ctx, opts) {
         }
         return warpFail(
           `worktree warp: ${copyGate.error}\n\n${held}${problems.join(', and ')}; the copy cannot be skipped\n`
-          + 'nothing was rolled back and nothing was overwritten\n'
+          // The safety sentence is EVIDENCE-BASED, never a blanket promise. A copy
+          // can fail PARTWAY: the error above counts the files that landed, and
+          // those files really are in the destination now, so the refusal may
+          // never claim an unqualified "nothing was overwritten". The scope is
+          // named instead — nothing BEYOND the files just listed — which stays
+          // true for a full refusal and for a partial copy alike.
+          + (proof.identical.length === 0
+            ? 'nothing was rolled back and nothing was overwritten\n'
+            : 'nothing was rolled back and nothing was overwritten beyond the files listed above\n')
           + `recovery: warp again without changes to leave the destination as it is, or reconcile those files in ${targetCwd} (commit or revert them) and warp again with the same changes`,
           {
             name, alreadyThere: false, cancelled: false,
@@ -6366,14 +6682,158 @@ function noteWarpDiscovery(repoRoot, live) {
 // Best-effort live scan for `session_start`: `{repo, live}` or null when
 // the session is outside a repository or git cannot list. Never throws,
 // never touches the registry.
-function scanLiveCheckouts(cwd) {
+//
+// It reads through the async runner: the sync readers resolve via
+// `spawnSync`, which froze the host event loop for the whole scan. Resolves to
+// the identical `{repo, live}` shape, or null for the same reasons; never
+// rejects. Falls back to the sync readers only when an older installed lib copy
+// does not carry the async twins.
+async function scanLiveCheckouts(cwd) {
   try {
     const git = libRequire("worktree-git.js");
     const from = typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
-    const repo = git.repoIdentity(from);
-    const live = git.listWorktrees(repo.root);
+    const repo = typeof git.repoIdentityAsync === "function"
+      ? await git.repoIdentityAsync(from)
+      : git.repoIdentity(from);
+    const live = typeof git.listWorktreesAsync === "function"
+      ? await git.listWorktreesAsync(repo.root)
+      : git.listWorktrees(repo.root);
     return { repo, live };
   } catch {
+    return null;
+  }
+}
+
+// Startup work that must not sit on the host's AWAITED `session_start` path
+// (the host awaits every handler it is handed, one at a time, so any awaited
+// probe delays the first prompt by its own duration) still has to stay honest
+// about which session it belongs to: a verdict or a registration that lands
+// after `session_shutdown` must not notify a dead UI or write into the session
+// that replaced it. Every dispatch captures the epoch below; shutdown advances
+// it, so late work drops instead of leaking across sessions.
+let startupEpoch = 0;
+const startupTasks = new Set();
+
+function beginStartupTask() {
+  return startupEpoch;
+}
+
+function startupTaskLive(epoch) {
+  return epoch === startupEpoch;
+}
+
+// Track a deferred startup task until it settles. The tracked promise never
+// rejects: a throwing phase settles into silence instead of an unhandled
+// rejection, and nothing is left unobserved.
+function trackStartupTask(task) {
+  const tracked = Promise.resolve(task).then(() => undefined, () => undefined);
+  startupTasks.add(tracked);
+  const forget = () => { startupTasks.delete(tracked); };
+  tracked.then(forget, forget);
+  return tracked;
+}
+
+// The ONE startup task whose completion `session_start` still waits for: the
+// discovery registration, because the registry it appends to is read by the
+// very next thing the session does. It is dispatched ahead of the other
+// startup work and awaited LAST, so the probes overlap and the host waits for
+// the slowest one instead of their sum.
+let startupRegistration = null;
+
+// Resolves once every deferred startup task has settled. Exported for tests and
+// for a shutdown path that must not leave work behind it.
+async function awaitPendingStartupTasks() {
+  while (startupTasks.size > 0) {
+    await Promise.all(Array.from(startupTasks));
+  }
+}
+
+// The discovery body the deferred startup task runs: scan, refresh the warp
+// cache, register the live checkouts the registry does not own. Read-only
+// outside the registry's own append, never throws, and a task whose session
+// ended before git answered drops instead of writing into the session that
+// replaced it. Returns the scan for tests and in-process callers.
+async function runStartupDiscovery(cwd, epoch) {
+  try {
+    const scanned = await scanLiveCheckouts(cwd);
+    if (scanned === null) return null;
+    if (!startupTaskLive(epoch)) return null;
+    noteWarpDiscovery(scanned.repo.root, scanned.live);
+    try {
+      const registry = libRequire("worktree-registry.js");
+      let principalId = null;
+      try {
+        if (typeof scanned.repo.commonDir === "string" && path.basename(scanned.repo.commonDir) === ".git") {
+          const rawPrincipal = path.resolve(path.dirname(scanned.repo.commonDir));
+          const pst = checkoutState(rawPrincipal, scanned.repo.root);
+          principalId = pst.real !== null ? pst.real : pst.absolute;
+        }
+      } catch {
+        principalId = null;
+      }
+      if (typeof registry.registerMissingWorktrees === "function") {
+        // S1: discovery only appends rows for live checkouts. It
+        // addresses no stored row, so it drops nothing and has no
+        // association to report.
+        registry.registerMissingWorktrees(scanned.repo.root, scanned.live, principalId);
+      }
+    } catch {
+      // Discovery registration is best-effort: the warp cache above
+      // already recorded the scan.
+    }
+    return scanned;
+  } catch {
+    return null;
+  }
+}
+
+// The S22/T1 verdict body the deferred startup task runs: probe the installed
+// plugin, deliver the one honest alert, and switch the sidebar option OFF
+// through the customize panel's own writer when the plugin is unusable. Same
+// flow as the awaited version it replaces, on the async runner. A session that
+// ended first drops both the alert and the sidebar write — a dead UI must not
+// be notified, and a replacing session must not inherit the previous verdict.
+async function runHerdrPluginStartupCheck(ctx, epoch) {
+  try {
+    const check = libRequire("herdr-plugin-check.js");
+    const notify = ctx && ctx.ui && typeof ctx.ui.notify === "function"
+      ? (text) => {
+        if (!startupTaskLive(epoch)) return;
+        ctx.ui.notify(text, "info");
+      }
+      : null;
+    // The panel registers its sidebar provider on a shared slot; the handle
+    // below is the same path a user selection uses, so the sidecar's
+    // convergence (marker, mode, rows attempt) is reused rather than
+    // duplicated here.
+    let sidebar = null;
+    try {
+      const slot = globalThis[Symbol.for("herdr-gentle.customize.v1")];
+      const provider = slot && slot.sidebar;
+      if (provider && typeof provider.read === "function" && typeof provider.apply === "function") {
+        sidebar = {
+          read: () => provider.read(),
+          apply: (value) => {
+            if (!startupTaskLive(epoch)) return { changed: false, text: "the session ended first" };
+            return provider.apply(value, ctx);
+          },
+          rowsManaged: () => (typeof provider.rowsManaged === "function" ? provider.rowsManaged() : false),
+        };
+      }
+    } catch {
+      sidebar = null;
+    }
+    if (typeof check.checkAndHandleHerdrPluginStartupAsync === "function") {
+      return await check.checkAndHandleHerdrPluginStartupAsync({ env: process.env, notify, sidebar });
+    }
+    if (typeof check.checkAndHandleHerdrPluginStartup === "function") {
+      return await check.checkAndHandleHerdrPluginStartup({ env: process.env, notify, sidebar });
+    }
+    // An older installed lib copy: keep the alert-only behaviour.
+    check.checkAndNotifyHerdrPlugin({ env: process.env, notify });
+    return null;
+  } catch {
+    // The plugin check must never break startup.
     return null;
   }
 }
@@ -6391,10 +6851,17 @@ function registerWarpMessageRenderer(pi) {
   try {
     const factory = libRequire("worktree-card.js");
     if (typeof factory.createWarpMessageRenderer !== "function") return;
-    pi.registerMessageRenderer(
-      "worktree-warp",
-      factory.createWarpMessageRenderer(resolveWorktreeCardHelpers() || undefined),
-    );
+    // Resolved per render (memoized by dependency identity) because the
+    // session UI — hence the click seam — is only known after `session_start`,
+    // long after this registration runs.
+    let cache = null;
+    pi.registerMessageRenderer("worktree-warp", (message, options, theme) => {
+      const deps = worktreeCardDeps();
+      if (!cache || cache.deps !== deps) {
+        cache = { deps, render: factory.createWarpMessageRenderer(deps) };
+      }
+      return cache.render(message, options, theme);
+    });
   } catch {
     // The default block still shows the notice; the warp itself is unaffected.
   }
@@ -6455,6 +6922,14 @@ const WARP_SELECTOR_OVERLAY = Object.freeze({
 const WARP_PANEL_OVERLAY = Object.freeze({
   overlay: true,
   overlayOptions: Object.freeze({ anchor: "bottom-center", width: "100%", margin: 0, maxHeight: WARP_OVERLAY_MAX_ROWS }),
+});
+// The pending-changes question is a step of this flow like the panel is, so it
+// mounts with the same bottom geometry. Mounted bare it painted as a
+// fullscreen component in the middle of the flow, which read as a different
+// surface than the panel that had just asked for it.
+const WARP_QUESTION_OVERLAY = Object.freeze({
+  overlay: true,
+  overlayOptions: Object.freeze({ anchor: "bottom-center", width: "100%", margin: 0 }),
 });
 function warpOverlayRows(hostTui) {
   let rows = WARP_OVERLAY_MAX_ROWS;
@@ -6576,7 +7051,10 @@ async function warpCheckoutsWithActivity(checkoutFacts, entries) {
 // and the SAME injectable seam (`setWarpDirtyAsker`) — never a second prompt
 // implementation. The answer becomes the create path's own `changes`
 // selection ("all" or "none"), so the transfer, its preflight and its refusals
-// stay in one place. Returns {ok:true, copy} / {cancelled:true}; never throws.
+// stay in one place. `asked` says whether the human actually answered (a clean
+// checkout answers nothing), because the ONE warp that follows this create must
+// not ask the same question a second time. Returns {ok:true, copy, asked} /
+// {cancelled:true}; never throws.
 async function askCreatePendingChanges({ ctx, git, fromCheckout }) {
   let changesLib = null;
   try {
@@ -6602,11 +7080,11 @@ async function askCreatePendingChanges({ ctx, git, fromCheckout }) {
   if (!summary || summary.ok !== true) {
     return { error: `cannot read the pending changes of ${fromCheckout} (${(summary && summary.error) || 'unknown error'})` };
   }
-  if (summary.files === 0) return { ok: true, copy: false };
+  if (summary.files === 0) return { ok: true, copy: false, asked: false };
   const summaryLine = `${summary.files} file${summary.files === 1 ? '' : 's'}, +${summary.added}/-${summary.deleted}`;
   const choice = await askWarpDirtyChoice(ctx, summaryLine);
   if (choice === null) return { cancelled: true };
-  return { ok: true, copy: choice === 'yes' };
+  return { ok: true, copy: choice === 'yes', asked: true };
 }
 
 // Create-then-return (S7): the selector's create completion mounts the
@@ -6708,7 +7186,19 @@ async function warpCreateAndEnter(ctx, git, notify) {
   // principal-anchored (S56): the new checkout lands beside the PRINCIPAL
   // checkout even when the panel runs inside a linked worktree, while the
   // branch base is local main (S2).
-  const created = await executeWorktreeCreate(createParams, ctx, { gitOnly: true, principalLayout: true });
+  //
+  // `backgroundHooks` is what makes a confirmed create feel instant: the
+  // checkout path is all the warp needs, so the slow setup (install, codegraph)
+  // runs behind it and reports itself when it settles. The pending-change copy
+  // is still AWAITED inside the create — it must be complete before the session
+  // can move, or the human would switch into a checkout that is missing the
+  // work they just asked to carry.
+  const created = await executeWorktreeCreate(createParams, ctx, {
+    gitOnly: true,
+    principalLayout: true,
+    backgroundHooks: true,
+    ...(typeof notify === 'function' ? { notify } : {}),
+  });
   if (created && created.isError) {
     // The refusal is a TOOL result, so its words live in `content[].text`
     // (`toolResultText`): it is reported verbatim, because it already names the
@@ -6725,8 +7215,17 @@ async function warpCreateAndEnter(ctx, git, notify) {
     : branch;
   // S7: the created checkout is a selector ROW, never an automatic move. The
   // name travels back so the caller can report/focus it; the session stays
-  // exactly where it is until the human chooses.
-  return { closed: true, created: true, worktree: slugOf(git, storedBranch) || storedBranch, branch: storedBranch };
+  // exactly where it is until the human chooses. `dirtyAsked` tells the caller
+  // that the pending-changes question was ALREADY answered in this flow, so the
+  // one warp that follows must not ask it again.
+  return {
+    closed: true,
+    created: true,
+    worktree: slugOf(git, storedBranch) || storedBranch,
+    branch: storedBranch,
+    dirtyAsked: pending.asked === true,
+    dirtyCopy: pending.copy === true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -6979,18 +7478,488 @@ async function issuesViewPages(gh, cwd, recentNumbers, scope) {
   return await refreshIssuesViewBuckets(gh, cwd, key, recentNumbers, scope);
 }
 
+// S4 (feedback: «falta el atajo para eliminar worktree»): the warp keyboard
+// DELETE. `ctrl+d` in the panel or in the extended list names one checkout;
+// this is the only thing that can turn that request into a removal, and a
+// keypress alone never does.
+//
+// Every rule is fail-closed, and they are all here rather than in the view:
+//   - the target must be one of the checkouts THIS selector just offered,
+//     matched by exact path — never a path the component invented;
+//   - the principal checkout and the checkout this session is running in are
+//     refused BEFORE any question is asked: this surface moves a session away
+//     from a checkout, it never deletes the project itself; deleting the
+//     current checkout is done by warping elsewhere and closing it from there
+//     (`worktree_close` owns that flow, including its live-session rules);
+//   - the disclosure comes from lib/warp-delete-confirm.js, so a checkout with
+//     pending changes says how many LINES would be lost (`+A/-D`), names the
+//     files git IGNORES (deleted with the checkout while the tree reads clean),
+//     and binds the question to the pending CONTENT, because identical `+A/-D`
+//     counts can hide different bytes;
+//   - an `unknown` reading of any of those is a REFUSAL: nothing can say what
+//     would be lost, so there is no honest question to answer either;
+//   - the confirmation is ALWAYS asked, and gentle-shell's YOLO grant is
+//     deliberately not consulted: that grant is standing permission for
+//     ordinary work, not for removing a checkout. A human answer is the only
+//     thing that authorizes this;
+//   - the target IDENTITY is pinned to what the selector listed (a live
+//     checkout's own realpath), checked before the question and compared again
+//     after it, so a path replaced by a symbolic link to another checkout is
+//     refused instead of answered for: `git worktree remove` resolves the
+//     spelling it is given, so an unapproved spelling is another checkout's
+//     directory. The same pin travels into the shared close, which re-verifies
+//     it immediately before any remover runs;
+//   - AFTER the answer the exact target is read AGAIN and every component is
+//     compared with its OWN earlier reading — the identity with the identity,
+//     the live branch with the live branch, the registry row with the registry
+//     row, the disclosure (counts, pending content, ignored files) with the
+//     disclosure. A row that vanished, a checkout that stopped being live, a
+//     moved branch, different bytes behind identical counts or a new ignored
+//     file all fail closed with nothing removed and the difference named — so
+//     the next attempt asks about the new state instead of destroying work
+//     nobody was shown. The live branch is NEVER compared with the registered
+//     one: they legitimately differ (the listing offers a sole claimant's
+//     CURRENT branch), and comparing them refused every such deletion;
+//   - `force` travels only on POSITIVE dirty evidence (the human just agreed
+//     to lose those lines). Unknown evidence never forces, which leaves git's
+//     own dirty refusal as the last line of defence.
+//
+// The removal itself is the shared `executeWorktreeClose` — one
+// implementation, with its branch-kept contract, its live-session protection
+// and its verification — told that this dialog already happened.
+async function warpDeleteCheckout(targetPath, ctx, deps) {
+  const git = deps.git;
+  const registry = deps.registry;
+  const repo = deps.repo;
+  const notify = deps.notify;
+  const offered = Array.isArray(deps.offered) ? deps.offered : [];
+  const principal = deps.principal && typeof deps.principal === "object" ? deps.principal : null;
+  const active = typeof deps.active === "string" && deps.active.length > 0 ? deps.active : null;
+  let confirmLib = null;
+  try {
+    confirmLib = libRequire("warp-delete-confirm.js");
+  } catch {
+    confirmLib = null;
+  }
+  if (!confirmLib
+    || typeof confirmLib.readWarpDeleteEvidence !== "function"
+    || typeof confirmLib.warpDeletePrompt !== "function"
+    || typeof confirmLib.warpDeleteEvidenceKey !== "function") {
+    notify?.("warp: cannot delete a worktree here: the removal disclosure is unavailable; nothing was removed.", "error");
+    return;
+  }
+
+  // 1. The exact checkout this selector listed, or nothing.
+  const target = offered.find((entry) => entry && entry.path === targetPath) || null;
+  if (!target) {
+    notify?.(`warp: refusing to delete ${JSON.stringify(targetPath)}: it is not one of the checkouts this selector listed; nothing was removed.`, "error");
+    return;
+  }
+  const targetState = checkoutState(target.path, repo.root);
+  const targetId = targetState.real !== null ? targetState.real : targetState.absolute;
+  // The identity the human is shown and the only checkout this removal may
+  // ever name: the path the selector listed, which is a live checkout's own
+  // realpath (`warpOfferedCheckouts` offers `st.real`). Everything below pins
+  // to this value, never to whatever the path resolves to later.
+  const approvedReal = targetState.absolute !== null ? targetState.absolute : path.resolve(target.path);
+
+  // 2. The project itself is never a deletion target.
+  if (principal && typeof principal.path === "string" && principal.path.length > 0) {
+    const principalState = checkoutState(principal.path, repo.root);
+    const principalId = principalState.real !== null ? principalState.real : principalState.absolute;
+    if (targetId !== null && principalId !== null && targetId === principalId) {
+      notify?.(`warp: refusing to delete the principal checkout at ${principal.path}: it is the project itself; nothing was removed.`, "error");
+      return;
+    }
+  }
+
+  // 3. Neither is the checkout this session stands on.
+  if (active !== null) {
+    const activeState = checkoutState(active, repo.root);
+    const activeId = activeState.real !== null ? activeState.real : activeState.absolute;
+    const coversTarget = activeId !== null && targetId !== null
+      && (activeId === targetId || activeId.startsWith(targetId + path.sep));
+    if (coversTarget) {
+      notify?.(`warp: refusing to delete the checkout this session is running in (${target.path}): warp to another checkout first; nothing was removed.`, "error");
+      return;
+    }
+  }
+
+  // 4. Only a REGISTERED worktree can be closed: the shared close resolves its
+  // target through the registry, so a live checkout nobody registered would be
+  // asked about and then refused. That is a question a human cannot act on, so
+  // it is refused here instead — before the dialog.
+  let registered = null;
+  try {
+    registered = registry.findByPath(repo.root, target.path);
+  } catch {
+    registered = null;
+  }
+  if (!registered) {
+    notify?.(`warp: refusing to delete ${target.path}: it is a live checkout this repository's worktree registry does not own; nothing was removed.`, "error");
+    return;
+  }
+
+  // 5. The BEFORE reading: one snapshot of the exact target (its registered
+  // row, its LIVE branch, whether it is still a live checkout) together with
+  // the disclosure. The same snapshot is taken again AFTER the answer, and each
+  // component is compared with its OWN earlier value — never the live branch
+  // against the registry row, which legitimately disagree (the listing offers a
+  // sole claimant's CURRENT branch, while the row stores the branch it was
+  // registered with; B1: comparing the two refused every such deletion).
+  const before = await warpDeleteSnapshot({ git, registry, repo, targetPath: target.path, confirmLib });
+  if (before.ok !== true) {
+    notify?.(before.text, "error");
+    return;
+  }
+  // 5b. The path must STILL BE the checkout the selector listed. A swap that
+  // landed between the listing and this reading leaves every other component
+  // identical (two DETACHED checkouts share an unknown live branch and the
+  // same disclosure), so the identity is the only fact that reveals it — and
+  // it is checked here, before any question is asked about a path that no
+  // longer names the checkout the human believes they are answering about.
+  if (before.identity.real === null || before.identity.real !== approvedReal) {
+    notify?.(`warp: refusing to delete ${target.path}: it no longer resolves to the checkout this selector listed (it now resolves to ${warpIdentityWords(before.identity)}); nothing was removed — reopen the warp selector to review the checkouts.`, "error");
+    return;
+  }
+  // 5c. The approved DIRECTORY is pinned too, not only its spelling: the
+  // device/inode pair of the object at that path. `dev`/`ino` are read from the
+  // SAME reading that just matched the selector's identity, and they travel
+  // into the shared close, which re-reads them immediately before the remover
+  // is launched — that is what catches a path replaced by ANOTHER directory
+  // (identical spelling, identical realpath, different object), the one swap a
+  // realpath comparison cannot see. An unreadable pair is a REFUSAL: without it
+  // the removal cannot say which directory it is about to destroy.
+  if (typeof before.identity.dev !== "number" || typeof before.identity.ino !== "number") {
+    notify?.(`warp: refusing to delete ${target.path}: the identity of its directory could not be read, so a path replaced by another directory could not be told apart; nothing was removed — retry, or close it with the worktree_close tool.`, "error");
+    return;
+  }
+  const approvedPin = { real: approvedReal, dev: before.identity.dev, ino: before.identity.ino };
+  const evidence = before.evidence;
+
+  // 5a. FAIL CLOSED on unknown evidence: if the pending work cannot be read —
+  // the change summary, the CONTENT fingerprint that binds the counts to real
+  // bytes, or the ignored files that die with the checkout — nothing can say
+  // what this deletion would destroy, so there is no honest question to ask and
+  // no answer that could authorize it.
+  const changes = evidence.changes && typeof evidence.changes === "object" ? evidence.changes : null;
+  if (!changes || changes.status === "unknown") {
+    const reason = changes && typeof changes.reason === "string" && changes.reason.length > 0
+      ? changes.reason
+      : "the change summary failed";
+    notify?.(`warp: refusing to delete ${target.path}: its uncommitted changes could not be read (${reason}), so nothing can say what would be lost; nothing was removed — retry, or close it with the worktree_close tool.`, "error");
+    return;
+  }
+  const content = evidence.content && typeof evidence.content === "object" ? evidence.content : null;
+  if (!content || content.status !== "known") {
+    const reason = content && typeof content.reason === "string" && content.reason.length > 0
+      ? content.reason
+      : "the pending content could not be fingerprinted";
+    notify?.(`warp: refusing to delete ${target.path}: what is pending in it could not be fingerprinted (${reason}), so an identical +/- count could hide different work; nothing was removed — retry, or close it with the worktree_close tool.`, "error");
+    return;
+  }
+  const ignored = evidence.ignored && typeof evidence.ignored === "object" ? evidence.ignored : null;
+  if (!ignored || ignored.status === "unknown") {
+    const reason = ignored && typeof ignored.reason === "string" && ignored.reason.length > 0
+      ? ignored.reason
+      : "the ignored-file listing failed";
+    notify?.(`warp: refusing to delete ${target.path}: the files git ignores there could not be listed (${reason}), so the removal could destroy work nobody was shown; nothing was removed — retry, or close it with the worktree_close tool.`, "error");
+    return;
+  }
+
+  const prompt = confirmLib.warpDeletePrompt(
+    { name: target.name, path: target.path, branch: target.branch },
+    evidence,
+  );
+
+  // 6. Always asked. No permission mode is read on this path.
+  if (!ctx || !ctx.ui || typeof ctx.ui.confirm !== "function") {
+    notify?.(`warp: cannot delete ${target.path}: this host cannot ask the confirmation a removal requires; nothing was removed.`, "error");
+    return;
+  }
+  let approved = false;
+  try {
+    approved = await ctx.ui.confirm(prompt.title, prompt.body);
+  } catch {
+    approved = false;
+  }
+  if (!approved) {
+    notify?.(`worktree delete cancelled: nothing was removed at ${target.path}.`, "info");
+    return;
+  }
+
+  // 7. Revalidate the EXACT target and its evidence after the answer, so a
+  // checkout that changed while the dialog was open is never removed on the
+  // strength of what the human read a moment ago.
+  const after = await warpDeleteSnapshot({ git, registry, repo, targetPath: target.path, confirmLib });
+  if (after.ok !== true) {
+    notify?.(after.text, "error");
+    return;
+  }
+  const moved = warpDeleteSnapshotDelta(before, after);
+  if (moved.length > 0) {
+    notify?.(`refusing to delete ${target.path}: the checkout changed while the confirmation was open (${moved.join("; ")}); nothing was removed — run the delete again to review the new state.`, "error");
+    return;
+  }
+
+  // 8. The shared close, told its own dialog already happened. `force` still
+  // comes only from positive dirty evidence. `expectedReal` carries the
+  // approval into the removal itself: the close re-reads the identity right
+  // before it names a checkout to a backend, so the narrowest possible window
+  // remains between that read and the remover.
+  let result;
+  try {
+    result = await executeWorktreeClose({ path: target.path, force: prompt.force === true }, ctx, { approved: true, expectedReal: approvedReal, expectedPin: approvedPin });
+  } catch (err) {
+    notify?.(`worktree delete failed at ${target.path}: ${(err && err.message) || err}; inspect the checkout before retrying.`, "error");
+    return;
+  }
+  if (result && result.isError === true) {
+    const reason = toolResultText(result) || "the removal reported no reason";
+    notify?.(`worktree delete failed at ${target.path}: ${reason}`, "error");
+    return;
+  }
+  notify?.(`worktree deleted: ${target.name} · ${target.path}; the branch '${target.branch}' is kept.`, "info");
+}
+
+// The EXACT checkout a deletion names, read on both sides of the question.
+// `absolute` is the path the selector offered, `real` the checkout that path
+// resolves to right now, and `link`/`linkTarget` say whether that path IS a
+// symbolic link — the shape a swap takes, because every offered row is a live
+// checkout's own realpath (`warpOfferedCheckouts`), never a link.
+function warpDeleteIdentity(targetPath, repoRoot) {
+  const state = checkoutState(targetPath, repoRoot);
+  let link = false;
+  let linkTarget = null;
+  let dev = null;
+  let ino = null;
+  if (state.absolute !== null) {
+    try {
+      link = fs.lstatSync(state.absolute).isSymbolicLink();
+      if (link) linkTarget = fs.readlinkSync(state.absolute);
+    } catch {
+      // A path that cannot be lstat'ed is not readable as a link; `exists`
+      // already reports that it is not there.
+      link = false;
+      linkTarget = null;
+    }
+    // The DIRECTORY behind the path (`statSync` follows a link, which is
+    // reported above): its device/inode pair is what tells the approved
+    // checkout apart from a different directory later placed at the same path,
+    // which a realpath comparison cannot see. Best-effort: `null` means the
+    // reading is unavailable, and callers decide whether that fails closed.
+    try {
+      const stats = fs.statSync(state.absolute);
+      dev = typeof stats.dev === "number" ? stats.dev : null;
+      ino = typeof stats.ino === "number" ? stats.ino : null;
+    } catch {
+      dev = null;
+      ino = null;
+    }
+  }
+  return {
+    absolute: state.absolute,
+    real: state.real,
+    exists: state.exists,
+    isDirectory: state.isDirectory,
+    link,
+    linkTarget,
+    dev,
+    ino,
+  };
+}
+
+// Two readings name the same checkout through the same kind of path only when
+// every one of these agrees. A realpath that moved is a different checkout; a
+// path that became a link (or stopped being one) is a different spelling, so
+// whatever a remover resolves it to is no longer the approved target; and a
+// `dev`/`ino` pair that moved is a DIFFERENT directory reached through the same
+// spelling — the one swap a realpath comparison alone cannot see.
+function warpSameIdentity(before, after) {
+  const a = before && typeof before === "object" ? before : {};
+  const b = after && typeof after === "object" ? after : {};
+  return (a.real ?? null) === (b.real ?? null)
+    && a.link === b.link
+    && (a.linkTarget ?? null) === (b.linkTarget ?? null)
+    && a.exists === b.exists
+    && a.isDirectory === b.isDirectory
+    && (a.dev ?? null) === (b.dev ?? null)
+    && (a.ino ?? null) === (b.ino ?? null);
+}
+
+// What the path is NOW, in the human's words, for a refusal. A link is named
+// with the target it carries and what that resolves to, because "a symlink"
+// alone does not say which checkout a remover would reach.
+function warpIdentityWords(identity) {
+  const read = identity && typeof identity === "object" ? identity : {};
+  const real = typeof read.real === "string" ? `'${read.real}'` : "nothing (the path does not resolve)";
+  if (read.link === true) {
+    const target = typeof read.linkTarget === "string" ? `'${read.linkTarget}'` : "an unreadable target";
+    return `a symbolic link to ${target}, which resolves to ${real}`;
+  }
+  return real;
+}
+
+// One reading of the deletion target, taken BEFORE the question and again after
+// the answer. Every component is compared with its own twin:
+//   - `identity`: the checkout the path resolves to, and whether that path is a
+//     symbolic link (see `warpSameIdentity`),
+//   - `registered`: the registry row's branch (the row is what the close
+//     resolves),
+//   - `live`: whether the checkout is still live AND the branch git reports for
+//     it (whichever branch it is on — the listing offers a sole claimant's
+//     CURRENT branch, so a checkout that was moved to another branch before the
+//     dialog is normal and must never look like a mismatch),
+//   - `evidence`: the disclosure, whose key covers counts, pending CONTENT and
+//     the ignored-file list.
+// A component that cannot be read makes the whole snapshot `ok:false`, because
+// a comparison against an unreadable value would either pass on nothing or
+// refuse on nothing.
+async function warpDeleteSnapshot({ git, registry, repo, targetPath, confirmLib }) {
+  let freshRead;
+  try {
+    freshRead = registry.readRegistry(repo.root);
+  } catch (err) {
+    return { ok: false, text: `refusing to delete ${targetPath}: the worktree registry could not be read (${(err && err.message) || err}); nothing was removed.` };
+  }
+  if (!freshRead || freshRead.ok !== true) {
+    return { ok: false, text: `refusing to delete ${targetPath}: the worktree registry could not be read (${(freshRead && freshRead.error) || "unknown error"}); nothing was removed.` };
+  }
+  let row = null;
+  try {
+    row = registry.findByPath(repo.root, targetPath);
+  } catch {
+    row = null;
+  }
+  let live;
+  try {
+    live = await git.listWorktreesAsync(repo.root, { runAsync: libRunner(git) });
+  } catch (err) {
+    return { ok: false, text: `refusing to delete ${targetPath}: the live worktree listing could not be read (${(err && err.message) || err}); nothing was removed.` };
+  }
+  const listing = Array.isArray(live) ? live : [];
+  const liveIds = liveIdentities(listing, repo.root);
+  const identityRead = warpDeleteIdentity(targetPath, repo.root);
+  const identity = identityRead.real !== null ? identityRead.real : identityRead.absolute;
+  const isLive = identity !== null && identityRead.exists && identityRead.isDirectory && liveIds.has(identity);
+  // The branch git reports for THAT identity, never for another spelling of it.
+  let liveBranch = null;
+  if (isLive) {
+    for (const entry of listing) {
+      if (!entry || typeof entry.path !== "string" || entry.path.length === 0) continue;
+      const entryState = checkoutState(entry.path, repo.root);
+      const entryId = entryState.real !== null ? entryState.real : entryState.absolute;
+      if (entryId !== identity) continue;
+      if (typeof entry.branch === "string" && entry.branch.length > 0) liveBranch = entry.branch;
+      break;
+    }
+  }
+  const evidence = await confirmLib.readWarpDeleteEvidence(targetPath, { git });
+  return {
+    ok: true,
+    identity: identityRead,
+    registered: { present: row !== null, branch: row && typeof row.branch === "string" ? row.branch : null },
+    live: { present: isLive, branch: liveBranch },
+    evidence,
+    evidenceKey: confirmLib.warpDeleteEvidenceKey(evidence),
+  };
+}
+
+// What moved between the confirmed reading and the one taken before the removal,
+// in the human's words. An empty list is the only state in which the deletion
+// may proceed; every entry names ONE component, so a message never says
+// "something changed" without saying what.
+function warpDeleteSnapshotDelta(before, after) {
+  const moved = [];
+  // FIRST, because it outranks everything else: when the path stopped naming
+  // the approved checkout, no other matching component means anything.
+  if (!warpSameIdentity(before.identity, after.identity)) {
+    const beforeLink = !!(before.identity && before.identity.link === true);
+    const afterLink = !!(after.identity && after.identity.link === true);
+    const sameResolution = (before.identity.real ?? null) === (after.identity.real ?? null);
+    const sameKind = beforeLink === afterLink
+      && (before.identity.linkTarget ?? null) === (after.identity.linkTarget ?? null);
+    if (!beforeLink && afterLink) {
+      moved.push(`its path was replaced by a symbolic link to the other checkout (it now resolves to ${warpIdentityWords(after.identity)}, not to the confirmed checkout ${warpIdentityWords(before.identity)})`);
+    } else if (beforeLink && !afterLink) {
+      moved.push(`its path stopped being a symbolic link (it now names ${warpIdentityWords(after.identity)})`);
+    } else if (sameResolution && sameKind) {
+      // Same spelling, same resolved path, same kind of path — and still a
+      // different object: the approved directory was moved aside and another
+      // directory put at that path, which only the pinned inode can reveal.
+      moved.push("the directory at that path was replaced by a different one (the same path, a different directory: the confirmed checkout is no longer there)");
+    } else {
+      moved.push(`its resolved checkout changed from ${warpIdentityWords(before.identity)} to ${warpIdentityWords(after.identity)}`);
+    }
+  }
+  if (before.live.present !== after.live.present) {
+    moved.push(after.live.present
+      ? "the checkout became live again"
+      : "it is no longer a live checkout");
+  }
+  if (before.live.branch !== after.live.branch) {
+    moved.push(`its live branch changed from '${before.live.branch === null ? "unknown" : before.live.branch}' to '${after.live.branch === null ? "unknown" : after.live.branch}'`);
+  }
+  if (before.registered.present !== after.registered.present) {
+    moved.push(after.registered.present
+      ? "its registry entry came back"
+      : "its registry entry disappeared");
+  }
+  if (before.registered.branch !== after.registered.branch) {
+    moved.push(`its registered branch changed from '${before.registered.branch === null ? "unknown" : before.registered.branch}' to '${after.registered.branch === null ? "unknown" : after.registered.branch}'`);
+  }
+  if (before.evidenceKey !== after.evidenceKey) {
+    const beforeContent = before.evidence && before.evidence.content ? before.evidence.content.fingerprint : null;
+    const afterContent = after.evidence && after.evidence.content ? after.evidence.content.fingerprint : null;
+    const beforeIgnored = before.evidence && before.evidence.ignored ? before.evidence.ignored.files : null;
+    const afterIgnored = after.evidence && after.evidence.ignored ? after.evidence.ignored.files : null;
+    if (beforeContent !== afterContent) {
+      moved.push("its pending content changed");
+    } else if (beforeIgnored !== afterIgnored) {
+      moved.push("its ignored files changed");
+    } else {
+      moved.push("its pending work changed");
+    }
+    moved.push(`confirmed: ${warpEvidenceSummary(before.evidence)}; now: ${warpEvidenceSummary(after.evidence)}`);
+  }
+  return moved;
+}
+
+// One short phrase per evidence read, used only by the refusal above so the
+// human can see WHAT moved between the dialog and the removal.
+function warpEvidenceSummary(evidence) {
+  const read = evidence && typeof evidence === "object" ? evidence : {};
+  const changes = read.changes && typeof read.changes === "object" ? read.changes : {};
+  let pending;
+  if (changes.status === "dirty") {
+    const files = Number.isFinite(changes.files) ? changes.files : 0;
+    pending = `${files} file${files === 1 ? "" : "s"}, +${changes.added}/-${changes.deleted}`;
+  } else if (changes.status === "clean") {
+    pending = "no pending changes";
+  } else {
+    pending = "pending changes unknown";
+  }
+  const aheadMain = read.aheadMain && typeof read.aheadMain === "object" ? read.aheadMain : {};
+  let ahead;
+  if (aheadMain.status === "ahead") ahead = `${aheadMain.ahead} ahead of main`;
+  else if (aheadMain.status === "none") ahead = "not ahead of main";
+  else ahead = "commits ahead of main unknown";
+  return `${pending}, ${ahead}`;
+}
+
 // Warp selector loop (human selector): the S4 bottom panel and its extended
 // list from lib/warp-selector-view.js, mounted through `ctx.ui.custom` as a
 // bottom-anchored, full-width overlay whose height the view computes from its
 // own content (S3). Returns undefined when the interaction resolved (warp,
-// create or cancel) and "fallback" when the host custom UI or the overlay is
-// unusable, so the caller falls through to the plain select path. Each
-// iteration re-reads the registry and the live git listing fresh.
+// create, delete or cancel) and "fallback" when the host custom UI or the
+// overlay is unusable, so the caller falls through to the plain select path.
+// Each iteration re-reads the registry and the live git listing fresh.
 //
-// S1/S4: this surface can only WARP or CREATE. The worktree edit panel, the
-// issue/ODD association write and the keyboard delete view are gone, so no
-// marker but `warp`, `create` and `null` is ever read here — a worktree is
-// modified by its own tools/commands, never from the warp popup.
+// S1/S4: this surface warps, creates and asks to DELETE. The worktree edit
+// panel and the issue/ODD association write are gone, so the markers read here
+// are `warp`, `create`, `delete` and `null` — and `delete` is only ever an
+// explicit question asked by a human (`warpDeleteCheckout` above); nothing
+// here reads a permission mode, and a worktree is never modified.
 async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
   let viewLib = null;
   try {
@@ -7017,6 +7986,13 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
   // S21: every child this loop needs is awaited (`git list`, the create's
   // reads), so the panel keeps repainting and taking keys between them.
   const runAsync = libRunner(git);
+  // Duplicate-prompt guard: a create from THIS flow already asked the
+  // pending-changes question and applied the answer, so the one warp that
+  // follows it — and only when it targets the checkout just created — must not
+  // ask the same question again (nor copy a second time, which the destination
+  // would refuse as an overlap the human cannot resolve). Any other pick keeps
+  // the ordinary gate.
+  let createDirtyName = null;
   for (;;) {
     let freshRead;
     try {
@@ -7115,7 +8091,11 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
         notify?.(`warp: unknown checkout selection ${JSON.stringify(out.warp)}; nothing was moved.`, "error");
         return undefined;
       }
-      const warpOut = await executeWorktreeWarp(chosen.name, ctx);
+      const warpOptions = createDirtyName !== null && createDirtyName === chosen.name
+        ? { skipDirtyPrompt: true }
+        : undefined;
+      createDirtyName = null;
+      const warpOut = await executeWorktreeWarp(chosen.name, ctx, warpOptions);
       if (warpOut.isError) notify?.(warpOut.text, "error");
       return undefined;
     }
@@ -7126,8 +8106,35 @@ async function runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify) {
       // read listing, so the human picks where the session goes, including the
       // checkout just created, which is never entered automatically. Closing
       // that returned selector is what ends the flow.
-      if (made && made.closed === true) continue;
+      if (made && made.closed === true) {
+        // Remembered for the next pick only: if it is the checkout this create
+        // made AND the question was already answered, the warp reuses that
+        // answer instead of asking the same thing twice.
+        createDirtyName = made.created === true && made.dirtyAsked === true && typeof made.worktree === "string"
+          ? made.worktree
+          : null;
+        continue;
+      }
       return undefined;
+    }
+    if (out && typeof out === "object" && typeof out.delete === "string") {
+      // S4: the keyboard delete. `warpDeleteCheckout` owns every rule (the
+      // disclosure, the always-asked confirmation, the post-answer
+      // revalidation and the shared close); this loop only hands it the fresh
+      // listing it just read, so the request is resolved against the state on
+      // screen. The selector then comes back with a re-read listing — removed,
+      // declined or refused — exactly like the create flow, so a deletion never
+      // closes the panel silently.
+      await warpDeleteCheckout(out.delete, ctx, {
+        git,
+        registry,
+        repo,
+        notify,
+        offered: freshOffered,
+        principal: freshPrincipal,
+        active: freshActive,
+      });
+      continue;
     }
     notify?.(`warp: unknown checkout selection ${JSON.stringify(out)}; nothing was moved.`, "error");
     return undefined;
@@ -7144,6 +8151,12 @@ function registerWarpCommand(pi) {
     description: "Move this session to another checkout of the project: pick from a selector, or warp <name>",
     handler: async (args, ctx) => {
       const notify = ctx?.ui?.notify;
+      // The worktree toggle gates this command's invocation too, so a runtime
+      // that could not be reloaded never moves a session while disabled.
+      if (!customizePluginToolEnabled("worktree")) {
+        notify?.("worktree tools are disabled; open /herdr-gentle:customize and apply the Plugin tools Worktree tools toggle to enable them", "error");
+        return;
+      }
       const raw = String(args ?? "").trim();
       // An agent handoff (queued by the `worktree_warp` tool) travels as ONE
       // `@<token>` argument. It is decoded and re-validated here; a rejected
@@ -7213,8 +8226,8 @@ function registerWarpCommand(pi) {
       noteWarpDiscovery(repo.root, live);
       // The popup: `runWarpSelectorLoop` mounts the redesigned overlay
       // (popup + extended list) when the host offers ctx.ui.custom. S1/S4:
-      // the popup warps or creates and nothing else — the edit panel and the
-      // keyboard delete view were removed, so a cancel/Esc simply reopens.
+      // the popup warps, creates, and asks to delete with `ctrl+d`; the edit
+      // panel is gone, so a cancel/Esc simply reopens.
       const useCustomWarp = ctx && ctx.ui && typeof ctx.ui.custom === "function";
       if (useCustomWarp) {
         const handled = await runWarpSelectorLoop(ctx, git, registry, repo, fromCwd, notify);
@@ -7327,19 +8340,42 @@ const CUSTOMIZE_CATEGORIES = [
     ],
   },
   {
-    id: "worktree",
-    title: "Worktree tools",
-    rows: [
-      { id: "enabled", label: "Enabled", detail: "agents can create, list, close, warp between and open sessions in agent worktrees" },
-      { id: "disabled", label: "Disabled", detail: "the worktree tools are not registered" },
-    ],
+    // One grouped section, three independent toggles: the worktree tool
+    // surface, the ODD command and the Issues command. Rows are built per open
+    // by customizePanelModel() so each one names its own stored state.
+    id: "plugin-tools",
+    title: "Plugin tools",
+    rows: [],
   },
   {
     id: "reset",
     title: "Reset",
     rows: [
-      { id: "reset", label: "Reset every option to its default", detail: "sidebar Gentle, Moshi notifications off and worktree tools enabled" },
+      { id: "reset", label: "Reset every option to its default", detail: "sidebar Gentle, Moshi notifications off and the three plugin tools enabled" },
     ],
+  },
+];
+
+// The three toggles of the "Plugin tools" section, in panel order. `id` is the
+// persisted key: `worktree` keeps the legacy mode file, `odd` and `issues` share
+// their own file. The copy names what each toggle actually gates — the
+// registered command or tool surface, never the automatic capture, which keeps
+// running either way.
+const CUSTOMIZE_PLUGIN_TOOLS = [
+  {
+    id: "worktree",
+    label: "Worktree tools",
+    detail: "agents can create, list, close, warp between and open sessions in agent worktrees; the warp command follows this toggle",
+  },
+  {
+    id: "odd",
+    label: "ODD command",
+    detail: "registers /herdr-gentle:odd; automatic ODD capture keeps running whether it is on or off",
+  },
+  {
+    id: "issues",
+    label: "Issues command",
+    detail: "registers /herdr-gentle:issues; the gh check stays a gate on opening it, never on registration",
   },
 ];
 
@@ -7368,12 +8404,79 @@ function customizeProviderValue(slot, name, ids) {
   }
 }
 
-function customizeWorktreeValue() {
+// The live state of the three plugin tools toggles, plus what a caller needs
+// to EXPLAIN a fail-closed read: the ODD/Issues verdict from
+// lib/worktree-mode.js carries `conflicts` (two stored copies that disagree)
+// and one actionable `diagnostic`. A missing mode file means enabled and a
+// malformed one never enables; an unreadable state directory fails closed on
+// every toggle. Never throws.
+function customizePluginToolsState() {
+  const state = { worktree: false, odd: false, issues: false, conflicts: [], diagnostic: null, paths: [], state: "unreadable" };
   try {
-    return libRequire("worktree-mode.js").readMode().enabled === true ? "enabled" : "disabled";
+    const mode = libRequire("worktree-mode.js");
+    state.worktree = mode.readMode().enabled === true;
+    const detail = typeof mode.readPluginToolsDetail === "function" ? mode.readPluginToolsDetail() : null;
+    const tools = detail || mode.readPluginTools();
+    state.odd = tools.odd === true;
+    state.issues = tools.issues === true;
+    state.state = typeof tools.state === "string" ? tools.state : "unknown";
+    state.conflicts = Array.isArray(tools.conflicts) ? tools.conflicts.slice() : [];
+    state.diagnostic = typeof tools.diagnostic === "string" ? tools.diagnostic : null;
+    state.paths = Array.isArray(tools.paths) ? tools.paths.slice() : [];
   } catch {
-    return "disabled";
+    // Fail closed: nothing is enabled when the state cannot be read.
   }
+  return state;
+}
+
+function customizePluginToolsRead() {
+  const state = customizePluginToolsState();
+  return { worktree: state.worktree, odd: state.odd, issues: state.issues };
+}
+
+function customizePluginToolEnabled(id) {
+  return customizePluginToolsRead()[id] === true;
+}
+
+// The diagnostic that explains a FAIL-CLOSED toggle, for the one toggle the
+// caller asked about: a conflicting key gets the two-copy sentence, and an
+// unreadable verdict (neither copy parses) explains both keys. A plain
+// disabled toggle has nothing to add — the panel row is the whole story.
+function customizePluginToolDiagnostic(id) {
+  const state = customizePluginToolsState();
+  if (!state.diagnostic) return null;
+  if (state.state === "conflict") return state.conflicts.includes(id) ? state.diagnostic : null;
+  if (state.state === "malformed") return state.diagnostic;
+  return null;
+}
+
+// The gated-invocation refusal keeps its pinned wording and gains the
+// fail-closed reason only when there is one, so a conflicted or unreadable
+// state never reads like a plain user-disabled toggle.
+function customizePluginToolRefusalSuffix(id) {
+  const diagnostic = customizePluginToolDiagnostic(id);
+  return diagnostic ? ` ${diagnostic}` : "";
+}
+
+// The panel rows for the Plugin tools section: one row per toggle, its label
+// carrying the stored value and its `mark` the same → the other categories use
+// for their active value.
+function customizePluginToolRows() {
+  const state = customizePluginToolsState();
+  return CUSTOMIZE_PLUGIN_TOOLS.map((tool) => {
+    const enabled = state[tool.id] === true;
+    // A conflicted or unreadable verdict says WHY in the preview, so the
+    // Disabled value is never a mystery the user has to guess at.
+    const diagnostic = customizePluginToolDiagnostic(tool.id);
+    return {
+      id: tool.id,
+      label: `${tool.label} · ${enabled ? "Enabled" : "Disabled"}`,
+      preview: tool.label,
+      mark: enabled ? "→ " : "  ",
+      detail: diagnostic ? `${tool.detail}. ${diagnostic}` : tool.detail,
+      enabled,
+    };
+  });
 }
 
 // The performance rows are gone (S22/S24): the customize panel offers no
@@ -7383,12 +8486,13 @@ function customizePanelModel() {
   const slot = customizeReadSlot();
   const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
   const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
-  const worktreeActive = customizeWorktreeValue();
   const byId = (id) => CUSTOMIZE_CATEGORIES.find((entry) => entry.id === id);
   return [
     { ...byId("sidebar"), available: sidebar.available, active: sidebar.active },
     { ...byId("moshi"), available: moshi.available, active: moshi.active },
-    { ...byId("worktree"), available: true, active: worktreeActive },
+    // `active` stays null: each plugin row carries its own stored value and
+    // its own → mark, so there is no single active value to hoist.
+    { ...byId("plugin-tools"), available: true, active: null, rows: customizePluginToolRows() },
     // The reset row never depends on the provider slot or the Herdr plugin: it
     // is always offered, and reports per option whatever it can actually reach.
     { ...byId("reset"), available: true, active: null },
@@ -7671,10 +8775,12 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       // S2 pins → on the active value; focus adds its own ▸ beside it
-      // (▸ → Label) so the two states never mask each other.
+      // (▸ → Label) so the two states never mask each other. A plugin tool
+      // row carries its own mark (its stored Enabled/Disabled state).
       const focusedValue = !navOnly && state.pane === "values" && index === state.row[state.cat];
+      const mark = typeof row.mark === "string" ? row.mark : (row.id === category.active ? "→ " : "  ");
       rightLines.push({
-        label: `${row.id === category.active ? "→ " : "  "}${row.label}`,
+        label: `${mark}${row.label}`,
         focused: focusedValue,
       });
     }
@@ -7750,7 +8856,9 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
     // once. The redundant Active: repeat is gone on purpose. S11/S13: the
     // `Preview` label is dim, the choice it names ordinary text and the
     // description muted — the accent stays with the buttons.
-    const previewLabel = current.row ? current.row.label : current.category.title;
+    const previewLabel = current.row
+      ? (typeof current.row.preview === "string" ? current.row.preview : current.row.label)
+      : current.category.title;
     const previewTitle = `Preview · ${previewLabel}`;
     const previewSample = current.row ? current.row.detail : "unavailable";
     if (previewLines === 3) {
@@ -7839,11 +8947,61 @@ function createCustomizePanel({ helpers, hostTui, theme, rowsAvailable, model, d
 const CUSTOMIZE_RESET_OPTIONS = [
   { id: "sidebar", label: "sidebar", valueId: "gentle" },
   { id: "moshi", label: "moshi", valueId: "off" },
-  { id: "worktree", label: "worktree", valueId: "enabled" },
+  // The three plugin tools are written THROUGH the same writers their own
+  // toggles use (`tool: true`), never by deleting a flag file.
+  { id: "worktree", label: "worktree", valueId: "enabled", tool: true },
+  { id: "odd", label: "odd", valueId: "enabled", tool: true },
+  { id: "issues", label: "issues", valueId: "enabled", tool: true },
 ];
+
+// Write ONE plugin tool toggle through the shared state writers, preserving
+// every invariant they enforce (atomic replace, symlink refusal, the legacy
+// worktree file's exact bytes). ODD and Issues go through the library's
+// serialized per-toggle update: it takes the family lock, re-reads the CURRENT
+// values inside it, merges this one key, and writes every copy that exists —
+// so two sessions flipping different toggles at the same time keep BOTH flips,
+// and the other key is never written from a stale snapshot. Resolves with the
+// paths written (more than one only when the state is stored in two places,
+// which the caller reports instead of silently picking one).
+function customizeWritePluginTool(id, enabled) {
+  const mode = libRequire("worktree-mode.js");
+  if (id === "worktree") {
+    mode.writeMode(enabled, process.env);
+    return Promise.resolve({ paths: [mode.modePath(process.env)] });
+  }
+  return mode.updatePluginTools({ [id]: Boolean(enabled) }, { env: process.env });
+}
 
 function customizeResetSummary(results) {
   return results.map((entry) => `${entry.label} ${entry.applied ? "changed" : "unchanged"}`).join(", ");
+}
+
+// A write of the toggle document covers EVERY copy, so it can stop half-way: the
+// library's `plugin_tools_write_partial` error carries the paths that already
+// hold the new value (`written`) and the one that does not (`failed`). Reporting
+// "nothing was changed" over that is false, and the pair now disagrees — which
+// reads as Disabled until it agrees again. Returns null for every failure that
+// truly wrote nothing, where that sentence stays the truth.
+function customizePluginToolsHalfApplied(err) {
+  if (!err || err.code !== "plugin_tools_write_partial") return null;
+  const written = Array.isArray(err.written)
+    ? err.written.filter((entry) => typeof entry === "string" && entry.length > 0)
+    : [];
+  if (written.length === 0) return null;
+  const failed = typeof err.failed === "string" && err.failed.length > 0 ? err.failed : null;
+  const left = failed ? `${failed} was left untouched` : "the remaining copies were left untouched";
+  return `${written.join(", ")} already hold${written.length === 1 ? "s" : ""} the new value and ${left}`;
+}
+
+// A copy that did not parse is OVERWRITTEN by a flip, which discards whatever the
+// user had in it. The writer reports those paths, so the repair is named instead
+// of happening silently.
+function customizePluginToolsRepairedNote(repaired) {
+  const paths = Array.isArray(repaired)
+    ? repaired.filter((entry) => typeof entry === "string" && entry.length > 0)
+    : [];
+  if (paths.length === 0) return "";
+  return ` ${paths.join(", ")} did not parse and ${paths.length === 1 ? "was" : "were"} rewritten by this flip, so whatever ${paths.length === 1 ? "it" : "they"} held was discarded.`;
 }
 
 // S6/T4: the sidebar's default is CONDITIONAL on the Herdr plugin — ON when it
@@ -7867,15 +9025,19 @@ function customizeSidebarConditionalDefault() {
   }
 }
 
-async function customizeResetAll(ctx, toolsRegistered) {
+async function customizeResetAll(ctx, runtime) {
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const slot = customizeReadSlot();
   const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
   const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
+  const tools = customizePluginToolsRead();
+  const toolValue = (id) => (tools[id] === true ? "enabled" : "disabled");
   const current = {
     sidebar: { available: sidebar.available, value: sidebar.active },
     moshi: { available: moshi.available, value: moshi.active },
-    worktree: { available: true, value: customizeWorktreeValue() },
+    worktree: { available: true, value: toolValue("worktree") },
+    odd: { available: true, value: toolValue("odd") },
+    issues: { available: true, value: toolValue("issues") },
   };
   // S6/T4: judge the sidebar against the default that APPLIES here. Without
   // the plugin OFF is that default (nothing to reset, nothing to apply); with
@@ -7897,13 +9059,17 @@ async function customizeResetAll(ctx, toolsRegistered) {
       notify(
         sidebarPluginMissing
           ? `Nothing to reset: the sidebar is already OFF by default, and moshi and worktree already match their defaults. ${sidebarConditionalDefault}`
-          : "Nothing to reset: sidebar, moshi and worktree already match their defaults.",
+          : "Nothing to reset: sidebar, moshi, worktree, odd and issues already match their defaults.",
         "info",
       );
     }
     return { changed: false, needsReload: false };
   }
   const results = [];
+  // Half-applied writes and repaired copies are real outcomes, not failures to
+  // summarise away (see customizePluginToolsHalfApplied).
+  const halfApplied = [];
+  const repairedPaths = [];
   let firstError = null;
   let needsReload = false;
   const fail = (label, reason) => {
@@ -7916,16 +9082,23 @@ async function customizeResetAll(ctx, toolsRegistered) {
       fail(option.label, `${option.label} is unavailable in this session; nothing was changed for it.`);
       continue;
     }
-    if (option.id === "worktree") {
+    if (option.tool === true) {
+      let target = null;
       try {
-        libRequire("worktree-mode.js").writeMode(true, process.env);
+        const mode = libRequire("worktree-mode.js");
+        target = option.id === "worktree" ? mode.modePath(process.env) : mode.pluginToolsPath(process.env);
+        const result = await customizeWritePluginTool(option.id, true);
+        const repaired = result && Array.isArray(result.repaired) ? result.repaired : [];
+        for (const repairedPath of repaired) if (!repairedPaths.includes(repairedPath)) repairedPaths.push(repairedPath);
       } catch (err) {
-        fail(option.label, `could not write the worktree mode: ${(err && err.message) || err}`);
+        const half = customizePluginToolsHalfApplied(err);
+        if (half) halfApplied.push(`${option.label}: ${half}`);
+        fail(option.label, `could not write ${target || "the plugin tools state"}: ${(err && err.message) || err}`);
         continue;
       }
       const applied = before !== option.valueId;
       results.push({ label: option.label, applied });
-      if (applied && toolsRegistered !== true) needsReload = true;
+      if (applied && (!runtime || runtime[option.id] !== true)) needsReload = true;
       continue;
     }
     const provider = slot ? slot[option.id] : null;
@@ -7971,11 +9144,15 @@ async function customizeResetAll(ctx, toolsRegistered) {
   let text;
   if (!firstError) {
     text = "Defaults saved.";
-  } else if (changedCount === 0) {
+  } else if (changedCount === 0 && halfApplied.length === 0) {
     text = `Partial reset: ${customizeResetSummary(results)}. Nothing was changed. ${firstError}`;
   } else {
     text = `Partial reset: ${customizeResetSummary(results)}. ${firstError}`;
   }
+  if (halfApplied.length > 0) {
+    text += ` Half applied — those copies already hold the new value, so the pair disagrees and the toggle reads Disabled until it agrees: ${halfApplied.join("; ")}.`;
+  }
+  text += customizePluginToolsRepairedNote(repairedPaths);
   if (sidebarPluginMissing) text += ` ${sidebarConditionalDefault}`;
   if (typeof notify === "function") notify(text, "info");
   if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
@@ -7986,31 +9163,80 @@ async function customizeResetAll(ctx, toolsRegistered) {
 // verdict; notifies exactly once (providers run against a capturing ctx
 // so an inline notify never double-posts) and reloads only when the
 // change reported needsReload.
-async function applyCustomizeChoice(categoryId, valueId, ctx, toolsRegistered) {
+// One plugin tool toggle (customize Plugin tools): ENTER on its row flips it,
+// persisting through the shared writer for that tool. The reload predicate is
+// the runtime's own registration, exactly like the legacy worktree switch, and
+// a runtime that cannot be reloaded still refuses the gated invocation because
+// every gated surface re-reads the stored flag. Notifies exactly once.
+async function applyPluginToolChoice(toolId, ctx, runtime) {
+  const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+  const tool = CUSTOMIZE_PLUGIN_TOOLS.find((entry) => entry.id === toolId);
+  if (!tool) {
+    if (typeof notify === "function") notify(`Unknown plugin tool "${String(toolId)}"; nothing was changed.`, "error");
+    return { changed: false, needsReload: false };
+  }
+  const enabled = !customizePluginToolEnabled(tool.id);
+  let target = null;
+  let written = [];
+  let repaired = [];
+  try {
+    const mode = libRequire("worktree-mode.js");
+    target = tool.id === "worktree" ? mode.modePath(process.env) : mode.pluginToolsPath(process.env);
+    const result = await customizeWritePluginTool(tool.id, enabled);
+    written = result && Array.isArray(result.paths) ? result.paths : [target];
+    repaired = result && Array.isArray(result.repaired) ? result.repaired : [];
+  } catch (err) {
+    const half = customizePluginToolsHalfApplied(err);
+    if (typeof notify === "function") {
+      if (half) {
+        // Neither a success nor a no-op: a copy already holds the new value, so
+        // name it and say the pair now disagrees instead of claiming nothing
+        // happened.
+        notify(
+          `${tool.label} is only half applied: ${half}, so the copies now disagree and the toggle reads Disabled until they agree. ${(err && err.message) || err}`,
+          "error",
+        );
+      } else {
+        notify(`Could not write ${target || "the plugin tools state"}: ${(err && err.message) || err}; nothing was changed.`, "error");
+      }
+    }
+    return { changed: false, needsReload: false };
+  }
+  // S6: reload only when the runtime's registration must change, i.e. the new
+  // value differs from what this session actually registered.
+  const registeredInRuntime = Boolean(runtime) && runtime[tool.id] === true;
+  const needsReload = enabled !== registeredInRuntime;
+  const canReload = Boolean(ctx && typeof ctx.reload === "function");
+  let tail = "";
+  if (needsReload) {
+    tail = canReload
+      ? " Reloading now to apply the change."
+      : " The change applies from the next session.";
+  }
+  // Two stored copies are updated together so they cannot diverge; say so
+  // instead of picking one silently.
+  if (written.length > 1) {
+    tail += ` The toggle is stored in ${written.length} places and all of them were updated: ${written.join(", ")}.`;
+  }
+  // A duplicate that did not parse was overwritten by this flip; name it so the
+  // repair is never silent.
+  tail += customizePluginToolsRepairedNote(repaired);
+  if (typeof notify === "function") {
+    notify(`${tool.label} ${enabled ? "enabled" : "disabled"}.${tail}`, "info");
+  }
+  if (needsReload && canReload) await ctx.reload();
+  return { changed: true, needsReload };
+}
+
+async function applyCustomizeChoice(categoryId, valueId, ctx, runtime) {
   // The reset spans every option, so it never goes through the
   // per-category provider lookup below.
-  if (categoryId === "reset") return customizeResetAll(ctx, toolsRegistered);
+  if (categoryId === "reset") return customizeResetAll(ctx, runtime);
+  // The grouped Plugin tools section applies one toggle per choice.
+  if (categoryId === "plugin-tools") return applyPluginToolChoice(valueId, ctx, runtime);
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const category = CUSTOMIZE_CATEGORIES.find((entry) => entry.id === categoryId);
   const title = category ? category.title : String(categoryId);
-  if (categoryId === "worktree") {
-    const enabled = valueId === "enabled";
-    const mode = libRequire("worktree-mode.js");
-    try {
-      mode.writeMode(enabled, process.env);
-    } catch (err) {
-      if (typeof notify === "function") notify(`Could not write ${mode.modePath(process.env)}: ${(err && err.message) || err}; nothing was changed.`, "error");
-      return { changed: false, needsReload: false };
-    }
-    // S6: reload only when the runtime's registration must change, i.e.
-    // enabling while the runtime loaded disabled or vice versa.
-    const needsReload = enabled !== toolsRegistered;
-    if (typeof notify === "function") {
-      notify(`Worktree tools ${enabled ? "enabled" : "disabled"}.${needsReload ? " Reloading now to apply the change." : ""}`, "info");
-    }
-    if (needsReload && ctx && typeof ctx.reload === "function") await ctx.reload();
-    return { changed: true, needsReload };
-  }
   const slot = customizeReadSlot();
   const provider = slot ? slot[categoryId] : null;
   if (!provider || typeof provider !== "object" || typeof provider.apply !== "function") {
@@ -8041,7 +9267,7 @@ async function applyCustomizeChoice(categoryId, valueId, ctx, toolsRegistered) {
   return { changed: result.changed === true, needsReload };
 }
 
-async function runCustomizeFallback(ctx, toolsRegistered) {
+async function runCustomizeFallback(ctx, runtime) {
   const select = ctx && ctx.ui ? ctx.ui.select : undefined;
   if (typeof select !== "function") return;
   const model = customizePanelModel();
@@ -8069,10 +9295,10 @@ async function runCustomizeFallback(ctx, toolsRegistered) {
   if (choice === undefined || choice === null) return;
   const row = category.rows.find((entry) => entry.label === choice);
   if (!row) return;
-  await applyCustomizeChoice(category.id, row.id, ctx, toolsRegistered);
+  await applyCustomizeChoice(category.id, row.id, ctx, runtime);
 }
 
-async function executeCustomize(rawArgs, ctx, toolsRegistered) {
+async function executeCustomize(rawArgs, ctx, runtime) {
   const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
   const raw = String(rawArgs ?? "").trim();
   const parts = raw.split(/\s+/).filter((part) => part.length > 0);
@@ -8082,9 +9308,14 @@ async function executeCustomize(rawArgs, ctx, toolsRegistered) {
     const slot = customizeReadSlot();
     const sidebar = customizeProviderValue(slot, "sidebar", ["gentle", "native"]);
     const moshi = customizeProviderValue(slot, "moshi", ["on", "off"]);
-    const worktree = customizeWorktreeValue();
+    const tools = customizePluginToolsRead();
+    const value = (id) => (tools[id] === true ? "enabled" : "disabled");
+    // A fail-closed reason travels with the line, so `customize status` never
+    // reports a Disabled toggle without saying why.
+    const state = customizePluginToolsState();
+    const why = state.diagnostic ? ` (${state.diagnostic})` : "";
     if (typeof notify === "function") {
-      notify(`customize status: sidebar=${sidebar.available ? sidebar.active : "unknown"} moshi=${moshi.available ? moshi.active : "unknown"} worktree=${worktree}`, "info");
+      notify(`customize status: sidebar=${sidebar.available ? sidebar.active : "unknown"} moshi=${moshi.available ? moshi.active : "unknown"} worktree=${value("worktree")} odd=${value("odd")} issues=${value("issues")}${why}`, "info");
     }
     return;
   }
@@ -8132,25 +9363,25 @@ async function executeCustomize(rawArgs, ctx, toolsRegistered) {
       );
     } catch {
       // A host that rejects the overlay degrades to the menu below.
-      await runCustomizeFallback(ctx, toolsRegistered);
+      await runCustomizeFallback(ctx, runtime);
       return;
     }
     // Esc (null) does nothing at all: no notification, no write, no
     // reload. Anything else runs the single apply path once the overlay
     // is disposed and the interaction is over (S6 ordering).
     if (!choice || typeof choice !== "object") return;
-    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx, toolsRegistered);
+    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx, runtime);
     return;
   }
-  await runCustomizeFallback(ctx, toolsRegistered);
+  await runCustomizeFallback(ctx, runtime);
 }
 
-function registerCustomizeCommand(pi, toolsRegistered) {
+function registerCustomizeCommand(pi, runtime) {
   if (typeof pi?.registerCommand !== "function") return;
   pi.registerCommand("herdr-gentle:customize", {
-    description: "Customize Herdr Gentle Shell in one panel: agent sidebar, Moshi notifications and worktree tools",
+    description: "Customize Herdr Gentle Shell in one panel: agent sidebar, Moshi notifications and the three plugin tools toggles",
     handler: async (args, ctx) => {
-      await executeCustomize(args, ctx, toolsRegistered);
+      await executeCustomize(args, ctx, runtime);
     },
   });
 }
@@ -8171,6 +9402,15 @@ function registerCustomizeCommand(pi, toolsRegistered) {
 // panel's, so no test loader needs a new stub line and a host without
 // `@earendil-works/pi-tui` degrades to the plain ctx.ui.select menu.
 // Everything on this path only reads: the listing and the documents.
+//
+// S21 («se demora mucho en cargar», «se traba a veces»): this is an INTERACTIVE
+// path, so neither the open nor `r` may block the host event loop on Git. The
+// open paints the CHEAP local scan at once (mtime order, no Git process) and
+// applies the git-ranked order to the live view when the awaited history walk
+// answers; `r` reloads through that same awaited reader. The checkout probe is
+// the awaited identity reader too. Order and failure semantics are unchanged —
+// the first frame is the listing's own documented mtime fallback, and the
+// settled order is exactly what the synchronous listing returned.
 // ---------------------------------------------------------------------------
 
 let oddTuiLoader = () => import("@earendil-works/pi-tui");
@@ -8192,14 +9432,57 @@ function oddCheckoutRoot(cwd) {
   return null;
 }
 
-function oddDocsFor(cwd) {
+// S21: /odd is an INTERACTIVE path, so its checkout read is the ASYNC twin
+// (`repoIdentityAsync`, the same two fixed `git rev-parse` probes awaited).
+// `spawnSync` here froze the whole session for the child's lifetime — which is
+// exactly the «se traba a veces» report — and a slow mount made that lifetime
+// seconds long. The synchronous reader stays for the callers that cannot await.
+async function oddCheckoutRootAsync(cwd) {
   try {
-    const listing = libRequire("odd-docs.js").listOddDocs(oddCheckoutRoot(cwd));
+    const git = libRequire("worktree-git.js");
+    const repo = await git.repoIdentityAsync(cwd, { runAsync: libRunner(git) });
+    if (repo && typeof repo.root === "string" && repo.root.length > 0) return repo.root;
+  } catch {
+    // Not a Git checkout, or git is unavailable: fail closed below.
+  }
+  return null;
+}
+
+// The CHEAP listing of one checkout: `odd/tasks` on disk in the documented
+// mtime order, with no Git process at all. The viewer paints its first frame
+// from this and answers "is there anything to read here?" with it, so opening
+// /odd never waits on a history walk.
+function oddDocsLocal(root) {
+  try {
+    const listing = libRequire("odd-docs.js").listOddDocsLocal(root);
     if (listing && typeof listing === "object") return listing;
   } catch {
     // A missing or broken lib never opens a viewer over nothing.
   }
   return { ok: false, reason: "no-checkout", docs: [] };
+}
+
+// The ORDERED listing: the same documents ranked by the checkout's own git
+// recency (commit time, or a local edit), read through the awaited reader so a
+// slow or network-mounted checkout never freezes the host event loop. The caller
+// applies it to the OPEN view, so the viewer is never blocked behind it.
+async function oddDocsOrdered(root) {
+  try {
+    const listing = await libRequire("odd-docs.js").listOddDocsAsync(root);
+    if (listing && typeof listing === "object") return listing;
+  } catch {
+    // A missing or broken lib never opens a viewer over nothing.
+  }
+  return { ok: false, reason: "no-checkout", docs: [] };
+}
+
+// The whole listing for a session cwd: checkout root, then the ranked order.
+// This is what `r` reloads through, so a reload is awaited off the loop exactly
+// like the initial load.
+async function oddDocsFor(cwd) {
+  const root = await oddCheckoutRootAsync(cwd);
+  if (!root) return { ok: false, reason: "no-checkout", docs: [] };
+  return oddDocsOrdered(root);
 }
 
 function oddTerminalRows(hostTui) {
@@ -8329,24 +9612,31 @@ async function executeOdd(rawArgs, ctx) {
     return;
   }
   const cwd = toolCwd(ctx);
-  const listing = oddDocsFor(cwd);
-  if (!listing.ok) {
+  // S21: the checkout read is awaited, never a `spawnSync` probe, and the
+  // listing that follows it is the CHEAP one — `odd/tasks` on disk with no Git
+  // process at all. So the viewer appears at once even on a checkout whose
+  // history walk takes seconds, and the ranked order lands in it afterwards
+  // (below). Nothing on this path blocks the host event loop.
+  const checkoutRoot = await oddCheckoutRootAsync(cwd);
+  if (!checkoutRoot) {
+    if (typeof notify === "function") notify(notGitRepositoryLine(cwd), "info");
+    return;
+  }
+  const listing = oddDocsLocal(checkoutRoot);
+  if (listing.ok !== true) {
     if (typeof notify === "function") notify(notGitRepositoryLine(cwd), "info");
     return;
   }
   // S9: with nothing to read there is no overlay at all — one muted line,
-  // exactly like the changes view answers an empty repository.
+  // exactly like the changes view answers an empty repository. The cheapest
+  // scan already answers this, so an empty checkout costs no Git process.
   if (listing.docs.length === 0) {
     if (typeof notify === "function") notify("No odd documents under odd/tasks/ in this checkout.", "info");
     return;
   }
-  // The assignment belongs to the checkout the session runs in
-  // (listing.root); it loads fail-soft so a broken registry never blocks
-  // reading, and saves overwrite that row's `odd[]` exactly.
-  const checkoutRoot = (listing && typeof listing.root === "string" && listing.root.length > 0)
-    ? listing.root
-    : oddCheckoutRoot(cwd);
-  const checkoutName = checkoutRoot ? path.basename(checkoutRoot) : "";
+  // The viewer names only the checkout it reads: nothing is assigned from this
+  // surface (S10b), so the root exists solely to know what was listed.
+  const checkoutName = path.basename(checkoutRoot);
   let helpers = null;
   try {
     helpers = await oddTuiLoader();
@@ -8356,45 +9646,75 @@ async function executeOdd(rawArgs, ctx) {
   if (helpers && ctx && ctx.ui && typeof ctx.ui.custom === "function") {
     try {
       await ctx.ui.custom(
-        (hostTui, theme, _keybindings, done) => perfTraceView("odd", libRequire("odd-view.js").createOddView({
-          docs: listing.docs,
-          checkoutName,
-          // S1: the viewer reads documents. It is handed NO association prop
-          // and NO write callback — a worktree carries no ODD document, so
-          // there is nothing to mark as assigned and nothing to save (the view
-          // itself has not read these props since S10b).
-          // `o` opens the focused document outside Pi through
-          // $VISUAL/$EDITOR (key-consistency K3): the shared opener
-          // reports honestly, so the view shows the miss or the failure
-          // instead of failing silently. S17: the open suspends the TUI for
-          // the editor's whole lifetime instead of sharing the terminal with
-          // it.
-          openExternal: (target) => openExternalSuspended(hostTui, target),
-          loadDoc: (doc) => libRequire("odd-docs.js").readOddDoc(doc),
-          reloadDocs: () => oddDocsFor(cwd),
-          helpers,
-          theme,
-          rowsAvailable: () => oddTerminalRows(hostTui),
-          requestRender: () => {
-            try {
-              if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
-            } catch {
-              // A repaint failure never breaks navigation.
-            }
-          },
-          done,
-        }), hostTui),
+        (hostTui, theme, _keybindings, done) => {
+          // Started INSIDE the factory so the history walk overlaps the overlay
+          // instead of preceding it, and never runs at all when the host falls
+          // back to the plain menu.
+          const settled = oddDocsOrdered(checkoutRoot);
+          const view = libRequire("odd-view.js").createOddView({
+            docs: listing.docs,
+            checkoutName,
+            // S1: the viewer reads documents. It is handed NO association prop
+            // and NO write callback — a worktree carries no ODD document, so
+            // there is nothing to mark as assigned and nothing to save (the view
+            // itself has not read these props since S10b).
+            // `o` opens the focused document outside Pi through
+            // $VISUAL/$EDITOR (key-consistency K3): the shared opener
+            // reports honestly, so the view shows the miss or the failure
+            // instead of failing silently. S17: the open suspends the TUI for
+            // the editor's whole lifetime instead of sharing the terminal with
+            // it.
+            openExternal: (target) => openExternalSuspended(hostTui, target),
+            loadDoc: (doc) => libRequire("odd-docs.js").readOddDoc(doc),
+            // S21: the reload is the awaited reader too, so `r` never freezes
+            // the frame on a slow history walk.
+            reloadDocs: () => oddDocsFor(cwd),
+            helpers,
+            theme,
+            rowsAvailable: () => oddTerminalRows(hostTui),
+            requestRender: () => {
+              try {
+                if (hostTui && typeof hostTui.requestRender === "function") hostTui.requestRender();
+              } catch {
+                // A repaint failure never breaks navigation.
+              }
+            },
+            done,
+          });
+          // The ranked order replaces the cheap one in the LIVE view: the
+          // focused document survives by identity, so the reader never loses
+          // the pane they are already reading. A walk that could not answer
+          // leaves the cheap first frame standing — it is the documented mtime
+          // fallback, never an empty viewer.
+          settled.then((next) => {
+            if (!next || next.ok !== true || !Array.isArray(next.docs)) return;
+            if (typeof view.applyDocs === "function") view.applyDocs(next.docs);
+          }).catch(() => {
+            // The cheap first frame already stands.
+          });
+          return perfTraceView("odd", view, hostTui);
+        },
         // Full screen like the reference Changes view: the point of this
         // surface is reading a long document.
         { overlay: true, overlayOptions: { anchor: "center", width: "100%", maxHeight: "100%", margin: 0 } },
       );
     } catch {
       // A host that rejects the overlay degrades to the menu below.
-      await runOddFallback(ctx, listing);
+      await runOddFallback(ctx, await oddFallbackListing(checkoutRoot, listing));
     }
     return;
   }
-  await runOddFallback(ctx, listing);
+  await runOddFallback(ctx, await oddFallbackListing(checkoutRoot, listing));
+}
+
+// The plain select menu is the DEGRADED path (no TUI helpers, or a host that
+// refused the overlay): there is no live frame to protect, so it keeps the same
+// git-ranked order the old synchronous listing handed it. A walk that cannot
+// answer leaves the cheap scan in place, so the menu never lists nothing.
+async function oddFallbackListing(root, local) {
+  const ordered = await oddDocsOrdered(root);
+  const usable = ordered && ordered.ok === true && Array.isArray(ordered.docs) && ordered.docs.length > 0;
+  return usable ? ordered : local;
 }
 
 // /herdr-gentle:issues (issues-view S1,S2,S5,S9,S10): a full-screen
@@ -8998,6 +10318,12 @@ function registerIssuesCommand(pi) {
     description: "Browse fresh GitHub issue pages and details; edit labels/assignees, comment or close when permitted",
     handler: async (args, ctx) => {
       const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+      // Plugin tools toggle: re-read before the gh probe, so a disabled
+      // command neither opens the reader nor spawns `gh`.
+      if (!customizePluginToolEnabled("issues")) {
+        if (typeof notify === "function") notify(`issues command is disabled; open /herdr-gentle:customize and apply the Plugin tools Issues command toggle to enable it${customizePluginToolRefusalSuffix("issues")}`, "error");
+        return;
+      }
       const gate = await probeIssuesGate(ctx);
       if (gate.ok !== true) {
         if (typeof notify === "function") notify(issuesGateMessage(gate.error), "error");
@@ -9013,6 +10339,14 @@ function registerOddCommand(pi) {
   pi.registerCommand("herdr-gentle:odd", {
     description: "Read this checkout's odd documents: list on the left, styled markdown on the right",
     handler: async (args, ctx) => {
+      // Plugin tools toggle: the stored flag gates the INVOCATION as well as
+      // the registration, so a runtime that could not be reloaded (no
+      // ctx.reload, a host that refuses) stops opening the viewer at once.
+      if (!customizePluginToolEnabled("odd")) {
+        const notify = ctx && ctx.ui ? ctx.ui.notify : undefined;
+        if (typeof notify === "function") notify(`odd command is disabled; open /herdr-gentle:customize and apply the Plugin tools ODD command toggle to enable it${customizePluginToolRefusalSuffix("odd")}`, "error");
+        return;
+      }
       await executeOdd(args, ctx);
     },
   });
@@ -9036,30 +10370,34 @@ export default function (pi) {
   // gentle-shell's YOLO grant is answered on its own host channel through
   // `pi.events`; this is the only handle this extension needs on it.
   hostEvents = pi && typeof pi === "object" ? pi.events ?? null : null;
-  // Load-time gate (D9): missing means enabled, malformed never enables.
-  // The customize panel always stays registered so the mode can be
-  // flipped back; the current registration state feeds its worktree rows
-  // and `customize status` (mode state, what is active, whether a reload
-  // is needed).
-  let toolsRegistered = false;
-  try {
-    toolsRegistered = libRequire("worktree-mode.js").readMode().enabled === true;
-  } catch {
-    toolsRegistered = false;
-  }
+  // Load-time gate (D9): missing means enabled, malformed never enables. The
+  // THREE plugin tools toggles are read here — the legacy worktree mode file
+  // plus the two new keys — and the resulting registration state is what the
+  // customize panel compares against to decide whether a reload is needed.
+  // The panel itself always stays registered so every toggle can be flipped
+  // back, and an unreadable state directory fails closed on all three.
+  const pluginTools = customizePluginToolsRead();
+  const registered = {
+    worktree: pluginTools.worktree === true,
+    odd: pluginTools.odd === true,
+    issues: pluginTools.issues === true,
+  };
   // S30: the customize panel's previews are plain-language copy from each
   // category's own rows; the measured evidence lives in the docs, never in the
   // UI (so the host's own raw setting descriptions are intentionally not read
   // into the panel).
   registerWarpMessageRenderer(pi);
-  registerCustomizeCommand(pi, toolsRegistered);
-  registerOddCommand(pi);
-  // S3: register the issues command eagerly so it is in the autocomplete
-  // snapshot from load; the gh check gates the INVOCATION instead of the
-  // registration, so a missing/unauthenticated gh still reports the honest
-  // fix and never opens.
-  registerIssuesCommand(pi);
-  if (toolsRegistered) {
+  registerCustomizeCommand(pi, registered);
+  // Each command follows its own plugin tools toggle. The ODD auto-capture
+  // below is NOT gated by these: naming a session from an ODD write is part of
+  // the worktree pipeline, not of the command surface.
+  if (registered.odd) registerOddCommand(pi);
+  // S3: register the issues command eagerly (while its toggle is enabled) so
+  // it is in the autocomplete snapshot from load; the gh check gates the
+  // INVOCATION instead of the registration, so a missing/unauthenticated gh
+  // still reports the honest fix and never opens.
+  if (registered.issues) registerIssuesCommand(pi);
+  if (registered.worktree) {
     // S28: `/herdr-gentle:warp` is part of the worktree tool surface, so it
     // is registered only while the worktree tools are enabled; a disabled or
     // malformed mode hides the command. The customize panel stays registered
@@ -9075,6 +10413,18 @@ export default function (pi) {
   // read/edit/write tools. Guarded so hosts (and the older unit-test
   // doubles) without `pi.on` still load the tools above.
   if (typeof pi?.on === "function") {
+    // The card click seam's session lifecycle (docs/worktree-tools.md,
+    // "Expanding a card"): remember the live UI on every session start and
+    // drop it on shutdown, so no render path ever reaches a context the
+    // runtime has invalidated.
+    pi.on("session_start", rememberWorktreeCardUi);
+    pi.on("session_shutdown", forgetWorktreeCardUi);
+    // Nothing deferred survives its session: shutdown advances the startup
+    // epoch, so a verdict or a registration still in flight drops instead of
+    // notifying a dead UI or writing into the session that replaced it.
+    pi.on("session_shutdown", () => {
+      startupEpoch += 1;
+    });
     pi.on("tool_call", (event, ctx) => handleWorktreeOddEvent(event, ctx, pi));
     pi.on("tool_result", (event, ctx) => handleWorktreeOddEvent(event, ctx, pi, true));
     // S28/S10: enumerate EVERY repository worktree through git at startup
@@ -9084,37 +10434,19 @@ export default function (pi) {
     // once by the shared registry helper, with registration provenance
     // (never a filesystem birth date). Best-effort: never writes user
     // config, never throws, never blocks the session.
+    //
+    // Dispatched here, awaited by the barrier below: the host runs
+    // session_start handlers one at a time and awaits each, so awaiting the
+    // scan inside this handler would serialize three `git` reads in front of
+    // the gh gate. Starting it now and waiting for it last makes the startup
+    // probes overlap — `session_start` still resolves with the registry
+    // written, just not with the sum of every probe in front of it.
     pi.on("session_start", (event, ctx) => {
       try {
         const cwd = ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0 ? ctx.cwd
           : event && typeof event.cwd === "string" && event.cwd.length > 0 ? event.cwd
           : process.cwd();
-        const scanned = scanLiveCheckouts(cwd);
-        if (scanned !== null) {
-          noteWarpDiscovery(scanned.repo.root, scanned.live);
-          try {
-            const registry = libRequire("worktree-registry.js");
-            let principalId = null;
-            try {
-              if (typeof scanned.repo.commonDir === "string" && path.basename(scanned.repo.commonDir) === ".git") {
-                const rawPrincipal = path.resolve(path.dirname(scanned.repo.commonDir));
-                const pst = checkoutState(rawPrincipal, scanned.repo.root);
-                principalId = pst.real !== null ? pst.real : pst.absolute;
-              }
-            } catch {
-              principalId = null;
-            }
-            if (typeof registry.registerMissingWorktrees === "function") {
-              // S1: discovery only appends rows for live checkouts. It
-              // addresses no stored row, so it drops nothing and has no
-              // association to report.
-              registry.registerMissingWorktrees(scanned.repo.root, scanned.live, principalId);
-            }
-          } catch {
-            // Discovery registration is best-effort: the warp cache above
-            // already recorded the scan.
-          }
-        }
+        startupRegistration = trackStartupTask(runStartupDiscovery(cwd, beginStartupTask()));
       } catch {
         // Discovery must never break startup.
       }
@@ -9129,36 +10461,14 @@ export default function (pi) {
     // write that fails is reported as still ON, never as a false success. The
     // check itself never throws, never blocks the session, never repeats the
     // message, and never mentions /reload.
-    pi.on("session_start", async (event, ctx) => {
+    //
+    // Fully deferred: nothing the session does next depends on this verdict, so
+    // it runs beside the other startup work and lands when it lands. The probe
+    // itself is on the async runner, so a slow `herdr` neither delays the first
+    // prompt nor freezes a repaint.
+    pi.on("session_start", (event, ctx) => {
       try {
-        const check = libRequire("herdr-plugin-check.js");
-        const notify = ctx && ctx.ui && typeof ctx.ui.notify === "function"
-          ? (text) => ctx.ui.notify(text, "info")
-          : null;
-        // The panel registers its sidebar provider on a shared slot; the
-        // handle below is the same path a user selection uses, so the
-        // sidecar's convergence (marker, mode, rows attempt) is reused rather
-        // than duplicated here.
-        let sidebar = null;
-        try {
-          const slot = globalThis[Symbol.for("herdr-gentle.customize.v1")];
-          const provider = slot && slot.sidebar;
-          if (provider && typeof provider.read === "function" && typeof provider.apply === "function") {
-            sidebar = {
-              read: () => provider.read(),
-              apply: (value) => provider.apply(value, ctx),
-              rowsManaged: () => (typeof provider.rowsManaged === "function" ? provider.rowsManaged() : false),
-            };
-          }
-        } catch {
-          sidebar = null;
-        }
-        if (typeof check.checkAndHandleHerdrPluginStartup === "function") {
-          await check.checkAndHandleHerdrPluginStartup({ env: process.env, notify, sidebar });
-        } else {
-          // An older installed lib copy: keep the alert-only behaviour.
-          check.checkAndNotifyHerdrPlugin({ env: process.env, notify });
-        }
+        void trackStartupTask(runHerdrPluginStartupCheck(ctx, beginStartupTask()));
       } catch {
         // The plugin check must never break startup.
       }
@@ -9174,12 +10484,37 @@ export default function (pi) {
     // /reload.
     pi.on("session_start", (event, ctx) => {
       try {
+        // The Issues command toggle gates the gh probe too: a disabled
+        // command never spawns gh at startup.
+        if (!customizePluginToolEnabled("issues")) return null;
         const out = checkIssuesGate(pi, ctx);
         if (out && typeof out.then === "function") return out.catch(() => ({ ok: false }));
         return out;
       } catch {
         // The gate must never break startup.
         return null;
+      }
+    });
+    // The startup barrier: the discovery registration dispatched above is the
+    // one piece of startup work whose result the next thing the session does
+    // depends on, so it is awaited HERE — after the other probes have been
+    // started and the gate above has already waited — instead of in front of
+    // them. `session_start` therefore still resolves with the registry written,
+    // and waits for the slowest probe rather than the sum of all of them. The
+    // task never rejects, and a session that ended first simply leaves nothing
+    // to wait for.
+    //
+    // Registered while the trace snapshot below stays the LAST session_start
+    // hook (an existing contract the trace wiring relies on): it starts no
+    // child, so waiting for it after the barrier would wait for nothing.
+    pi.on("session_start", async () => {
+      const pending = startupRegistration;
+      startupRegistration = null;
+      if (!pending) return;
+      try {
+        await pending;
+      } catch {
+        // Discovery must never break startup.
       }
     });
     // S16/S16a: the trace's session snapshot, written once per session while
@@ -9197,4 +10532,4 @@ export default function (pi) {
   }
 }
 
-export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, setCustomizeTuiLoader, setOddTuiLoader, setIssuesTuiLoader, setWorktreeCardHelpers, setWarpDirtyAsker, setWarpFactsFactory, warpCreatePreflight, warpForkSourceUsable };
+export { executeWorktreeCreate, executeWorktreeList, executeWorktreeClose, resolveThread, executeWorktreeWarp, executeWorktreeWarpTool, emitOsc7, executeWorktreeSessionOpen, startAgentSessionWatcher, clearSessionWatchers, awaitPendingCreationSetups, awaitPendingStartupTasks, setCustomizeTuiLoader, setOddTuiLoader, setIssuesTuiLoader, setWorktreeCardHelpers, setWarpDirtyAsker, setWarpFactsFactory, warpCreatePreflight, warpForkSourceUsable };

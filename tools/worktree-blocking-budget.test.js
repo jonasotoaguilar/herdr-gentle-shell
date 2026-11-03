@@ -366,11 +366,16 @@ describe('interactive worktree create keeps the host event loop free (S21)', { c
 });
 
 // ---------------------------------------------------------------------------
-// Delete: the warp selector's Ctrl+D is GONE (S4). The extended list used to
-// run the real shared close from that key; worktrees are no longer modified
-// from the popup, so the key is inert and the blocking budget it needed went
-// with the path. The case stays here as the pin: pressing it must ask nothing,
-// remove nothing, and leave the selector live until `esc`.
+// Delete: the warp selector's Ctrl+D asks to delete the focused checkout (S4
+// feedback). The key was inert for a while, and it is back — running the real
+// shared close, behind an always-asked confirmation. That makes it exactly the
+// class of path this file exists for: every read it performs (the pending-work
+// summary, the content fingerprint, the ignored-file listing, the wave of
+// `git worktree list` calls and the removal itself) is a child that used to
+// freeze Pi. The measurement below pins that the whole deletion, confirmation
+// included, keeps the host event loop free — the latency assertion is the point
+// of the case, and the functional assertions make sure a frozen-but-empty path
+// could not pass it.
 // ---------------------------------------------------------------------------
 
 const plainTheme = { fg: (_role, text) => String(text), bg: (_role, text) => String(text), bold: (text) => String(text) };
@@ -508,8 +513,8 @@ function selectorDriver(keys) {
   return { mount, views, mounts: () => mounts };
 }
 
-describe('the warp selector delete path is gone, and Ctrl+D is inert (S4)', { concurrency: false }, () => {
-  test('Ctrl+D asks nothing, removes nothing and never freezes the selector', async () => {
+describe('the warp selector delete keeps the host event loop free (S4)', { concurrency: false }, () => {
+  test('Ctrl+D asks once, removes the approved checkout, and never freezes the selector', async () => {
     const root = makeRepo('delete');
     const target = addRegisteredWorktree(root, 'feat/del');
     const shimDir = makeShimDir('delete');
@@ -520,9 +525,10 @@ describe('the warp selector delete path is gone, and Ctrl+D is inert (S4)', { co
       const FakeSM = makeFakeSM(calls);
       const sessionFile = sessionFileIn();
       const checkoutsBefore = git(root, ['worktree', 'list', '--porcelain']);
-      // `v` opens the extended list, down focuses the worktree row, Ctrl+D is
-      // the old delete binding (now inert), and two `esc` steps back to the
-      // panel and closes it. Only the two `esc` keys ever resolve the mount.
+      // `v` opens the extended list, down focuses the worktree row, and Ctrl+D
+      // resolves the deletion request; the returned selector then closes with
+      // `esc`. The slow children on the way (summary, content fingerprint,
+      // ignored listing, worktree listings, removal) are what the probe watches.
       const driver = selectorDriver(['v', '\x1b[B', '\x04', '\x1b', '\x1b']);
       const built = makeWiredCtx({
         cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls,
@@ -532,16 +538,24 @@ describe('the warp selector delete path is gone, and Ctrl+D is inert (S4)', { co
       const def = commands.get('herdr-gentle:warp');
       assert.ok(def, 'expected the warp command to be registered');
 
+      const probe = startTickProbe();
       await def.handler('', built.ctx);
+      const stats = probe.stop();
 
-      // The delete surface is gone: no confirmation was ever built, nothing
-      // was closed, and the row is byte-identical to what it was.
-      assert.deepEqual(built.confirms, [], 'Ctrl+D never asks for a deletion');
-      assert.ok(fs.existsSync(target), 'the checkout is untouched');
-      assert.ok(registryLib.findByPath(root, target), 'its registry row is untouched');
-      assert.equal(git(root, ['worktree', 'list', '--porcelain']), checkoutsBefore, 'no checkout disappeared');
-      assert.equal(driver.mounts(), 1, 'the selector never reopened: the panel simply stayed up');
-      assert.deepEqual(built.notes, [], 'and nothing is claimed');
+      // Functional shape first, so a path that froze AND did nothing cannot
+      // pass: one question, the approved removal, its row dropped, the branch
+      // kept, and the selector back with a freshly read listing.
+      assert.equal(built.confirms.length, 1, 'Ctrl+D asks exactly one question');
+      assert.equal(built.confirms[0][0], "Delete worktree 'feat-del'?");
+      assert.ok(!fs.existsSync(target), 'the approved checkout was removed');
+      assert.equal(registryLib.findByPath(root, target), null, 'its registry row was dropped');
+      assert.notEqual(git(root, ['worktree', 'list', '--porcelain']), checkoutsBefore, 'the listing really changed');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del'), 'the branch is kept');
+      assert.equal(driver.mounts(), 2, 'the selector came back after the deletion');
+      assert.deepEqual(built.notes.map(([, level]) => level), ['info']);
+
+      // The property this file exists for: no child on that path blocked it.
+      assertLoopStayedFree(stats, 'the warp selector delete');
     } finally {
       process.env.PATH = savedPath;
     }
@@ -768,7 +782,7 @@ describe('the warp selector loads its rows without freezing the host (S11)', { c
         return /branch feat\/s11-a/.test(frame) && /modified just now/.test(frame) && !/reading …/.test(frame);
       }, 'the current and focused rows to finish loading');
       const frame = stripFrame(view.render(120));
-      assert.match(frame, /changes \+2 −0/, `the change size loaded\n${frame}`);
+      assert.match(frame, /\+2 −0/, `the change size loaded, without the retired label\n${frame}`);
       assert.ok(!/reading …/.test(frame), `no row is still reading\n${frame}`);
       const stats = probe.stop();
 

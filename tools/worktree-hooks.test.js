@@ -1038,6 +1038,104 @@ describe('worktree-hooks: S63 async counterpart (nonblocking)', { concurrency: f
 });
 
 // ---------------------------------------------------------------------------
+// Deferred setup: the interactive create returns to Warp as soon as the
+// checkout path exists, so the SLOW half of the hooks (dependency install,
+// `codegraph init`) is handed back as one callable instead of being awaited.
+// Nothing is skipped and nothing runs twice: `setup()` runs those phases
+// exactly once, keeps their steps and warnings, and never rejects.
+// ---------------------------------------------------------------------------
+describe('worktree-hooks: deferred setup for the interactive create', { concurrency: false }, () => {
+  test('deferSetup reports the file steps, defers install/codegraph, and setup() runs them once', async () => {
+    const principal = makePrincipal('defer');
+    const worktree = addLinkedWorktree(principal, 'hooks/defer');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    const lib = hooksLib();
+    const ran = [];
+    const result = await lib.runCreationHooksAsync({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      installTable: [{ key: 'custom', markers: ['custom.lock'], argv: ['custom-bin', 'install'] }],
+      runAsync: async (bin) => {
+        ran.push(bin);
+        return { status: 0, stdout: '', stderr: '', error: null };
+      },
+      hasBinary: () => true,
+      deferSetup: true,
+    });
+    // The link phase still runs inline (its own `git ls-files` reads); the
+    // SLOW children are the ones that must not have run yet.
+    assert.deepEqual(ran.filter((bin) => bin !== 'git'), [], 'no slow child ran before the create returned');
+    assert.equal(result.ok, true, 'the file-level hooks settled successfully');
+    const names = (result.steps || []).map((step) => step.name);
+    assert.ok(names.includes('copy-unversioned'), 'the file-level copy step still ran inline');
+    assert.ok(names.includes('link-principal-entries'), 'the link step still ran inline');
+    const install = (result.steps || []).find((step) => step.name === 'install');
+    assert.ok(install && install.status === 'pending', `install is reported pending (${JSON.stringify(result.steps)})`);
+    const codegraph = (result.steps || []).find((step) => step.name === 'codegraph-init');
+    assert.ok(codegraph && codegraph.status === 'pending', 'codegraph is reported pending');
+    assert.equal(typeof result.setup, 'function', 'the deferred phases travel as one callable');
+    const first = await result.setup();
+    const second = await result.setup();
+    assert.deepEqual(ran.filter((bin) => bin !== 'git'), ['custom-bin', 'codegraph'], 'the setup children ran exactly once, in order');
+    assert.equal(first.ok, true, 'the deferred setup succeeded');
+    assert.equal(second.ok, first.ok, 'setup() is idempotent: a second call never re-runs the children');
+    assert.ok((first.steps || []).some((step) => step.name === 'install:custom' && step.status === 'done'), 'install step reported');
+    assert.ok((first.steps || []).some((step) => step.name === 'codegraph-init' && step.status === 'done'), 'codegraph step reported');
+    assert.deepEqual(first.warnings, [], 'a clean setup warns about nothing');
+  });
+
+  test('a failing deferred setup reports the failure instead of rejecting', async () => {
+    const principal = makePrincipal('deferfail');
+    const worktree = addLinkedWorktree(principal, 'hooks/deferfail');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    const lib = hooksLib();
+    const result = await lib.runCreationHooksAsync({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      installTable: [{ key: 'custom', markers: ['custom.lock'], argv: ['custom-bin', 'install'] }],
+      runAsync: async () => ({ status: 1, stdout: '', stderr: 'boom', error: null }),
+      hasBinary: () => true,
+      deferSetup: true,
+    });
+    assert.equal(typeof result.setup, 'function');
+    const setup = await result.setup();
+    assert.equal(setup.ok, false, 'the failure is reported, never swallowed');
+    assert.ok((setup.steps || []).some((step) => step.name === 'install:custom' && step.status === 'failed'), 'the failed step is named');
+    assert.ok((setup.warnings || []).some((warning) => /install:custom/.test(warning)), 'the warning travels with it');
+  });
+
+  test('the inline default still runs every hook before it returns', async () => {
+    const principal = makePrincipal('deferdefault');
+    const worktree = addLinkedWorktree(principal, 'hooks/deferdefault');
+    fs.writeFileSync(path.join(worktree, 'custom.lock'), 'x\n');
+    const lib = hooksLib();
+    const ran = [];
+    const result = await lib.runCreationHooksAsync({
+      principalRoot: principal,
+      worktreePath: worktree,
+      root: principal,
+      env: process.env,
+      unversionedCandidates: [],
+      installTable: [{ key: 'custom', markers: ['custom.lock'], argv: ['custom-bin', 'install'] }],
+      runAsync: async (bin) => {
+        ran.push(bin);
+        return { status: 0, stdout: '', stderr: '', error: null };
+      },
+      hasBinary: () => true,
+    });
+    assert.deepEqual(ran.filter((bin) => bin !== 'git'), ['custom-bin', 'codegraph'], 'without the option every child runs before the call settles');
+    assert.equal(result.setup, undefined, 'an inline run hands back no deferred callable');
+    assert.ok((result.steps || []).every((step) => step.status !== 'pending'), 'no step is left pending');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // S63 follow-up: owned-child cleanup proof (test-first RED).
 //
 // The effective production runner is `lib/worktree-git.js` runArgvAsync

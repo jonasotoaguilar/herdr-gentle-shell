@@ -8,7 +8,8 @@ automated suite is not a substitute for real terminal input. Shortcut authority 
 `/herdr-gentle:worktree` is gone: worktrees no longer take an issue or ODD
 association, so the panel that command drove no longer exists. The full-screen
 worktree detail, its edit view and the delete view are gone with it (S4): the
-warp popup only warps or creates, and `e`/`ctrl+d` are not bindings there.
+warp popup only warps, creates or asks to delete, `e` is not a binding there,
+and `ctrl+d` asks before deleting a checkout (it never deletes on its own).
 
 ## Launch
 
@@ -38,9 +39,13 @@ screenshot, then mark PASS, FAIL or NOT EXERCISED.
       surface, because there is none any more.
 
 - [ ] Warp popup keys: `c` opens create, `v` opens the extended list, `r`
-      reloads and `esc` closes. `e` and `ctrl+d` do nothing at all — no edit
-      panel, no detail, no delete confirmation, no checkout or registry change
-      — and the footer legend names neither key.
+      reloads and `esc` closes. `e` does nothing at all — no edit panel and no
+      detail — and the footer legend does not name it. `ctrl+d` on the focused
+      checkout ASKS before deleting and never deletes on its own: the footer
+      names `ctrl+d delete`, the confirmation names the checkout, its branch and
+      any pending or ignored work that would be lost, and answering no removes
+      nothing and changes no registry row. The extended list asks only while the
+      filter is closed; while typing, `ctrl+d` is not a delete key.
 
 - [ ] Preview paging: press what the footer actually names on this terminal —
       `ctrl+shift+j`/`ctrl+shift+k` if it says so, otherwise `Shift+J`/`Shift+K`

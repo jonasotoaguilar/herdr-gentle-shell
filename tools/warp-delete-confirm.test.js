@@ -45,6 +45,22 @@ function git(cwd, args) {
   return (result.stdout || '').trim();
 }
 
+// Deterministic incompressible bytes: `--binary` zlib-compresses the patch, so
+// a repeating pattern would produce a tiny patch and never reach the budget.
+function noise(length, seed = 0x9e3779b9) {
+  const buffer = Buffer.allocUnsafe(length);
+  let state = seed >>> 0;
+  for (let index = 0; index < length; index += 1) {
+    state ^= state << 13;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+    buffer[index] = state & 0xff;
+  }
+  return buffer;
+}
+
 function makeRepo(tag) {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), `wt-confirm-${tag}-`)));
   git(dir, ['init']);
@@ -170,5 +186,286 @@ describe('S4: the keyboard delete dialog is always asked and always honest', () 
     assert.equal(typeof changesLib.summarizeChanges, 'function');
     assert.equal(typeof confirmLib.readWarpDeleteEvidence, 'function');
     assert.equal(typeof confirmLib.warpDeletePrompt, 'function');
+  });
+});
+
+// The dialog is answered BEFORE the removal, so the evidence the human read can
+// be stale by the time the checkout would be deleted. The key below is what
+// makes that comparison possible: two reads with the same key described the
+// same pending work and the same ahead-of-main state, so the confirmation still
+// describes the checkout; any difference means the human was shown something
+// that is no longer true and the caller must ask again.
+describe('S4: a confirmed disclosure can be compared with the read after it', () => {
+  const CLEAN = { changes: { status: 'clean', files: 0, added: 0, deleted: 0 }, aheadMain: { status: 'none', ahead: 0 } };
+  const DIRTY = { changes: { status: 'dirty', files: 1, added: 1, deleted: 0 }, aheadMain: { status: 'none', ahead: 0 } };
+
+  test('the same reading is the same key, whatever else the object carries', () => {
+    const copy = JSON.parse(JSON.stringify(DIRTY));
+    assert.equal(confirmLib.warpDeleteEvidenceKey(DIRTY), confirmLib.warpDeleteEvidenceKey(copy));
+  });
+
+  test('a clean read, a changed count and an unreadable read are all different keys', () => {
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(CLEAN), confirmLib.warpDeleteEvidenceKey(DIRTY));
+    const moreFiles = { changes: { ...DIRTY.changes, files: 2, added: 4 }, aheadMain: DIRTY.aheadMain };
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(DIRTY), confirmLib.warpDeleteEvidenceKey(moreFiles));
+    const unreadable = { changes: { status: 'unknown', reason: 'git exploded' }, aheadMain: DIRTY.aheadMain };
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(DIRTY), confirmLib.warpDeleteEvidenceKey(unreadable));
+    const aheadChanged = { changes: DIRTY.changes, aheadMain: { status: 'ahead', ahead: 3 } };
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(DIRTY), confirmLib.warpDeleteEvidenceKey(aheadChanged));
+  });
+
+  test('a read of the same checkout before and after it gained a line changes the key', async () => {
+    // No `main` here on purpose: both ahead-of-main reads answer the same
+    // `unknown`, so the key moves only because the PENDING WORK moved.
+    const repo = makeRepo('key-changes');
+    const clean = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(clean.changes.status, 'clean');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
+    const dirty = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(dirty.changes.status, 'dirty');
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(clean), confirmLib.warpDeleteEvidenceKey(dirty));
+    git(repo, ['add', 'a.txt']);
+    git(repo, ['commit', '-m', 'seed']);
+    const cleanAgain = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(cleanAgain.changes.status, 'clean');
+    assert.equal(confirmLib.warpDeleteEvidenceKey(clean), confirmLib.warpDeleteEvidenceKey(cleanAgain),
+      'the same pending-work statement is the same key, so a stable read never refuses');
+  });
+});
+
+// A1 (verification): `+A/-D` is not the pending work. Rewriting a line leaves
+// the counts identical while the bytes differ, so a confirmation bound only to
+// the counts authorizes deleting something the human never saw. The evidence
+// therefore carries a CONTENT fingerprint, and a read that cannot produce one
+// is `unknown` — never "unchanged".
+describe('A1: the confirmation is bound to the pending CONTENT, not to a line count', () => {
+  test('the same counts with different bytes are a different reading', async () => {
+    const repo = makeRepo('content-swap');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
+    git(repo, ['add', 'a.txt']);
+    git(repo, ['commit', '-m', 'seed']);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+    const first = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(first.changes.status, 'dirty');
+    assert.deepEqual(
+      { files: first.changes.files, added: first.changes.added, deleted: first.changes.deleted },
+      { files: 1, added: 1, deleted: 1 },
+      'the fixture really keeps the counts identical',
+    );
+    assert.equal(first.content.status, 'known');
+    // Same added/deleted counts, different bytes.
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'three\n');
+    const second = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.deepEqual(
+      { files: second.changes.files, added: second.changes.added, deleted: second.changes.deleted },
+      { files: first.changes.files, added: first.changes.added, deleted: first.changes.deleted },
+      'the counts are still identical',
+    );
+    assert.notEqual(first.content.fingerprint, second.content.fingerprint, 'but the content fingerprint moved');
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(first), confirmLib.warpDeleteEvidenceKey(second));
+  });
+
+  test('an unchanged checkout reads the same fingerprint every time', async () => {
+    const repo = makeRepo('content-stable');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
+    git(repo, ['add', 'a.txt']);
+    git(repo, ['commit', '-m', 'seed']);
+    fs.appendFileSync(path.join(repo, 'a.txt'), 'two\n');
+    const first = await confirmLib.readWarpDeleteEvidence(repo);
+    const second = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(first.content.status, 'known');
+    assert.equal(first.content.fingerprint, second.content.fingerprint);
+    assert.equal(confirmLib.warpDeleteEvidenceKey(first), confirmLib.warpDeleteEvidenceKey(second));
+  });
+
+  test('untracked files are part of the content fingerprint, so a silent edit is caught', async () => {
+    const repo = makeRepo('content-untracked');
+    fs.writeFileSync(path.join(repo, 'new.txt'), 'alpha\n');
+    const first = await confirmLib.readWarpDeleteEvidence(repo);
+    const second = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(confirmLib.warpDeleteEvidenceKey(first), confirmLib.warpDeleteEvidenceKey(second), 'a stable read is stable');
+    fs.writeFileSync(path.join(repo, 'new.txt'), 'alpha\nbeta\n');
+    const grown = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(first), confirmLib.warpDeleteEvidenceKey(grown));
+  });
+
+  test('a fingerprint that cannot be read is unknown, never an unchanged reading', async () => {
+    const repo = makeRepo('content-unknown');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
+    const failing = {
+      aheadBehind: async () => ({ ok: true, ahead: 0, base: 'main' }),
+      runArgvAsync: async (bin, argv) => (argv[0] === 'diff' && argv.includes('--binary')
+        ? { status: 128, stdout: '', stderr: 'diff exploded', error: null }
+        : { status: 0, stdout: '', stderr: '', error: null }),
+    };
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo, {
+      git: failing,
+      changesLib: { summarizeChanges: async () => ({ ok: true, files: 0, added: 0, deleted: 0 }) },
+    });
+    assert.equal(evidence.content.status, 'unknown');
+    assert.match(evidence.content.reason, /diff exploded/);
+  });
+
+  test('pending work past the fingerprint budget is unknown instead of being guessed', async () => {
+    const repo = makeRepo('content-budget');
+    fs.writeFileSync(path.join(repo, 'big.bin'), 'x'.repeat(4096));
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo, { maxFingerprintBytes: 64 });
+    assert.equal(evidence.content.status, 'unknown');
+    assert.match(evidence.content.reason, /larger than/);
+  });
+
+  // The budget used to be checked only inside the UNTRACKED loop, after the
+  // tracked patch had already been collected from stdout and decoded: a 40 MiB
+  // binary patch cost ~247 MiB of RSS and was never refused at all, because a
+  // checkout with no untracked files never entered that loop.
+  test('a tracked patch alone past the budget is unknown, and never authorizes a delete', async () => {
+    const repo = makeRepo('content-tracked-budget');
+    // Wholesale replacement, so the binary delta cannot shrink the patch under
+    // the budget the way a single flipped byte does.
+    const before = noise(8192, 0x9e3779b9);
+    const after = noise(8192, 0x51ed270b);
+    fs.writeFileSync(path.join(repo, 'a.bin'), before);
+    git(repo, ['add', 'a.bin']);
+    git(repo, ['commit', '-m', 'seed']);
+    fs.writeFileSync(path.join(repo, 'a.bin'), after);
+    assert.equal(git(repo, ['status', '--porcelain=v1', '--untracked-files=all']), 'M a.bin',
+      "the fixture's pending work is the TRACKED patch, with no untracked file to notice the cap");
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo, { maxFingerprintBytes: 1024 });
+    assert.equal(evidence.content.status, 'unknown');
+    assert.equal(evidence.content.fingerprint, null);
+    assert.match(evidence.content.reason, /larger than 1024 bytes/);
+  });
+
+  test('a tracked binary patch within the budget is fingerprinted by its bytes', async () => {
+    const repo = makeRepo('content-tracked-binary');
+    const seed = noise(256, 0x12345678);
+    fs.writeFileSync(path.join(repo, 'a.bin'), seed);
+    git(repo, ['add', 'a.bin']);
+    git(repo, ['commit', '-m', 'seed']);
+    fs.writeFileSync(path.join(repo, 'a.bin'), Buffer.concat([seed, Buffer.from([0, 255, 7])]));
+    const first = await confirmLib.readWarpDeleteEvidence(repo);
+    const second = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(first.content.status, 'known');
+    assert.equal(first.content.fingerprint, second.content.fingerprint, 'a stable binary patch is stable');
+    fs.writeFileSync(path.join(repo, 'a.bin'), Buffer.concat([seed, Buffer.from([0, 255, 8])]));
+    const changed = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(changed.content.status, 'known');
+    assert.notEqual(first.content.fingerprint, changed.content.fingerprint,
+      'one different byte in a binary patch changes the reading');
+  });
+
+  test('an untracked file past the budget is refused by its size, without being read whole', async () => {
+    const repo = makeRepo('content-untracked-budget');
+    const big = path.join(repo, 'huge.bin');
+    // Sparse on every filesystem this suite runs on: the SIZE is what must be
+    // refused before a read, so the fixture does not need 64 MiB of real data.
+    const fd = fs.openSync(big, 'w');
+    try {
+      fs.ftruncateSync(fd, 64 * 1024 * 1024);
+    } finally {
+      fs.closeSync(fd);
+    }
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo, { maxFingerprintBytes: 1024 * 1024 });
+    assert.equal(evidence.content.status, 'unknown');
+    assert.equal(evidence.content.fingerprint, null);
+    assert.match(evidence.content.reason, /larger than 1048576 bytes/);
+  });
+
+  // The memory guarantee itself: the patch is written by git to a private
+  // file, so the shared runner never collects its bytes on stdout. Its size is
+  // then what the cap decides on, and the scratch file never outlives the read.
+  test('the tracked patch is staged in a private file, never buffered on the child stdout', async () => {
+    const repo = makeRepo('content-patch-file');
+    fs.writeFileSync(path.join(repo, 'a.bin'), Buffer.from([0, 1, 2, 3]));
+    git(repo, ['add', 'a.bin']);
+    git(repo, ['commit', '-m', 'seed']);
+    fs.writeFileSync(path.join(repo, 'a.bin'), Buffer.from([9, 8, 7, 6]));
+    const patchText = 'diff --binary staged bytes\n';
+    let diffArgv = null;
+    let stagedPath = null;
+    const recording = {
+      aheadBehind: async () => ({ ok: true, ahead: 0, base: 'main' }),
+      runArgvAsync: async (bin, argv) => {
+        if (argv[0] !== 'diff') return { status: 0, stdout: '', stderr: '', error: null };
+        diffArgv = argv;
+        const output = argv.find((entry) => entry.startsWith('--output='));
+        assert.ok(output, 'the patch is addressed to a file instead of the child stdout');
+        stagedPath = output.slice('--output='.length);
+        fs.writeFileSync(stagedPath, patchText);
+        return { status: 0, stdout: '', stderr: '', error: null };
+      },
+    };
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo, {
+      git: recording,
+      changesLib: { summarizeChanges: async () => ({ ok: true, files: 0, added: 0, deleted: 0 }) },
+    });
+    assert.ok(diffArgv.includes('--binary'), 'binary edits still count');
+    assert.equal(evidence.content.status, 'known');
+    assert.equal(evidence.content.bytes, Buffer.byteLength(patchText),
+      'the byte count comes from the staged file, not from a decoded stdout string');
+    assert.equal(fs.existsSync(stagedPath), false, 'the scratch patch is removed before the read resolves');
+  });
+});
+
+// A2 (verification): a checkout can read CLEAN while git ignores files that
+// only exist inside it, and removing the checkout deletes them. They are
+// therefore disclosed in the question, and their path list is part of the
+// reading so a file that appears during the dialog is noticed.
+describe('A2: ignored files are disclosed, never silently deleted', () => {
+  function withIgnored(tag) {
+    const repo = makeRepo(tag);
+    git(repo, ['branch', 'main', 'HEAD']);
+    fs.writeFileSync(path.join(repo, '.gitignore'), '*.log\nbuild/\n');
+    git(repo, ['add', '.gitignore']);
+    git(repo, ['commit', '-m', 'ignore rules']);
+    fs.writeFileSync(path.join(repo, 'debug.log'), 'log\n');
+    fs.mkdirSync(path.join(repo, 'build'));
+    fs.writeFileSync(path.join(repo, 'build', 'out.txt'), 'artifact\n');
+    return repo;
+  }
+
+  test('a checkout that reads clean but holds ignored files discloses them', async () => {
+    const repo = withIgnored('ignored-present');
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(evidence.changes.status, 'clean', 'nothing git tracks is pending');
+    assert.equal(evidence.ignored.status, 'present');
+    assert.equal(evidence.ignored.files, 2);
+    assert.deepEqual(evidence.ignored.samples, ['build/out.txt', 'debug.log']);
+    const prompt = confirmLib.warpDeletePrompt(TARGET, evidence);
+    assert.match(prompt.body, /Ignored files \(deleted with the checkout\): build\/out\.txt, debug\.log\./);
+    assert.equal(prompt.force, false, 'ignored files do not force: git needs no --force for them');
+  });
+
+  test('a checkout with no ignored files keeps the dialog byte-identical', async () => {
+    const repo = makeRepo('ignored-none');
+    git(repo, ['branch', 'main', 'HEAD']);
+    const evidence = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(evidence.ignored.status, 'none');
+    assert.equal(evidence.ignored.files, 0);
+    assert.equal(confirmLib.warpDeletePrompt(TARGET, evidence).body, BASE_BODY);
+    assert.equal(confirmLib.warpDeletePrompt(TARGET, evidence).force, false);
+  });
+
+  test('an unreadable ignored listing is unknown, and the key notices a file that appeared', async () => {
+    const repo = withIgnored('ignored-listing');
+    const before = await confirmLib.readWarpDeleteEvidence(repo);
+    fs.writeFileSync(path.join(repo, 'late.log'), 'late\n');
+    const after = await confirmLib.readWarpDeleteEvidence(repo);
+    assert.equal(after.ignored.files, 3);
+    assert.notEqual(confirmLib.warpDeleteEvidenceKey(before), confirmLib.warpDeleteEvidenceKey(after),
+      'an ignored file that appeared changes the reading');
+
+    const failing = {
+      aheadBehind: async () => ({ ok: true, ahead: 0, base: 'main' }),
+      runArgvAsync: async (bin, argv) => (argv[0] === 'ls-files'
+        ? { status: 1, stdout: '', stderr: 'ls-files exploded', error: null }
+        : { status: 0, stdout: '', stderr: '', error: null }),
+    };
+    const unreadable = await confirmLib.readWarpDeleteEvidence(repo, {
+      git: failing,
+      changesLib: { summarizeChanges: async () => ({ ok: true, files: 0, added: 0, deleted: 0 }) },
+    });
+    assert.equal(unreadable.ignored.status, 'unknown');
+    assert.match(unreadable.ignored.reason, /ls-files exploded/);
   });
 });

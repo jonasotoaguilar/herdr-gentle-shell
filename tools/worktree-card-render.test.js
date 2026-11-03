@@ -114,6 +114,33 @@ function resultFor(tool) {
   }
 }
 
+// The Pi host (dist/modes/interactive/components/tool-execution.js) shares ONE
+// rendererState object across the call and result renders of a tool row and
+// re-invokes both renderers on every update; renderResult marks that state,
+// which is what turns the paired call card into the card's top rule (no
+// closing rule of its own). `settledCard` replays that order through the
+// public hooks, so a test can read the WHOLE card — top rule, body, closing
+// rule — the way the transcript shows it.
+function settledCard(tool, options) {
+  const opts = options || {};
+  const width = opts.width === undefined ? 60 : opts.width;
+  const theme = opts.theme || THEME;
+  const card = createWorktreeCardRenderer(tool);
+  const state = {};
+  const context = {
+    state,
+    isPartial: false,
+    expanded: opts.expanded === true,
+    durationMs: opts.durationMs,
+    outputPad: opts.outputPad === undefined ? 0 : opts.outputPad,
+  };
+  const expanded = opts.expanded === true;
+  const body = renderLines(
+    card.renderResult(resultFor(tool), { expanded, isPartial: false }, theme, context), width);
+  const top = renderLines(card.renderCall(callFor(tool), theme, context), width);
+  return { card, state, context, top, body, lines: [...top, ...body] };
+}
+
 describe('factory contract', () => {
   test('exposes renderShell self plus renderCall/renderResult for every tool', () => {
     for (const tool of TOOLS) {
@@ -775,17 +802,19 @@ describe('worktree git-identity compact cards (S19 RED)', () => {
     assert.deepStrictEqual(bodyRows(lines), ['no worktrees']);
   });
 
-  test('closing rule right-aligns the hint, then the evidence-backed duration', () => {
-    const card = createWorktreeCardRenderer('worktree_close');
-    const plain = closer(renderLines(card.renderResult(resultFor('worktree_close'), {}, THEME, {}), 60));
-    assert.ok(plain.endsWith('ctrl+o to expand'), 'hint rides the rule end: ' + JSON.stringify(plain));
-    assert.equal(visible(plain), 60, 'the hint is right-aligned to the full width: ' + JSON.stringify(plain));
-    const timed = closer(renderLines(
-      card.renderResult(resultFor('worktree_close'), {}, THEME, { durationMs: 1200 }), 60,
-    ));
-    assert.ok(timed.includes('ctrl+o to expand'), 'hint survives timing: ' + JSON.stringify(timed));
-    assert.ok(timed.endsWith('1.2s'), 'duration closes the rule: ' + JSON.stringify(timed));
-    assert.ok(!plain.includes('1.2s'), 'no duration without host evidence');
+  test('the top rule right-aligns the hint; the closing rule carries the duration only', () => {
+    const timed = settledCard('worktree_close', { durationMs: 1200 });
+    const topRow = stripAnsi(timed.top[0]);
+    assert.ok(topRow.endsWith('ctrl+o to expand'), 'hint rides the top rule: ' + JSON.stringify(topRow));
+    assert.equal(visible(timed.top[0]), 60, 'the hint is right-aligned to the full width: ' + JSON.stringify(topRow));
+    const rule = closer(timed.body);
+    assert.ok(!rule.includes('ctrl+o'), 'the closing rule carries no hint: ' + JSON.stringify(rule));
+    assert.ok(rule.endsWith('1.2s'), 'duration closes the rule: ' + JSON.stringify(rule));
+    assert.ok(!timed.body.map(stripAnsi).some((row) => row.includes('ctrl+o')),
+      'the hint appears once, above the body: ' + JSON.stringify(timed.body));
+    const untimed = settledCard('worktree_close', {});
+    assert.ok(!untimed.lines.join('\n').includes('1.2s'), 'no duration without host evidence');
+    assert.ok(!closer(untimed.body).includes('ctrl+o'), 'no hint on the closing rule without timing either');
   });
 
   test('expanded list shows every row while compact shows the action and count', () => {
@@ -924,13 +953,460 @@ describe('S19: bounded compact per tool plus card parity', () => {
     assert.ok(roles.has('warning'), 'the git-orange tone role is used');
     assert.ok(roles.has('error'), 'failures read as errors');
     for (const tool of TOOLS) {
-      const card = createWorktreeCardRenderer(tool);
-      const plain = stripAnsi(card.renderResult(resultFor(tool), {}, THEME, {}).render(60).pop());
-      assert.ok(plain.endsWith('ctrl+o to expand'), `${tool} hint rides the rule end: ${JSON.stringify(plain)}`);
-      assert.equal(visible(plain), 60, `${tool} hint right-aligned: ${JSON.stringify(plain)}`);
-      const untimed = stripAnsi(card.renderResult(resultFor(tool), {}, THEME, {}).render(60).join('\n'));
-      assert.ok(!/\d+(ms|s)/.test(untimed.replace(/ctrl\+o to expand/, '')), `${tool} shows no duration without host evidence`);
+      const { top, body, lines } = settledCard(tool);
+      const topRow = stripAnsi(top[0]);
+      assert.ok(topRow.endsWith('ctrl+o to expand'), `${tool} hint rides the top rule: ${JSON.stringify(topRow)}`);
+      assert.equal(visible(top[0]), 60, `${tool} hint right-aligned on the top rule: ${JSON.stringify(topRow)}`);
+      assert.ok(!body.map(stripAnsi).some((row) => row.includes('ctrl+o')),
+        `${tool} keeps the hint above the body: ${JSON.stringify(body)}`);
+      const untimed = lines.map(stripAnsi).join('\n').replace(/ctrl\+o to (expand|collapse)/g, '');
+      assert.ok(!/\d+(ms|s)/.test(untimed), `${tool} shows no duration without host evidence`);
     }
+  });
+});
+
+describe('expand-hint placement: the hint rides the top rule, the closing rule carries only the duration', () => {
+  // The user's report (screenshot of the Warp card): the ctrl+o hint sat at the
+  // bottom right beside the duration, so one corner carried two unrelated
+  // facts — "el expand debe ir arriba ... abajo derecha van los ms/s". The
+  // hint now right-aligns on the card's TOP rule (the header row the call
+  // renderer draws for a tool card, the heading row for a message card) and
+  // the closing rule carries only the host-evidenced duration, never a
+  // fabricated or placeholder one. Click-to-expand is the host's, not ours:
+  // see the mouse test at the end of this block.
+  const HINT = /ctrl\+o to (expand|collapse)/;
+
+  function warpMessage(overrides) {
+    return {
+      customType: 'worktree-warp',
+      content: "Worktree warp: now in /repo/to (branch 'feat/cards').",
+      display: true,
+      details: {
+        from: '/repo/from',
+        to: '/repo/to',
+        fromDesc: 'principal \u00B7 main',
+        fromName: 'principal',
+        name: 'feat-cards',
+        branch: 'feat/cards',
+      },
+      ...(overrides || {}),
+    };
+  }
+
+  function floatTheme() {
+    const BG_OPEN = '\x1b[48;5;22m';
+    const BG_RESET = '\x1b[49m';
+    return { fg: (_role, text) => text, bg: (_role, text) => `${BG_OPEN}${text}${BG_RESET}` };
+  }
+
+  test('every tool card shows the hint once, on the top rule, in both states', () => {
+    for (const tool of TOOLS) {
+      for (const expanded of [false, true]) {
+        for (const width of [60, 100]) {
+          const { top, body } = settledCard(tool, { expanded, width });
+          assertFits([...top, ...body], width);
+          const topRow = stripAnsi(top[0]);
+          assert.ok(topRow.startsWith('\u258E \u2387 '), `${tool} keeps the identity first: ${JSON.stringify(topRow)}`);
+          assert.ok(topRow.includes(expanded ? 'ctrl+o to collapse' : 'ctrl+o to expand'),
+            `${tool} at ${width} (${expanded ? 'expanded' : 'collapsed'}) hint on top: ${JSON.stringify(topRow)}`);
+          assert.equal(visible(top[0]), width, `${tool} hint right-aligned on the top rule: ${JSON.stringify(topRow)}`);
+          const below = body.map(stripAnsi).filter((row) => HINT.test(row));
+          assert.deepStrictEqual(below, [], `${tool} never repeats the hint below the top rule: ${JSON.stringify(below)}`);
+        }
+      }
+    }
+  });
+
+  test('the closing rule carries the host duration alone, and nothing without it', () => {
+    for (const tool of TOOLS) {
+      const timed = settledCard(tool, { durationMs: 1500 });
+      const rule = stripAnsi(timed.body[timed.body.length - 1]);
+      assert.ok(rule.includes('\u2500'), `${tool} still closes its frame: ${JSON.stringify(rule)}`);
+      assert.ok(!HINT.test(rule), `${tool} closing rule carries no hint: ${JSON.stringify(rule)}`);
+      assert.ok(rule.endsWith('1.5s'), `${tool} duration sits bottom-right: ${JSON.stringify(rule)}`);
+      assert.equal(visible(timed.body[timed.body.length - 1]), 60, `${tool} duration right-aligned: ${JSON.stringify(rule)}`);
+      const untimed = settledCard(tool, {});
+      const bare = stripAnsi(untimed.body[untimed.body.length - 1]).replace(/\s+$/, '');
+      assert.equal(bare, '\u258E \u2500', `${tool} bare rule without timing evidence: ${JSON.stringify(bare)}`);
+      assert.ok(!/\d+(ms|s)/.test(untimed.lines.map(stripAnsi).join('\n').replace(HINT, '')),
+        `${tool} never invents a duration`);
+    }
+  });
+
+  test('sub-second and second-scale host timings keep their own units', () => {
+    const ms = settledCard('worktree_create', { durationMs: 40 });
+    assert.ok(stripAnsi(ms.body[ms.body.length - 1]).endsWith('40ms'), 'milliseconds stay milliseconds');
+    const seconds = settledCard('worktree_create', { durationMs: 12345 });
+    assert.ok(stripAnsi(seconds.body[seconds.body.length - 1]).endsWith('12.3s'), 'long runs read in seconds');
+  });
+
+  test('a header with no room for the hint keeps its identity and drops the hint', () => {
+    // Documented degradation: the hint is an affordance, the identity is the
+    // content, so a narrow card clips the identity and omits the hint rather
+    // than truncating the identity to make room — and the hint never falls
+    // back to the bottom-right corner, which belongs to the duration.
+    const { top, body } = settledCard('worktree_session_open', { width: 30 });
+    assertFits([...top, ...body], 30);
+    const topRow = stripAnsi(top[0]);
+    assert.ok(topRow.includes('\u2026'), `the identity clips with an ellipsis: ${JSON.stringify(topRow)}`);
+    assert.ok(!HINT.test(topRow), `no fill column means no hint: ${JSON.stringify(topRow)}`);
+    assert.ok(![...top, ...body].map(stripAnsi).some((row) => HINT.test(row)), 'the hint never drops to the bottom');
+    assert.equal(stripAnsi(body[body.length - 1]).replace(/\s+$/, ''), '\u258E \u2500', 'the closing rule stays bare');
+  });
+
+  test('the float card puts the hint on its heading band and the duration on the closing band', () => {
+    const theme = floatTheme();
+    for (const tool of TOOLS) {
+      const { top, body } = settledCard(tool, { theme, durationMs: 1200 });
+      // The float recipe opens with a blank padding band above the heading.
+      const heading = top[1];
+      assert.equal(visible(heading), 60, `${tool} float heading band is full width`);
+      assert.ok(stripAnsi(heading).includes('ctrl+o to expand'),
+        `${tool} float hint on the heading: ${JSON.stringify(stripAnsi(heading))}`);
+      const closer = stripAnsi(body[body.length - 1]);
+      assert.ok(/1\.2s {1,2}$/.test(closer), `${tool} float duration closes the card: ${JSON.stringify(closer)}`);
+      assert.ok(!HINT.test(closer), `${tool} float closing band carries no hint: ${JSON.stringify(closer)}`);
+      assert.equal(visible(body[body.length - 1]), 60, `${tool} float closing band is full width`);
+    }
+  });
+
+  test('the warp card puts the hint on its heading row and leaves the closing rule empty', () => {
+    const render = createWarpMessageRenderer();
+    for (const expanded of [false, true]) {
+      const lines = renderLines(render(warpMessage(), { expanded, outputPad: 1 }, THEME), 60);
+      assertFits(lines, 60);
+      // outputPad adds one margin column on each side, so the heading row is
+      // read trimmed: the bar, the identity, the right-aligned hint.
+      const heading = stripAnsi(lines[0]).trim();
+      assert.ok(heading.startsWith('\u258E \u2387 Warp \u00B7 moved'),
+        `heading identity first: ${JSON.stringify(heading)}`);
+      assert.ok(heading.endsWith(expanded ? 'ctrl+o to collapse' : 'ctrl+o to expand'),
+        `warp hint on the heading: ${JSON.stringify(heading)}`);
+      assert.equal(visible(lines[0]), 60, `warp hint right-aligned: ${JSON.stringify(heading)}`);
+      const rules = lines.map(stripAnsi).filter((line) => line.includes('\u2500'));
+      assert.equal(rules.length, 1, 'one closing rule');
+      assert.ok(!HINT.test(rules[0]), `warp closing rule carries no hint: ${JSON.stringify(rules[0])}`);
+      assert.ok(!lines.slice(1).map(stripAnsi).some((row) => HINT.test(row)), 'the hint appears once, on top');
+    }
+  });
+
+  test('the hint does not depend on render order: a settled call shows it before the result marks the row', () => {
+    // The host re-invokes the call renderer BEFORE the result renderer in the
+    // same update (tool-execution.js updateDisplay), and it is the RESULT
+    // render that marks the shared row state. So on the first pass after a
+    // result arrives the call still looks 'awaiting' while the execution is
+    // already finished — the expand hint must be on the top rule there too,
+    // never only after some later re-render.
+    const card = createWorktreeCardRenderer('worktree_create');
+    const state = {};
+    const context = { state, isPartial: false, expanded: false, outputPad: 0 };
+    const call = renderLines(card.renderCall(callFor('worktree_create'), THEME, context), 60);
+    assert.ok(stripAnsi(call[0]).endsWith('ctrl+o to expand'),
+      `the settled call carries the hint before the result renders: ${JSON.stringify(stripAnsi(call[0]))}`);
+    const running = renderLines(card.renderCall(callFor('worktree_create'), THEME, { ...context, isPartial: true }), 60);
+    assert.ok(!running.map(stripAnsi).some((row) => HINT.test(row)),
+      `a still-running card advertises nothing to expand: ${JSON.stringify(running.map(stripAnsi))}`);
+  });
+
+  test('without the injected toggle the card stays keyboard-only: no mouse handler', () => {
+    // Opt-in seam: the mouse handler exists ONLY when the extension injects a
+    // toggle callback (the host integration is wired by the extension, which
+    // calls ctx.ui.setToolsExpanded(!ctx.ui.getToolsExpanded())). With no
+    // callback the components stay render/invalidate-only and the host's own
+    // click paths are untouched.
+    for (const tool of TOOLS) {
+      const card = createWorktreeCardRenderer(tool);
+      const state = {};
+      const context = { state, isPartial: false, outputPad: 0 };
+      const components = [
+        card.renderCall(callFor(tool), THEME, context),
+        card.renderResult(resultFor(tool), { expanded: false }, THEME, context),
+      ];
+      for (const component of components) {
+        assert.equal(typeof component.handleMouse, 'undefined', `${tool} has no mouse seam without a callback`);
+        assert.equal(typeof component.render, 'function', `${tool} still renders`);
+        assert.equal(typeof component.invalidate, 'function', `${tool} still invalidates`);
+      }
+    }
+    const warp = createWarpMessageRenderer()(warpMessage(), { expanded: false, outputPad: 1 }, THEME);
+    assert.equal(typeof warp.handleMouse, 'undefined', 'the warp card has no mouse seam without a callback');
+  });
+});
+
+describe('click-to-expand seam: left press/click on the hint region only', () => {
+  // The host (pi-tui 1.4.0) delivers a click to the component that CLAIMED the
+  // press: tui-alt-screen.js records `mousePressTarget` from the dispatch result
+  // of the press, and on release at the same cell it synthesizes a `click`
+  // retargeted to that exact component (handleMouseEvent). So a press must
+  // return { handled: true } or the click never arrives. Both host shells reach
+  // the renderer: tool cards through tool-execution.js's MouseRegion, which
+  // dispatches to its child first, and message cards through
+  // CustomMessageComponent (a Container) forwarding to the renderer component.
+  // The card therefore claims ONLY the hint's own cells, and only a left
+  // press/click; everywhere else it returns undefined so the host's behavior is
+  // exactly what it was.
+  const HINT_TEXT = /ctrl\+o to (expand|collapse)/;
+
+  function hintGeometry(lines) {
+    for (let row = 0; row < lines.length; row += 1) {
+      const plain = stripAnsi(lines[row]);
+      const found = HINT_TEXT.exec(plain);
+      if (!found) continue;
+      // The fixtures are all single-column characters, so the string index is
+      // the visible column: exactly what the host reports in event.x.
+      return { row, start: found.index, end: found.index + found[0].length, text: found[0] };
+    }
+    return undefined;
+  }
+
+  function mouseEvent(type, x, y, over) {
+    return { type, button: 'left', x, y, width: 60, height: 6, shift: false, alt: false, ctrl: false, ...(over || {}) };
+  }
+
+  function seam() {
+    const calls = [];
+    return { calls, deps: { toggleExpanded: () => calls.push('toggle') } };
+  }
+
+  function settledComponents(tool, deps, options) {
+    const opts = options || {};
+    const theme = opts.theme || THEME;
+    const card = createWorktreeCardRenderer(tool, deps);
+    const state = {};
+    const context = { state, isPartial: false, expanded: opts.expanded === true, outputPad: 0, durationMs: opts.durationMs };
+    const expanded = opts.expanded === true;
+    const body = card.renderResult(resultFor(tool), { expanded, isPartial: false }, theme, context);
+    const top = card.renderCall(callFor(tool), theme, context);
+    return { card, top, body, lines: [...renderLines(top, opts.width || 60), ...renderLines(body, opts.width || 60)] };
+  }
+
+  function warpMessage(overrides) {
+    return {
+      customType: 'worktree-warp',
+      content: "Worktree warp: now in /repo/to (branch 'feat/cards').",
+      display: true,
+      details: {
+        from: '/repo/from',
+        to: '/repo/to',
+        fromDesc: 'principal \u00B7 main',
+        fromName: 'principal',
+        name: 'feat-cards',
+        branch: 'feat/cards',
+      },
+      ...(overrides || {}),
+    };
+  }
+
+  test('an injected toggle makes the hint cells a left-click target, and only the click toggles', () => {
+    for (const tool of TOOLS) {
+      const s = seam();
+      const { top } = settledComponents(tool, s.deps);
+      const lines = renderLines(top, 60);
+      const hint = hintGeometry(lines);
+      assert.ok(hint, `${tool} renders the hint: ${JSON.stringify(lines.map(stripAnsi))}`);
+      assert.equal(typeof top.handleMouse, 'function', `${tool} exposes the seam`);
+      const cell = { x: hint.start, y: hint.row };
+      // The press CLAIMS the gesture (so the host retargets the click here) but
+      // must not repaint, so the measured row stays valid for the click.
+      assert.deepStrictEqual(
+        top.handleMouse(mouseEvent('press', cell.x, cell.y)),
+        { handled: true, render: false },
+        `${tool} press on the hint is claimed without a repaint`,
+      );
+      assert.deepStrictEqual(s.calls, [], `${tool} a press alone never toggles`);
+      const click = top.handleMouse(mouseEvent('click', cell.x, cell.y));
+      assert.ok(click && click.handled === true, `${tool} click on the hint is handled: ${JSON.stringify(click)}`);
+      assert.deepStrictEqual(s.calls, ['toggle'], `${tool} exactly one toggle per click`);
+      // Every cell of the hint range reacts; the last one included.
+      top.handleMouse(mouseEvent('click', hint.end - 1, hint.row));
+      assert.deepStrictEqual(s.calls, ['toggle', 'toggle'], `${tool} the hint's last cell is inside the region`);
+    }
+  });
+
+  test('only the hint cells react: the header text, the body, and the closing rule pass through', () => {
+    const s = seam();
+    const { top, body, lines } = settledComponents('worktree_create', s.deps);
+    const hint = hintGeometry(lines);
+    assert.ok(hint);
+    const outside = [
+      ['left of the hint', mouseEvent('press', hint.start - 1, hint.row)],
+      ['left of the hint (click)', mouseEvent('click', hint.start - 1, hint.row)],
+      ['one past the hint', mouseEvent('click', hint.end, hint.row)],
+      ['the header bar cell', mouseEvent('click', 0, hint.row)],
+      ['a body row', mouseEvent('click', hint.start, hint.row + 2)],
+      ['the closing rule', mouseEvent('click', hint.start, lines.length - 1)],
+      ['past the last row', mouseEvent('click', hint.start, lines.length)],
+      ['a negative row', mouseEvent('click', hint.start, -1)],
+    ];
+    for (const entry of outside) {
+      const label = entry[0];
+      const event = entry[1];
+      assert.equal(top.handleMouse(event), undefined, `${label} is not claimed by the card`);
+    }
+    assert.deepStrictEqual(s.calls, [], 'no click outside the hint region toggles');
+    // The body-only half renders no hint at all, so it claims nothing either.
+    assert.equal(typeof body.handleMouse, 'function', 'the result half still exposes the seam');
+    for (let row = 0; row < lines.length; row += 1) {
+      assert.equal(body.handleMouse(mouseEvent('click', hint.start, row)), undefined, `result row ${row} is not claimed`);
+    }
+    assert.deepStrictEqual(s.calls, [], 'the result half never toggles on its own');
+  });
+
+  test('only a left press/click reacts: other buttons, wheel, move, drag and release pass through', () => {
+    const s = seam();
+    const { top } = settledComponents('worktree_warp', s.deps);
+    const hint = hintGeometry(renderLines(top, 60));
+    assert.ok(hint);
+    const passthrough = [
+      mouseEvent('press', hint.start, hint.row, { button: 'right' }),
+      mouseEvent('click', hint.start, hint.row, { button: 'right' }),
+      mouseEvent('click', hint.start, hint.row, { button: 'middle' }),
+      mouseEvent('click', hint.start, hint.row, { button: 'none' }),
+      mouseEvent('wheel', hint.start, hint.row),
+      mouseEvent('move', hint.start, hint.row),
+      mouseEvent('drag', hint.start, hint.row),
+      mouseEvent('release', hint.start, hint.row),
+    ];
+    for (const event of passthrough) {
+      assert.equal(top.handleMouse(event), undefined, `${event.type}/${event.button} is not claimed`);
+    }
+    assert.deepStrictEqual(s.calls, [], 'nothing but a left press/click toggles');
+    assert.equal(top.handleMouse(undefined), undefined, 'a missing event never throws or toggles');
+    assert.equal(top.handleMouse({}), undefined, 'a malformed event never throws or toggles');
+  });
+
+  test('a narrow card that drops the hint has no click region at all', () => {
+    const s = seam();
+    const { top } = settledComponents('worktree_session_open', s.deps, { width: 30 });
+    const lines = renderLines(top, 30);
+    assert.ok(!lines.map(stripAnsi).some((row) => HINT_TEXT.test(row)), 'no hint is rendered at 30');
+    for (let row = 0; row < lines.length; row += 1) {
+      for (let x = 0; x < 30; x += 1) {
+        assert.equal(top.handleMouse(mouseEvent('press', x, row)), undefined, `press at ${x},${row} is not claimed`);
+        assert.equal(top.handleMouse(mouseEvent('click', x, row)), undefined, `click at ${x},${row} is not claimed`);
+      }
+    }
+    assert.deepStrictEqual(s.calls, [], 'a card with no visible hint cannot be clicked open');
+  });
+
+  test('the seam never changes what the card renders, and the keyboard path stays', () => {
+    const withSeam = { toggleExpanded: () => {} };
+    const float = { fg: (_role, text) => text, bg: (_role, text) => `\x1b[48;5;22m${text}\x1b[49m` };
+    for (const tool of TOOLS) {
+      for (const expanded of [false, true]) {
+        for (const theme of [THEME, float]) {
+          const plain = settledComponents(tool, undefined, { expanded, width: 80, theme });
+          const seamed = settledComponents(tool, withSeam, { expanded, width: 80, theme });
+          assert.deepStrictEqual(seamed.lines, plain.lines, `${tool} renders identically with the seam`);
+        }
+      }
+    }
+    const s = seam();
+    const { top } = settledComponents('worktree_close', s.deps);
+    const text = renderLines(top, 60).map(stripAnsi).join('\n');
+    assert.ok(text.includes('ctrl+o to expand'), 'the key hint still names ctrl+o: ' + JSON.stringify(text));
+  });
+
+  // The real host shells, driven through the real pi-tui primitives: the tool
+  // card sits inside tool-execution.js's MouseRegion, and the message card sits
+  // inside CustomMessageComponent — a Container — which forwards to its child
+  // with a row offset. Both must reach the card, and the card's claimed press
+  // must become the gesture target the synthesized click is retargeted to.
+  test('the real host shells reach the card: claimed press, retargeted click, host toggle untouched', () => {
+    let tui = null;
+    try {
+      tui = require('@earendil-works/pi-tui');
+    } catch {
+      tui = null;
+    }
+    if (!tui || typeof tui.MouseRegion !== 'function' || typeof tui.Container !== 'function' || typeof tui.Spacer !== 'function') {
+      return;
+    }
+
+    // tui-alt-screen's retarget: the click arrives with the target's own
+    // origin subtracted, exactly as retargetMouseEvent computes it.
+    function hostClickFrom(pressResult, clickEvent) {
+      const target = pressResult.target;
+      return {
+        ...clickEvent,
+        x: clickEvent.screenX - target.originX,
+        y: clickEvent.screenY - target.originY,
+        width: target.width,
+        height: target.height,
+      };
+    }
+
+    // --- tool card: Container -> MouseRegion(card, hostToggle) -> card ---
+    const s = seam();
+    const hostToggles = [];
+    const hostToggle = (event) => {
+      if (event.type !== 'click' || event.button !== 'left') return undefined;
+      hostToggles.push('host');
+      return { handled: true };
+    };
+    const { top } = settledComponents('worktree_create', s.deps);
+    const lines = renderLines(top, 60);
+    const hint = hintGeometry(lines);
+    assert.ok(hint);
+    const region = new tui.MouseRegion(top, hostToggle);
+    const pressEvent = { ...mouseEvent('press', hint.start, hint.row), screenX: hint.start, screenY: hint.row, height: lines.length };
+    const pressResult = region.handleMouse(pressEvent);
+    assert.ok(pressResult && pressResult.handled === true, 'the host region forwards and keeps the card\'s claimed press');
+    assert.strictEqual(pressResult.target.component, top, 'the gesture target is the card component itself');
+    const clickEvent = { ...pressEvent, type: 'click' };
+    const clickResult = pressResult.target.component.handleMouse(hostClickFrom(pressResult, clickEvent));
+    assert.ok(clickResult && clickResult.handled === true, 'the retargeted click is handled by the card');
+    assert.deepStrictEqual(s.calls, ['toggle'], 'the card callback toggled exactly once');
+    assert.deepStrictEqual(hostToggles, [], 'the host region handler did not also toggle');
+
+    // A press OUTSIDE the hint is not claimed, so the host's own handler keeps
+    // the click: nothing about the surrounding card changes.
+    const outside = region.handleMouse({ ...pressEvent, x: 0, screenX: 0 });
+    assert.equal(outside, undefined, 'a press off the hint is not claimed by the card');
+    assert.deepStrictEqual(s.calls, ['toggle'], 'no extra toggle from the pass-through press');
+
+    // --- message card: Container (CustomMessageComponent) -> card ---
+    const m = seam();
+    const render = createWarpMessageRenderer(m.deps);
+    const card = render(warpMessage(), { expanded: false, outputPad: 0 }, THEME);
+    const cardLines = renderLines(card, 60);
+    const cardHint = hintGeometry(cardLines);
+    assert.ok(cardHint);
+    const container = new tui.Container();
+    // CustomMessageComponent opens with a Spacer(1), so the card starts one row down.
+    container.addChild(new tui.Spacer(1));
+    container.addChild(card);
+    const height = cardLines.length + 1;
+    const messagePress = container.handleMouse({
+      ...mouseEvent('press', cardHint.start, cardHint.row + 1), screenX: cardHint.start, screenY: cardHint.row + 1, height,
+    });
+    assert.ok(messagePress && messagePress.handled === true, 'the message container forwards the claimed press');
+    assert.strictEqual(messagePress.target.component, card, 'the message gesture target is the card component');
+    const messageClick = container.handleMouse({
+      ...mouseEvent('click', cardHint.start, cardHint.row + 1), screenX: cardHint.start, screenY: cardHint.row + 1, height,
+    });
+    assert.ok(messageClick && messageClick.handled === true, 'the message card handles the click');
+    assert.deepStrictEqual(m.calls, ['toggle'], 'the message card toggled exactly once');
+  });
+
+  test('the warp message card gets the same hint-region seam', () => {
+    const s = seam();
+    const render = createWarpMessageRenderer(s.deps);
+    const component = render(warpMessage(), { expanded: false, outputPad: 1 }, THEME);
+    const lines = renderLines(component, 60);
+    const hint = hintGeometry(lines);
+    assert.ok(hint, 'the warp heading carries the hint');
+    assert.equal(typeof component.handleMouse, 'function', 'the message card exposes the seam');
+    assert.deepStrictEqual(
+      component.handleMouse(mouseEvent('press', hint.start, hint.row)),
+      { handled: true, render: false },
+      'the warp press is claimed so the host retargets the click',
+    );
+    assert.deepStrictEqual(s.calls, [], 'the warp press alone never toggles');
+    assert.ok(component.handleMouse(mouseEvent('click', hint.start, hint.row)).handled, 'the warp click is handled');
+    assert.deepStrictEqual(s.calls, ['toggle'], 'one warp toggle per click');
+    assert.equal(component.handleMouse(mouseEvent('click', 0, hint.row)), undefined, 'the heading bar cell is not claimed');
+    assert.deepStrictEqual(s.calls, ['toggle'], 'clicks outside the warp hint change nothing');
   });
 });
 
@@ -991,7 +1467,9 @@ describe('warp message renderer (S20)', () => {
       assertFits(lines, width);
       assertWarpFrame(lines);
       const rows = warpBodyRows(lines);
-      assert.equal(rows[0], '\u2387 Warp \u00B7 moved', 'own label with glyph, never the bracketed customType');
+      assert.ok(rows[0].startsWith('\u2387 Warp \u00B7 moved'),
+        'own label with glyph, never the bracketed customType: ' + JSON.stringify(rows[0]));
+      assert.ok(rows[0].endsWith('ctrl+o to expand'), 'the expand hint rides the heading: ' + JSON.stringify(rows[0]));
       // S42: compact is EXACTLY the two name-only rows — no branch, no path.
       assert.deepStrictEqual(rows.slice(1), ['moved: principal', 'to: feat-cards']);
       assert.ok(!rows.join('\n').includes('feat/cards'), 'no branch row in the compact card: ' + JSON.stringify(rows));
@@ -1024,7 +1502,10 @@ describe('warp message renderer (S20)', () => {
     const lines = renderLines(render(warpMessage(), { expanded: true, outputPad: 1 }, THEME), 100);
     assertFits(lines, 100);
     const rows = warpBodyRows(lines);
-    assert.equal(rows[0], '\u2387 Warp \u00B7 moved');
+    assert.ok(rows[0].startsWith('\u2387 Warp \u00B7 moved'),
+      'the heading keeps its identity first: ' + JSON.stringify(rows[0]));
+    assert.ok(rows[0].endsWith('ctrl+o to collapse'),
+      'the hint rides the heading, not the closing rule: ' + JSON.stringify(rows[0]));
     assert.deepStrictEqual(rows.slice(1, 3), ['moved: principal', 'to: feat-cards']);
     assert.deepStrictEqual(rows.slice(3), ['path: now in "/repo/to"', 'branch: now in "feat/cards"'],
       'S42: expanded appends exactly path then branch: ' + JSON.stringify(rows));
@@ -1147,14 +1628,16 @@ describe('warp message renderer (S20)', () => {
     // tone; that limitation is stated in lib/worktree-card.js and the docs.
   });
 
-  test('the closing rule carries the ctrl+o hint on both states', () => {
+  test('the heading row carries the ctrl+o hint on both states', () => {
     const render = createWarpMessageRenderer();
     for (const expanded of [false, true]) {
       const lines = renderLines(render(warpMessage(), { expanded, outputPad: 1 }, THEME), 60);
+      assert.ok(stripAnsi(lines[0]).trim().endsWith(expanded ? 'ctrl+o to collapse' : 'ctrl+o to expand'),
+        'expand hint rides the heading: ' + JSON.stringify(stripAnsi(lines[0])));
       const rules = lines.map((line) => stripAnsi(line)).filter((line) => line.includes('\u2500'));
       assert.equal(rules.length, 1, 'one closing rule');
-      assert.ok(rules[0].includes(expanded ? 'ctrl+o to collapse' : 'ctrl+o to expand'),
-        'expand hint rides the rule: ' + JSON.stringify(rules[0]));
+      assert.ok(!rules[0].includes('ctrl+o'),
+        'the closing rule carries no hint: ' + JSON.stringify(rules[0]));
     }
   });
 });
@@ -1426,11 +1909,13 @@ describe('S24 float card recipe (T17 RED)', () => {
       assertFullWidthPainted(wide, 60);
       const wideCloser = stripAnsi(wide[wide.length - 1]);
       assert.ok(/1\.2s {1,2}$/.test(wideCloser), `${tool} duration closes the rule when it fits: ${JSON.stringify(wideCloser)}`);
+      // the closing rule is the duration's alone, so the only way it is
+      // omitted is a duration that leaves no fill column at a narrow width.
       const narrow = renderLines(
-        card.renderResult(resultFor(tool), { expanded: false }, floatTheme(), { durationMs: 1200 }), 20);
-      assertFullWidthPainted(narrow, 20);
+        card.renderResult(resultFor(tool), { expanded: false }, floatTheme(), { durationMs: 1234567 }), 12);
+      assertFullWidthPainted(narrow, 12);
       const narrowCloser = stripAnsi(narrow[narrow.length - 1]);
-      assert.ok(!narrowCloser.includes('1.2s'), `${tool} omits the duration when it cannot fit: ${JSON.stringify(narrowCloser)}`);
+      assert.ok(!narrowCloser.includes('1234.6s'), `${tool} omits the duration when it cannot fit: ${JSON.stringify(narrowCloser)}`);
       assert.ok(!narrowCloser.includes('\u2500'), `${tool} never renders a placeholder dash: ${JSON.stringify(narrowCloser)}`);
     }
   });

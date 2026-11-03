@@ -28,6 +28,8 @@ const { spawnSync, execFileSync } = require('node:child_process');
 
 const {
   listOddDocs,
+  listOddDocsAsync,
+  listOddDocsLocal,
   readOddDoc,
   commitCacheInfo,
   COMMIT_CACHE_LIMIT,
@@ -627,5 +629,175 @@ describe('commit-time memo (S13)', () => {
       !JSON.stringify(info.entries).includes('private text'),
       'no document content reaches the memo',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interactive listing (S21 «se traba»): the viewer is an INTERACTIVE path, so
+// the listing has to answer without freezing the host event loop on Git, and
+// the first frame must not wait for a history walk at all. Two additions carry
+// that, and both must agree with the synchronous listing document for
+// document:
+//
+//   listOddDocsLocal(root)  — the cheap scan alone: `odd/tasks` on disk ordered
+//                             by the documented mtime fallback, with no Git
+//                             process of any kind. The first frame paints from
+//                             this, and it decides whether there is anything to
+//                             read at all.
+//   listOddDocsAsync(root)  — the same listing `listOddDocs` returns, with every
+//                             Git read awaited off the loop instead of spawned
+//                             synchronously. Same rows, same order, same
+//                             degradations: an answer git cannot give leaves the
+//                             mtime fallback exactly as it does synchronously.
+//
+// A slow Git is simulated deterministically through the injected async runner
+// (the package convention `(bin, argv, cwd) => Promise<{status,stdout,stderr}>`)
+// and through a real recording git binary, never by mocking the module.
+// ---------------------------------------------------------------------------
+describe('interactive listing (S21)', () => {
+  // The package's async runner convention, with a deterministic extra delay per
+  // Git call, delegating the actual read to the real binary so the output is
+  // the same one a host would see.
+  function delayedRunner(delayMs) {
+    return async (bin, args, cwd) => {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return spawnSync(bin, args, { cwd, encoding: 'utf8', env: GIT_ENV });
+    };
+  }
+
+  function cloneWithConflictingSignals(tag) {
+    const source = makeRepo(`${tag}-source`);
+    writeDoc(source, 'odd/tasks/aaa.md', '# aaa\n');
+    commitAll(source, '2026-01-01T00:00:00Z', 'older document');
+    writeDoc(source, 'odd/tasks/zzz.md', '# zzz\n');
+    commitAll(source, '2026-06-01T00:00:00Z', 'newer document');
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), `odd-docs-${tag}-clone-`));
+    roots.push(parent);
+    const clone = path.join(parent, 'checkout');
+    git(parent, ['clone', '-q', source, clone]);
+    // mtime contradicts the commit dates: `aaa` is the newer file on disk.
+    setMtime(clone, 'odd/tasks/aaa.md', '2026-09-01T00:00:00Z');
+    setMtime(clone, 'odd/tasks/zzz.md', '2026-07-01T00:00:00Z');
+    return clone;
+  }
+
+  test('the local scan lists every document by mtime, reading no Git signal at all', () => {
+    const clone = cloneWithConflictingSignals('local');
+    const local = listOddDocsLocal(clone);
+    assert.equal(local.ok, true);
+    assert.equal(local.root, clone);
+    assert.deepEqual(
+      local.docs.map((doc) => doc.name),
+      ['aaa', 'zzz'],
+      'the cheap scan is the mtime fallback: had it read git, the commit dates would decide',
+    );
+    assert.deepEqual(
+      local.docs.map((doc) => doc.name),
+      listOddDocs(clone).docs.map((doc) => doc.name).reverse(),
+      'and it is the same document set the full listing returns, in mtime order',
+    );
+    assert.deepEqual(Object.keys(local.docs[0]), ['name', 'file', 'path'], 'the row shape is unchanged');
+  });
+
+  test('the local scan still fails closed and still treats a missing odd/tasks as empty', () => {
+    assert.equal(listOddDocsLocal('').ok, false);
+    assert.equal(listOddDocsLocal(null).ok, false);
+    assert.equal(listOddDocsLocal(path.join(os.tmpdir(), `odd-docs-local-missing-${process.pid}`)).ok, false);
+    const empty = fixture({ 'README.md': '# readme\n' });
+    assert.deepEqual(listOddDocsLocal(empty), { ok: true, root: empty, docs: [] });
+  });
+
+  test('the async listing resolves the same documents in the same order as the synchronous one', async () => {
+    const root = makeRepo('async-same');
+    writeDoc(root, 'odd/tasks/alpha.md', '# alpha\n');
+    commitAll(root, '2026-01-01T00:00:00Z', 'alpha');
+    writeDoc(root, 'odd/tasks/bravo.md', '# bravo\n');
+    commitAll(root, '2026-05-01T00:00:00Z', 'bravo');
+
+    const asyncListing = await listOddDocsAsync(root);
+    assert.equal(asyncListing.ok, true);
+    assert.equal(asyncListing.root, root);
+    assert.deepEqual(asyncListing.docs.map((doc) => doc.name), ['bravo', 'alpha'], 'commit recency, newest first');
+    assert.deepEqual(
+      asyncListing.docs,
+      listOddDocs(root).docs,
+      'both readers describe the same checkout identically, row for row',
+    );
+  });
+
+  test('the async listing leaves the host event loop free while Git answers', async () => {
+    const root = makeRepo('async-free');
+    writeDoc(root, 'odd/tasks/alpha.md', '# alpha\n');
+    commitAll(root, '2026-01-01T00:00:00Z', 'alpha');
+
+    let settled = false;
+    let ticked = false;
+    const pending = listOddDocsAsync(root, { runAsync: delayedRunner(60) });
+    assert.equal(typeof pending.then, 'function', 'the interactive reader hands back a promise');
+    pending.then(() => { settled = true; });
+    setTimeout(() => { ticked = true; }, 10);
+    // One macrotask after the call, the loop is already turning while every
+    // Git read is still sleeping: nothing on this path is `spawnSync`.
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    assert.equal(ticked, true, 'the host got a turn while git was still answering');
+    assert.equal(settled, false, 'the listing had not answered yet, so the turn came from the wait being off-loop');
+    const listing = await pending;
+    assert.deepEqual(listing.docs.map((doc) => doc.name), ['alpha']);
+  });
+
+  test('a git that cannot answer degrades to mtime instead of failing the listing', async () => {
+    const root = makeRepo('async-degrade');
+    writeDoc(root, 'odd/tasks/aaa.md', '# aaa\n');
+    commitAll(root, '2026-01-01T00:00:00Z', 'aaa');
+    writeDoc(root, 'odd/tasks/zzz.md', '# zzz\n');
+    commitAll(root, '2026-06-01T00:00:00Z', 'zzz');
+    setMtime(root, 'odd/tasks/aaa.md', '2026-09-01T00:00:00Z');
+    setMtime(root, 'odd/tasks/zzz.md', '2026-07-01T00:00:00Z');
+
+    const failing = async () => ({ status: 1, stdout: '', stderr: 'fatal: no history' });
+    const listing = await listOddDocsAsync(root, { runAsync: failing });
+    assert.equal(listing.ok, true, 'recency never fails the listing');
+    assert.deepEqual(names(listing), ['aaa', 'zzz'], 'the mtime fallback ranks the documents');
+    assert.deepEqual(names(listing), names(listOddDocsLocal(root)), 'identical to the cheap scan');
+  });
+
+  test('an empty checkout and a missing root cost no Git process at all', async () => {
+    const calls = [];
+    const counting = async (bin, args, cwd) => {
+      calls.push({ bin, args, cwd });
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const empty = fixture({ 'README.md': '# readme\n' });
+    assert.deepEqual(await listOddDocsAsync(empty, { runAsync: counting }), { ok: true, root: empty, docs: [] });
+    assert.deepEqual(calls, [], 'no documents, no git process');
+    const missing = path.join(os.tmpdir(), `odd-docs-async-missing-${process.pid}`);
+    assert.equal((await listOddDocsAsync(missing, { runAsync: counting })).ok, false);
+    assert.deepEqual(calls, [], 'a root that is not a checkout never reaches git');
+  });
+
+  test('the async listing shares the commit-time memo, so a slow walk is paid once', {
+    skip: process.platform === 'win32' ? 'POSIX stub script' : false,
+  }, async () => {
+    const root = makeRepo('async-memo');
+    writeDoc(root, 'odd/tasks/aaa.md', '# aaa\n');
+    commitAll(root, '2026-01-01T00:00:00Z', 'older');
+    writeDoc(root, 'odd/tasks/zzz.md', '# zzz\n');
+    commitAll(root, '2026-06-01T00:00:00Z', 'newer');
+    const logFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'odd-docs-async-memo-')), 'calls.log');
+    roots.push(path.dirname(logFile));
+    const bin = recordingGit('async-memo', logFile);
+
+    // The synchronous listing paid the walk through the recording binary.
+    assert.deepEqual(names(listOddDocs(root, { gitBin: bin })), ['zzz', 'aaa']);
+    assert.equal(countCalls(logFile, LOG_CALL), 1, 'the premise: one history walk happened');
+
+    // The async twin resolves the identical order and, on an unchanged HEAD,
+    // walks no history again — it reaches the SAME memo through the default
+    // async runner, so neither reader serves an order it did not derive.
+    const listing = await listOddDocsAsync(root, { gitBin: bin });
+    assert.deepEqual(names(listing), ['zzz', 'aaa'], 'the async reader returns the git-ranked order');
+    assert.equal(countCalls(logFile, LOG_CALL), 1, 'an unchanged HEAD is not walked a second time');
+    assert.equal(countCalls(logFile, HEAD_CALL), 2, 'it still re-reads HEAD to know the memo is current');
+    assert.equal(countCalls(logFile, STATUS_CALL), 2, 'and it still re-reads the local-edit signal');
   });
 });

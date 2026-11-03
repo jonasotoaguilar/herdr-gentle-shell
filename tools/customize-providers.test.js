@@ -445,7 +445,7 @@ const RESET_ROW = 'Reset every option to its default';
 // S22: the panel's categories are sidebar, moshi, worktree and reset — there is
 // no Performance section, so the reset row is reached as the fourth and last
 // category.
-const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Worktree tools', 'Reset'];
+const CATEGORY_TITLES = ['Herdr Sidebar', 'Moshi notifications', 'Plugin tools', 'Reset'];
 
 async function loadWorktreeExtension() {
   const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-customize-reset-')));
@@ -539,6 +539,7 @@ describe('customize reset to defaults', { concurrency: false }, () => {
       fs.writeFileSync(flagPath(fix, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
       fs.writeFileSync(flagPath(fix, 'gentle-moshi.json'), `${JSON.stringify({ enabled: true })}\n`);
       fs.writeFileSync(flagPath(fix, 'gentle-worktree-mode.json'), '{"version":1,"enabled":false}\n');
+      fs.writeFileSync(flagPath(fix, 'gentle-plugin-tools.json'), '{"version":1,"odd":false,"issues":false}\n');
       fs.writeFileSync(path.join(fix.agentDir, 'extensions', 'moshi-hooks.ts'), '// moshi hook\n');
       fs.writeFileSync(path.join(fix.agentDir, 'settings.json'), `${JSON.stringify({ extensions: ['-extensions/moshi-hooks.ts'] }, null, 2)}\n`);
       await loadExtension();
@@ -554,10 +555,12 @@ describe('customize reset to defaults', { concurrency: false }, () => {
       assert.deepEqual(readJson(flagPath(fix, 'gentle-sidebar-mode.json')), { version: 1, enabled: true }, 'sidebar returns to gentle');
       assert.equal(readJson(flagPath(fix, 'gentle-moshi.json')).enabled, false, 'moshi returns to off');
       assert.deepEqual(readJson(flagPath(fix, 'gentle-worktree-mode.json')), { version: 1, enabled: true }, 'worktree returns to enabled');
+      assert.deepEqual(readJson(flagPath(fix, 'gentle-plugin-tools.json')), { version: 1, odd: true, issues: true }, 'both plugin tool commands return to enabled');
+      assert.deepEqual(readJson(flagPath(fix, 'gentle-worktree-mode.json')), { version: 1, enabled: true }, 'the legacy worktree file keeps its exact shape');
       assert.ok(fs.existsSync(flagPath(fix, 'gentle-sidebar-mode.json')), 'the sidebar flag is rewritten, never removed');
       assert.ok(fs.existsSync(flagPath(fix, 'gentle-moshi.json')), 'the moshi flag is rewritten, never removed');
       assert.ok(fs.existsSync(flagPath(fix, 'gentle-worktree-mode.json')), 'the worktree flag is rewritten, never removed');
-      for (const name of ['gentle-sidebar-mode.json', 'gentle-moshi.json', 'gentle-worktree-mode.json']) {
+      for (const name of ['gentle-sidebar-mode.json', 'gentle-moshi.json', 'gentle-worktree-mode.json', 'gentle-plugin-tools.json']) {
         assert.ok(
           !seen.some(([, target]) => target === flagPath(fix, name)),
           `${name} is never unlinked or removed`,
@@ -591,7 +594,7 @@ describe('customize reset to defaults', { concurrency: false }, () => {
       const { ctx, notes, selects, reloads } = resetCtx();
       await commands.get('herdr-gentle:customize').handler('', ctx);
       assert.deepEqual(selects[1][1], [RESET_ROW]);
-      assert.deepEqual(notes, [['Nothing to reset: sidebar, moshi and worktree already match their defaults.', 'info']]);
+      assert.deepEqual(notes, [['Nothing to reset: sidebar, moshi, worktree, odd and issues already match their defaults.', 'info']]);
       assert.ok(!fs.existsSync(flagPath(fix, 'gentle-sidebar-mode.json')), 'nothing to reset creates no sidebar flag');
       assert.ok(!fs.existsSync(flagPath(fix, 'gentle-moshi.json')), 'nothing to reset creates no moshi flag');
       assert.ok(!fs.existsSync(flagPath(fix, 'gentle-worktree-mode.json')), 'nothing to reset creates no worktree flag');
@@ -652,7 +655,7 @@ describe('customize reset to defaults', { concurrency: false }, () => {
       assert.deepEqual(calls, [['sidebar', 'gentle'], ['moshi', 'off']], 'both writers are reached, never skipped');
       assert.deepEqual(readJson(flagPath(fix, 'gentle-worktree-mode.json')), { version: 1, enabled: true }, 'the other options stay applied');
       assert.deepEqual(notes, [[
-        'Partial reset: sidebar changed, moshi unchanged, worktree changed. Could not write the moshi flag: permission denied; nothing was changed.',
+        'Partial reset: sidebar changed, moshi unchanged, worktree changed, odd unchanged, issues unchanged. Could not write the moshi flag: permission denied; nothing was changed.',
         'info',
       ]]);
     } finally {
@@ -738,7 +741,7 @@ describe('customize reset to defaults', { concurrency: false }, () => {
       await commands.get('herdr-gentle:customize').handler('', ctx);
       assert.deepEqual(
         notes,
-        [['Nothing to reset: sidebar, moshi and worktree already match their defaults.', 'info']],
+        [['Nothing to reset: sidebar, moshi, worktree, odd and issues already match their defaults.', 'info']],
         'the summary names only the options this package owns',
       );
       assert.equal(

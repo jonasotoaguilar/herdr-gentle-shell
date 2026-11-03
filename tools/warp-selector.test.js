@@ -1083,6 +1083,23 @@ function watchMutations() {
   };
 }
 
+// Every removal argv the shared close issues, recorded in ORDER. The keyboard
+// delete's fail-closed contract is "no remover ran at all", which is only
+// observable here: a run that leaves the fixture intact after a refused
+// `git worktree remove` still asked a backend to delete a path nobody approved.
+function watchRemovals() {
+  const removals = [];
+  const original = gitLib.runArgvAsync;
+  gitLib.runArgvAsync = function wrapped(...args) {
+    const argv = Array.isArray(args[1]) ? args[1] : [];
+    if (argv[0] === 'worktree' && argv[1] === 'remove') {
+      removals.push({ argv: argv.slice(), cwd: args[2] && args[2].cwd });
+    }
+    return original.apply(this, args);
+  };
+  return { removals, restore: () => { gitLib.runArgvAsync = original; } };
+}
+
 // Every created-state this task calls "created": a branch, a checkout and a
 // registry row. Snapshotted whole so Esc that created anything fails.
 function createdState(root) {
@@ -1118,12 +1135,13 @@ function missingSessionFile(tag) {
 }
 
 // ---------------------------------------------------------------------------
-// S1/S4: the warp popup reaches NO worktree modification any more. The old
-// `e` opened the full-screen worktree detail and deleted issues/ODD
-// associations there; `ctrl+d` (panel and extended list) opened the delete
-// confirmation. Both views were removed with the association, so every one of
-// those keys is inert and mutates nothing.
-describe('S1/S4: the warp popup cannot edit or delete a worktree', { concurrency: false }, () => {
+// S1/S4: the warp popup reaches no worktree modification beyond the delete
+// REQUEST. The old `e` opened the full-screen worktree detail and deleted
+// issues/ODD associations there; that view was removed with the association,
+// so `e` is inert. `ctrl+d` (panel and extended list) asks to DELETE, and the
+// confirmation, the disclosure, the refusals and the removal are the
+// extension's — nothing a keypress alone can do.
+describe('S1/S4: the warp popup edits nothing, and `e` stays inert', { concurrency: false }, () => {
   test('`e` opens no detail, asks nothing, writes nothing and leaves the popup in place', async () => {
     setEnv(warpStateEnv());
     try {
@@ -1141,32 +1159,6 @@ describe('S1/S4: the warp popup cannot edit or delete a worktree', { concurrency
         assert.deepEqual(built.confirms, [], 'no dialog was raised');
         assert.deepEqual(watcher.kinds(), [], 'no creation and no registry write');
         assert.deepEqual(createdState(root), before, 'the checkout and the registry are untouched');
-        assert.deepEqual(built.notes, [], 'an inert key is silent');
-      } finally {
-        watcher.restore();
-      }
-    } finally {
-      restoreEnv();
-    }
-  });
-
-  test('`ctrl+d` in the panel and in the extended list deletes nothing', async () => {
-    setEnv(warpStateEnv());
-    try {
-      const root = makeRepo('no-delete-key');
-      const target = addRegisteredWorktree(root, 'feat/del-target');
-      const before = createdState(root);
-      const watcher = watchMutations();
-      try {
-        // `v` enters the extended list, where Ctrl+D used to resolve a delete.
-        const driver = multiDriver([['v', '\x04', 'ctrl+d', '\x1b', '\x04', 'ctrl+d', '\x1b']]);
-        const built = wiredCtx(root, driver);
-        const { commands } = await loadExtension();
-        await warpDef(commands).handler('', built.ctx);
-        assert.deepEqual(built.confirms, [], 'no deletion confirmation was asked');
-        assert.deepEqual(watcher.kinds(), [], 'nothing was removed and nothing was written');
-        assert.deepEqual(createdState(root), before, 'the checkout is still there');
-        assert.ok(fs.existsSync(target), 'the checkout directory still exists on disk');
         assert.deepEqual(built.notes, [], 'an inert key is silent');
       } finally {
         watcher.restore();
@@ -1202,8 +1194,788 @@ describe('S1/S4: the warp popup cannot edit or delete a worktree', { concurrency
   });
 });
 
-describe('T16: the panels write nothing until the user confirms (S17)', { concurrency: false }, () => {
-  test('opening the creating panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
+// ---------------------------------------------------------------------------
+// S4 (feedback: «falta el atajo para eliminar worktree»): `ctrl+d` in the warp
+// panel and in the extended list asks to DELETE the focused checkout. What is
+// pinned here is the whole decision, observed from the command's outside:
+//   1. the question is ALWAYS asked, names the checkout, its branch and the
+//      pending changes it would lose (+lines/-lines), and gentle-shell's YOLO
+//      grant never waives it (the same grant does waive `worktree_close`'s own
+//      dialog for a clean checkout — that is the proof it was ON);
+//   2. a decline mutates nothing at all;
+//   3. confirming removes the checkout, keeps the branch and drops exactly
+//      that registry row;
+//   4. the principal and the checkout the session runs in are refused BEFORE
+//      any question is asked;
+//   5. evidence that moved while the dialog was open fails closed, because the
+//      human answered about a state that no longer exists.
+const NO_HERDR = () => path.join(os.tmpdir(), 'definitely-not-a-herdr-binary-warp-delete');
+
+// A herdr stub that makes the filesystem change INSIDE the awaited
+// `herdr worktree list`. That child process is the longest window between an
+// identity check and the remover, so the swap landing there is deterministic:
+// the stub performs it, then exits non-zero so the close falls back to
+// `git worktree remove` — a remover that resolves the spelling it is given.
+//
+// Two shapes of replacement, because they defeat different checks:
+//   - `symlink`: the approved path becomes a link to another checkout, which a
+//     realpath comparison can see;
+//   - `move`: the approved directory is moved aside and ANOTHER detached
+//     checkout of the same commit is moved into its place — every string stays
+//     identical (same path, same realpath, not a link), so only the pinned
+//     device/inode pair tells the two directories apart.
+function makeSwappingHerdr({ target, aside, victim, mode = 'symlink' }) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-swap-herdr-')));
+  const bin = path.join(dir, 'herdr');
+  const script = path.join(dir, 'swap.sh');
+  const marker = path.join(dir, 'swapped');
+  const swapLines = mode === 'move'
+    ? ['mv "$SWAP_VICTIM" "$SWAP_TARGET"']
+    : ['ln -s "$SWAP_VICTIM" "$SWAP_TARGET"'];
+  fs.writeFileSync(script, [
+    '#!/bin/sh',
+    'set -e',
+    'mv "$SWAP_TARGET" "$SWAP_ASIDE"',
+    ...swapLines,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  fs.writeFileSync(bin, [
+    '#!/bin/sh',
+    'if [ "$1" = "worktree" ] && [ "$2" = "list" ] && [ ! -f "$HERDR_SWAP_MARKER" ]; then',
+    '  : > "$HERDR_SWAP_MARKER"',
+    '  /bin/sh "$HERDR_SWAP_SCRIPT" || exit 1',
+    'fi',
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { bin, script, marker, dir };
+}
+
+// A herdr stub that ANSWERS the listing with one workspace for the target and
+// removes it through git when asked by workspace id, logging every argv. It is
+// what proves the reordered close keeps the Herdr-first removal intact.
+function makeListingHerdr({ root, target }) {
+  const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-warp-list-herdr-')));
+  const bin = path.join(dir, 'herdr');
+  const log = path.join(dir, 'argv.log');
+  fs.writeFileSync(log, '');
+  fs.writeFileSync(bin, [
+    '#!/bin/sh',
+    'printf \'%s\\n\' "$*" >> "$HERDR_LOG"',
+    'if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then',
+    '  printf \'{"result":{"worktrees":[{"path":"%s","open_workspace_id":"ws-target"}]}}\\n\' "$HERDR_TARGET"',
+    '  exit 0',
+    'fi',
+    'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+    '  git -C "$HERDR_REPO" worktree remove --force "$HERDR_REMOVE_PATH"',
+    '  exit $?',
+    'fi',
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o755 });
+  return { bin, log, dir };
+}
+
+describe('S4: the warp delete shortcut asks, discloses and revalidates', { concurrency: false }, () => {
+  test('ctrl+d asks one confirmation that names the losing lines, and a decline removes nothing', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-decline');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-decline');
+      // Two appended lines and one brand-new file: the disclosure must count
+      // LINES that would be lost, not files.
+      fs.appendFileSync(path.join(target, 'work.txt'), 'one\ntwo\n');
+      const before = createdState(root);
+      // The first row is the only other checkout (the session sits in the
+      // principal), so one `ctrl+d` targets it.
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: false });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1, 'exactly one question, never none and never two');
+      const [title, body] = built.confirms[0];
+      assert.equal(title, "Delete worktree 'feat-del-decline'?");
+      assert.match(body, new RegExp(`Delete worktree checkout at ${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} for branch 'feat/del-decline'`));
+      assert.match(body, /Pending changes: 1 file, \+2\/-0\./, `the pending lines are named: ${body}`);
+      assert.match(body, /keeps the branch/, 'the branch-kept contract travels with the question');
+
+      assert.deepEqual(createdState(root), before, 'a decline changed no branch, no checkout and no row');
+      assert.ok(fs.existsSync(target), 'the checkout is still on disk');
+      assert.ok(registryLib.findByPath(root, target), 'and still registered');
+      assert.deepEqual(built.notes, [['worktree delete cancelled: nothing was removed at ' + target + '.', 'info']],
+        'the answer is acknowledged and the loss is not claimed');
+      assert.equal(driver.mounts(), 2, 'the selector comes back with a freshly read listing');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a clean checkout is still asked under YOLO, which does waive the tool\'s own dialog', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    // The live session holds gentle-shell's YOLO grant for this test.
+    answerYolo('ON');
+    try {
+      const root = makeRepo('delete-yolo');
+      addMainBranch(root);
+      const waived = addRegisteredWorktree(root, 'feat/del-waived');
+      const target = addRegisteredWorktree(root, 'feat/del-yolo');
+      const { tools, commands } = await loadExtension();
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      built.ctx.hasUI = true;
+      // Proof the grant is ON: the tool's own dialog is waived for a CLEAN
+      // checkout, so no question is asked for it.
+      const closed = await tools.get('worktree_close').execute('close-1', { path: waived }, undefined, undefined, built.ctx);
+      assert.notEqual(closed.isError, true, JSON.stringify(closed));
+      assert.deepEqual(built.confirms, [], 'YOLO waived the tool dialog for a clean checkout');
+      assert.ok(!fs.existsSync(waived), 'and the tool removed that checkout');
+
+      await warpDef(commands).handler('', built.ctx);
+      assert.equal(built.confirms.length, 1, 'the warp delete asked anyway: a keypress never borrows that grant');
+      assert.match(built.confirms[0][1], /^Delete worktree checkout at /);
+      assert.ok(!/Pending changes/.test(built.confirms[0][1]), 'a clean checkout names no pending changes');
+      assert.ok(!fs.existsSync(target), 'the approved removal happened');
+      assert.equal(registryLib.findByPath(root, target), null, 'its registry row is dropped');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del-yolo'),
+        'the branch is kept, exactly like every other close');
+      assert.deepEqual(built.notes, [['worktree deleted: feat-del-yolo · ' + target + "; the branch 'feat/del-yolo' is kept.", 'info']]);
+    } finally {
+      resetYolo();
+      restoreEnv();
+    }
+  });
+
+  test('confirming a dirty checkout discloses the lines it loses and forces exactly that removal', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-dirty');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-dirty');
+      fs.appendFileSync(path.join(target, 'work.txt'), 'one\ntwo\nthree\n');
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1);
+        assert.match(built.confirms[0][1], /Pending changes: 1 file, \+3\/-0\./);
+        assert.ok(!fs.existsSync(target), 'the checkout the human agreed to lose is removed');
+        assert.deepEqual(watcher.writes().map((event) => event.name), ['removeWorktreeByPath'],
+          'exactly one registry write: the drop that follows a verified removal');
+        assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del-dirty'), 'the branch survives');
+      } finally {
+        watcher.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('evidence that changed while the dialog was open is refused, never removed', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-toctou');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-toctou');
+      const driver = multiDriver([['\x04', '\x1b']]);
+      let asked = null;
+      const built = wiredCtx(root, driver, {
+        confirmImpl: (title, body) => {
+          asked = body;
+          // The human is answering about a CLEAN checkout; the work appears
+          // between the answer and the removal.
+          fs.writeFileSync(path.join(target, 'late.txt'), 'arrived late\n');
+          return true;
+        },
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.ok(!/Pending changes/.test(asked), `the human was shown a clean checkout: ${asked}`);
+      assert.ok(fs.existsSync(target), 'the checkout that gained work is NOT removed');
+      assert.ok(fs.existsSync(path.join(target, 'late.txt')), 'and the new file is still there');
+      assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /refusing to delete/);
+      assert.match(refusal, /changed while the confirmation was open/);
+      assert.match(refusal, /confirmed: no pending changes/, `the refusal names what the human was shown: ${refusal}`);
+      assert.match(refusal, /now: 1 file, \+1\/-0/, `and what is true now: ${refusal}`);
+      assert.deepEqual(built.notes.map(([, level]) => level), ['error']);
+      assert.equal(driver.mounts(), 2, 'the selector is still usable after a refusal');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('B1: a live branch that already differs from the registry row is not a refusal', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-branch-moved');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-registered');
+      // The checkout was moved to another branch AFTER it was registered, so
+      // the live branch and the registry row legitimately disagree. The warp
+      // listing offers the LIVE branch (sole claimant), and comparing it with
+      // the row used to refuse this deletion every single time.
+      git(target, ['checkout', '-b', 'feat/live-renamed']);
+      assert.equal(registryLib.findByPath(root, target).branch, 'feat/del-registered', 'the row keeps the old name');
+      assert.equal(git(target, ['rev-parse', '--abbrev-ref', 'HEAD']), 'feat/live-renamed', 'the checkout is on another branch');
+
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1, 'the question is asked, not pre-refused');
+      assert.ok(!built.notes.some(([, level]) => level === 'error'), `no refusal was reported: ${JSON.stringify(built.notes)}`);
+      assert.ok(!fs.existsSync(target), 'the approved removal happened');
+      assert.equal(registryLib.findByPath(root, target), null, 'and its row was dropped');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/live-renamed'), 'the live branch is kept');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('A1: identical +/- counts with different bytes are refused, never removed', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-content-swap');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-content');
+      fs.writeFileSync(path.join(target, 'work.txt'), 'one\n');
+      git(target, ['add', 'work.txt']);
+      git(target, ['commit', '-m', 'seed work']);
+      // +1/-1 pending, so the dialog names a real change size.
+      fs.writeFileSync(path.join(target, 'work.txt'), 'two\n');
+      const driver = multiDriver([['\x04', '\x1b']]);
+      let asked = null;
+      const built = wiredCtx(root, driver, {
+        confirmImpl: (title, body) => {
+          asked = body;
+          // The pending size is IDENTICAL (+1/-1); only the bytes differ.
+          fs.writeFileSync(path.join(target, 'work.txt'), 'three\n');
+          return true;
+        },
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.match(asked, /Pending changes: 1 file, \+1\/-1\./, 'the human was shown a real size');
+      assert.ok(fs.existsSync(target), 'a checkout whose bytes moved is NOT removed');
+      assert.equal(fs.readFileSync(path.join(target, 'work.txt'), 'utf8'), 'three\n', 'the newer content survives');
+      assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /its pending content changed/, `the refusal names the content, not the counts: ${refusal}`);
+      assert.match(refusal, /confirmed: 1 file, \+1\/-1, 1 ahead of main; now: 1 file, \+1\/-1, 1 ahead of main/,
+        'both readings agree on the size');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('A2: ignored files are disclosed in the question, and one that appears later aborts the delete', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-ignored');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-ignored');
+      fs.writeFileSync(path.join(target, '.gitignore'), '*.log\n');
+      git(target, ['add', '.gitignore']);
+      git(target, ['commit', '-m', 'ignore rules']);
+      fs.writeFileSync(path.join(target, 'build.log'), 'artifact\n');
+      // Nothing git tracks is pending, so the checkout reads CLEAN while the
+      // ignored file only exists here and would die with the checkout.
+      const driver = multiDriver([['\x04', '\x1b']]);
+      let asked = null;
+      const built = wiredCtx(root, driver, {
+        confirmImpl: (title, body) => {
+          asked = body;
+          fs.writeFileSync(path.join(target, 'late.log'), 'arrived late\n');
+          return true;
+        },
+      });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.match(asked, /Ignored files \(deleted with the checkout\): build\.log\./, `the human is told: ${asked}`);
+      assert.ok(!/Pending changes/.test(asked), 'the tracked tree reads clean');
+      assert.ok(fs.existsSync(target), 'the checkout is NOT removed');
+      assert.ok(fs.existsSync(path.join(target, 'late.log')), 'and the ignored file that appeared survives');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /its ignored files changed/, `the refusal names the ignored files: ${refusal}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The reproduced high-severity race: the approved path is replaced, while the
+  // human is answering, by a symbolic link to a DIFFERENT checkout. Two DETACHED
+  // checkouts at the same commit are the worst case for this surface, because
+  // the one component that could reveal the swap (the live branch) is unknown
+  // on both sides, and the disclosure reads identically through the link. What
+  // must never happen is a removal aimed at a path that no longer names the
+  // checkout the human approved — `git worktree remove` resolves the spelling it
+  // is given, so that is another checkout's directory.
+  test('a checkout swapped for a symlink to another detached checkout during the dialog is refused before any removal', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-symlink-swap');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-symlink-swap');
+      // Detached: git reports no branch for it, so `live.branch` is null.
+      git(target, ['checkout', '--detach']);
+      // The other checkout an attacker would aim the removal at: a detached
+      // live checkout of the SAME commit, so every disclosure number matches.
+      const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-victim`);
+      track(victim);
+      git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+      const victimReal = fs.realpathSync(victim);
+      const aside = track(`${target}-swapped-aside`);
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        let asked = null;
+        const built = wiredCtx(root, driver, {
+          confirmImpl: (title, body) => {
+            asked = body;
+            // The swap lands between the question and the answer's use.
+            fs.renameSync(target, aside);
+            fs.symlinkSync(victimReal, target);
+            return true;
+          },
+        });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1, 'the human is asked once, about the real checkout');
+        assert.ok(asked.includes(target), `the question named the approved checkout: ${asked}`);
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.deepEqual(removalWatch.removals, [], `no removal may be attempted for an unapproved path: ${JSON.stringify(removalWatch.removals)}`);
+        assert.match(notes, /refusing to delete/, `the delete is refused, not attempted: ${notes}`);
+        assert.match(notes, /symbolic link/, `the refusal names the replacement: ${notes}`);
+        assert.match(notes, /nothing was removed/);
+        assert.deepEqual(built.notes.map(([, level]) => level), ['error'], 'one refusal, at error level');
+        // Nothing at all was destroyed: the other checkout is a live worktree
+        // with its own metadata, and the approved one is still where the swap
+        // put it.
+        assert.ok(fs.existsSync(path.join(victimReal, '.git')), 'the other checkout keeps its git metadata');
+        assert.ok(git(root, ['worktree', 'list', '--porcelain']).includes(victimReal), 'it is still a live worktree of this repository');
+        assert.ok(fs.lstatSync(target).isSymbolicLink(), 'the swapped path is untouched');
+        assert.ok(fs.existsSync(path.join(aside, '.git')), 'the approved checkout is untouched');
+        assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+        assert.equal(driver.mounts(), 2, 'the selector comes back after the refusal');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The same swap, one step earlier: the link is already in place when the
+  // question's reading is taken. Every component matches on both sides then
+  // (`live.branch` null, the disclosure read through the link), so the pin has
+  // to be the identity the SELECTOR listed — a live checkout's own realpath —
+  // and not whatever the path resolves to at question time.
+  test('a path swapped for a symlink before the question is refused against the identity the selector listed', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-symlink-preswap');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-symlink-preswap');
+      git(target, ['checkout', '--detach']);
+      const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-preswap-victim`);
+      track(victim);
+      git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+      const victimReal = fs.realpathSync(victim);
+      const aside = track(`${target}-pinned-aside`);
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        // The swap lands after the selector rendered its row and BEFORE the
+        // question's reading is taken: the row still names the approved path,
+        // while that path already resolves to the other checkout.
+        const driver = multiDriver([(view) => {
+          fs.renameSync(target, aside);
+          fs.symlinkSync(victimReal, target);
+          view.handleInput('\x04');
+        }]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.deepEqual(built.confirms, [], 'no question: the path is not the listed checkout any more');
+        assert.deepEqual(removalWatch.removals, [], `no removal may be attempted: ${JSON.stringify(removalWatch.removals)}`);
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.match(notes, /refusing to delete/, `the delete is refused: ${notes}`);
+        assert.match(notes, /symbolic link/, `the refusal names the replacement: ${notes}`);
+        assert.ok(fs.existsSync(path.join(victimReal, '.git')), 'the other checkout is untouched');
+        assert.ok(git(root, ['worktree', 'list', '--porcelain']).includes(victimReal), 'and still a live worktree');
+        assert.ok(registryLib.findByPath(root, target), 'the registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The reproduced high-severity race, one step LATER than the dialog: the
+  // swap lands while the removal resolves its Herdr workspace from
+  // `herdr worktree list`. That listing is a child process, so it is an await
+  // — the longest window between a check and the remover — and the approved
+  // path is a real, live checkout on both sides of it, which is why a check
+  // that runs BEFORE the listing cannot see the swap. What must hold is that
+  // no remover is launched at all once the path stopped naming the approved
+  // checkout; the deterministic trigger is the shim itself, so the swap lands
+  // inside that exact await and nowhere else.
+  test('a checkout swapped for a symlink while the removal listing is awaited is refused before any remover runs', async () => {
+    const root = makeRepo('delete-swap-at-listing');
+    addMainBranch(root);
+    const target = addRegisteredWorktree(root, 'feat/del-swap-listing');
+    // Detached, like the dialog cases: the live branch cannot reveal the swap.
+    git(target, ['checkout', '--detach']);
+    const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-listing-victim`);
+    track(victim);
+    git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+    const victimReal = fs.realpathSync(victim);
+    const aside = track(`${target}-listing-aside`);
+    const shim = makeSwappingHerdr({ target, aside, victim: victimReal });
+    setEnv(warpStateEnv({
+      HERDR_BIN_PATH: shim.bin,
+      HERDR_SWAP_MARKER: shim.marker,
+      HERDR_SWAP_SCRIPT: shim.script,
+      SWAP_TARGET: target,
+      SWAP_ASIDE: aside,
+      SWAP_VICTIM: victimReal,
+    }));
+    try {
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1, 'the human was asked once, about the real checkout');
+        assert.ok(fs.existsSync(shim.marker), 'the swap really landed inside the awaited listing');
+        assert.deepEqual(
+          removalWatch.removals,
+          [],
+          `no removal may be launched for a path that stopped naming the approved checkout: ${JSON.stringify(removalWatch.removals)}`,
+        );
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.match(notes, /refusing to close worktree for branch 'feat\/del-swap-listing'/, `the close refuses: ${notes}`);
+        assert.match(notes, /no longer resolves to the approved checkout/, `the refusal names the approved identity: ${notes}`);
+        assert.match(notes, /symbolic link/, `and the replacement it found: ${notes}`);
+        assert.ok(fs.existsSync(path.join(victimReal, '.git')), 'the other checkout keeps its git metadata');
+        assert.ok(git(root, ['worktree', 'list', '--porcelain']).includes(victimReal), 'it is still a live worktree of this repository');
+        assert.ok(fs.lstatSync(target).isSymbolicLink(), 'the swapped path is untouched');
+        assert.ok(fs.existsSync(path.join(aside, '.git')), 'the approved checkout is untouched');
+        assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The same window, with the replacement a realpath comparison CANNOT see: the
+  // approved directory is moved aside and another detached checkout of the same
+  // commit takes its exact path. The spelling, the resolved path and the kind of
+  // path are all identical afterwards, so the pin that answers this is the
+  // approved directory's own device/inode pair — and the removal is refused
+  // because the path no longer names the directory the human approved.
+  test('a checkout replaced by another directory at the same path while the listing is awaited is refused', async () => {
+    const root = makeRepo('delete-replace-at-listing');
+    addMainBranch(root);
+    const target = addRegisteredWorktree(root, 'feat/del-replace-listing');
+    git(target, ['checkout', '--detach']);
+    const victim = path.join(path.dirname(root), `${path.basename(root)}-wired-replace-victim`);
+    track(victim);
+    git(root, ['worktree', 'add', '--detach', victim, 'HEAD']);
+    const victimReal = fs.realpathSync(victim);
+    const aside = track(`${target}-replace-aside`);
+    const shim = makeSwappingHerdr({ target, aside, victim: victimReal, mode: 'move' });
+    setEnv(warpStateEnv({
+      HERDR_BIN_PATH: shim.bin,
+      HERDR_SWAP_MARKER: shim.marker,
+      HERDR_SWAP_SCRIPT: shim.script,
+      SWAP_TARGET: target,
+      SWAP_ASIDE: aside,
+      SWAP_VICTIM: victimReal,
+    }));
+    try {
+      const removalWatch = watchRemovals();
+      const watcher = watchMutations();
+      try {
+        const driver = multiDriver([['\x04', '\x1b']]);
+        const built = wiredCtx(root, driver, { confirmImpl: true });
+        const { commands } = await loadExtension();
+        await warpDef(commands).handler('', built.ctx);
+
+        assert.equal(built.confirms.length, 1, 'the human was asked once, about the real checkout');
+        assert.ok(fs.existsSync(shim.marker), 'the replacement landed inside the awaited listing');
+        assert.equal(fs.realpathSync(target), target, 'the path still resolves to itself: no link, no moved realpath');
+        assert.deepEqual(
+          removalWatch.removals,
+          [],
+          `no removal may be launched for a directory nobody approved: ${JSON.stringify(removalWatch.removals)}`,
+        );
+        const notes = built.notes.map(([message]) => message).join('\n');
+        assert.match(notes, /refusing to close worktree for branch 'feat\/del-replace-listing'/, `the close refuses: ${notes}`);
+        assert.match(notes, /no longer the confirmed checkout/, `and names the replaced directory: ${notes}`);
+        assert.ok(fs.existsSync(path.join(target, '.git')), 'the replacement is untouched');
+        assert.ok(fs.existsSync(path.join(aside, '.git')), 'the approved checkout is untouched where the swap put it');
+        assert.ok(registryLib.findByPath(root, target), 'its registry row is kept');
+        assert.deepEqual(watcher.writes(), [], 'no registry write');
+      } finally {
+        watcher.restore();
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE for the reordered close: moving the listing ahead of the final
+  // check must not change the Herdr-first removal. With Herdr answering, the
+  // workspace is still resolved from that listing and the checkout is removed
+  // BY ID (never by a path spelling), the row drops and the branch survives.
+  test('the herdr path still resolves the workspace after the listing and removes by id', async () => {
+    const root = makeRepo('delete-herdr-path');
+    addMainBranch(root);
+    const target = addRegisteredWorktree(root, 'feat/del-herdr-path');
+    const shim = makeListingHerdr({ root, target });
+    setEnv(warpStateEnv({
+      HERDR_BIN_PATH: shim.bin,
+      HERDR_LOG: shim.log,
+      HERDR_TARGET: target,
+      HERDR_REPO: root,
+      HERDR_REMOVE_PATH: target,
+    }));
+    try {
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.equal(built.confirms.length, 1);
+      assert.ok(!fs.existsSync(target), 'the approved checkout is removed');
+      const calls = fs.readFileSync(shim.log, 'utf8').split('\n').filter((line) => line.length > 0);
+      const removeCall = calls.find((line) => line.startsWith('worktree remove'));
+      assert.ok(removeCall, `herdr was asked to remove the workspace: ${JSON.stringify(calls)}`);
+      assert.ok(removeCall.includes('--workspace ws-target'), `by workspace id: ${removeCall}`);
+      assert.ok(!removeCall.includes(target), `never the path spelling: ${removeCall}`);
+      assert.equal(registryLib.findByPath(root, target), null, 'the registry row is dropped');
+      assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/del-herdr-path'), 'the branch is kept');
+      const notes = built.notes.map(([message]) => message).join('\n');
+      assert.match(notes, /worktree deleted: feat-del-herdr-path/, `the success names the checkout: ${notes}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // PRESERVE: the shared close the keyboard delete calls is ALSO the agent
+  // tool's removal. Its `path`/`force` behavior is unchanged by the identity
+  // pin, which only the keyboard path supplies.
+  test('worktree_close still removes exactly the checkout it names, keeping every other one', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('close-preserved');
+      addMainBranch(root);
+      const kept = addRegisteredWorktree(root, 'feat/close-kept');
+      const target = addRegisteredWorktree(root, 'feat/close-target');
+      fs.appendFileSync(path.join(target, 'work.txt'), 'pending line\n');
+      const removalWatch = watchRemovals();
+      try {
+        const built = wiredCtx(root, multiDriver([]));
+        const { tools } = await loadExtension();
+        const closed = await tools.get('worktree_close').execute('close-1', { path: target, force: true }, undefined, undefined, built.ctx);
+
+        assert.notEqual(closed.isError, true, JSON.stringify(closed));
+        assert.match(closed.content[0].text, /removed|closed/i, `the tool reports its outcome: ${closed.content[0].text}`);
+        assert.ok(!fs.existsSync(target), 'the named checkout is removed');
+        assert.ok(fs.existsSync(kept), 'the other checkout is untouched');
+        assert.equal(registryLib.findByPath(root, target), null, 'its registry row is dropped');
+        assert.ok(registryLib.findByPath(root, kept), 'the other row stays');
+        assert.ok(git(root, ['branch', '--format=%(refname:short)']).split('\n').includes('feat/close-target'), 'the branch is kept');
+        assert.equal(removalWatch.removals.length, 1, 'exactly one removal ran');
+        assert.deepEqual(removalWatch.removals[0].argv.slice(-2), ['--force', target], 'the same argv as before, --force from the caller');
+      } finally {
+        removalWatch.restore();
+      }
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('A2: a clean checkout whose ignored files are unreadable is refused before asking', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-ignored-unknown');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-ignored-unknown');
+      const before = createdState(root);
+      // A `.gitignore` rule that git itself cannot evaluate (an unreadable
+      // exclude file) is the realistic shape; here the whole ignored listing
+      // fails through a broken repository, so the read is unknown and the
+      // deletion must not be offered at all.
+      fs.rmSync(path.join(target, '.git'), { force: true });
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: an unknown reading is a refusal');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /could not be read|could not be fingerprinted|could not be listed/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the principal checkout is refused before any question is asked', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-principal');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-principal');
+      const before = createdState(root);
+      // The extended list is the only view that offers the principal row, and
+      // it is the first row there (and the row the panel was focused on).
+      const driver = multiDriver([['v', '\x04', '\x1b']]);
+      const built = wiredCtx(target, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: the refusal comes first');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /refusing to delete the principal checkout/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(root), 'the principal checkout still exists');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the checkout this session runs in is refused before any question is asked', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-current');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-current');
+      const before = createdState(root);
+      // The session lives in the agent checkout; the extended list offers it
+      // (row 1, principal first) so `ctrl+d` can name the ground it stands on.
+      const driver = multiDriver([['v', '\x1b[B', '\x04', '\x1b']]);
+      const built = wiredCtx(target, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: the session is not deleting its own checkout');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /the checkout this session is running in/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a live checkout the registry does not own is refused before any question is asked', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-unregistered');
+      addMainBranch(root);
+      // A real checkout nobody registered (the S14 discovery case): the warp
+      // list offers it, but only the registry can authorize a close, so this
+      // must never become a deletion candidate.
+      const stray = path.join(path.dirname(root), `${path.basename(root)}-wired-stray`);
+      track(stray);
+      git(root, ['worktree', 'add', '-b', 'feat/stray', stray, 'HEAD']);
+      const realStray = fs.realpathSync(stray);
+      const before = createdState(root);
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: an unowned checkout has no close path');
+      assert.match(built.notes.map(([message]) => message).join('\n'), /does not own/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(realStray), 'the checkout is still on disk');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('an unreadable pending-change read refuses the delete instead of asking', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-unknown-evidence');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-unknown');
+      // A checkout whose git metadata is gone: it is still listed and still a
+      // directory, so the only thing that cannot be read is what is pending in
+      // it. That is exactly the case that must never be guessed.
+      fs.rmSync(path.join(target, '.git'), { force: true });
+      const before = createdState(root);
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver, { confirmImpl: true });
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.deepEqual(built.confirms, [], 'no question: an unreadable disclosure is a refusal');
+      const refusal = built.notes.map(([message]) => message).join('\n');
+      assert.match(refusal, /its uncommitted changes could not be read/);
+      assert.match(refusal, /nothing was removed/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target), 'the checkout is still on disk');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a host that cannot ask is refused instead of removing anything', async () => {
+    setEnv(warpStateEnv({ HERDR_BIN_PATH: NO_HERDR() }));
+    try {
+      const root = makeRepo('delete-no-dialog');
+      addMainBranch(root);
+      const target = addRegisteredWorktree(root, 'feat/del-no-dialog');
+      const before = createdState(root);
+      const driver = multiDriver([['\x04', '\x1b']]);
+      const built = wiredCtx(root, driver);
+      // A destructive act is never performed on a host that cannot ask.
+      delete built.ctx.ui.confirm;
+      const { commands } = await loadExtension();
+      await warpDef(commands).handler('', built.ctx);
+
+      assert.match(built.notes.map(([message]) => message).join('\n'), /cannot ask the confirmation a removal requires/);
+      assert.deepEqual(createdState(root), before, 'nothing was removed and nothing was written');
+      assert.ok(fs.existsSync(target));
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+describe('T16: the panels write nothing until the user confirms (S17)', { concurrency: false }, () => {  test('opening the creating panel performs no registry write and no checkout creation, and Esc creates no state', async () => {
     setEnv(warpStateEnv());
     try {
       const root = makeRepo('no-write-open-create');
@@ -1688,6 +2460,277 @@ describe('S2: creating from the panel offers the pending changes', { concurrency
       assert.equal(asked, 0, 'a clean checkout never prompts');
       assert.equal(mounts.length, 3, 'the selector returns after the creation');
       assert.equal(fs.existsSync(target), true, 'the checkout was created');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The create flow returns to Warp as soon as the checkout path exists.
+//
+// The slow half of the creation hooks (dependency install, `codegraph init`)
+// is what made "confirm" feel like a hang: the selector could not come back
+// until an install had finished. The path is all the warp needs, so the setup
+// now runs in a managed background task and reports itself when it settles.
+// The pending-changes question is one step of this flow like the panel is, so
+// it mounts with the SAME bottom overlay — mounted bare it painted as a
+// fullscreen component in the middle of the flow. And the question is asked
+// ONCE per flow: a create that already took the answer hands it to the one
+// warp that follows, so the human is never asked the same thing twice (nor
+// offered a second copy the destination would refuse as an overlap).
+// ---------------------------------------------------------------------------
+describe('create flow: returns to Warp immediately and asks the copy question once', { concurrency: false }, () => {
+  // A `codegraph` that sleeps, then drops a marker: the marker's absence at
+  // the moment the selector returns is the observable proof of WHEN it ran.
+  function makeSlowCodegraph() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-cgslow-')));
+    const marker = path.join(dir, 'done');
+    fs.writeFileSync(
+      path.join(dir, 'codegraph'),
+      ['#!/bin/sh', 'sleep 0.3', `printf done > "${marker}"`, 'exit 0', ''].join('\n'),
+      { mode: 0o755 },
+    );
+    return { dir, marker };
+  }
+
+  // Drive the whole flow with one mount handler that decides each surface's
+  // keys: `c` on the selector, the name on the panel, the answer on the
+  // question (when it is a real mount) and a choice on the returned selector.
+  async function driveCreate({ root, name, asker, pickCreated }) {
+    const calls = [];
+    const FakeSM = makeFakeSM(calls);
+    const sessionFile = sessionFileIn();
+    const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+    const { commands, mod } = await loadExtension();
+    const mounts = [];
+    const rendered = [];
+    built.ctx.ui.custom = async (factory, options) => {
+      mounts.push(options);
+      const hostTui = { requestRender: () => {}, terminal: { rows: 24 } };
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('component did not settle')), 5000);
+        const done = (value) => { clearTimeout(timer); resolve(value); };
+        let view;
+        try {
+          view = factory(hostTui, plainTheme, {}, done);
+        } catch (err) {
+          clearTimeout(timer);
+          reject(err);
+          return;
+        }
+        rendered.push(clean(view.render(80).join('\n')));
+        const drive = () => {
+          try {
+            const at = mounts.length;
+            if (at === 1) {
+              view.handleInput('c'); // the create hotkey
+              return;
+            }
+            if (at === 2) {
+              view.handleInput('\t');
+              for (const char of name) view.handleInput(char);
+              view.handleInput('enter'); // confirm the creation
+              return;
+            }
+            // A REAL pending-changes question is its own overlay: answer it.
+            if (/YES COPY/.test(rendered[at - 1])) {
+              view.handleInput('\r'); // YES COPY
+              return;
+            }
+            // The returned selector: pick the created checkout, or leave.
+            if (pickCreated) {
+              const others = view.state.checkouts.filter((entry) => entry.path !== root);
+              const index = others.findIndex((entry) => entry.name === pickCreated);
+              if (index >= 0) {
+                for (let step = 0; step < index; step += 1) view.handleInput('\x1b[B');
+                view.handleInput('\r');
+                return;
+              }
+            }
+            view.handleInput('\x1b');
+          } catch (err) {
+            clearTimeout(timer);
+            reject(err);
+          }
+        };
+        if (mounts.length === 1) drive();
+        else tick().then(drive);
+      });
+    };
+    if (typeof asker === 'function') asker(mod);
+    await warpDef(commands).handler('', built.ctx);
+    return { built, mounts, rendered, mod };
+  }
+
+  test('the selector comes back before the setup finishes, and the setup reports itself after', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makeRepo('wired-create-bg');
+      addMainBranch(root);
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-slow-setup');
+      track(path.dirname(target));
+      const slow = makeSlowCodegraph();
+      setEnv({ PATH: `${slow.dir}${path.delimiter}${process.env.PATH || ''}` });
+      const { built, mounts, mod } = await driveCreate({ root, name: 'slow-setup' });
+      assert.equal(mounts.length, 3, 'selector, panel, selector: the flow returned without waiting');
+      assert.equal(fs.existsSync(target), true, 'the path the warp needs already exists');
+      assert.equal(fs.existsSync(slow.marker), false, 'the slow setup had NOT finished when the selector returned');
+      assert.deepEqual(built.notes, [], 'nothing is reported while the setup is still running');
+      await mod.awaitPendingCreationSetups();
+      assert.equal(fs.existsSync(slow.marker), true, 'the deferred setup still ran, in the background');
+      const reports = built.notes.filter(([message]) => /setup/i.test(String(message)));
+      assert.equal(reports.length, 1, `exactly one setup report, got ${JSON.stringify(built.notes)}`);
+      assert.match(String(reports[0][0]), /setup finished for feat\/slow-setup/, 'the report names the checkout');
+      assert.equal(reports[0][1], 'info');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('the pending-changes question mounts as the same bottom overlay as the panel', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-question-overlay');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-overlay-change');
+      track(path.dirname(target));
+      const { mounts, rendered } = await driveCreate({ root, name: 'overlay-change' });
+      assert.equal(mounts.length, 4, 'selector, panel, question, selector');
+      const question = mounts[2];
+      assert.equal(question.overlay, true, 'the question is an overlay, never a bare fullscreen component');
+      assert.equal(question.overlayOptions.anchor, 'bottom-center', 'the same bottom geometry as Warp');
+      assert.equal(question.overlayOptions.width, '100%');
+      assert.equal(question.overlayOptions.margin, 0);
+      assert.match(rendered[2], /Uncommitted changes/, 'the question states what is at stake');
+      assert.match(rendered[2], /YES COPY/);
+      assert.match(rendered[2], /NO COPY/);
+      assert.equal(mounts[3].overlay, true, 'and the selector still returns as an overlay');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the answer still travels');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a create that already asked does not ask again when the created row is picked', async () => {
+    setEnv(warpStateEnv({ GENTLE_WORKTREE_THREAD: 'wired-thread' }));
+    try {
+      const root = makePendingChangeRepo('wired-create-no-repeat');
+      addRegisteredWorktree(root, 'feat/one');
+      const target = panelTarget(root, 'feat-repeat-change');
+      track(path.dirname(target));
+      let asked = 0;
+      const { built, mounts } = await driveCreate({
+        root,
+        name: 'repeat-change',
+        asker: (mod) => mod.setWarpDirtyAsker(async () => { asked += 1; return 'yes'; }),
+        pickCreated: 'feat-repeat-change',
+      });
+      assert.equal(mounts.length, 3, 'selector, panel, selector: the question was asked once, not twice');
+      assert.equal(asked, 1, 'the same pending work is never offered twice in one flow');
+      assert.deepEqual(built.notes, [], `nothing failed: ${JSON.stringify(built.notes)}`);
+      assert.equal(built.switches.length, 1, 'the picked checkout is where the session went');
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the copy made at creation is the one that counts');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A copy can fail PARTWAY: the helper lands some files and then reports the
+// failure together with what already landed ("N of M files already copied"),
+// which is the only honest state description. The warp's refusal must never
+// contradict that evidence with a blanket "nothing was overwritten" — the
+// destination really does hold the files this attempt put there — while it
+// keeps saying the one thing that IS always true (nothing was rolled back) and
+// the partial-copy warning itself.
+//
+// The partial state is produced through the same seam production uses: the
+// extension resolves its helpers from GENTLE_WORKTREE_LIB_DIR, so a shim module
+// delegates every read to the real helper and reports a copy that landed one
+// file before failing.
+// ---------------------------------------------------------------------------
+describe('handoff copy failure: the report matches what is really on disk', { concurrency: false }, () => {
+  function libDirWithPartialCopy({ landedFile, landedBytes, error }) {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-partial-lib-')));
+    for (const entry of fs.readdirSync(LIB_DIR)) {
+      if (!entry.endsWith('.js') || entry === 'worktree-changes.js') continue;
+      fs.symlinkSync(path.join(LIB_DIR, entry), path.join(dir, entry));
+    }
+    fs.writeFileSync(path.join(dir, 'worktree-changes.js'), [
+      "'use strict';",
+      `const real = require(${JSON.stringify(path.join(LIB_DIR, 'worktree-changes.js'))});`,
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      'module.exports = {',
+      '  ...real,',
+      '  async copyChanges(args) {',
+      `    fs.writeFileSync(path.join(args.to, ${JSON.stringify(landedFile)}), ${JSON.stringify(landedBytes)});`,
+      `    return { ok: false, error: ${JSON.stringify(error)} };`,
+      '  },',
+      '};',
+      '',
+    ].join('\n'));
+    return dir;
+  }
+
+  test('a partial copy is reported as partial, never as nothing written', async () => {
+    setEnv(warpStateEnv());
+    try {
+      const root = makePendingChangeRepo('handoff-partial');
+      const target = addRegisteredWorktree(root, 'feat/handoff-partial');
+      // The destination is born from HEAD (`a.txt` = 'one\n'), so the shim's
+      // landed `a.txt` is exactly the file this attempt wrote there.
+      const libDir = libDirWithPartialCopy({
+        landedFile: 'a.txt',
+        landedBytes: 'one\ntwo\n',
+        error: 'cannot copy changes: "blocked/second.txt" could not be written; '
+          + '1 of 2 files already copied ("a.txt"); the rest were not copied; '
+          + 'inspect the destination before retrying',
+      });
+      const calls = [];
+      const FakeSM = makeFakeSM(calls);
+      const sessionFile = sessionFileIn();
+      const built = makeWiredCtx({ cwd: root, FakeSM, sessionFile, sessionDir: path.dirname(sessionFile), calls, mount: async () => null });
+      const { mod } = await loadExtension();
+      // The loader pins GENTLE_WORKTREE_LIB_DIR to the real helpers, so the shim
+      // is installed after it: every helper call the warp makes resolves through
+      // the shim module, which delegates everything except `copyChanges`.
+      setEnv({ GENTLE_WORKTREE_LIB_DIR: libDir });
+      const out = await mod.executeWorktreeWarp('feat-handoff-partial', built.ctx, {
+        handoff: {
+          name: 'feat-handoff-partial',
+          target: fs.realpathSync(target),
+          from: root,
+          branch: 'feat/handoff-partial',
+          changes: { mode: 'all', paths: [] },
+        },
+      });
+      assert.equal(out.isError, true, `the failed copy refuses the move: ${out.text}`);
+      const text = String(out.text);
+      assert.match(text, /1 of 2 files already copied/, `the partial-copy warning survives verbatim: ${text}`);
+      assert.doesNotMatch(
+        text,
+        /nothing was overwritten\s*\n/,
+        `the refusal never makes an UNQUALIFIED "nothing was overwritten" claim when a file landed: ${text}`,
+      );
+      assert.match(text, /nothing was rolled back/, `it still states that nothing was undone: ${text}`);
+      assert.match(
+        text,
+        /nothing was overwritten beyond the files listed above/,
+        `and it scopes the safety claim to what really happened: ${text}`,
+      );
+      assert.match(text, /now holds 1 file: a\.txt/, `it names what the destination really holds: ${text}`);
+      assert.match(text, /b\.txt does not match the source byte for byte/, `and what is still missing: ${text}`);
+      assert.match(text, /recovery:/, 'and offers the recovery');
+      assert.deepEqual(built.switches, [], 'no session switch');
+      assert.deepEqual(calls, [], 'no fork either');
+      // The report matches the disk: the landed file is still there.
+      assert.equal(fs.readFileSync(path.join(target, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the landed file stays on disk');
+      assert.equal(fs.existsSync(path.join(target, 'b.txt')), false, 'the missing file was never written');
+      assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
     } finally {
       restoreEnv();
     }

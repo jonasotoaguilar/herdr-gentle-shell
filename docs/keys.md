@@ -30,17 +30,42 @@ header; up to five other checkouts follow, principal first when not current.
 | Move selection | `↑`/`↓`, `j`/`k` |
 | Enter focused checkout | `enter` |
 | Create a checkout | `c` |
+| Delete the focused checkout | `ctrl+d` |
 | View every checkout, when some are hidden | `v` or the `view all worktrees` row |
 | Reload | `r` |
 | Close | `esc`, `ctrl+c` |
 
-Warp moves the session and creates worktrees; it never modifies one. There is
-no edit key and no delete key: the worktree edit panel, the fullscreen worktree
-detail and the keyboard delete view were removed with the issue/ODD
-association, so `e` and `ctrl+d` are inert here. The extended list supports
-typing to filter and `[`/`]` or `pgUp`/`pgDn` to page. Escape leaves search
-first, then returns to the bottom panel. Printable text is meaningful, so `q`
-is not close.
+Warp moves the session and creates worktrees; it edits nothing. There is no
+edit key: the worktree edit panel, the fullscreen worktree detail and the
+issue/ODD association were removed, so `e` is inert here. The extended list
+supports typing to filter and `[`/`]` or `pgUp`/`pgDn` to page. Escape leaves
+search first, then returns to the bottom panel. Printable text is meaningful, so
+`q` is not close.
+
+`ctrl+d` (in the panel and in the extended list, while the search is closed)
+ASKS to delete the focused checkout. It never deletes on its own, and no
+permission mode shortens the path: YOLO is not consulted here, so the human
+answer is always required. The question names the checkout, its branch and —
+when it has any — the uncommitted changes that would be lost, as
+`Pending changes: N files, +A/-D` line counts. It also names the files git
+IGNORES there, because they are deleted with the checkout while the working
+tree reads clean. Any read that cannot answer — the change summary, the pending
+bytes, the ignored files — refuses the delete without a question: nothing can
+say what would be lost, so there is nothing honest to confirm. Answering no
+changes nothing.
+
+Deleting removes the checkout and keeps the branch, and it is refused before
+any question for the principal checkout and for the checkout the session is
+running in — warp out first, or close it with the `worktree_close` tool. After
+the answer the target is read again and compared with what the question
+described: a row that vanished, a checkout that stopped being live, a moved
+branch, different pending BYTES behind identical `+A/-D` counts, or an ignored
+file that appeared all abort the delete with the difference named and nothing
+removed. A live branch that already differs from the stored registry branch is
+not a change — that is what the checkout is on, and it never blocks a delete.
+The extended list's data line shows the pending size as bare `+A −D`; only an
+unreadable size keeps the word `changes` in front of it.
+
 
 ## Create
 
@@ -50,6 +75,21 @@ There are no Issues/ODD panes or associations, and this is the only key map the
 panel has. `enter` advances/confirms, and `esc` cancels without creating a
 branch or checkout. There is ONE create key: `ctrl+s` is not a binding any
 more (it duplicated `enter`).
+
+A dirty checkout adds ONE question before anything is written, in the same
+bottom overlay as the panel:
+
+| Action | Keys |
+| --- | --- |
+| Carry the pending changes into the new checkout | `YES COPY` (`↑`/`↓`, then `enter`) |
+| Create it empty from the base commit | `NO COPY` (`↑`/`↓`, then `enter`) |
+| Cancel the creation (nothing written) | `esc`, `ctrl+c` |
+
+That answer is taken once per flow: the warp that follows the creation reuses
+it instead of asking again. Confirming does not wait for dependency install or
+the CodeGraph index — the selector comes back with the new checkout as a row as
+soon as the path and the pending copy exist, and the setup reports itself when
+it finishes.
 
 ## Worktree detail
 

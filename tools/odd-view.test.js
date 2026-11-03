@@ -2189,3 +2189,109 @@ describe('createOddView shortcut round (S8,S9,S10)', () => {
     assert.ok(!/\d+-\d+\//.test(paged), 'and the range never comes back');
   });
 });
+
+// ---------------------------------------------------------------------------
+// S21 («se traba»): the /odd view can be handed its list in TWO steps — the
+// interactive open paints the cheap local scan at once, and the git-ranked
+// order lands when the checkout's history walk answers. `applyDocs` is that
+// second step, and it has to behave like the `s` order toggle rather than like
+// a reload: the focused document survives by IDENTITY (the reader keeps
+// reading the same file while the list settles), the window re-anchors on its
+// new position, and no document is re-read because only the order changed.
+// ---------------------------------------------------------------------------
+describe('createOddView two-step listing (S21)', () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const listCells = (lines) => lines.slice(2, -2).map((line) => strip(line).split('│')[1] || '');
+  const filled = (lines) => listCells(lines).filter((cell) => cell.trim() !== '');
+  const rowName = (cell) => cell.trim().replace(/^▸\s*/, '');
+  const namesOf = (lines) => filled(lines).map(rowName);
+  const focusedName = (lines) => {
+    const cell = filled(lines).find((entry) => entry.includes('▸'));
+    return cell === undefined ? null : rowName(cell);
+  };
+  const bodyOf = (lines) => strip(lines.join('\n'));
+
+  function build({ docs, rows = 20, load } = {}) {
+    const reads = [];
+    const paints = [];
+    const view = createOddView({
+      docs,
+      loadDoc: (entry) => {
+        reads.push(entry.name);
+        return { ok: true, text: `# ${entry.name}\n\nbody of ${entry.name}\n` };
+      },
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => rows,
+      requestRender: () => { paints.push(true); },
+      done: () => {},
+    });
+    return { view, reads, paints };
+  }
+
+  test('a re-ranked list keeps the focused document and its already-rendered pane', async () => {
+    const { view, reads, paints } = build({ docs: [doc('bravo'), doc('alpha'), doc('mike')] });
+    await tick();
+    view.render(80);
+    view.handleInput('down');
+    view.handleInput('down');
+    const before = view.render(80);
+    assert.equal(focusedName(before), 'mike', 'the premise: mike is the focused document');
+    const readsBefore = reads.slice();
+
+    const paintsBefore = paints.length;
+    view.applyDocs([doc('mike'), doc('alpha'), doc('bravo')]);
+    assert.ok(paints.length > paintsBefore, 'applying the settled order requests a repaint');
+
+    const after = view.render(80);
+    assert.deepEqual(namesOf(after), ['mike', 'alpha', 'bravo'], 'the list takes the new sequence');
+    assert.equal(focusedName(after), 'mike', 'the reader keeps the SAME document, not the same index');
+    assert.match(bodyOf(after), /body of mike/, 'the pane still shows the document being read');
+    assert.deepEqual(reads, readsBefore, 'only the order moved, so no document is read again');
+  });
+
+  test('the applied order keeps the selection inside the list when a document disappears', async () => {
+    const { view } = build({ docs: [doc('alpha'), doc('bravo'), doc('charlie')] });
+    await tick();
+    view.handleInput('down');
+    view.handleInput('down');
+    assert.equal(focusedName(view.render(80)), 'charlie');
+    // The checkout changed under the reader: charlie is gone from the settled
+    // listing, so the selection clamps instead of pointing past the end.
+    view.applyDocs([doc('alpha'), doc('bravo')]);
+    const lines = view.render(80);
+    assert.deepEqual(namesOf(lines), ['alpha', 'bravo']);
+    assert.ok(view.state.index <= 1, `the selection stays inside the list: ${view.state.index}`);
+    assert.match(bodyOf(lines), /body of bravo/, 'and it lands on the last document instead of nothing');
+  });
+
+  test('an apply that carries nothing usable leaves the open list exactly as it was', async () => {
+    const { view } = build({ docs: [doc('alpha'), doc('bravo')] });
+    await tick();
+    view.handleInput('down');
+    const before = view.render(80);
+    view.applyDocs(undefined);
+    view.applyDocs(null);
+    const after = view.render(80);
+    assert.deepEqual(namesOf(after), namesOf(before), 'an absent answer never empties the list');
+    assert.equal(focusedName(after), focusedName(before), 'and never moves the reader');
+  });
+
+  test('a two-step open still shows the whole first list and closes on esc', async () => {
+    let closed = 'pending';
+    const view = createOddView({
+      docs: [doc('alpha'), doc('beta')],
+      loadDoc: () => ({ ok: true, text: '# alpha\n' }),
+      helpers,
+      theme: plainTheme,
+      rowsAvailable: () => 20,
+      requestRender: () => {},
+      done: (result) => { closed = result; },
+    });
+    const first = view.render(80);
+    assert.match(bodyOf(first), /✎ Odd · 2 documents/, 'the cheap first frame already counts the documents');
+    assert.deepEqual(namesOf(first), ['alpha', 'beta'], 'and already lists them');
+    view.handleInput('escape');
+    assert.equal(closed, null, 'esc still closes the view');
+  });
+});

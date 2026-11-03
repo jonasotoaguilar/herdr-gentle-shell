@@ -17,7 +17,9 @@ the active TaskStore role — `explorer`, `worker`, `verify`, `judge`, `rdd`
 `gentle`, plus the total running count in parentheses only when above one),
 `ask` (three independent event legs — choice, native questionnaire, legacy rpiv — plus
 executed `ask_user_question`/`ask_user_choice` tool calls (execution opens, end/result closes;
-proposals never block), tool-gated `ui_prompt` spans, and
+proposals never block), tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD
+viewer, changes view, design canvas — never counts: opening a panel is navigation, not a
+question), and
 permission waiting; `gentle_review` starts never speculate ask, amber/orange `?`), `blocked`, `done`, `idle`) plus compact
 changes segments folded into the single row-1 heading cell (nonempty ` +N`/` -N`/` ↑N`
 with leading spaces, symbols color-distinguished by `contains` rules: ` +` green for added,
@@ -345,7 +347,7 @@ the principal session actively works — even with zero subagents —
 `explorer`, `verify`, `judge`, ... — plus the total running count in
 parentheses only when above one), row 1 shows
 the single heading cell (`● <project>` plus ` +N`/` -N`/` ↑N` inline, zero `·`) after edits / when behind upstream; then `ask` on an open
-question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` spans, or permission waiting; `gentle_review` starts never speculate ask) and `blocked` on error. `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
+question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD viewer, changes view, design canvas — never counts, because opening a panel is navigation, not a question), or permission waiting; `gentle_review` starts never speculate ask) and `blocked` on error. `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
 `HERDR_CONFIG_PATH` on a temp file for apply/uninstall checks.
 
 ## Core Workflow
@@ -423,15 +425,20 @@ lives in [docs/worktree-tools.md](docs/worktree-tools.md).
 - Single-writer coexistence with `herdr-pi-tree`: no shared token names, no
   dual-write, scoped sweep of own tokens on handover.
 - Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement above is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. Choosing `Native Herdr` in `/herdr-gentle:customize` removes only our owned exclusion and managed rows, gates our producer/daemon, and reloads automatically to hand back the native sidebar; never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
-- Customize (`/herdr-gentle:customize`): one panel for the three switches —
-  `Agentes sidebar` (`Gentle (this extension)` / `Native Herdr`), `Moshi
-  notifications` (`On` / `Off`), `Worktree tools` (`Enabled` / `Disabled`)
-  — with a one-line description per row. A choice applies immediately and
-  reloads the extension runtime itself only when the change needs it.
-  `customize status` is the read-only replacement of the removed `status`
-  verbs: one terse line per switch
-  (`customize status: sidebar=gentle moshi=off worktree=enabled`).
-  See [docs/sidebar-control.md](docs/sidebar-control.md).
+- Customize (`/herdr-gentle:customize`): one panel with the sidebar and Moshi
+  switches — `Agentes sidebar` (`Gentle (this extension)` / `Native Herdr`),
+  `Moshi notifications` (`On` / `Off`) — plus one grouped `Plugin tools`
+  section holding three independent toggles: `Worktree tools`, `ODD command`
+  and `Issues command`. Each plugin row names its stored value
+  (`Worktree tools · Enabled`) and `Enter` flips only that toggle; the ODD
+  toggle gates the command, never the automatic ODD naming. A choice applies
+  immediately and reloads the extension runtime itself only when the change
+  needs it; when no reload is available the gated surfaces still re-read the
+  stored flag and refuse. `customize status` is the read-only replacement of
+  the removed `status` verbs: one terse line naming every switch
+  (`customize status: sidebar=gentle moshi=off worktree=enabled odd=enabled
+  issues=enabled`). See [docs/sidebar-control.md](docs/sidebar-control.md) and
+  [docs/worktree-tools.md](docs/worktree-tools.md).
 - Odd viewer (`/herdr-gentle:odd`): read-only two-pane overlay over the
   current checkout's `odd/tasks/*.md` — document names on the left, the
   selected document as styled markdown on the right.
@@ -471,7 +478,8 @@ lives in [docs/worktree-tools.md](docs/worktree-tools.md).
   absence-driven completion records `completed` without latching an error.
 - TTL-bounded tokens: stale panes fall back to native `idle`.
 - Agent worktrees (`worktree_create` / `worktree_list` / `worktree_close`,
-  plus the `Worktree tools` rows of `/herdr-gentle:customize`): one or more
+  plus the `Plugin tools · Worktree tools` toggle of
+  `/herdr-gentle:customize`): one or more
   checkouts per thread at the flattened worktree path, created from the branch
   alone — no issue or ODD association — with creation hooks (untracked env
   copies, lockfile-detected installs, shared-dir symlinks, `codegraph init`,

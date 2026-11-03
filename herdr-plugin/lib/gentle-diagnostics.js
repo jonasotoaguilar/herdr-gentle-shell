@@ -31,6 +31,9 @@ const PLUGIN_ID = STATE_PLUGIN_ID;
 // dir (which changes with the plugin id) holds none of these while the
 // stored dir does, the stored dir wins so pre-rename flags stay readable.
 // Fresh installs with no stored files converge on the injected dir.
+// This family is IDENTICAL in the sidebar, daemon, worktree-mode and state
+// extension resolvers: a file one of them cannot see is state it reports as
+// missing, and the plugin toggles default to enabled when missing.
 const STATE_KNOWN_FILES = [
   'gentle-sidebar-mode.json',
   'gentle-moshi.json',
@@ -39,6 +42,7 @@ const STATE_KNOWN_FILES = [
   'gentle-interruptions.json',
   'installer-state',
   'gentle-worktree-mode.json',
+  'gentle-plugin-tools.json',
 ];
 const CLI_TIMEOUT_MS = 5000;
 const MAX_FILE_BYTES = 256 * 1024;

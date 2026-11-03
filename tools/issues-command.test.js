@@ -2116,3 +2116,54 @@ describe('/herdr-gentle:issues fork scope (S5)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The Issues command is one of the three "Plugin tools" toggles. It gates the
+// command and the session-start gh probe; a runtime that could not be reloaded
+// still refuses the invocation instead of opening the reader.
+// ---------------------------------------------------------------------------
+describe('/herdr-gentle:issues Plugin tools toggle', { concurrency: false }, () => {
+  function pluginTools(state) {
+    fs.writeFileSync(
+      path.join(process.env.GENTLE_STATUS_STATE_DIR, 'gentle-plugin-tools.json'),
+      `${JSON.stringify({ version: 1, ...state })}\n`,
+    );
+  }
+
+  test('a disabled command registers nothing and never probes gh at startup', async () => {
+    pluginTools({ odd: true, issues: false });
+    const calls = [];
+    ghIssues.setGhRunner(async (bin, argv) => { calls.push([bin, argv]); return { status: 0, stdout: '[]', stderr: '', error: null }; });
+    const { commands, sessionStarts } = await loadExtension();
+    assert.ok(!commands.has('herdr-gentle:issues'), 'the disabled command is not registered');
+    assert.ok(commands.has('herdr-gentle:customize'), 'the panel stays registered so it can be flipped back');
+    const root = makeRepo({ tag: 'issues-toggle-off' });
+    const notes = [];
+    await fireSessionStart(sessionStarts, gateCtx(root, notes));
+    assert.deepEqual(notes, [], 'a disabled command never alerts about gh');
+    assert.deepEqual(calls, [], 'a disabled command never spawns gh');
+    pluginTools({ odd: true, issues: true });
+  });
+
+  test('a disabled command invoked through a stale runtime refuses and opens nothing', async () => {
+    pluginTools({ odd: true, issues: true });
+    const { commands, mod } = await loadExtension();
+    const def = commands.get('herdr-gentle:issues');
+    assert.ok(def, 'registered at load while enabled');
+    const calls = [];
+    ghIssues.setGhRunner(async (bin, argv) => { calls.push([bin, argv]); return { status: 0, stdout: '[]', stderr: '', error: null }; });
+    pluginTools({ odd: true, issues: false });
+    const root = makeRepo({ tag: 'issues-toggle-stale' });
+    mod.setIssuesTuiLoader(async () => stubTui);
+    const { ctx, customs, selects, notes } = makeCtx({ cwd: root, customImpl: async () => null });
+    await def.handler('', ctx);
+    assert.equal(customs.length, 0, 'no overlay');
+    assert.deepEqual(selects, [], 'no fallback menu either');
+    assert.deepEqual(calls, [], 'the gh probe is never reached');
+    assert.deepEqual(notes, [[
+      'issues command is disabled; open /herdr-gentle:customize and apply the Plugin tools Issues command toggle to enable it',
+      'error',
+    ]]);
+    pluginTools({ odd: true, issues: true });
+  });
+});

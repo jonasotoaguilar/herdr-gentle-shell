@@ -211,6 +211,10 @@ function herdrStateDir() {
 // stored dir does, the stored dir wins so pre-rename flags stay readable.
 // Fresh installs with no stored files converge on the injected dir.
 // GENTLE_STATUS_STATE_DIR (explicit user override) is always used as-is.
+// This family is IDENTICAL in the sidebar, diagnostics, worktree-mode and
+// state-extension resolvers. The daemon also WRITES here (pidfile, mode,
+// ledger), so a file it cannot see is a file whose dir it splits off: the
+// stored ODD/Issues toggle then reads as missing, i.e. enabled.
 const STATE_KNOWN_FILES = [
   'gentle-sidebar-mode.json',
   'gentle-moshi.json',
@@ -219,6 +223,7 @@ const STATE_KNOWN_FILES = [
   'gentle-interruptions.json',
   'installer-state',
   'gentle-worktree-mode.json',
+  'gentle-plugin-tools.json',
 ];
 
 function dirHasKnownFiles(dir) {

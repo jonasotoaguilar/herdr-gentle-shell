@@ -714,13 +714,11 @@ describe('S3/S4: worktree_create changes selection', { concurrency: false }, () 
     }
   });
 
-  // S2/S3: a copy that cannot be applied is REPORTED, never hidden. The
-  // worktree is created from local main while the pending change was written
-  // against another branch's tree, so the patch cannot apply. The worktree is
-  // already there: an honest result names it AND the copy failure, instead of
-  // claiming a copy that did not happen or silently dropping the selection.
-  test('a copy the destination rejects is reported, and the worktree it made is named', async () => {
-    const root = makeRepo('changes-copy-fail');
+  // A destination born from LOCAL MAIN routinely lacks a file the session
+  // branch added: the pending edit still has to travel, because the human or
+  // agent asked for it, while nothing the source branch merely COMMITTED does.
+  test('a file the session branch added is created in the checkout born from local main', async () => {
+    const root = makeRepo('changes-copy-new-file');
     git(root, ['branch', '-f', 'main']); // local main stays at the empty first commit
     git(root, ['checkout', '-b', 'feat/session']);
     fs.writeFileSync(path.join(root, 'f.txt'), 'one\n');
@@ -736,20 +734,68 @@ describe('S3/S4: worktree_create changes selection', { concurrency: false }, () 
     });
     try {
       const tools = await loadExtension();
-      const target = expectedTarget(root, 'feat-copy-fail');
+      const target = expectedTarget(root, 'feat-copy-new-file');
       const result = await tools.get('worktree_create').execute(
-        'c1', { branch: 'feat/copy-fail', changes: 'all' }, undefined, undefined, makeCtx({ repoRoot: root }),
+        'c1', { branch: 'feat/copy-new-file', changes: 'all' }, undefined, undefined, makeCtx({ repoRoot: root }),
+      );
+      assert.equal(result.isError, undefined, `expected success: ${resultText(result)}`);
+      assert.match(resultText(result), /created: feat-copy-new-file \u00B7 feat\/copy-new-file/);
+      assert.equal(resultText(result).split('\n').at(-1), 'copied: 1 file, +1/-0');
+      assert.deepEqual(result.details.copied, {
+        files: 1, added: 1, deleted: 0, paths: ['f.txt'],
+      });
+      assert.equal(
+        fs.readFileSync(path.join(target, 'f.txt'), 'utf8'),
+        'one\ntwo\n',
+        'the pending version of the file main never had reaches the new checkout',
+      );
+      assert.equal(fs.readFileSync(path.join(root, 'f.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // S2/S3: a copy that cannot be applied is REPORTED, never hidden. Here the
+  // two sides reworked the SAME lines, so there is no automatic answer: the
+  // worktree is already there, and an honest result names it AND the copy
+  // failure instead of claiming a copy that did not happen.
+  test('a copy the destination cannot resolve is reported, and the worktree it made is named', async () => {
+    const root = makeRepo('changes-copy-conflict');
+    fs.writeFileSync(path.join(root, 'x.txt'), 'A\n');
+    git(root, ['add', 'x.txt']);
+    git(root, ['commit', '-m', 'x.txt A']);
+    git(root, ['branch', '-f', 'main', 'HEAD']);
+    git(root, ['checkout', '-b', 'feat/session']);
+    fs.writeFileSync(path.join(root, 'x.txt'), 'B\n');
+    git(root, ['commit', '-am', 'session: x.txt B']);
+    fs.writeFileSync(path.join(root, 'x.txt'), 'C\n');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+    });
+    try {
+      const tools = await loadExtension();
+      const target = expectedTarget(root, 'feat-copy-conflict');
+      const result = await tools.get('worktree_create').execute(
+        'c1', { branch: 'feat/copy-conflict', changes: 'all' }, undefined, undefined, makeCtx({ repoRoot: root }),
       );
       assert.equal(result.isError, true, 'the copy failure is an error result');
       const text = resultText(result);
-      assert.match(text, /created: feat-copy-fail \u00B7 feat\/copy-fail/, `the result still names the worktree it made: ${text}`);
+      assert.match(text, /created: feat-copy-conflict \u00B7 feat\/copy-conflict/, `the result still names the worktree it made: ${text}`);
       assert.match(text, /were NOT copied/, `the failure says the copy did not happen: ${text}`);
       assert.equal(typeof result.details.copyError, 'string', 'the reason travels in the details');
+      assert.match(result.details.copyError, /conflicts/, `the reason names the conflict: ${result.details.copyError}`);
+      assert.match(result.details.copyError, /resolve the conflict first/, 'the reason says how to get unstuck');
+      assert.match(result.details.copyError, /warp again without copying/, 'the reason offers the do-not-copy retry');
       assert.equal(result.details.path, target);
       assert.equal(result.details.copied, undefined, 'no copy is claimed');
       assert.equal(fs.existsSync(target), true, 'the created checkout is kept, never silently removed');
-      assert.ok(registryRows(root).some((row) => row.branch === 'feat/copy-fail'), 'the created checkout stays registered');
-      assert.equal(fs.readFileSync(path.join(root, 'f.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its work');
+      assert.ok(registryRows(root).some((row) => row.branch === 'feat/copy-conflict'), 'the created checkout stays registered');
+      assert.equal(fs.readFileSync(path.join(target, 'x.txt'), 'utf8'), 'A\n', 'main\'s own line survives in the new checkout');
+      assert.equal(fs.readFileSync(path.join(root, 'x.txt'), 'utf8'), 'C\n', 'the source keeps its work');
     } finally {
       restoreEnv();
     }
@@ -782,6 +828,160 @@ describe('S3/S4: worktree_create changes selection', { concurrency: false }, () 
         );
       }
       assert.equal(fs.readFileSync(path.join(root, 'a.txt'), 'utf8'), 'one\ntwo\n', 'the source keeps its changes');
+    } finally {
+      restoreEnv();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Interactive create: the checkout path is what the warp needs, so the SLOW
+// half of the creation hooks (dependency install, `codegraph init`) must not
+// stand between the human's confirmation and the selector coming back. The
+// deferred route is OPT-IN (`backgroundHooks`) and only the warp panel asks
+// for it: the agent tool keeps the inline contract, because its result is the
+// agent's only report and the hooks must have settled before it is returned.
+// Nothing is orphaned and nothing is swallowed — every background task is
+// tracked, settles into exactly one report, and a failure reaches the human.
+// ---------------------------------------------------------------------------
+describe('interactive create: setup runs in the background', { concurrency: false }, () => {
+  async function loadModule() {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-create-tool-bg-ext-')));
+    const copy = path.join(dir, 'gentle-worktree-tools.mjs');
+    fs.writeFileSync(copy, stubbed);
+    return import(pathToFileURL(copy).href);
+  }
+
+  // A `codegraph` that sleeps, then drops a marker: the marker's presence is
+  // the observable proof of WHEN the deferred setup actually ran.
+  function makeSlowCodegraph({ exitCode = 0 } = {}) {
+    const dir = track(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-create-tool-bg-bin-')));
+    const marker = path.join(dir, 'done');
+    fs.writeFileSync(
+      path.join(dir, 'codegraph'),
+      ['#!/bin/sh', 'sleep 0.3', `printf done > "${marker}"`, `exit ${exitCode}`, ''].join('\n'),
+      { mode: 0o755 },
+    );
+    return { dir, marker };
+  }
+
+  test('backgroundHooks returns once the path exists and the setup settles into one report', async () => {
+    const root = makeRepo('bg-hooks');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    const slow = makeSlowCodegraph();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      PATH: `${slow.dir}${path.delimiter}${process.env.PATH || ''}`,
+    });
+    try {
+      const mod = await loadModule();
+      const notes = [];
+      const ctx = makeCtx({ repoRoot: root });
+      ctx.ui.notify = (message, level) => { notes.push([message, level]); };
+      const result = await mod.executeWorktreeCreate(
+        { branch: 'feat/bg-hooks', changes: 'none' },
+        ctx,
+        { gitOnly: true, principalLayout: true, backgroundHooks: true },
+      );
+      const target = expectedTarget(root, 'feat-bg-hooks');
+      assert.equal(result.isError, undefined, `the create succeeded: ${resultText(result)}`);
+      assert.equal(fs.existsSync(target), true, 'the path the warp needs already exists');
+      assert.ok(registryRows(root).some((row) => row.branch === 'feat/bg-hooks'), 'the checkout is registered');
+      assert.equal(fs.existsSync(slow.marker), false, 'the create returned before the slow setup finished');
+      assert.deepEqual(notes, [], 'nothing is reported while the setup is still running');
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const install = steps.find((step) => step.name === 'install');
+      assert.ok(install && install.status === 'pending', `install is reported pending (${JSON.stringify(steps)})`);
+      const codegraphStep = steps.find((step) => step.name === 'codegraph-init');
+      assert.ok(codegraphStep && codegraphStep.status === 'pending', 'codegraph is reported pending');
+      assert.equal(result.details.setupPending, true, 'the result states that the setup is still running');
+      assert.equal(result.details.codegraph.status, 'pending', 'the CodeGraph fact is pending, never a claimed init');
+      assert.ok(
+        resultText(result).split('\n').includes('codegraph: pending (setup runs in the background)'),
+        `the visible row says the setup is still running: ${resultText(result)}`,
+      );
+      await mod.awaitPendingCreationSetups();
+      assert.equal(fs.existsSync(slow.marker), true, 'the deferred setup still ran, in the background');
+      const reports = notes.filter(([message]) => /setup/i.test(String(message)));
+      assert.equal(reports.length, 1, `exactly one setup report, got ${JSON.stringify(notes)}`);
+      assert.match(String(reports[0][0]), /setup finished for feat\/bg-hooks/, 'the report names the checkout');
+      assert.match(String(reports[0][0]), /codegraph initialized/, 'and what actually ran');
+      assert.equal(reports[0][1], 'info', 'a clean setup is informational');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  // The no-op case: a checkout with no lockfile and no `codegraph` on PATH runs
+  // NO setup step at all. Reporting "setup finished" there claims a setup that
+  // never happened, so a run where nothing completed stays silent — while a
+  // failure keeps its error report (the test below), which is the half that
+  // must never be suppressed.
+  test('a background setup where no step ran reports no success toast', async () => {
+    const root = makeRepo('bg-hooks-noop');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      PATH: pathWithoutCodegraph(),
+    });
+    try {
+      const mod = await loadModule();
+      const notes = [];
+      const ctx = makeCtx({ repoRoot: root });
+      ctx.ui.notify = (message, level) => { notes.push([message, level]); };
+      const result = await mod.executeWorktreeCreate(
+        { branch: 'feat/bg-hooks-noop', changes: 'none' },
+        ctx,
+        { gitOnly: true, principalLayout: true, backgroundHooks: true },
+      );
+      assert.equal(result.isError, undefined, `the create itself still succeeds: ${resultText(result)}`);
+      assert.ok(registryRows(root).some((row) => row.branch === 'feat/bg-hooks-noop'), 'the checkout is registered');
+      assert.deepEqual(notes, [], 'nothing is reported while the setup is still running');
+      await mod.awaitPendingCreationSetups();
+      assert.deepEqual(notes, [], `a setup that ran no step reports nothing at all: ${JSON.stringify(notes)}`);
+      const steps = (result.details.hooks && result.details.hooks.steps) || [];
+      const deferred = steps.filter((step) => step.name === 'install' || step.name === 'codegraph-init');
+      assert.equal(deferred.length, 2, `both deferred steps are named: ${JSON.stringify(steps)}`);
+      assert.ok(deferred.every((step) => step.status === 'pending'), `and reported as pending, never as done: ${JSON.stringify(deferred)}`);
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('a failing background setup is reported as an error and never swallowed', async () => {
+    const root = makeRepo('bg-hooks-fail');
+    const herdr = makeHerdrStub();
+    resetCodegraphCalls();
+    const slow = makeSlowCodegraph({ exitCode: 1 });
+    setEnv({
+      GENTLE_WORKTREE_LIB_DIR: LIB_DIR,
+      HERDR_BIN_PATH: herdr.bin,
+      HERDR_SHIM_LOG: herdr.log,
+      PATH: `${slow.dir}${path.delimiter}${process.env.PATH || ''}`,
+    });
+    try {
+      const mod = await loadModule();
+      const notes = [];
+      const ctx = makeCtx({ repoRoot: root });
+      ctx.ui.notify = (message, level) => { notes.push([message, level]); };
+      const result = await mod.executeWorktreeCreate(
+        { branch: 'feat/bg-hooks-fail', changes: 'none' },
+        ctx,
+        { gitOnly: true, principalLayout: true, backgroundHooks: true },
+      );
+      assert.equal(result.isError, undefined, 'the checkout is created whatever the setup does');
+      await mod.awaitPendingCreationSetups();
+      const errors = notes.filter(([, level]) => level === 'error');
+      assert.equal(errors.length, 1, `exactly one failure report, got ${JSON.stringify(notes)}`);
+      assert.match(String(errors[0][0]), /setup for feat\/bg-hooks-fail finished with problems/, 'the report names the checkout');
+      assert.match(String(errors[0][0]), /codegraph-init: codegraph init failed/, 'and the step that failed');
+      assert.match(String(errors[0][0]), /is usable/, 'and states that the checkout is still usable');
     } finally {
       restoreEnv();
     }
