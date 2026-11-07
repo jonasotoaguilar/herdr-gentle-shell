@@ -441,13 +441,15 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   publications never appear and still depend on chat delivery, and
   absence-driven completion records `completed` without latching an error.
 - TTL-bounded tokens: stale panes fall back to native `idle`.
-- Herdr Pi session opener (`worktree_session_open`): opens a Pi session inside
-  a registered agent worktree through Herdr — workspace only, never a path —
-  resolving the name against the worktree registry, refusing the principal and
-  any stale or unregistered checkout, verifying the Herdr workspace and the
-  root pane's cwd before starting Pi, and (unless `notify: false`) waking the
-  caller when that session really finishes. The other worktree tools, the ODD
-  and issues panels and the Customize panel live in `odd-worktree` now. See
+- Herdr session opener (`herdr_session_open`): opens a Herdr panel running a
+  Pi session at a path. A linked Git worktree opens as a **worktree panel**
+  (reusing the workspace Herdr already has for that checkout); a repository's
+  primary checkout, a subdirectory or any generic directory opens as a
+  **normal panel**. Panel kind is decided from git, the pane Herdr names is
+  verified to belong to its workspace and to sit in the requested path before
+  Pi starts, and (unless `notify: false`) the caller is woken when that session
+  really finishes. The other worktree tools, the ODD and issues panels and the
+  Customize panel live in `odd-worktree` now. See
   [docs/herdr-session-open.md](docs/herdr-session-open.md).
 
 ## Documentation
@@ -460,7 +462,7 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 | Supervision triage (read-only doctor/trace/whois) | [docs/diagnostics.md](docs/diagnostics.md) |
 | Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
 | Sidebar switch (`bin/gentle-sidebar.js`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
-| Herdr Pi session opener (`worktree_session_open`) | [docs/herdr-session-open.md](docs/herdr-session-open.md) |
+| Herdr session opener (`herdr_session_open`) | [docs/herdr-session-open.md](docs/herdr-session-open.md) |
 | Performance trace and its report | [docs/performance-trace.md](docs/performance-trace.md) |
 
 ## Next Steps

@@ -18,7 +18,8 @@ const PKG = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
 const SHIPPED = PKG.files ?? [];
 
 // Commands and agent tools the package no longer implements. The session
-// opener (`worktree_session_open`) is NOT on this list: it is retained (S6).
+// opener was renamed to `herdr_session_open` (S8): the old worktree-only name
+// is gone, and no document may teach it.
 const REMOVED_SURFACE = [
   '/herdr-gentle:customize',
   '/herdr-gentle:odd',
@@ -29,6 +30,7 @@ const REMOVED_SURFACE = [
   'worktree_list',
   'worktree_close',
   'worktree_warp',
+  'worktree_session_open',
 ];
 
 // Modules whose only consumers were the removed tools, panels and readers.

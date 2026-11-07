@@ -141,6 +141,7 @@ describe('documentation', () => {
       'worktree_warp',
       'worktree_close',
       'worktree_list',
+      'worktree_session_open',
       'odd-list',
     ];
     for (const file of files) {
