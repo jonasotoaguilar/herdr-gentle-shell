@@ -56,6 +56,23 @@ const MAX_ROLES_CHARS = 512;
 // (done/native-blocked), and recognized roles, ahead of main working.
 const ORCH_TOKEN = 'gentle_orchestrating_v1';
 const ORCH_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
+// Subagent disclosure list (`agents sidebar feedback` T3): CSV of
+// `<ordinal>:<agent>` entries, oldest launch first, at most 8 entries and 512
+// bytes. `<agent>` is the FULL agent package name (`gentle-ai-explore`), never
+// a role word, and entries are never merged — the launch ordinal is the entry
+// identity, so two runs of one agent are two entries. `<ordinal>` is the
+// 1-based launch ordinal within the session; a gap is normal (that subagent
+// finished), so ordinals are never renumbered. The producer clears the token
+// below two running subagents. Herdr renders the disclosure from this list
+// (2+ entries only) as `{agent} · {ordinal}`; the plugin only parses it.
+const SUBS_TOKEN = 'gentle_subs_v1';
+// Ordinal field: 1-based, never zero, same width bound as `count`.
+const SUBS_ORDINAL_RE = /^[1-9]\d{0,15}$/;
+// Agent field mirrors the producer's sanitizeSubAgent output: no control
+// chars, no CSV separators, no quotes (NAME_BAD_RE), 1-64 chars.
+const MAX_SUBS_AGENT_CHARS = 64;
+const MAX_SUBS_ENTRIES = 8;
+const MAX_SUBS_CHARS = 512;
 // Durable ask signal (DESIGN §4.3): `<hash>:<intentId>:<expiry>` — the same
 // session binding and TTL discipline as gentle_work_v1. Emitted on every
 // producer beat while ask is active (rpiv questionnaire or Gentle Shell
@@ -562,6 +579,38 @@ function parseRoles(value) {
   return roles;
 }
 
+// gentle_subs_v1 = CSV of `<ordinal>:<agent>`. Bounded like parseRoles:
+// malformed entries are dropped individually (a field outside its anchored
+// grammar never becomes a guessed entry), a value over 512 bytes or over the
+// 8-entry cap is rejected whole (truncating would present a plausible-looking
+// list the producer never wrote), and a repeated ordinal is dropped because
+// the ordinal is the entry identity. Entries are never deduplicated by agent
+// name: two launches of one agent stay two entries, in the producer's
+// oldest-first order. A wholly unusable value yields [] (no disclosure).
+function parseSubs(value) {
+  if (typeof value !== 'string' || value.length === 0) return [];
+  if (value.length > MAX_SUBS_CHARS) return [];
+  const parts = value.split(',');
+  if (parts.length > MAX_SUBS_ENTRIES) return [];
+  const seen = new Set();
+  const entries = [];
+  for (const part of parts) {
+    const colon = part.indexOf(':');
+    if (colon <= 0 || colon === part.length - 1) continue;
+    const rawOrdinal = part.slice(0, colon);
+    const agent = part.slice(colon + 1);
+    if (!SUBS_ORDINAL_RE.test(rawOrdinal)) continue;
+    if (agent.length > MAX_SUBS_AGENT_CHARS) continue;
+    if (NAME_BAD_RE.test(agent)) continue;
+    const ordinal = Number(rawOrdinal);
+    if (!Number.isSafeInteger(ordinal)) continue;
+    if (seen.has(ordinal)) continue;
+    seen.add(ordinal);
+    entries.push({ ordinal, agent });
+  }
+  return entries;
+}
+
 // Canonical role word -> machine display key. `rdd` (and its legacy alias)
 // collapses onto the stable `review` display key, whose user-facing word is
 // `rdd` (DISPLAY_LABELS); `judge` stays distinct (never rdd/review);
@@ -944,6 +993,7 @@ module.exports = {
   DISPLAYS,
   DISPLAY_LABELS,
   ROLES_TOKEN,
+  SUBS_TOKEN,
   ORCH_TOKEN,
   ASK_TOKEN,
   REVIEW_TOKEN,
@@ -970,6 +1020,7 @@ module.exports = {
   parseChangesV2,
   parseNames,
   parseRoles,
+  parseSubs,
   parseOrchestrating,
   parseAsk,
   parseReview,

@@ -73,6 +73,25 @@ Review the script before piping it to a shell — fetch the URL
 (never `main`) and read it first. The installer never uses `sudo` and never
 handles credentials.
 
+### Install in Pi
+
+```sh
+pi install npm:@jonasotoaguilar/herdr-gentle-shell
+```
+
+### Install in Gentle Shell
+
+```sh
+gentle-shell install npm:@jonasotoaguilar/herdr-gentle-shell
+```
+
+Both hosts install the same npm package,
+`@jonasotoaguilar/herdr-gentle-shell` — the Pi extension that publishes the
+session facts behind the sidebar states — and only the host command differs.
+These two commands install the Pi package only; the Herdr plugin side still
+comes from the installer script below or from
+`herdr plugin install jonasotoaguilar/herdr-gentle-agents/herdr-plugin`.
+
 ### Public install (stable, one command)
 
 ```sh

@@ -1234,3 +1234,70 @@ describe('principal interleave precedence (live-reported stuck-gentle)', () => {
     assert.equal(reduced.label, 'gentle');
   });
 });
+
+// ---------------------------------------------------------------------------
+// gentle_subs_v1 disclosure list (agents sidebar feedback, plugin T3):
+// CSV of `<ordinal>:<agent>`, oldest launch first, at most 8 entries and 512
+// bytes. Parsing mirrors the sibling parsers: an anchored per-field grammar,
+// malformed entries dropped individually, an overlength or over-count value
+// rejected whole (never truncated into a plausible-looking list). Entries are
+// never merged — the launch ordinal is the only identity, so two runs of one
+// agent stay two entries.
+describe('gentle_subs_v1 disclosure list', () => {
+  it('exposes the token name the producer writes', () => {
+    assert.equal(tokens.SUBS_TOKEN, 'gentle_subs_v1');
+  });
+
+  it('parses launch-ordered entries without merging same-agent runs', () => {
+    assert.deepEqual(
+      tokens.parseSubs('1:gentle-ai-explore,2:gentle-ai-explore,3:gentle-ai-worker'),
+      [
+        { ordinal: 1, agent: 'gentle-ai-explore' },
+        { ordinal: 2, agent: 'gentle-ai-explore' },
+        { ordinal: 3, agent: 'gentle-ai-worker' },
+      ],
+    );
+  });
+
+  it('keeps the ordinals as launched, never renumbering a gap', () => {
+    assert.deepEqual(tokens.parseSubs('2:gentle-ai-worker,5:jd-judge-a'), [
+      { ordinal: 2, agent: 'gentle-ai-worker' },
+      { ordinal: 5, agent: 'jd-judge-a' },
+    ]);
+  });
+
+  it('drops malformed entries individually and keeps the valid ones', () => {
+    assert.deepEqual(tokens.parseSubs('0:a,:b,1:,2:ok,x:c,3:quo"te'), [
+      { ordinal: 2, agent: 'ok' },
+    ]);
+  });
+
+  it('drops a repeated ordinal (the ordinal is the entry identity)', () => {
+    assert.deepEqual(tokens.parseSubs('1:gentle-ai-worker,1:gentle-ai-explore'), [
+      { ordinal: 1, agent: 'gentle-ai-worker' },
+    ]);
+  });
+
+  it('rejects a value that is not a bounded CSV string', () => {
+    for (const value of [undefined, null, 7, '', '   ']) {
+      assert.deepEqual(tokens.parseSubs(value), []);
+    }
+  });
+
+  it('accepts the eight-entry cap and rejects more entries whole', () => {
+    const agent = 'a'.repeat(60);
+    const eight = Array.from({ length: 8 }, (_, at) => `${at + 1}:${agent}`).join(',');
+    assert.equal(eight.length <= 512, true);
+    assert.deepEqual(tokens.parseSubs(eight), [
+      ...Array.from({ length: 8 }, (_, at) => ({ ordinal: at + 1, agent })),
+    ]);
+    const nine = `${eight},9:${agent}`;
+    assert.deepEqual(tokens.parseSubs(nine), []);
+  });
+
+  it('rejects a value over 512 bytes whole', () => {
+    const eight = Array.from({ length: 8 }, (_, at) => `${at + 1}:${'a'.repeat(64)}`).join(',');
+    assert.equal(eight.length > 512, true);
+    assert.deepEqual(tokens.parseSubs(eight), []);
+  });
+});

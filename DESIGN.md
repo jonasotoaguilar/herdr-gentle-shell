@@ -193,7 +193,7 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 | Producer event (source) | Tokens written | v1 state contribution |
 |---|---|---|
 | `agent_start` / `isIdle=false` (main actively working, incl. 0 active subs) | `gentle_work_v1=<hash>:0:<exp>` + `gentle_orchestrating_v1=<hash>:<exp>` (root marker while main actively works) + clear `herdr:blocked` labels | `gentle` (machine key `orchestrating`) while the principal session actively works, even with zero subagents |
-| TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total; the consumer renders the oldest role plus this total in parentheses only when above one) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | oldest running role word (known short word or unknown sanitized name), else generic `gentle` (no delegation — a single delegate carries no suffix; a fresh root marker reduces to `orchestrating` only with no delegation active |
+| TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total; the consumer renders the oldest role plus this total in parentheses only when above one) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_subs_v1=<csv>` (subagent disclosure list, §4.3: `<ordinal>:<agent>` oldest launch first, never merged, cleared below two running subs) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | oldest running role word (known short word or unknown sanitized name), else generic `gentle` (no delegation — a single delegate carries no suffix; a fresh root marker reduces to `orchestrating` only with no delegation active |
 | `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt` dialog spans (`kind` other than `custom` — a panel or overlay such as the agents view, ODD viewer, changes view or design canvas never counts, because opening a panel is navigation, not a question), plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
 | Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` with `reviewerRunAcknowledged: true` in the runtime args; `correctionLines` (native planning, never a reviewer), forecast-only calls, `gentle_review` (any operation), `gentle_review_scope`, and all sidebar/hook signals never enter — unknown legacy shapes stay dark (conservative) | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label. Bounded approximation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today |
 | agent error / task failed / transport failure | `herdr:blocked` label `error:<code>` | `blocked` (machine key `error`) |
@@ -295,6 +295,16 @@ role            = "explorer" / "worker" / "verify" / "judge" / "rdd" / passthrou
                     ; never a generic collapse; producer truncates to 32)
 gentle_roles_v1   = role *("," role)       ; total <= ~512 chars; null (clear)
                     ; when no delegation is active (no role words)
+gentle_subs_v1    = subentry *("," subentry) ; / 8 subentry / total <= 512 chars
+                    ; subentry = ordinal ":" agent
+                    ; ordinal  = [1-9] 0*15DIGIT  (1-based launch ordinal,
+                    ;            ascending, never reused, gaps allowed)
+                    ; agent    = 1*64 chars, no control chars, no "," / "
+                    ;            (full agent package name, e.g.
+                    ;            gentle-ai-explore — never a role word)
+                    ; oldest launch first; entries are never merged, so two
+                    ; runs of one agent are two entries; null (clear) below
+                    ; two running subagents
 gentle_orchestrating_v1 = sessionHash ":" expiry
                     ; root-only presence marker, no count — fresh while the
                     ; root main session actively works (even with zero subs),
@@ -331,6 +341,7 @@ and treat the pane as `unknown → idle` for that signal (§7).
 ```text
 pane.report_metadata --source gentle:v1 --token gentle_work_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:2:1789000000000
 pane.report_metadata --source gentle:v1 --token gentle_roles_v1=worker,explorer
+pane.report_metadata --source gentle:v1 --token gentle_subs_v1=1:gentle-ai-explore,2:gentle-ai-worker,3:gentle-ai-explore
 pane.report_metadata --source gentle:v1 --token gentle_orchestrating_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:1789000000000
 pane.report_metadata --source gentle:v1 --token gentle_names_v1=planner,code-writer
 pane.report_metadata --source gentle:v1 --token gentle_changes_v2=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:5:110:22:1789000000000
@@ -357,6 +368,9 @@ terminal `done` states).
   `herdr pane report-metadata <pane> --source gentle:v1 --token name=value`.
 - One report carries at most 16 tokens; `gentle_names_v1` never chunks:
   excess advisory names are dropped at ~512 chars total (fail-closed).
+  `gentle_subs_v1` never chunks either: the producer stops at 8 entries /
+  512 chars, so the consumer rejects an over-cap value whole instead of
+  reassembling or truncating it.
   The `#p=<i>/<m>` suffix form is retired and never emitted; a consumer
   must not expect reassembly.
 - Writes are idempotent full-state snapshots per pane (all gentle tokens
@@ -369,7 +383,9 @@ terminal `done` states).
   new/reloaded session under a different session hash cannot retain the prior
   session's change token. `gentle_names_v1` clears the same way when the
   authoritative active TaskStore list has no labels, and `gentle_roles_v1`
-  clears (null) when no delegation is active. v2 stays the visible
+  clears (null) when no delegation is active. `gentle_subs_v1` clears the
+  same way below two running subagents, so a single child can never
+  disclose. v2 stays the visible
   normative source; v1 remains legacy only.
 
 ## 5. Consumer contract (daemon; snapshot → sidebar)
@@ -648,8 +664,9 @@ mechanism writes each piece of state.
 ## 8. Limits
 
 - Token budget: ≤ 16 tokens per report per pane (E8 discipline); the
-  producer emits at most 7 tokens per beat (`gentle_work_v1`,
-  `gentle_roles_v1`, `gentle_names_v1`, `gentle_orchestrating_v1`,
+  producer emits at most 8 tokens per beat (`gentle_work_v1`,
+  `gentle_roles_v1`, `gentle_subs_v1`, `gentle_names_v1`,
+  `gentle_orchestrating_v1`,
   `gentle_ask_v1`, `gentle_changes_v2`,
   `gentle_changes_v1`) and the daemon publishes its 72-token owned family
   chunked ≤ 16 per report (row 1 is the 3 native tokens
@@ -682,7 +699,8 @@ mechanism writes each piece of state.
 ## 9. Compatibility and migration
 
 - Additive only in v1: new token names (`gentle_work_v1`,
-  `gentle_roles_v1`, `gentle_names_v1`, `gentle_orchestrating_v1`,
+  `gentle_roles_v1`, `gentle_subs_v1`, `gentle_names_v1`,
+  `gentle_orchestrating_v1`,
   `gentle_ask_v1`, `gentle_review_v1`, `gentle_changes_v1`, `gentle_changes_v2`,
   `gentle_state_*`, `gentle_title_*`, `gentle_agent_*`, `gentle_agent`,
   `gentle_icon_*`,

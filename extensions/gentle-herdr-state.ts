@@ -52,6 +52,18 @@
 //                       TaskStore list has no labels; null change tokens when the session model has
 //                       zero changed files — refreshed/cleared from the live
 //                       session model, never carried across sessions.
+//   gentle_subs_v1    = CSV of `<ordinal>:<agent>` entries, oldest launch
+//                       first, ≤ 8 entries and ≤ 512 bytes; `<agent>` is the
+//                       full agent package name (`gentle-ai-explore`) and
+//                       entries are never merged — two runs of one agent are
+//                       two entries. `<ordinal>` is the 1-based launch
+//                       ordinal within the session, assigned in launch order
+//                       and never reused: a subagent launched after an
+//                       earlier one finishes takes the next ordinal, never
+//                       the freed one. Clear (null) below two running
+//                       subagents, so the consumer can never disclose a
+//                       single child. The subagent disclosure list — the
+//                       roles/names tokens keep their own collapsing.
 //   gentle_ask_v1         = <hash>:<intentId>:<expiry>
 //                       (durable ask signal, session-bound + TTL-fresh like
 //                       gentle_orchestrating_v1: emitted on every beat while
@@ -674,6 +686,9 @@ const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
 const MAX_NAMES_CHARS = 512;
 const MAX_ROLES_CHARS = 512;
+const SUBS_TOKEN = "gentle_subs_v1";
+const MAX_SUBS_ENTRIES = 8;
+const MAX_SUBS_CHARS = 512;
 const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
 const TRANSPORT_FAIL_LATCH = 3;
@@ -796,6 +811,21 @@ function sanitizeLabel(value, fallback) {
     .trim()
     .slice(0, MAX_LABEL_CHARS);
   return clean.length > 0 ? clean : String(fallback).slice(0, MAX_LABEL_CHARS);
+}
+
+// Full agent package name for the subagent disclosure list (`gentle-ai-explore`,
+// never a role word): the full name survives, only characters that would break
+// the CSV wire (control chars, `,`, `"`) are stripped, with the same 64-char
+// bound the task record already carries. Returns undefined when nothing
+// salvageable remains so the caller drops the entry instead of inventing a
+// name.
+function sanitizeSubAgent(agent) {
+  if (typeof agent !== "string" || agent.length === 0) return undefined;
+  const clean = agent
+    .replace(/[\x00-\x1f\x7f-\x9f",]/g, "")
+    .trim()
+    .slice(0, MAX_LABEL_CHARS);
+  return clean.length > 0 ? clean : undefined;
 }
 
 // Unknown-agent fallback (slug rules, 32-char bound): a delegation agent
@@ -1781,8 +1811,22 @@ export default function (pi) {
   // Finished/failed/cancelled/waiting entries may linger in the map but
   // never count; the map is cleared only on session reset (plus the
   // bounded-map guard) — never by a local staleness timeout.
-  const pendingCalls = new Map(); // toolCallId -> { agent, label, at }
-  const tasks = new Map(); // taskId -> { agent, label, status, at }
+  const pendingCalls = new Map(); // toolCallId -> { agent, label, at, ordinal }
+  const tasks = new Map(); // taskId -> { agent, label, status, at, ordinal }
+
+  // gentle_subs_v1 launch ordinals (agents sidebar disclosure list):
+  // 1-based, minted at the launch observation (the pending tool call, so two
+  // in-flight launches keep call order) and bound to the task record when it
+  // arrives. Session-scoped, monotonic, never reused — a subagent launched
+  // after an earlier one finished takes the next ordinal, never the freed
+  // one. A resumed launch (`subagent_continue` allocates a new task id) is a
+  // fresh subagent and therefore a fresh ordinal.
+  let launchCounter = 0;
+
+  function nextLaunchOrdinal() {
+    launchCounter += 1;
+    return launchCounter;
+  }
 
   // Blocker legs. ask combines choice + native questionnaire + legacy
   // questionnaire + tool-gated confirmation + direct ask_user_* tool calls
@@ -2099,6 +2143,7 @@ export default function (pi) {
           agent: task.agent,
           label: task.label,
           at: task.at,
+          ordinal: task.ordinal,
           firstSeen: typeof task.firstSeen === "number" ? task.firstSeen : task.at,
         });
       }
@@ -2119,6 +2164,7 @@ export default function (pi) {
           agent: task.agent,
           label: task.label,
           at: task.at,
+          ordinal: task.ordinal,
           firstSeen: typeof task.firstSeen === "number" ? task.firstSeen : task.at,
         });
       }
@@ -2234,6 +2280,33 @@ export default function (pi) {
     return parts.join(",");
   }
 
+  // Bounded CSV of `<ordinal>:<agent>` entries for the subagent disclosure,
+  // oldest launch first (ordinal ascending == launch order) and capped at
+  // MAX_SUBS_ENTRIES / MAX_SUBS_CHARS. Entries are never merged or
+  // deduplicated: the ordinal is the entry identity, so two runs of one agent
+  // are two entries. Fewer than two usable entries yields an empty CSV so the
+  // caller clears the token — a malformed single name can never turn into a
+  // one-child disclosure.
+  function subsCsv(subs) {
+    const entries = [];
+    for (const sub of subs) {
+      const agent = sanitizeSubAgent(sub.agent);
+      if (!agent || typeof sub.ordinal !== "number") continue;
+      entries.push({ ordinal: sub.ordinal, agent });
+    }
+    entries.sort((a, b) => a.ordinal - b.ordinal);
+    const parts = [];
+    let length = 0;
+    for (const { ordinal, agent } of entries) {
+      const entry = `${ordinal}:${agent}`;
+      const add = (parts.length === 0 ? 0 : 1) + entry.length;
+      if (parts.length >= MAX_SUBS_ENTRIES || length + add > MAX_SUBS_CHARS) break;
+      parts.push(entry);
+      length += add;
+    }
+    return parts.length >= 2 ? parts.join(",") : "";
+  }
+
   function buildTokens() {
     if (!sessionHash) return {};
     const expiry = Date.now() + TTL_MS;
@@ -2262,6 +2335,14 @@ export default function (pi) {
     const roles = rolesCsv(mergedRoleSubs());
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;
+    // Subagent disclosure list (S1-S3): `<ordinal>:<agent>` CSV over the
+    // RUNNING delegates — the same executing set the visible count and roles
+    // use, so the disclosure can never disagree with the row it extends.
+    // Null (clear) below two running subagents, so a single child never
+    // discloses.
+    const subsList = subsCsv(running);
+    if (subsList.length > 0) tokens[SUBS_TOKEN] = subsList;
+    else tokens[SUBS_TOKEN] = null;
     // Durable ask signal (DESIGN §4.3): session-bound + TTL-fresh
     // `<hash>:<intentId>:<expiry>`, emitted on every beat while ask is
     // active, null (clear) when inactive. Repairs a missed edge-triggered
@@ -2721,6 +2802,9 @@ export default function (pi) {
   function resetSessionState() {
     pendingCalls.clear();
     tasks.clear();
+    // Launch ordinals are session-scoped ("within the session"): a new
+    // session restarts at 1 with no carried task ids.
+    launchCounter = 0;
     choiceActive = false;
     questionActive = false;
     questionnaireActive = false;
@@ -2915,7 +2999,11 @@ export default function (pi) {
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
       const parsed = launchInput(event.input);
       if (!parsed || typeof event.toolCallId !== "string") return;
-      pendingCalls.set(event.toolCallId, { ...parsed, at: Date.now() });
+      pendingCalls.set(event.toolCallId, {
+        ...parsed,
+        ordinal: nextLaunchOrdinal(),
+        at: Date.now(),
+      });
       if (pendingCalls.size > MAX_TRACKED_TASKS) {
         const oldest = pendingCalls.keys().next().value;
         pendingCalls.delete(oldest);
@@ -3029,6 +3117,11 @@ export default function (pi) {
       status,
       at: now,
       firstSeen: typeof previous?.firstSeen === "number" ? previous.firstSeen : now,
+      // Launch ordinal for the subagent disclosure: the pending call's ordinal
+      // carries true launch order across overlapping in-flight launches, and a
+      // task id keeps the ordinal it was first given for the whole session
+      // (never reused, never renumbered).
+      ordinal: previous?.ordinal ?? pending?.ordinal ?? nextLaunchOrdinal(),
       epoch: taskEpochFor(previous, status, event.toolName === "subagent_continue"),
     });
     if (tasks.size > MAX_TRACKED_TASKS) {
@@ -3079,6 +3172,9 @@ export default function (pi) {
       at: Date.now(),
       firstSeen:
         typeof previous?.firstSeen === "number" ? previous.firstSeen : Date.now(),
+      // Background starts announce themselves through this path (no launch
+      // tool call), so a first sighting mints the ordinal here.
+      ordinal: previous?.ordinal ?? nextLaunchOrdinal(),
       epoch: taskEpochFor(previous, details.status, false),
     });
     if (tasks.size > MAX_TRACKED_TASKS) {
