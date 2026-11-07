@@ -1,19 +1,26 @@
-# Sidebar control (`/herdr-gentle:customize` — `Agentes sidebar` rows)
+# Sidebar control (`node bin/gentle-sidebar.js`)
 
-Switch the Herdr Agents-panel integration between OUR sidebar and the
-native Herdr sidebar. This controls sidebar wiring only, never Pi
-subagent execution. (The old `/herdr-gentle:sidebar` command is removed;
-`customize status` is its read-only replacement.)
+Switch the Herdr Agents-panel integration between OUR sidebar and the native
+Herdr sidebar. This controls sidebar wiring only, never Pi subagent execution.
 
-| Row | Meaning |
+```bash
+node bin/gentle-sidebar.js (enable|disable|status|toggle) [--json]
+```
+
+Exit codes: `0` success, `1` operational failure, `2` usage failure. The
+isolated form points every path at temp files:
+
+```bash
+GENTLE_STATUS_STATE_DIR=/tmp/s PI_CODING_AGENT_DIR=/tmp/a \
+HERDR_CONFIG_PATH=/tmp/c.toml node bin/gentle-sidebar.js status
+```
+
+| Verb | Meaning |
 | --- | --- |
-| `Gentle (this extension)` | Use OUR sidebar. |
-| `Native Herdr` | Use the NATIVE sidebar. |
-
-Open `/herdr-gentle:customize` with no argument for the two-pane panel
-(CATEGORIES on the left, the focused category's rows on the right) and
-apply the row with `Enter`; `Esc` closes without writing. `customize
-status` reports all three switches as one terse line and writes nothing.
+| `enable` | Use OUR sidebar. |
+| `disable` | Use the NATIVE sidebar. |
+| `status` | Report the current mode; writes nothing. |
+| `toggle` | Flip to the other mode. |
 
 ## What enable and disable do
 
@@ -40,13 +47,11 @@ never read, written, or deleted.
 
 ## Reload rule
 
-Row changes apply to Herdr through the synchronous configure run, and the
-panel reloads the Pi extension runtime itself after every successful
-switch — the Pi settings exclusion and the native sidebar only take
-effect on the next extension load. No surface ever asks you to run
-`/reload`, and success is only
-reported after the managed-row effect is verified — never on a queued
-acceptance.
+Row changes apply to Herdr through the synchronous configure run. The Pi
+settings exclusion and the native sidebar only take effect on the next
+extension load, so a running Pi session needs `/reload` after a switch —
+success is reported once the managed-row effect is verified, never on a
+queued acceptance.
 
 ## Mode file
 
@@ -63,7 +68,7 @@ the lifecycle owner (`herdr-plugin/bin/gentle-status.js`); the producer just sto
 ## Recovery
 
 Every failure names the recoverable next step: fix the cause, then
-re-apply the same row from the panel to converge. Completion runs before any local
+re-run the same verb to converge. Completion runs before any local
 mutation, so a failed configure leaves mode and exclusion untouched; if
 rows were stranded by a failed reload they are restored through the
 marker-scoped reverse operation (only our own markers are ever removed,
@@ -71,10 +76,13 @@ so user tables and concurrent edits outside them survive). If the mode
 file itself cannot be written after the rows already flipped, the message
 says exactly that. When the ownership
 record names another entry or another settings file, resolve it
-manually (delete the record or the entry) — the apply never adopts it.
+manually (delete the record or the entry) — neither verb adopts it.
 
-## Package-side equivalent
+## Implementation
 
-`node bin/gentle-sidebar.js (enable|disable|status|toggle)` implements
-the same contract outside Pi via `lib/gentle-sidebar.js` (authoritative
-exclusion helper + the installed plugin's `bin/configure.js`, same rollback discipline).
+`bin/gentle-sidebar.js` is the CLI; `lib/gentle-sidebar.js` holds the
+contract (mode file, owned exclusion through
+`lib/pi-extension-exclusion.js`, and the installed plugin's
+`bin/configure.js` with the same rollback discipline). The Pi producer
+extension reads only the mode file, so the switch and the producer never
+disagree about which sidebar is active.

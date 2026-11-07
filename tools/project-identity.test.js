@@ -115,12 +115,12 @@ describe('project identity rename (S15/T9)', () => {
     );
   });
 
-  it('the README keeps the existing command verbs with no new aliases', () => {
-    // Registration itself is exercised by tools/customize-warp.test.js and
-    // tools/customize-panel.test.js; here the public doc contract pins that
-    // the rename introduced no new command prefix.
+  it('the README documents the surviving command surface with no new prefix', () => {
+    // The customize/odd/issues/warp verbs were removed with their features;
+    // bin/gentle-sidebar.js is the one command left, and the rename
+    // introduced no `herdr-gentle-shell:` prefix.
     const readme = read('README.md');
-    assert.ok(readme.includes('/herdr-gentle:customize'));
+    assert.ok(readme.includes('bin/gentle-sidebar.js'));
     assert.ok(!readme.includes('herdr-gentle-shell:'));
   });
 

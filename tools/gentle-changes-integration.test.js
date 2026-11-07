@@ -1,8 +1,8 @@
 'use strict';
 // S62/T48 integration: the producer publishes live Git totals (not transcript
 // sums) over the subscribed scope with the unchanged gentle_changes_v2
-// schema, plus parity between the inline mirror in
-// extensions/gentle-herdr-state.ts and lib/live-session-changes.js.
+// schema, and its inline live-change helpers keep their fixed-vector
+// contract (extensions/gentle-herdr-state.ts).
 // Real isolated git repos + a loopback Herdr socket; no live daemon/Pi/UI.
 
 const { test, describe, after } = require('node:test');
@@ -14,8 +14,6 @@ const net = require('node:net');
 const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
-
-const live = require('../lib/live-session-changes.js');
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-live-int-'));
 after(() => {
@@ -43,26 +41,35 @@ function sessionHashOf(file) {
   return createHash('sha256').update(file, 'utf8').digest('base64url');
 }
 
-describe('parity: inline mirror matches lib/live-session-changes.js', { concurrency: false }, () => {
-  test('parsers and scope agree on fixed vectors', async () => {
+describe('inline live-change helpers keep their fixed-vector contract', { concurrency: false }, () => {
+  test('parsers and scope resolve known inputs', async () => {
     const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
     const srcText = fs.readFileSync(src, 'utf8');
     const stubbed = srcText.replace(
       /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
       'const generateUnifiedPatch = () => { throw new Error("stubbed"); };',
     );
-    const copy = path.join(scratch, 'parity-state.mjs');
+    const copy = path.join(scratch, 'inline-state.mjs');
     fs.writeFileSync(copy, stubbed);
     const mod = await import(pathToFileURL(copy).href);
     for (const name of ['liveParseNumstat', 'liveParsePorcelain', 'liveSnapshotChanges', 'liveSessionChangeRoots', 'liveResolveScopeRoots', 'liveSummarizeRoots']) {
       assert.equal(typeof mod[name], 'function', `${name} must be exported live (not a stub)`);
     }
-    const numstat = '2\t1\ta.txt\n-\t-\timg.bin\n';
-    assert.deepEqual(mod.liveParseNumstat(numstat), live.parseNumstat(numstat));
+    assert.deepEqual(mod.liveParseNumstat('2\t1\ta.txt\n-\t-\timg.bin\n'), [
+      { path: 'a.txt', added: 2, deleted: 1 },
+      { path: 'img.bin', added: 0, deleted: 0 },
+    ]);
     const porcelain = ['M  a.txt', '?? new.txt', 'R  new2.txt', 'old.txt'].join('\0') + '\0';
-    assert.deepEqual([...mod.liveParsePorcelain(porcelain).entries()], [...live.parsePorcelain(porcelain).entries()]);
+    assert.deepEqual([...mod.liveParsePorcelain(porcelain).entries()], [
+      ['a.txt', 'modified'],
+      ['new.txt', 'untracked'],
+      ['new2.txt', 'renamed'],
+    ]);
     const snap = { numstat: '3\t1\ta.txt\n', porcelain: ['M  a.txt', '?? new.txt'].join('\0') + '\0' };
-    assert.deepEqual(mod.liveSnapshotChanges(snap), live.snapshotChanges(snap));
+    assert.deepEqual(mod.liveSnapshotChanges(snap), [
+      { path: 'a.txt', added: 3, deleted: 1, status: 'modified' },
+      { path: 'new.txt', added: 0, deleted: 0, status: 'untracked' },
+    ]);
     const WT = 'gentle-pi.session-worktree/v1';
     const CE = 'gentle-pi.session-change/v1';
     const entries = [
@@ -70,20 +77,7 @@ describe('parity: inline mirror matches lib/live-session-changes.js', { concurre
       { type: 'custom', customType: CE, data: { sessionId: 's1', evidence: { id: 'e1', root: '/r/b', path: 'f', before: { kind: 'absent' }, after: { kind: 'text', text: 'x' } } } },
       { type: 'custom', customType: WT, data: { sessionId: 's2', root: '/r/other' } },
     ];
-    assert.deepEqual(mod.liveSessionChangeRoots('s1', entries).sort(), live.sessionChangeRoots('s1', entries).sort());
-  });
-
-  test('lib and reference argv agree on a real dirty fixture', async () => {
-    const root = makeRepo('parity-real');
-    fs.writeFileSync(path.join(root, 'a.txt'), 'one\nTWO\n');
-    git(root, ['add', 'a.txt']);
-    fs.appendFileSync(path.join(root, 'a.txt'), 'three\n');
-    fs.writeFileSync(path.join(root, 'new.txt'), 'l1\nl2\n');
-    const summary = await live.summarizeRoots([root]);
-    assert.equal(summary.ok, true);
-    assert.equal(summary.files, 2);
-    assert.equal(summary.added, 4);
-    assert.equal(summary.deleted, 1);
+    assert.deepEqual(mod.liveSessionChangeRoots('s1', entries).sort(), ['/r/a', '/r/b']);
   });
 });
 

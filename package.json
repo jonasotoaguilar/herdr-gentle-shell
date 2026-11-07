@@ -1,11 +1,12 @@
 {
   "name": "@jonasotoaguilar/herdr-gentle-shell",
   "version": "0.5.0",
-  "description": "Pi package for Herdr sidebar states: the Pi extension sidecar that publishes session facts as Herdr pane-metadata tokens, plus the Pi-side helpers the Herdr Gentle Shell plugin drives.",
+  "description": "Pi package for Herdr sidebar states: the Pi extension sidecar that publishes session facts as Herdr pane-metadata tokens, the optional Moshi notification channel, and the Pi-side helpers the Herdr Gentle Shell plugin drives.",
   "keywords": [
     "pi-package",
     "pi",
-    "herdr"
+    "herdr",
+    "moshi"
   ],
   "homepage": "https://github.com/jonasotoaguilar/herdr-gentle-agents#readme",
   "bugs": {
@@ -28,14 +29,12 @@
     "bin",
     "lib",
     "docs",
-    "rules",
     "README.md",
     "DESIGN.md"
   ],
   "pi": {
     "extensions": [
-      "./extensions/gentle-herdr-state.ts",
-      "./extensions/gentle-worktree-tools.ts"
+      "./extensions/gentle-herdr-state.ts"
     ]
   }
 }

@@ -371,30 +371,6 @@ supervision triage ships beside it: the `doctor` and `whois` plugin actions
 See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 [docs/diagnostics.md](docs/diagnostics.md) for the triage commands.
 
-### Agent worktrees
-
-An agent thread may own several checkouts, each created with
-`worktree_create`, which takes exactly two parameters: the `branch`, and a
-required `changes` selection — `"all"` copies the current checkout's pending
-work into the new worktree, `"none"` copies nothing so it is born from the
-commit, and an explicit list of file paths copies only those. An omitted
-`changes` is refused before anything is written. Every NEW branch is born from
-local `main`; a repository with no local `main` is refused with a message saying
-so (adopting an existing branch needs no base). Success answers
-`created: <slug> · <branch>`, its path, `registered: new|replaced|appended|unchanged`
-for what the registry write did, whether CodeGraph was initialized, the `base`
-commit it used, and `copied: N files, +N/-N` when the selection carried work
-across. Checkouts are inspected with `worktree_list` and removed with
-`worktree_close` (the branch is kept). Idempotency is keyed to the requested
-branch: the same branch returns its own checkout as `already exists`, while
-any other branch is created even when the thread already owns one. Creation
-copies untracked env files, installs dependencies by detected lockfile,
-symlinks the shared `odd/` / `.agents/` / `.claude/` dirs, and runs
-`codegraph init` when available; an already existing checkout only has its
-index state READ (never re-initialized). A worktree carries no issue or ODD
-association. Full contract — registry, hooks, mode gate, and limitations —
-lives in [docs/worktree-tools.md](docs/worktree-tools.md).
-
 ## Key Features You Should Know About
 
 - Full v1 state matrix including the root-session `orchestrating` marker
@@ -424,46 +400,34 @@ lives in [docs/worktree-tools.md](docs/worktree-tools.md).
   session model and never carried across sessions.
 - Single-writer coexistence with `herdr-pi-tree`: no shared token names, no
   dual-write, scoped sweep of own tokens on handover.
-- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement above is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. Choosing `Native Herdr` in `/herdr-gentle:customize` removes only our owned exclusion and managed rows, gates our producer/daemon, and reloads automatically to hand back the native sidebar; never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
-- Customize (`/herdr-gentle:customize`): one panel with the sidebar and Moshi
-  switches — `Agentes sidebar` (`Gentle (this extension)` / `Native Herdr`),
-  `Moshi notifications` (`On` / `Off`) — plus one grouped `Plugin tools`
-  section holding three independent toggles: `Worktree tools`, `ODD command`
-  and `Issues command`. Each plugin row names its stored value
-  (`Worktree tools · Enabled`) and `Enter` flips only that toggle; the ODD
-  toggle gates the command, never the automatic ODD naming. A choice applies
-  immediately and reloads the extension runtime itself only when the change
-  needs it; when no reload is available the gated surfaces still re-read the
-  stored flag and refuse. `customize status` is the read-only replacement of
-  the removed `status` verbs: one terse line naming every switch
-  (`customize status: sidebar=gentle moshi=off worktree=enabled odd=enabled
-  issues=enabled`). See [docs/sidebar-control.md](docs/sidebar-control.md) and
-  [docs/worktree-tools.md](docs/worktree-tools.md).
-- Odd viewer (`/herdr-gentle:odd`): read-only two-pane overlay over the
-  current checkout's `odd/tasks/*.md` — document names on the left, the
-  selected document as styled markdown on the right.
-  See [docs/odd-viewer.md](docs/odd-viewer.md).
-- Issues viewer (`/herdr-gentle:issues`): three-page overlay over the
-  current checkout's repository issues — the issue list on the left, the
-  selected issue with its comments on the right.
-  See [docs/issues-viewer.md](docs/issues-viewer.md).
-- Optional Moshi replacement (off by default): the `Moshi notifications`
-  rows of `/herdr-gentle:customize` (`On` / `Off`, read-only state via
-  `customize status`). With it on, this plugin **replaces the Moshi-managed Pi
-  hook**: the same Moshi integration (Chat View, Live Activity, session row,
-  terminal context, phone-side approvals) keeps working, but notifications
-  follow this plugin's policy — one when Pi really needs your input (`ask`)
-  and one when Pi really finishes. Nothing per prompt, nothing per turn.
-  `enable` also excludes the Moshi-managed Pi hook
-  (`-extensions/moshi-hooks.ts` in the Pi settings) so it cannot notify in
-  parallel, and `disable` restores it; both edits happen only while
-  `extensions/moshi-hooks.ts` exists and leave every other settings key and
-  entry untouched. Enabling first requires the real prerequisites: the
-  `moshi-hook` CLI on PATH and `moshi-hook status --json` reporting
-  `paired: true`. When either is missing, `On` refuses with one message
-  naming the fix (install the CLI, or `moshi-hook pair --token
-  <pairing-token>`) and changes nothing — the switch stays `Off`, no
-  flag or settings write, no reload. Disabling never requires the CLI.
+- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement below is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `node bin/gentle-sidebar.js disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and hands the sidebar back to the native publisher (running Pi sessions need `/reload`); never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
+- Sidebar switch (`enable` / `disable` / `status` / `toggle`):
+  `node bin/gentle-sidebar.js <verb>` picks between this plugin's sidebar rows
+  and the native Herdr sidebar. `status` is read-only; `enable` converges the
+  managed Herdr rows and records the owned native-extension exclusion;
+  `disable` removes only our owned rows and exclusion, never a user table.
+  See [docs/sidebar-control.md](docs/sidebar-control.md).
+- Optional Moshi replacement (off by default): one flag file,
+  `<state dir>/gentle-moshi.json` containing `{"enabled":true}` (the state dir
+  is `GENTLE_STATUS_STATE_DIR`, else the stored `herdr-gentle-agents` state dir
+  under `$XDG_STATE_HOME/herdr` or `~/.local/state/herdr`):
+
+  ```sh
+  dir="${GENTLE_STATUS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-gentle-agents}"
+  mkdir -p "$dir" && echo '{"enabled":true}' > "$dir/gentle-moshi.json"
+  ```
+
+  With the flag on, this plugin **replaces the
+  Moshi-managed Pi hook**: the same Moshi integration (Chat View, Live Activity,
+  session row, terminal context, phone-side approvals) keeps working, but
+  notifications follow this plugin's policy — one when Pi really needs your
+  input (`ask`) and one when Pi really finishes. Nothing per prompt, nothing per
+  turn. If `extensions/moshi-hooks.ts` is installed, add
+  `-extensions/moshi-hooks.ts` to the `extensions` list in your Pi
+  `settings.json` so the Moshi-managed hook cannot notify in parallel; that edit
+  leaves every other settings key and entry untouched. Removal of the flag (or
+  `{"enabled":false}`) silences this channel immediately — the flag is re-read
+  per event — and restoring the hook entry brings the original notifier back.
   Moshi owns pairing and credentials; this plugin never
   reads or stores a token, an absent daemon or unpaired host is a silent
   no-op, and Pi is never interrupted by a Moshi failure.
@@ -477,14 +441,6 @@ lives in [docs/worktree-tools.md](docs/worktree-tools.md).
   publications never appear and still depend on chat delivery, and
   absence-driven completion records `completed` without latching an error.
 - TTL-bounded tokens: stale panes fall back to native `idle`.
-- Agent worktrees (`worktree_create` / `worktree_list` / `worktree_close`,
-  plus the `Plugin tools · Worktree tools` toggle of
-  `/herdr-gentle:customize`): one or more
-  checkouts per thread at the flattened worktree path, created from the branch
-  alone — no issue or ODD association — with creation hooks (untracked env
-  copies, lockfile-detected installs, shared-dir symlinks, `codegraph init`,
-  whose outcome the create result reports). See
-  [docs/worktree-tools.md](docs/worktree-tools.md).
 
 ## Documentation
 
@@ -495,11 +451,8 @@ lives in [docs/worktree-tools.md](docs/worktree-tools.md).
 | Open decisions blocking implementation | [DESIGN.md](DESIGN.md) §10 |
 | Supervision triage (read-only doctor/trace/whois) | [docs/diagnostics.md](docs/diagnostics.md) |
 | Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
-| Customize (`/herdr-gentle:customize`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
-| Agent worktrees (`worktree_*` tools) | [docs/worktree-tools.md](docs/worktree-tools.md) |
-| Odd viewer (`/herdr-gentle:odd`) | [docs/odd-viewer.md](docs/odd-viewer.md) |
-| Key map (all views) | [docs/keys.md](docs/keys.md) |
-| Issues viewer (`/herdr-gentle:issues`) | [docs/issues-viewer.md](docs/issues-viewer.md) |
+| Sidebar switch (`bin/gentle-sidebar.js`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
+| Performance trace and its report | [docs/performance-trace.md](docs/performance-trace.md) |
 
 ## Next Steps
 

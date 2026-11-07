@@ -564,11 +564,13 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   stays in-flow/native; `error` is visible as sidebar state (native `blocked`
   attention on `herdr:blocked` already fires per E9 — the plugin adds no
   toast path).
-- Optional Moshi replacement (off by default): the `Moshi notifications`
-  rows of `/herdr-gentle:customize` (`On` / `Off`; read-only state via
-  `customize status`) — driven by the producer extension through its
-  provider slot (see below), which owns the flag file
-  `gentle-moshi.json` in the plugin state root. With it
+- Optional Moshi replacement (off by default): one flag file,
+  `gentle-moshi.json` in the plugin state root, holding
+  `{"enabled":true}` and re-read per event by the producer extension. While
+  `extensions/moshi-hooks.ts` is installed, enabling also means adding
+  `-extensions/moshi-hooks.ts` to the Pi settings `extensions` list by hand so
+  the Moshi-managed hook cannot notify in parallel; that edit preserves every
+  other key and entry and is reverted by removing the entry again. With it
   on, the producer extension replaces the Moshi-managed Pi hook entirely: it
   speaks the same wire protocol (category-less `session.update` carriers plus
   categorized events over the Moshi daemon socket), so Chat View, Live
@@ -607,12 +609,10 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   unverified): the phone-side approval round-trip through Moshi's TUI bridge,
   the Live Activity lifecycle, and whether a `task_complete` renders as a
   separate banner or only updates a running Live Activity are Moshi's.
-- Mid-session enable reloads automatically when the Pi settings exclusion
-  actually changed: the panel applies the change first, then calls
-  `ctx.reload()` itself — no surface ever asks the user to run `/reload`.
-  The flag itself is re-read per event, so our sender reacts immediately;
-  fresh sessions are single-emitter by construction (exclusion record +
-  flag).
+- The flag is re-read per event, so flipping it silences or activates our
+  sender immediately; a settings-exclusion edit only takes effect on the next
+  Pi extension load, so a running session needs `/reload` after that one edit.
+  Fresh sessions are single-emitter by construction (exclusion entry + flag).
 - Gentle mode is enabled by default: while selected, the gentle producer is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats (session path-or-id binding, monotonic seq seeded from the clock as
 `Date.now() * 1000` exactly like Herdr's own plugin SDK, serial latest-wins
 coalesced queue, bounded retries; never `done`/`finished`, never a
@@ -624,64 +624,26 @@ the producer keeps beating for the new one — the consumer then rejects those
 fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
 report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
-  preserved on disk, never auto-loaded next to ours). The `Herdr Sidebar`
-  rows of `/herdr-gentle:customize` (`Gentle (this extension)` / `Native
-  Herdr`, plus read-only `customize status`) select the publisher: native
-  gates
+  preserved on disk, never auto-loaded next to ours). `node
+  bin/gentle-sidebar.js (enable|disable|status|toggle)` selects the
+  publisher: native gates
   our producer/daemon, removes only our ownership-bound native exclusion and
-  managed sidebar rows, and reloads the extension runtime automatically
-  (every sidebar switch needs it — the exclusion and the native sidebar
-  only take effect on the next Pi extension load). Its shared
+  managed sidebar rows, and reports that the running session needs `/reload`
+  (the exclusion and the native sidebar only take effect on the next Pi
+  extension load). Its shared
   `gentle-sidebar-mode.json` uses `{version:1,enabled:boolean}`; missing means
   enabled, malformed fails closed. Never run both publishers on the same pane
   (dual publishers collide). See [docs/sidebar-control.md](docs/sidebar-control.md). Limits (unverified, host-owned): the host `idle`->`done`->`finished` mapping (finished text, toast/sound) and unknown-state handling are owned by Herdr.
 
-### Customize panel contract
+### Command surface
 
-`/herdr-gentle:customize` is the single surface for the three switches
-(sidebar, Moshi, worktree tools); `/herdr-gentle:warp <name>` moves the
-session between checkouts; `/herdr-gentle:odd` opens a read-only two-pane
-overlay over the current checkout's `odd/tasks/*.md` (name list plus styled
-document), implemented in `lib/odd-docs.js` (discovery/read),
-`lib/odd-markdown.js` (renderer) and `lib/odd-view.js` (view) — it writes
-nothing and never leaves the checkout; `/herdr-gentle:issues` opens a
-four-tab overlay (My issues / Assigned / Involved / All) over the current
-checkout's repository GitHub issues, implemented in `lib/gh-issues.js`
-(the only place that runs `gh`), `lib/issues-view.js` (the pure view) and
-the command in `extensions/gentle-worktree-tools.ts`. The interactive pager
-searches the whole active bucket through GitHub, debounces typing, keeps
-query-bound cursors, reuses loaded tabs and explicitly refreshes with `r`.
-It never adds All to the shared three-bucket snapshot's totals. The reader
-30/70 geometry and lossless title wrapping live in `lib/view-layout.js`;
-complete metadata and comments use `lib/issue-preview.js`. Preview keys and
-capability-based legends use `lib/preview-scroll-keys.js`, not OS guesses or a
-Pi host fork.
-
-Listing, search, paging and scrolling never write. Issues permits only its
-explicit label, assignee, comment and close actions; it paints saving before
-invoking a callback and locks input until completion. Neither viewer writes a
-worktree association, and no surface assigns issues or ODD documents to a
-worktree any more: a worktree is created and listed, never modified.
-Enrichment applies to the mounted viewer; closed-view outcomes cannot
-authorize registry writes. The viewers retain one-row shortcut legends rather
-than a duplicate `?` overlay. ODD and Issues
-follow their own `Plugin tools` toggles (`ODD command`, `Issues command`) and stay registered with `Worktree tools` disabled. Warp is registered only with `Worktree tools` enabled. The sidebar and Moshi actions stay inline in
-the producer extension (`extensions/gentle-herdr-state.ts`) and are
-reached through one in-process provider slot,
-`globalThis[Symbol.for("herdr-gentle.customize.v1")]`, written once at
-load as `{sidebar:{read,apply}, moshi:{read,apply}}` — the single
-cross-extension contract (`Symbol.for` yields the same symbol in both
-modules without a shared import, so the key literal is the contract).
-`read()` returns the active value id; `apply(value, ctx)` reuses the
-existing paths unchanged and returns `{changed, needsReload, text}`.
-Reload matrix: sidebar ALWAYS (the Pi settings exclusion and the native
-sidebar only take effect on the next Pi extension load), Moshi only when
-the exclusion entry actually changed (the flag itself is re-read per
-event), worktree tools only when the runtime registration must change
-(`enabled !== toolsRegistered`). Ordering is mandatory: the panel closes
-first (`done()`), then the notification, then `await ctx.reload()` — no
-surface ever asks the user to run `/reload`. A missing or malformed
-provider renders its category unavailable and `Enter` writes nothing.
+There is no in-Pi panel. The package ships exactly one switch command,
+`node bin/gentle-sidebar.js (enable|disable|status|toggle)` (§7), and the Moshi
+channel is switched by its flag file. Anything that used to be a second
+surface for the same job — the `/herdr-gentle:customize` panel, the
+`Plugin tools` toggles and the in-process provider slot
+`globalThis[Symbol.for("herdr-gentle.customize.v1")]` — is gone, so exactly one
+mechanism writes each piece of state.
 
 ## 8. Limits
 
@@ -738,6 +700,12 @@ provider renders its category unavailable and `Enter` writes nothing.
 - Coexistence: `herdr-pi-tree` stays installed but disabled for gentle-owned
   panes (O1). No uninstall, no token migration, no dual-run merge — ownership
   handoff is by enable/disable switch, reversible at any time.
+- Removed surfaces: the worktree tools (`worktree_create` / `worktree_list` /
+  `worktree_close` / `worktree_session_open` / `worktree_warp`), the warp
+  panel, the ODD and Issues readers, the `Plugin tools` toggles and the
+  `/herdr-gentle:customize` panel no longer ship. This package publishes the
+  Herdr producer sidecar and the Moshi channel only; `bin/gentle-sidebar.js`
+  is its one command.
 - Rollback: disable this plugin → producer stops writing; consumer sweeps
   only `gentle_*` tokens + labels it set (O5); pi-tree re-enable restores
   `↳N` behavior with zero data migration.
@@ -819,113 +787,3 @@ confirming each criterion has a normative section:
 Task closes when V1–V6 are all traceable above and the file re-read reports
 path + line count. Any untraceable cell → `status: partial` with the gap
 list, not silent.
-
-## 12. Agent worktree tools (`worktree_*`)
-
-Agent-callable worktrees: `worktree_create` / `worktree_list` /
-`worktree_close` as Pi extension tools (`extensions/gentle-worktree-tools.ts`,
-listed in the Pi package's `pi.extensions`), plus the `Plugin tools ·
-Worktree tools` toggle of `/herdr-gentle:customize` (`Enabled` / `Disabled`,
-plus the read-only `customize status`). Surface is
-extension tools via `pi.registerTool()` — codemode is a QuickJS sandbox
-with no filesystem, network, or timers and adds no tools, so it cannot
-implement this; it may call these tools. Normative detail (parameters,
-output contract, hook table, capture bounds) lives in
-[docs/worktree-tools.md](docs/worktree-tools.md); this section records the
-design decisions.
-
-### Ownership rule
-
-The worktree belongs to the THREAD, not to the feature or task, and a
-thread may own SEVERAL checkouts: a second branch is a second worktree,
-not a replay of the first one. The registry entry records the owning
-thread (`thread`, resolved from `GENTLE_WORKTREE_THREAD` else the Pi
-session id, failing closed when neither exists); `worktree_list` shows
-which thread owns each checkout; `worktree_close` reports the owner
-instead of refusing, because a delivered thread is routinely closed from
-a later session; and `worktree_create` is idempotent on the REQUEST, never
-on the thread: the same branch that already has this thread's checkout
-returns that checkout (`alreadyExists: true`, the text says
-`already exists`), while any other branch is created and registered even
-when the thread already owns another checkout. `already exists` is keyed
-to the requested branch's own worktree; a checkout the thread owns for a
-different branch never answers for it. A second thread never adopts
-another thread's checkout, and a branch already checked out at a live path
-is refused rather than shared.
-
-A worktree carries NO issue or ODD association: `worktree_create` takes the
-branch and nothing else, never verifies or writes an association, and its
-output names the checkout, its path, what the registry write actually did
-(`registered: new | replaced | appended | unchanged`) and the one CodeGraph
-fact of the creation. Legacy `issues`/`odd` fields already in the registry
-are preserved byte for byte by every write that does not address their row,
-and no surface displays them.
-
-### Registry
-
-`<git-common-dir>/pi-worktrees.json` — inside `.git`, never in a working
-tree, never committed, shared by every checkout of the repository.
-Entries `{branch, path, thread, issues[], odd, createdAt, updatedAt}`
-(`odd` is ONE document or `null`; both association fields are legacy — the
-create tool writes no association and only preserves what is stored).
-Reads tolerate malformed content (reported, never thrown, file left
-untouched, never silently enabling); writes are atomic (temp file plus
-rename) under an exclusive lock file with bounded wait and stale-lock
-recovery. The tools verify against `git worktree list --porcelain -z`
-before and after instead of trusting Herdr JSON, and every external
-process uses fixed argv (values as separate elements — herdr rejects
-`--flag=value`), so branch names and paths cannot inject commands.
-`--trust-repository` is deliberately absent from the herdr allowlist:
-trusting a repository is a human decision these tools never take.
-
-### Hook policy
-
-Creation hooks make a fresh checkout usable without silently destroying
-anything: copy unversioned env files only when present, untracked, and
-absent at the target (never overwrite, never copy a tracked file);
-install dependencies for every lockfile-detected stack (a missing binary
-is `skipped`, a non-zero exit is `failed` plus a warning, never fatal);
-link `.agents/`, `.pi/`, `.claude/` and `odd/` to their principal counterparts
-only when each source exists as a directory, Git tracks nothing under it and
-Git ignores it. Tracked entries arrive via checkout; untracked but nonignored
-entries are not linked. Existing targets are never removed or replaced, and
-missing source directories are never created. Never share `.codegraph/`; run
-`codegraph init` when the CLI is available. Hook outcomes travel inside
-the success `details`, never turning a verified creation into an error.
-The pre-existing `~/.config/herdr` `worktree-hooks` plugin stays
-untouched by this feature; its double-run hazard is resolved when it is
-replaced.
-
-### Mode gate
-
-The `Plugin tools` section of `/herdr-gentle:customize` groups three
-independent toggles. `Worktree tools` flips a shared mode file
-(`gentle-worktree-mode.json`, `{version:1,enabled:boolean}`) in the plugin state
-directory, default enabled, malformed failing closed. `ODD command` and `Issues
-command` share `gentle-plugin-tools.json`
-(`{version:1,odd:boolean,issues:boolean}`) in the same directory, both default
-enabled, malformed failing closed on both; they gate the registered commands
-only, never the automatic ODD naming. Gating is two-level — load-time
-registration plus per-invocation re-read — and the panel itself always
-stays registered so every toggle can be flipped back. Registration changes
-reload the extension runtime automatically when the registration must
-change (the requested value differs from what this load registered, i.e.
-enabling while the runtime loaded disabled or vice versa), which `customize
-status` reports; without a reload the gated invocation still refuses, so the
-toggle holds and the notification says it applies from the next session.
-Create never
-prompts — a create touches no existing data; close prompts when the host
-offers dialog UI, waived under gentle-shell YOLO only for a checkout proven
-clean. Warp keyboard deletion is separate: it always prompts, even under YOLO,
-and discloses pending changes and commits ahead of main (or unknown evidence).
-List is read-only and never prompts.
-
-### Known limitations (stated, not solved here)
-
-A normally-created worktree is dirty from git's point of view from day
-one (the hooks deliberately create untracked files and never delete
-them silently), so closing normally requires `force: true`; the issue
-check requires `gh` plus a GitHub remote and fails closed otherwise;
-`odd/` capture from `bash` converges only through the bounded re-scan,
-never through argv parsing; `.codegraph/` is never shared and the tools
-index nothing beyond `codegraph init`.
