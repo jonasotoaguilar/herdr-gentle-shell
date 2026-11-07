@@ -17,6 +17,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
+
+// The package ships two Pi extensions: the Herdr state producer and the
+// retained worktree session opener (S6).
+const DECLARED_EXTENSIONS = [
+  './extensions/gentle-herdr-state.ts',
+  './extensions/herdr-session-open.ts',
+];
 const EXTENSION = path.join(ROOT, 'extensions', 'gentle-herdr-state.ts');
 
 function read(rel) {
@@ -60,16 +67,16 @@ const REMOVED_LIB_FAMILIES = [
 ];
 
 describe('package manifest', () => {
-  test('declares only the Herdr state sidecar as a Pi extension', () => {
+  test('declares the Herdr state sidecar and the session opener as Pi extensions', () => {
     const pkg = JSON.parse(read('package.json'));
-    assert.deepEqual(pkg.pi.extensions, ['./extensions/gentle-herdr-state.ts']);
+    assert.deepEqual(pkg.pi.extensions, DECLARED_EXTENSIONS);
   });
 
-  test('ships no other extension next to the state sidecar', () => {
+  test('ships no extension beyond those two', () => {
     const entries = fs.readdirSync(path.join(ROOT, 'extensions'))
       .filter((name) => name !== '.gitkeep')
       .sort();
-    assert.deepEqual(entries, ['gentle-herdr-state.ts']);
+    assert.deepEqual(entries, ['gentle-herdr-state.ts', 'herdr-session-open.ts']);
   });
 });
 
@@ -133,7 +140,6 @@ describe('documentation', () => {
       'worktree_create',
       'worktree_warp',
       'worktree_close',
-      'worktree_session_open',
       'worktree_list',
       'odd-list',
     ];

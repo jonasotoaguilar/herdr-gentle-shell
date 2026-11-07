@@ -35,9 +35,12 @@ describe('Pi package identity', () => {
 
   it('declares the Pi extensions and every declared file exists', () => {
     const declared = PKG.pi?.extensions ?? [];
-    // The package ships one extension: the Herdr state producer. The
-    // worktree/ODD/issues tools were removed, so a second entry is a bug.
-    assert.deepEqual(declared, ['./extensions/gentle-herdr-state.ts']);
+    // Two extensions: the Herdr state producer, and the worktree session
+    // opener that stays with Herdr (S6). Everything else was removed.
+    assert.deepEqual(declared, [
+      './extensions/gentle-herdr-state.ts',
+      './extensions/herdr-session-open.ts',
+    ]);
     for (const rel of declared) {
       assert.ok(fs.existsSync(path.join(REPO_ROOT, rel)), `missing extension ${rel}`);
     }
