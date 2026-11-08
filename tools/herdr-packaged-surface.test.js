@@ -19,9 +19,11 @@ const SHIPPED = PKG.files ?? [];
 
 // Commands and agent tools the package no longer implements. The session
 // opener was renamed to `herdr_session_open` (S8): the old worktree-only name
-// is gone, and no document may teach it.
+// is gone, and no document may teach it. `/herdr-gentle:customize` is NOT here:
+// the command is back with two local switches only (sidebar agent rows, Moshi
+// notifications), so it is a shipped surface again — its removed `Plugin tools`
+// and `Reset` sections are pinned by tools/herdr-cleanup-surface.test.js.
 const REMOVED_SURFACE = [
-  '/herdr-gentle:customize',
   '/herdr-gentle:odd',
   '/herdr-gentle:issues',
   '/herdr-gentle:warp',
@@ -34,6 +36,9 @@ const REMOVED_SURFACE = [
 ];
 
 // Modules whose only consumers were the removed tools, panels and readers.
+// `moshi-prereq.js` stays here on purpose: the Moshi enable gate was restored
+// but it lives inline in extensions/gentle-herdr-state.ts (that file ships
+// alone and imports no sibling), so the module itself must not come back.
 const OBSOLETE_MODULES = [
   'clipboard.js',
   'herdr-plugin-check.js',

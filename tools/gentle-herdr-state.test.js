@@ -1537,7 +1537,7 @@ test('T2b RED: judge agents map distinctly; oldest-first; progress never reorder
   }
 });
 
-test('T2b RED: queued/waiting/pending never count; mixed completion drops suffix', async () => {
+test('T2b RED: queued/waiting/pending never count; mixed completion keeps the survivor role', async () => {
   const wire = await startT2bWire('test-pane-t2b-count');
   try {
     const { createHash } = require('node:crypto');
@@ -1608,7 +1608,7 @@ test('T2b RED: queued/waiting/pending never count; mixed completion drops suffix
       5000,
       'single survivor counted once',
     );
-    assert.equal(single.gentle_roles_v1, 'explorer', 'one explorer left, no suffix at the producer (consumer renders bare)');
+    assert.equal(single.gentle_roles_v1, 'explorer', 'one explorer left (the consumer renders the bare role word)');
   } finally {
     process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
     process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
@@ -1655,15 +1655,79 @@ test('T2b RED: session reset clears prior running roles (no stale counts)', asyn
 // Producer wire: CSV of `<ordinal>:<agent>` entries, oldest launch first,
 // at most 8 entries and 512 bytes. `<agent>` is the full agent package name
 // and entries are never merged (two runs of one agent are two entries);
-// `<ordinal>` is the 1-based launch ordinal within the session, never reused
+// `<ordinal>` is the subagent's 1-based number in THIS Gentle Shell session
+// (seeded at session start from the persisted roster below), never reused
 // when an earlier subagent finishes. The token is cleared below two running
 // subagents so the consumer can never disclose a single child.
 // `gentle_names_v1` keeps its own dedupe and `gentle_roles_v1` its own
 // collapse — the new list rides alongside them unchanged.
 
-async function startT3Wire(paneId, sessionId, name) {
+// Gentle Shell's only durable per-session roster of launches, including
+// finished ones: `<agentHome>/gentle-agents/tasks/<id>.json`, one JSON file
+// per task shaped `{ task: TaskRecord, thread }`. The tests write it directly
+// so session-true numbering is observable on the wire, with an explicit
+// throwaway agent home so the developer's real roster never leaks in.
+function t3RosterRecord(id, parentSessionId, createdAt) {
+  return {
+    id,
+    agent: 'gentle-ai-explore',
+    mode: 'task',
+    prompt: '',
+    label: `${id} work`,
+    cwd: '/tmp',
+    parentSessionId,
+    status: 'completed',
+    createdAt,
+    startedAt: createdAt,
+    endedAt: createdAt + 1000,
+    model: 'test-model',
+    sessionPath: null,
+    error: null,
+    result: null,
+    lastStep: '',
+    lastActivityAt: createdAt + 1000,
+    turns: 1,
+    toolCalls: 1,
+    tokens: 0,
+    cost: 0,
+  };
+}
+
+function t3RosterDir(agentHome) {
+  return path.join(agentHome, 'gentle-agents', 'tasks');
+}
+
+function writeT3Roster(agentHome, records) {
+  const dir = t3RosterDir(agentHome);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const record of records) {
+    fs.writeFileSync(path.join(dir, `${record.id}.json`), JSON.stringify({ task: record, thread: { items: [] } }));
+  }
+}
+
+// `options.roster`: records already on disk for the session (or for other
+// sessions, which must never count). `options.rosterDirIsFile`: the roster
+// path exists but is not a directory (unreadable). `options.rosterFiles`: raw
+// file bodies written beside `options.roster` (malformed records).
+async function startT3Wire(paneId, sessionId, name, options = {}) {
   const { createHash } = require('node:crypto');
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), `gentle-t3-home-${name}-`));
+  const prevHome = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  if (options.roster) writeT3Roster(agentHome, options.roster);
+  if (options.rosterDirIsFile) {
+    fs.mkdirSync(path.dirname(t3RosterDir(agentHome)), { recursive: true });
+    fs.writeFileSync(t3RosterDir(agentHome), 'not a directory');
+  }
+  if (options.rosterFiles) {
+    fs.mkdirSync(t3RosterDir(agentHome), { recursive: true });
+    for (const [file, body] of Object.entries(options.rosterFiles)) {
+      fs.writeFileSync(path.join(t3RosterDir(agentHome), file), body);
+    }
+  }
   const wire = await startT2bWire(paneId);
+  wire.agentHome = agentHome;
+  wire.prevHome = prevHome;
   const h = harness();
   wire.factory(h.pi);
   const sessionFile = `/tmp/gentle-t3-${name}-session`;
@@ -1673,6 +1737,8 @@ async function startT3Wire(paneId, sessionId, name) {
 }
 
 async function stopT3Wire(wire) {
+  if (wire.prevHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+  else process.env.GENTLE_PI_AGENT_HOME = wire.prevHome;
   process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
   process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
   process.env.HERDR_PANE_ID = wire.prevEnv.HERDR_PANE_ID;
@@ -1777,6 +1843,81 @@ test('T3: an ordinal is never reused after a sibling finishes, and one survivor 
       'one running subagent left clears the list',
     );
     assert.equal(survivor.gentle_subs_v1, null);
+  } finally {
+    await stopT3Wire(wire);
+  }
+});
+
+test('T3: numbering continues this session roster instead of restarting at one', async () => {
+  const sessionId = 'sess-t3-roster';
+  // Six subagents this session already ran (a reloaded extension must not
+  // number them 1..6 again), plus three from other sessions that never count.
+  const roster = [
+    ...Array.from({ length: 6 }, (_, at) => t3RosterRecord(`prior${at + 1}`, sessionId, 1000 + at)),
+    ...Array.from({ length: 3 }, (_, at) => t3RosterRecord(`other${at + 1}`, 'sess-t3-other', 2000 + at)),
+  ];
+  const { wire, h, paneHash } = await startT3Wire('test-pane-t3-roster', sessionId, 'roster', { roster });
+  try {
+    launchRunning(h, 'run-r1', 'r1', 'gentle-ai-explore');
+    launchRunning(h, 'run-r2', 'r2', 'gentle-ai-worker');
+    const resumed = await wire.waitForFrom(
+      0,
+      (p) => p.gentle_subs_v1 === '7:gentle-ai-explore,8:gentle-ai-worker',
+      5000,
+      'first launches after a reload continue at 7 and 8',
+    );
+    assert.ok(resumed.gentle_work_v1.startsWith(`${paneHash}:2:`));
+    assert.equal(resumed.gentle_roles_v1, 'explorer,worker');
+    launchRunning(h, 'run-r3', 'r3', 'gentle-ai-verify');
+    await wire.waitForFrom(
+      0,
+      (p) => p.gentle_subs_v1 === '7:gentle-ai-explore,8:gentle-ai-worker,9:gentle-ai-verify',
+      5000,
+      'session numbering keeps ascending from the roster seed',
+    );
+  } finally {
+    await stopT3Wire(wire);
+  }
+});
+
+test('T3: an unreadable roster falls back to numbering from one', async () => {
+  const { wire, h } = await startT3Wire('test-pane-t3-unreadable', 'sess-t3-unreadable', 'unreadable', {
+    rosterDirIsFile: true,
+  });
+  try {
+    launchRunning(h, 'run-u1', 'u1', 'gentle-ai-explore');
+    launchRunning(h, 'run-u2', 'u2', 'gentle-ai-worker');
+    await wire.waitForFrom(
+      0,
+      (p) => p.gentle_subs_v1 === '1:gentle-ai-explore,2:gentle-ai-worker',
+      5000,
+      'unreadable roster still numbers the session from one',
+    );
+  } finally {
+    await stopT3Wire(wire);
+  }
+});
+
+test('T3: a malformed roster record falls back to numbering from one', async () => {
+  const sessionId = 'sess-t3-malformed';
+  const roster = Array.from({ length: 4 }, (_, at) => t3RosterRecord(`m${at + 1}`, sessionId, 1000 + at));
+  const { wire, h } = await startT3Wire('test-pane-t3-malformed', sessionId, 'malformed', {
+    roster,
+    rosterFiles: {
+      // Unparseable JSON, and a parseable record without the session binding.
+      'broken-json.json': '{"task":',
+      'broken-record.json': JSON.stringify({ task: { id: 'nobind', agent: 'gentle-ai-explore', status: 'completed', createdAt: 1 } }),
+    },
+  });
+  try {
+    launchRunning(h, 'run-x1', 'x1', 'gentle-ai-explore');
+    launchRunning(h, 'run-x2', 'x2', 'gentle-ai-worker');
+    await wire.waitForFrom(
+      0,
+      (p) => p.gentle_subs_v1 === '1:gentle-ai-explore,2:gentle-ai-worker',
+      5000,
+      'malformed roster never numbers from a partially read seed',
+    );
   } finally {
     await stopT3Wire(wire);
   }
@@ -1965,6 +2106,93 @@ test('T1: queued delegate after settle emits count0 with a fresh marker (never f
       'count0 with a fresh marker after settle (queued cover, vetoes done)',
     );
     assert.equal(settled.gentle_roles_v1, null, 'queued supplies no running role');
+  } finally {
+    process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
+    process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
+    process.env.HERDR_PANE_ID = wire.prevEnv.HERDR_PANE_ID;
+    await wire.close();
+  }
+});
+
+// --- Principal-only activity marker (gentle_principal_v1) ---------------
+// The row's working-vs-idle decision needs the principal's OWN activity: the
+// native status aggregates delegate activity (`computeNativeState` returns
+// working for any running delegate or pending launch), so it cannot say
+// whether the principal itself works. This token carries only `agentActive`
+// (the principal input of computeNativeState), session-bound and TTL-fresh
+// like the other gentle_* markers, and clears on settle even while delegates
+// keep running.
+
+test('principal marker carries only the principal activity, never the delegate aggregate', async () => {
+  const wire = await startT2bWire('test-pane-principal');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('principal');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    // The principal starts idle: a running delegate alone must never publish
+    // a principal marker (that is the aggregate signal this token replaces).
+    h.fire(
+      'session_start',
+      {},
+      {
+        mode: 'tui',
+        sessionManager: {
+          getSessionId: () => 'sess-principal',
+          getSessionFile: () => sessionFile,
+          getEntries: () => [],
+        },
+        isIdle: () => true,
+      },
+    );
+    launchRunning(h, 'run-p1', 'p1', 'gentle-ai-explore');
+    const idlePrincipal = await wire.waitForFrom(
+      0,
+      (p) =>
+        typeof p.gentle_work_v1 === 'string' &&
+        p.gentle_work_v1.startsWith(`${paneHash}:1:`) &&
+        'gentle_principal_v1' in p,
+      5000,
+      'running delegate beat with the principal token published',
+    );
+    assert.equal(idlePrincipal.gentle_principal_v1, null, 'idle principal publishes no marker');
+    assert.equal(idlePrincipal.gentle_roles_v1, 'explorer');
+    assert.equal(typeof idlePrincipal.gentle_orchestrating_v1, 'string', 'orchestrating marker unchanged');
+
+    // Principal starts working: the marker appears alongside the same delegate.
+    const beforeActive = wire.received.length;
+    h.fire('agent_start', {});
+    const workingPrincipal = await wire.waitForFrom(
+      beforeActive,
+      (p) => typeof p.gentle_principal_v1 === 'string',
+      5000,
+      'principal marker while the principal works',
+    );
+    const [markerHash, rawExpiry] = workingPrincipal.gentle_principal_v1.split(':');
+    assert.equal(markerHash, paneHash, 'marker is bound to the pane session hash');
+    assert.equal(workingPrincipal.gentle_principal_v1.split(':').length, 2, 'marker carries no count');
+    assert.ok(Number(rawExpiry) > Date.now(), 'marker expiry is in the future');
+    assert.ok(Number(rawExpiry) <= Date.now() + 60000, 'marker expiry stays inside the TTL horizon');
+    assert.equal(workingPrincipal.gentle_roles_v1, 'explorer', 'delegate role still published');
+
+    // Principal settles with the delegate still running: the marker clears
+    // while the delegate count, role, and orchestrating marker stay live.
+    const beforeSettle = wire.received.length;
+    h.fire('agent_settled', {}, { isIdle: () => true });
+    const settledPrincipal = await wire.waitForFrom(
+      beforeSettle,
+      (p) => 'gentle_principal_v1' in p && p.gentle_principal_v1 === null,
+      5000,
+      'settle clears the principal marker',
+    );
+    assert.equal(settledPrincipal.gentle_roles_v1, 'explorer', 'delegate role survives the clear');
+    assert.equal(
+      typeof settledPrincipal.gentle_work_v1 === 'string' &&
+        settledPrincipal.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      true,
+      'delegate count survives the clear',
+    );
   } finally {
     process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
     process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;

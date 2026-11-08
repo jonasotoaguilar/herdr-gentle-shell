@@ -39,6 +39,17 @@
 //                       null / clear once the main session settles (or any
 //                       non-root session). Never alters the authoritative
 //                       work count or the roles CSV.)
+//   gentle_principal_v1 = <hash>:<expiry>
+//                       (principal-only activity marker, same session binding
+//                       and TTL discipline as gentle_orchestrating_v1 but
+//                       carrying no count: emitted while THIS session's own
+//                       agent is active (agentActive) — the principal input
+//                       of computeNativeState, never its delegate aggregate
+//                       — and null / clear once the principal settles, so an
+//                       idle principal with running delegates never looks
+//                       busy. The consumer uses it for the working-vs-idle
+//                       decision; the aggregate native status keeps its own
+//                       meaning. Never alters the work count or roles CSV.)
 //   gentle_changes_v2 = <hash>:<files>:<added>:<deleted>:<expiry>
 //                       (normative; exact added/deleted totals kept separate)
 //   gentle_changes_v1 = <hash>:<files>:<added+deleted>:<expiry>
@@ -56,11 +67,18 @@
 //                       first, ≤ 8 entries and ≤ 512 bytes; `<agent>` is the
 //                       full agent package name (`gentle-ai-explore`) and
 //                       entries are never merged — two runs of one agent are
-//                       two entries. `<ordinal>` is the 1-based launch
-//                       ordinal within the session, assigned in launch order
-//                       and never reused: a subagent launched after an
-//                       earlier one finishes takes the next ordinal, never
-//                       the freed one. Clear (null) below two running
+//                       two entries. `<ordinal>` is the subagent's 1-based
+//                       number in this session, assigned in launch order and
+//                       never reused: a subagent launched after an earlier
+//                       one finishes takes the next ordinal, never the freed
+//                       one, and gaps stay gaps. The sequence is seeded at
+//                       session start by counting this session's records in
+//                       Gentle Shell's persisted task roster
+//                       (`<agentHome>/gentle-agents/tasks`), so a mid-session
+//                       extension reload continues the session's numbering
+//                       instead of restarting at 1; a missing, unreadable, or
+//                       malformed roster falls back to the in-process counter.
+//                       Clear (null) below two running
 //                       subagents, so the consumer can never disclose a
 //                       single child. The subagent disclosure list — the
 //                       roles/names tokens keep their own collapsing.
@@ -217,7 +235,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve as resolvePath, relative as pathRelative, basename as pathBasename, isAbsolute as pathIsAbsolute } from "node:path";
+import { delimiter as pathDelimiter, dirname, join, resolve as resolvePath, relative as pathRelative, basename as pathBasename, isAbsolute as pathIsAbsolute } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 // Inlined presence reconciliation (T1). Single-file deployment boundary:
 // the installed copy/symlink of this file ships WITHOUT the sibling
@@ -305,7 +323,11 @@ function presenceSafeDirectory(path, owned, ownerMask) {
   return true;
 }
 
-export function resolvePresenceProfile(env = process.env, home = homedir()) {
+// Gentle Shell agent home (GENTLE_PI_AGENT_HOME, else PI_CODING_AGENT_DIR,
+// else `~/.pi/agent`), tilde-expanded and realpathed. Undefined when the two
+// env vars disagree or the path cannot be resolved, so every caller degrades
+// instead of guessing.
+function resolveAgentHome(env = process.env, home = homedir()) {
   const gentle = env?.GENTLE_PI_AGENT_HOME;
   const piDir = env?.PI_CODING_AGENT_DIR;
   const hasGentle = typeof gentle === "string" && gentle.length > 0;
@@ -318,12 +340,16 @@ export function resolvePresenceProfile(env = process.env, home = homedir()) {
   else if (selected.startsWith("~/") || (process.platform === "win32" && selected.startsWith("~\\"))) {
     expanded = join(home, selected.slice(2));
   }
-  let real;
   try {
-    real = fs.realpathSync(resolvePath(expanded));
+    return fs.realpathSync(resolvePath(expanded));
   } catch {
     return undefined;
   }
+}
+
+export function resolvePresenceProfile(env = process.env, home = homedir()) {
+  const real = resolveAgentHome(env, home);
+  if (real === undefined) return undefined;
   const shared = join(real, "gentle-agents");
   const presenceRoot = join(shared, "presence");
   if (!presenceSafeDirectory(real, false, 0)) return undefined;
@@ -334,6 +360,58 @@ export function resolvePresenceProfile(env = process.env, home = homedir()) {
     if (dirname(path) === path) break;
   }
   return presenceRoot;
+}
+
+// Gentle Shell's only durable per-session launch roster: one JSON record per
+// task (finished ones included) at `<agentHome>/gentle-agents/tasks/<id>.json`,
+// shaped `{ task: TaskRecord, thread }` and pruned to `history_max_tasks`.
+// The live TaskStore projection cannot serve this purpose — it holds only
+// active tasks and nothing across a process reload — so a launch ordinal that
+// must be the subagent's number in THIS session is seeded from here.
+export const ROSTER_MAX_RECORDS = 1024;
+const ROSTER_MAX_RECORD_CHARS = 1 << 20;
+
+export function resolveRosterDirectory(env = process.env, home = homedir()) {
+  const agentHome = resolveAgentHome(env, home);
+  return agentHome === undefined ? undefined : join(agentHome, "gentle-agents", "tasks");
+}
+
+// Number of launches this session already made, from the persisted roster.
+// Undefined — never zero — when the answer is unknown (no directory, an
+// unreadable entry, or any malformed record), so the caller keeps its
+// in-process counter instead of claiming a session that has no history.
+export function sessionRosterLaunchCount(sessionId, directory = resolveRosterDirectory()) {
+  if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
+  if (typeof directory !== "string" || directory.length === 0) return undefined;
+  let names;
+  try {
+    names = fs.readdirSync(directory).filter((name) => name.endsWith(".json"));
+  } catch {
+    return undefined;
+  }
+  if (names.length > ROSTER_MAX_RECORDS) return undefined;
+  let launches = 0;
+  for (const name of names) {
+    let parsed;
+    try {
+      const raw = fs.readFileSync(join(directory, name), "utf8");
+      if (raw.length > ROSTER_MAX_RECORD_CHARS) return undefined;
+      parsed = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+    if (!isRecord(parsed)) return undefined;
+    const task = isRecord(parsed.task) ? parsed.task : parsed;
+    if (
+      typeof task.id !== "string" ||
+      typeof task.parentSessionId !== "string" ||
+      typeof task.createdAt !== "number"
+    ) {
+      return undefined;
+    }
+    if (task.parentSessionId === sessionId) launches += 1;
+  }
+  return launches;
 }
 
 function presenceBoundedRead(path, limit) {
@@ -752,6 +830,12 @@ const ASK_TOKEN = "gentle_ask_v1";
 // review is active (acknowledged capture/group execution only). Null /
 // clear the beat the last execution resolves — NO GRACE, no timers.
 const REVIEW_TOKEN = "gentle_review_v1";
+// Principal-only activity marker (DESIGN §4.3): session-bound + TTL-fresh
+// `<hash>:<expiry>`, emitted while this session's own agent is active and
+// cleared when it settles. It carries the principal input of
+// computeNativeState alone — the aggregate native status answers `working`
+// for any delegate, so the consumer cannot use it to decide the row.
+const PRINCIPAL_TOKEN = "gentle_principal_v1";
 
 const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
 const COUNT_RE = /^(0|[1-9]\d{0,15})$/;
@@ -1785,7 +1869,494 @@ function lastFinishedLabel(taskMap) {
   return clean || undefined;
 }
 
+// ---------------------------------------------------------------------------
+// `/herdr-gentle:customize`: exactly two switches, nothing else.
+//
+// The command is registered BEFORE the `enabled()` gate in the factory below,
+// so it stays reachable from a plain Pi session outside a Herdr pane; the
+// producer itself still needs a pane. The two switches are:
+//
+// - Sidebar agent rows. The marked `[ui.sidebar.agents.rows_by_agent]` block
+//   belongs to the Herdr plugin's own `bin/configure.js`, which is installed as
+//   its own package, so this command only drives it — `--check` to read the
+//   current state, `--apply --reload` / `--uninstall --reload` to change it —
+//   and re-reads `--check` as the completion proof instead of trusting an exit
+//   code. This file never edits the Herdr config itself.
+// - Moshi notifications. The flag file plus, while `extensions/moshi-hooks.ts`
+//   is installed, the `-extensions/moshi-hooks.ts` exclusion in Pi's
+//   settings.json, so the Moshi-managed hook cannot notify in parallel.
+//   Enabling runs the `moshi-hook` prerequisite gate first (exact-name PATH scan
+//   plus `moshi-hook status --json` reporting `paired: true`); a refusal writes
+//   nothing at all. Disabling skips the gate and stays unconditional. A Pi
+//   reload is requested only when the settings entry actually changed, because
+//   that entry is the only part that waits for the next Pi extension load.
+//
+// The removed `Plugin tools` and `Reset` sections, the two-pane TUI and the
+// cross-extension provider slot the old panel read are deliberately NOT
+// restored: they switched worktree/ODD/issues surfaces this package no longer
+// contains, and a flat `ctx.ui.select` menu is the whole interaction.
+// ---------------------------------------------------------------------------
+
+const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
+const CUSTOMIZE_SIDEBAR_LABEL = "Sidebar agent rows";
+const CUSTOMIZE_MOSHI_LABEL = "Moshi notifications";
+const CUSTOMIZE_ON = "On";
+const CUSTOMIZE_OFF = "Off";
+
+// bin/configure.js lives in the Herdr plugin (installed as its own package), so
+// the Pi side resolves that root exactly like lib/gentle-sidebar.js does:
+// read-only `herdr plugin list --json`, with GENTLE_HERDR_PLUGIN_ROOT as the
+// documented override for isolated runs. The active (renamed) id is queried
+// first; a zero match falls through to one explicit lookup by the retired id.
+// Ambiguous roots fail closed on either id.
+const HERDR_PLUGIN_ACTIVE_ID = "herdr-gentle-shell";
+const HERDR_PLUGIN_LEGACY_ID = "herdr-gentle-agents";
+
+function herdrPluginRoots(id) {
+  let result;
+  try {
+    result = spawnSync(
+      process.env.HERDR_BIN_PATH || "herdr",
+      ["plugin", "list", "--plugin", id, "--json"],
+      { encoding: "utf8", timeout: 15000, windowsHide: true },
+    );
+  } catch (error) {
+    return { ok: false, note: `could not resolve the installed plugin root: ${error?.message ?? error}.` };
+  }
+  if (result.error) {
+    return { ok: false, note: `could not resolve the installed plugin root: ${result.error.message}.` };
+  }
+  if (result.status !== 0) {
+    return { ok: false, note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
+  }
+  try {
+    const doc = JSON.parse(result.stdout || "");
+    const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
+    if (!Array.isArray(arr)) throw new Error("no plugins array");
+    const hits = arr.filter((p) => p && (p.plugin_id === id || p.id === id));
+    const roots = [...new Set(hits.map((hit) => hit.plugin_root).filter((root) => typeof root === "string" && root.length > 0))];
+    return { ok: true, roots };
+  } catch (error) {
+    return { ok: false, note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
+  }
+}
+
+function checkConfigureScript(roots) {
+  if (roots.length !== 1 || !pathIsAbsolute(roots[0])) {
+    const why = roots.length === 0 ? "no match" : "ambiguous or non-absolute";
+    return { ok: false, note: `could not resolve the installed plugin root (${why}).` };
+  }
+  const script = join(roots[0], "bin", "configure.js");
+  if (!fs.existsSync(script)) {
+    return { ok: false, note: `could not resolve the installed plugin root (${roots[0]} has no bin/configure.js).` };
+  }
+  return { ok: true, script };
+}
+
+function resolveConfigureScript() {
+  const override = process.env.GENTLE_HERDR_PLUGIN_ROOT;
+  if (typeof override === "string" && override.length > 0) {
+    return { ok: true, script: join(resolvePath(override), "bin", "configure.js") };
+  }
+  const active = herdrPluginRoots(HERDR_PLUGIN_ACTIVE_ID);
+  if (!active.ok) return active;
+  if (active.roots.length > 0) return checkConfigureScript(active.roots);
+  const legacy = herdrPluginRoots(HERDR_PLUGIN_LEGACY_ID);
+  if (!legacy.ok) return legacy;
+  if (legacy.roots.length > 0) return checkConfigureScript(legacy.roots);
+  return { ok: false, note: `could not resolve the installed plugin root (no match for ${HERDR_PLUGIN_ACTIVE_ID} or ${HERDR_PLUGIN_LEGACY_ID}).` };
+}
+
+// Fixed argv, no shell, bounded time. `--check` output is only used to explain a
+// refusal, so it is trimmed and capped.
+function runConfigureScript(script, op, reload) {
+  const args = [script, op];
+  if (reload) args.push("--reload");
+  let result;
+  try {
+    result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60000, windowsHide: true });
+  } catch (error) {
+    return { exit: -1, output: `configure ${op} could not start: ${error?.message ?? error}.` };
+  }
+  if (result.error) {
+    return { exit: -1, output: `configure ${op} could not start: ${result.error.message}.` };
+  }
+  const output = `${result.stdout || ""}${result.stderr || ""}`.trim().slice(0, 300);
+  return { exit: result.status, output };
+}
+
+// `--check` verdict: 0 = managed rows present and current, 1 = absent (needs
+// --apply), anything else = refuse (unmanaged override, unreadable config).
+function readSidebarRows(script) {
+  const ran = runConfigureScript(script, "--check", false);
+  if (ran.exit === 0) return { state: "on", output: ran.output };
+  if (ran.exit === 1) return { state: "off", output: ran.output };
+  return { state: "unknown", output: ran.output };
+}
+
+// Never throws: an unresolvable plugin root or an inconclusive check reports
+// `unknown` instead of guessing, and nothing is written by a read.
+function sidebarRowsState() {
+  const resolved = resolveConfigureScript();
+  if (!resolved.ok) return { state: "unknown", note: resolved.note };
+  return readSidebarRows(resolved.script);
+}
+
+async function applySidebarRows(want) {
+  const verb = want ? "enable" : "disable";
+  const target = want ? "on" : "off";
+  const resolved = resolveConfigureScript();
+  if (!resolved.ok) {
+    return { changed: false, needsReload: false, level: "error", text: `Could not ${verb} the sidebar agent rows: ${resolved.note}` };
+  }
+  const before = readSidebarRows(resolved.script);
+  if (before.state === target) {
+    return {
+      changed: false,
+      needsReload: false,
+      level: "info",
+      text: `Sidebar agent rows already ${target === "on" ? "enabled" : "disabled"}; nothing was changed.`,
+    };
+  }
+  const ran = runConfigureScript(resolved.script, want ? "--apply" : "--uninstall", true);
+  const after = readSidebarRows(resolved.script);
+  if (after.state !== target) {
+    const detail = ran.exit !== 0
+      ? `configure exited ${ran.exit}${ran.output ? `: ${ran.output}` : "."}`
+      : `configure reported success but the managed rows are still ${after.state}.`;
+    return { changed: false, needsReload: false, level: "error", text: `Could not ${verb} the sidebar agent rows: ${detail} Nothing was changed.` };
+  }
+  return {
+    changed: true,
+    needsReload: false,
+    level: "info",
+    text: want
+      ? "Sidebar agent rows enabled; the managed block is in place and Herdr reloaded its config."
+      : "Sidebar agent rows disabled; the managed block is gone and Herdr reloaded its config.",
+  };
+}
+
+// Moshi flag + exclusion. Both helpers mirror what the Moshi switch needs and
+// nothing else: the flag file is re-read per event, the settings entry is the
+// only edit that waits for the next Pi load.
+const MOSHI_HOOKS_REL = "extensions/moshi-hooks.ts";
+const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
+
+function writeMoshiFlag(path, enabled) {
+  fs.mkdirSync(dirname(path), { recursive: true });
+  fs.writeFileSync(path, `${JSON.stringify({ enabled, updatedAt: new Date().toISOString() })}\n`);
+}
+
+function piAgentDir() {
+  const env = process.env;
+  const selected = env.GENTLE_PI_AGENT_HOME ?? env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  if (selected === "~") return homedir();
+  if (selected.startsWith("~/")) return join(homedir(), selected.slice(2));
+  return selected;
+}
+
+function moshiHooksPath() {
+  return join(piAgentDir(), "extensions", "moshi-hooks.ts");
+}
+
+function piSettingsPath() {
+  return join(piAgentDir(), "settings.json");
+}
+
+// Fail closed: null means "do not touch it" (unreadable, invalid JSON, a
+// non-object document, or an `extensions` value that is not a list of strings).
+// A missing file yields an empty document, exactly like Pi.
+function readSettingsDoc(path) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { doc: {}, exists: false };
+    return null;
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(doc)) return null;
+  if (doc.extensions !== undefined && !Array.isArray(doc.extensions)) return null;
+  if (Array.isArray(doc.extensions) && doc.extensions.some((entry) => typeof entry !== "string")) return null;
+  return { doc, exists: true };
+}
+
+// Atomic and mode-preserving. A symlinked settings.json keeps pointing at its
+// target because the temp file is created next to the resolved target.
+function writeSettingsDoc(path, doc) {
+  let target = path;
+  try {
+    target = fs.realpathSync(path);
+  } catch {
+    // Missing or dangling: write where the path points.
+  }
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(target).mode & 0o777;
+  } catch {
+    // Fresh file.
+  }
+  const temp = join(dirname(target), `.settings.json.gentle-${randomUUID().slice(0, 8)}.tmp`);
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(doc, null, 2)}\n`, { mode });
+    fs.renameSync(temp, target);
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+function moshiExclusionPresent() {
+  const loaded = readSettingsDoc(piSettingsPath());
+  if (loaded === null) return null;
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  return list.includes(MOSHI_EXCLUSION_ENTRY);
+}
+
+// Only ever appends or removes the exact entry, preserving every other key,
+// value and entry. Both directions are gated on the Moshi-managed hook
+// existing: with no hook file there is nothing to exclude, so settings.json is
+// never touched.
+function setMoshiExclusion(want) {
+  if (!fs.existsSync(moshiHooksPath())) {
+    return { ok: true, note: `${MOSHI_HOOKS_REL} is not installed; settings.json untouched.` };
+  }
+  const settings = piSettingsPath();
+  const loaded = readSettingsDoc(settings);
+  if (loaded === null) {
+    return { ok: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
+  }
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  const present = list.includes(MOSHI_EXCLUSION_ENTRY);
+  if (want === present) {
+    return { ok: true, note: want ? "exclusion already present." : "no exclusion to remove." };
+  }
+  const next = want
+    ? [...list, MOSHI_EXCLUSION_ENTRY]
+    : list.filter((entry) => entry !== MOSHI_EXCLUSION_ENTRY);
+  try {
+    writeSettingsDoc(settings, { ...loaded.doc, extensions: next });
+  } catch (error) {
+    return { ok: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
+  }
+  return { ok: true, note: want ? `added ${MOSHI_EXCLUSION_ENTRY}.` : `removed ${MOSHI_EXCLUSION_ENTRY}.` };
+}
+
+// Moshi enable prerequisites. Before the switch flips to On: (a) `moshi-hook`
+// resolves on PATH by exact name (join + stat, never a shell), and (b)
+// `moshi-hook status --json` (fixed argv, short timeout) reports a top-level
+// `paired: true`. Pairing is what lets a notification reach the phone; only the
+// `paired` flag is read, never a token. Either check missing refuses with one
+// message naming the fix and changes NOTHING: no flag write, no settings write,
+// no exclusion entry, no reload, and the switch stays Off. The `pi` hooks entry
+// is deliberately NOT required — enabling excludes `extensions/moshi-hooks.ts`
+// on purpose, so this plugin is the single notifier.
+const MOSHI_BIN_NAME = "moshi-hook";
+const MOSHI_STATUS_ARGS = ["status", "--json"];
+const MOSHI_STATUS_TIMEOUT_MS = 5000;
+
+function resolveMoshiHook() {
+  const names = process.platform === "win32"
+    ? ["moshi-hook.exe", "moshi-hook.cmd", "moshi-hook.bat", MOSHI_BIN_NAME]
+    : [MOSHI_BIN_NAME];
+  const pathEnv = process.env.PATH ?? "";
+  for (const dir of String(pathEnv).split(pathDelimiter)) {
+    if (!dir) continue;
+    for (const name of names) {
+      const candidate = join(dir, name);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // Unreadable entries never decide; keep scanning.
+      }
+    }
+  }
+  return null;
+}
+
+function runMoshiStatus(cliPath) {
+  let result;
+  try {
+    result = spawnSync(cliPath, [...MOSHI_STATUS_ARGS], {
+      encoding: "utf8",
+      timeout: MOSHI_STATUS_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch {
+    return { ok: false, reason: "spawn-failed" };
+  }
+  if (!result || result.status !== 0) {
+    return { ok: false, reason: "non-zero-exit", status: result ? result.status : null };
+  }
+  const out = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  if (!out) return { ok: false, reason: "unparseable" };
+  let doc;
+  try {
+    doc = JSON.parse(out);
+  } catch {
+    return { ok: false, reason: "unparseable" };
+  }
+  if (!isRecord(doc)) return { ok: false, reason: "missing-field" };
+  if (doc.paired !== true) return { ok: false, reason: doc.paired === false ? "not-paired" : "missing-field" };
+  return { ok: true };
+}
+
+function moshiMissingCliText() {
+  return "Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.";
+}
+
+function moshiNotPairedText() {
+  return "Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.";
+}
+
+function moshiStatusFailedText(reason, status) {
+  let detail = "could not be run";
+  if (reason === "non-zero-exit") detail = `exited with status ${status ?? "unknown"}`;
+  else if (reason === "unparseable") detail = "produced no parseable JSON";
+  else if (reason === "missing-field") detail = "reported no paired flag";
+  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from /herdr-gentle:customize.`;
+}
+
+function checkMoshiEnablePrereqs() {
+  let cliPath = null;
+  try {
+    cliPath = resolveMoshiHook();
+  } catch {
+    cliPath = null;
+  }
+  if (typeof cliPath !== "string" || cliPath.length === 0) return { ok: false, text: moshiMissingCliText() };
+  let status;
+  try {
+    status = runMoshiStatus(cliPath);
+  } catch {
+    status = { ok: false, reason: "spawn-failed" };
+  }
+  if (status && status.ok === true) return { ok: true, cliPath };
+  if (status && status.reason === "not-paired") return { ok: false, text: moshiNotPairedText() };
+  const reason = status && typeof status.reason === "string" ? status.reason : "spawn-failed";
+  return { ok: false, text: moshiStatusFailedText(reason, status ? status.status : null) };
+}
+
+function applyMoshiNotifications(want) {
+  const file = moshiFlagPath();
+  const current = moshiFlagEnabled(file);
+  if (current === want) {
+    return {
+      changed: false,
+      needsReload: false,
+      level: "info",
+      text: `Moshi notifications already ${want ? "on" : "off"}; nothing was changed.`,
+    };
+  }
+  if (want) {
+    // The gate runs before any write, so a refusal leaves the flag, the
+    // settings file and the exclusion exactly as found.
+    const gate = checkMoshiEnablePrereqs();
+    if (!gate || gate.ok !== true) {
+      return {
+        changed: false,
+        needsReload: false,
+        level: "error",
+        text: (gate && typeof gate.text === "string" && gate.text) || moshiStatusFailedText("spawn-failed", null),
+      };
+    }
+  }
+  const exclusionBefore = moshiExclusionPresent();
+  try {
+    writeMoshiFlag(file, want);
+  } catch (error) {
+    return { changed: false, needsReload: false, level: "error", text: `Could not write ${file}: ${error?.message ?? error}; nothing was changed.` };
+  }
+  let exclusion;
+  try {
+    exclusion = setMoshiExclusion(want);
+  } catch (error) {
+    exclusion = { ok: false, note: `could not update the Moshi hook exclusion: ${error?.message ?? error}.` };
+  }
+  const exclusionAfter = moshiExclusionPresent();
+  return {
+    changed: true,
+    needsReload: exclusionBefore !== exclusionAfter,
+    level: exclusion.ok === false ? "error" : "info",
+    text: `Moshi notifications ${want ? "enabled" : "disabled"}. ${exclusion.note}`,
+  };
+}
+
+// One apply path for both switches: notify once with the verdict and reload Pi
+// only when the Moshi settings entry actually changed.
+async function applyCustomizeSwitch(id, value, ctx) {
+  const result = id === "sidebar"
+    ? await applySidebarRows(value === "on")
+    : applyMoshiNotifications(value === "on");
+  const notify = ctx?.ui?.notify;
+  if (typeof notify === "function") {
+    notify(`${result.text}${result.needsReload ? " Reloading now to apply the change." : ""}`, result.level);
+  }
+  if (result.needsReload && typeof ctx?.reload === "function") await ctx.reload();
+}
+
+async function executeCustomize(rawArgs, ctx) {
+  const notify = ctx?.ui?.notify;
+  const raw = String(rawArgs ?? "").trim();
+  const head = (raw.split(/\s+/).filter((part) => part.length > 0)[0] || "").toLowerCase();
+  if (head === "status") {
+    // One read-only line: nothing is written and nothing is reloaded.
+    const sidebar = sidebarRowsState();
+    const moshi = moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
+    if (typeof notify === "function") {
+      notify(`customize status: sidebar=${sidebar.state} moshi=${moshi}`, "info");
+    }
+    return;
+  }
+  if (head !== "") {
+    if (typeof notify === "function") {
+      notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
+    }
+    return;
+  }
+  const select = ctx?.ui?.select;
+  if (typeof select !== "function") return;
+  let picked = null;
+  try {
+    picked = await select(CUSTOMIZE_TITLE, [CUSTOMIZE_SIDEBAR_LABEL, CUSTOMIZE_MOSHI_LABEL]);
+  } catch {
+    picked = undefined;
+  }
+  // Esc/cancel (null or undefined) writes nothing and reloads nothing.
+  if (picked === undefined || picked === null) return;
+  const id = picked === CUSTOMIZE_SIDEBAR_LABEL ? "sidebar" : picked === CUSTOMIZE_MOSHI_LABEL ? "moshi" : null;
+  if (!id) return;
+  const current = id === "sidebar"
+    ? sidebarRowsState().state
+    : (moshiFlagEnabled(moshiFlagPath()) ? "on" : "off");
+  let choice = null;
+  try {
+    choice = await select(`${picked} (currently ${current})`, [CUSTOMIZE_ON, CUSTOMIZE_OFF]);
+  } catch {
+    choice = undefined;
+  }
+  if (choice !== CUSTOMIZE_ON && choice !== CUSTOMIZE_OFF) return;
+  await applyCustomizeSwitch(id, choice === CUSTOMIZE_ON ? "on" : "off", ctx);
+}
+
 export default function (pi) {
+  // Registered before the pane gate on purpose: the switches are local state and
+  // must stay reachable from a plain Pi session outside a Herdr pane.
+  if (typeof pi?.registerCommand === "function") {
+    pi.registerCommand("herdr-gentle:customize", {
+      description: "Customize Herdr Gentle Shell: sidebar agent rows and Moshi notifications",
+      handler: async (args, ctx) => {
+        await executeCustomize(args, ctx);
+      },
+    });
+  }
   if (!enabled()) return;
 
   let rootSession = false;
@@ -1820,8 +2391,23 @@ export default function (pi) {
   // arrives. Session-scoped, monotonic, never reused — a subagent launched
   // after an earlier one finished takes the next ordinal, never the freed
   // one. A resumed launch (`subagent_continue` allocates a new task id) is a
-  // fresh subagent and therefore a fresh ordinal.
+  // fresh subagent and therefore a fresh ordinal. The sequence is seeded at
+  // session start from the persisted roster (seedLaunchOrdinals), so the
+  // number under a pane row is the subagent's position in this session, not
+  // a private counter that restarts when the extension reloads.
   let launchCounter = 0;
+
+  // Session-true seeding: the roster keeps every finished launch of this
+  // session, so its count is the highest ordinal already handed out. A
+  // missing, unreadable, or malformed roster leaves the in-process counter
+  // alone (a fresh load numbers from one) — numbering must never fail the
+  // beat — and a seed never moves the counter backwards over ordinals
+  // already minted here.
+  function seedLaunchOrdinals() {
+    const seeded = sessionRosterLaunchCount(sessionId);
+    if (seeded === undefined) return;
+    launchCounter = Math.max(launchCounter, seeded);
+  }
 
   function nextLaunchOrdinal() {
     launchCounter += 1;
@@ -2382,6 +2968,15 @@ export default function (pi) {
     } else {
       tokens.gentle_orchestrating_v1 = null;
     }
+    // Principal-only activity marker: session-bound freshness
+    // (<hash>:<expiry>, same discipline as gentle_orchestrating_v1) emitted
+    // while the principal's own agent is active — `agentActive` alone, the
+    // same principal input computeNativeState uses, never the delegate
+    // aggregate that native `working` carries — and null (clear) once it
+    // settles. A settled principal therefore never publishes it, no matter
+    // how many delegates keep running.
+    if (agentActive) tokens[PRINCIPAL_TOKEN] = `${sessionHash}:${expiry}`;
+    else tokens[PRINCIPAL_TOKEN] = null;
     if (changes.files > 0) {
       const files = String(changes.files);
       const added = String(changes.added);
@@ -3203,6 +3798,7 @@ export default function (pi) {
     rootSession = true;
     sessionManager = ctx.sessionManager;
     refreshSessionRef(ctx);
+    seedLaunchOrdinals();
     moshiCtxRef = ctx;
     if (moshiEnabled()) moshiEnsureContext();
     // LIVE-1: bind the session before any state beat so Herdr attributes the

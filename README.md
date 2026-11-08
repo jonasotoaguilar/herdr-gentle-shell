@@ -9,12 +9,18 @@ Local Herdr plugin so the sidebar recognises Pi + Gentle Shell agents.
 Reports per-pane agent state (`gentle` for generic activity — machine key
 `working` — e.g. the orchestrator/main agent when settled with no fresh
 root marker; `gentle` in pink while the principal
-session actively works with no delegation active — even with zero
+session actively works — even with zero
 subagents — (machine display key
-`orchestrating`, pink palette unchanged),
-the active TaskStore role — `explorer`, `worker`, `verify`, `judge`, `rdd`
-— with delegated subagents (the oldest running role shows over root
-`gentle`, plus the total running count in parentheses only when above one),
+`orchestrating`, pink palette unchanged). The principal's own activity marker
+(`gentle_principal_v1`, published while the principal session itself works and
+cleared when it settles) decides the row — never the delegate count, and
+never Herdr's aggregate native status (which reads `working` whenever any
+delegate runs): while the principal is working it
+reads `gentle` and no delegate role word wins; while the principal is idle
+the oldest running delegate role shows — `explorer`, `worker`, `verify`,
+`judge`, `rdd` — however many delegates run. No label carries a
+running-count suffix (the Herdr disclosure list shows the individual
+subagents, numbered by their position in this session),
 `ask` (three independent event legs — choice, native questionnaire, legacy rpiv — plus
 executed `ask_user_question`/`ask_user_choice` tool calls (execution opens, end/result closes;
 proposals never block), tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD
@@ -264,8 +270,8 @@ cells, no colors wired here — row-1 glyph and identity coloring, including
 the native `state_icon`, is Herdr-native and not plugin-controlled); row 2
 wires the eleven presence-encoded `gentle_title_*` state cells (state word
 only, one current title per frame, each in its state's semantic color as
-base fg with no rules; role words carry the total running count in
-parentheses only when above one, e.g. `worker (2)`) followed by the three
+base fg with no rules; no state word carries a running-count suffix)
+followed by the three
 change-segment tokens (added green `+N`, deleted red `-N`, pull blue `↑N`,
 each its own color cell with no rules, never swapped). The review leg
 renders the user-facing word `rdd` in blue `#89b4fa` (same as
@@ -284,8 +290,7 @@ is never swapped. The custom `$gentle_heading_*` / `$gentle_project` /
 `$gentle_agent` cells and `gentle_changes_summary` stay published and owned
 for compatibility but are wired into no visible row.
 Only one `gentle_title_*` token carries a value per frame (presence
-encoding), so row 2 shows the current state word (role words with ` (n)`
-only when the running total is above one) plus any nonempty change
+encoding), so row 2 shows the current state word plus any nonempty change
 segments while the rest render empty; native separators on row 2 are
 acceptable. Row 1 holds 3 native cells and row 2 holds 14 cells (11 state
 + 3 changes), each within Herdr's 16-token per-row ceiling (full block below).
@@ -312,17 +317,31 @@ compatibility but render no visible row. `gentle`
 renders for generic activity (machine key `working`): the main agent when settled with no fresh root marker or roles
 (or active subs with an unsalvageable role shape and no fresh marker); pink
 `gentle` (machine key `orchestrating`, pink palette unchanged) renders while the principal session actively works — even with zero subagents —
-retaining running-subagent or pending-launch coverage (outranking generic
-activity only, yielding to any recognized role, `ask`/`rdd`/`blocked` and
-terminal `done` — where `done` needs settled-plus-empty (principal settled
-with no running delegates and no pending launches; a settled principal with
-running delegates keeps the oldest role, never `done`); the oldest running
-TaskStore role (`explorer`, `worker`,
-`verify`, `judge`, `rdd`) renders with delegated subagents plus the total
-running count in parentheses only when above one (e.g. `explorer (3)` for
-three explorers, `explorer (2)` for oldest-explorer-plus-worker, bare `worker`
-for a single survivor) — never a subagent name; ask/error/idle/done/gentle
-never suffix. The work total is a direct projection of the
+retaining running-subagent or pending-launch coverage. The principal's own
+activity decides the row, never the delegate count and never Herdr's
+aggregate native status (the work token counts running delegates, and the
+native status reads `working` for any running delegate, pending launch, or
+live job — so neither can say the principal works): the dedicated
+`gentle_principal_v1` marker is published while the principal session itself
+works and cleared when it settles. A **working principal** reads `gentle` —
+pink
+`orchestrating` while a fresh root marker is live — and no delegate role word
+wins; an **idle principal** shows the oldest running TaskStore role
+(`explorer`, `worker`, `verify`, `judge`, `rdd`), however many delegates run.
+Both yield to `ask`/`rdd`/`blocked` and terminal `done` — where `done` needs
+settled-plus-empty (principal settled with no running delegates and no
+pending launches; a settled principal with running delegates keeps the role
+word, never `done`). A role word is never a subagent name, and no label
+carries a running-count suffix: Herdr's disclosure list shows the individual
+subagents, each numbered by its position in this Gentle Shell session. That
+number is assigned once per subagent at launch and never reused (a finishing
+sibling never renumbers a running one, and gaps stay gaps), and the sequence
+is seeded at session start from Gentle Shell's persisted task roster
+(`<agentHome>/gentle-agents/tasks`, filtered by `parentSessionId`), so a
+mid-session extension reload continues the session's numbering — 6 finished
+launches means the next launch is 7 — instead of restarting at 1. A missing,
+unreadable, or malformed roster falls back to the in-process counter. The
+work total is a direct projection of the
 Gentle Shell TaskStore `running` records (only `running` counts as
 executing; queued/waiting never count), never a calculated
 pending-call estimate: pending tool calls are role-only display hints (exact
@@ -331,13 +350,15 @@ role even at count 0) plus label correlation, and
 true concurrent tasks all count. A live `running` record is never regressed
 by a racy non-final status read (only the authoritative launch outcomes,
 completions, and presence terminals move it), so principal activity with
-live delegates keeps the oldest role; a sanitized unknown slug exactly
+live delegates keeps `gentle` while an idle principal keeps the role word; a
+sanitized unknown slug exactly
 equal to `working` degrades to `gentle` (the bare word `working` never
 renders).
 Background launches (`subagent_run` with `mode: background`) announce
 lifecycle over `message_end` custom results: an ACTIVE status promotes the
 start into the tasks map like a task-mode record, so an active background
-worker renders `worker`, not `gentle`.
+worker keeps the pane on live activity and shows the worker role word rather
+than settling to `idle`/`done`.
 Errors render as user-facing `blocked`.
 Other agents are unaffected. `--apply` refuses (exit 2, no write) when an
 unmanaged `rows_by_agent` override already exists; remove or rename it, then
@@ -361,10 +382,9 @@ herdr server reload-config
 Live check: with the daemon running and the override applied, open a Pi pane
 and confirm row 2 shows pink `gentle` (machine key
 `orchestrating`) while
-the principal session actively works — even with zero subagents —
-(yielding to the oldest running role — `worker`,
-`explorer`, `verify`, `judge`, ... — plus the total running count in
-parentheses only when above one), row 1 shows
+the principal session actively works — even with zero subagents — and keeps
+`gentle` while its delegates run (a role word such as `worker`, `explorer`,
+`verify`, `judge` shows once the principal itself is idle), row 1 shows
 the single heading cell (`● <project>` plus ` +N`/` -N`/` ↑N` inline, zero `·`) after edits / when behind upstream; then `ask` on an open
 question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD viewer, changes view, design canvas — never counts, because opening a panel is navigation, not a question), or permission waiting; `gentle_review` starts never speculate ask) and `blocked` on error. `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
 `HERDR_CONFIG_PATH` on a temp file for apply/uninstall checks.
@@ -395,15 +415,18 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 - Full v1 state matrix including the root-session `orchestrating` marker
   (pink `●` + user-facing word `gentle`, while the principal session actively
   works — even with zero subagents — retaining subagent/pending coverage;
-  yielding to recognized roles, `ask`/`rdd`/`blocked` and terminal `done` (done
-  needs settled-plus-empty);
-  outranking generic activity (machine key `working`) only) and the authoritative TaskStore role signal
+  yielding only to `ask`/`rdd`/`blocked` and terminal `done` (done needs
+  settled-plus-empty)) and the authoritative TaskStore role signal
   (`explorer` / `worker` / `verify` / `judge` / `rdd` from `TaskRecord.agent`,
-  oldest running first by immutable first-seen; `gentle` (machine key `working`) for
-  generic activity (no delegation; an unknown delegation instead keeps its
-  original sanitized name, 32-char bound — never a generic collapse), with the total running count in
-  parentheses only when above one (`explorer (3)`, bare `worker` when single;
-  ask/error/idle/done/gentle never suffix), `ask` on blocked user input,
+  oldest running first by immutable first-seen, shown while the principal
+  itself is idle — a working principal keeps `gentle`, asserted by the
+  principal-only `gentle_principal_v1` marker rather than by the delegate
+  count or Herdr's aggregate native status; `gentle` (machine
+  key `working`) for the principal's own working state; an unknown delegation
+  keeps its original sanitized name, 32-char bound — never a generic
+  collapse), with no running-count suffix on any label (the Herdr disclosure
+  list shows the individual subagents, each numbered by its position in the
+  session), `ask` on blocked user input,
   `rdd` during native review execution (machine key stays `review`; execution
   is silent — desktop attention fires only for a waiting `ask` intent, as
   Herdr's native toast), and
@@ -419,13 +442,25 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   session model and never carried across sessions.
 - Single-writer coexistence with `herdr-pi-tree`: no shared token names, no
   dual-write, scoped sweep of own tokens on handover.
-- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement below is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `node bin/gentle-sidebar.js disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and hands the sidebar back to the native publisher (running Pi sessions need `/reload`); never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
+- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning — it reads `working` while any delegate runs — while the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` marker, so an idle principal with a running delegate shows the delegate role word instead of `gentle`. Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement below is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `node bin/gentle-sidebar.js disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and hands the sidebar back to the native publisher (running Pi sessions need `/reload`); never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
 - Sidebar switch (`enable` / `disable` / `status` / `toggle`):
   `node bin/gentle-sidebar.js <verb>` picks between this plugin's sidebar rows
   and the native Herdr sidebar. `status` is read-only; `enable` converges the
   managed Herdr rows and records the owned native-extension exclusion;
   `disable` removes only our owned rows and exclusion, never a user table.
   See [docs/sidebar-control.md](docs/sidebar-control.md).
+- In-Pi switches (`/herdr-gentle:customize`): exactly two toggles, both local
+  state and both reachable from a plain Pi session outside a Herdr pane.
+  `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
+  (`--check` to read, `--apply --reload` / `--uninstall --reload` to change) and
+  never edits the Herdr config itself; `Moshi notifications` writes the flag
+  below and adds or removes the `-extensions/moshi-hooks.ts` exclusion in Pi's
+  `settings.json`, running the `moshi-hook` pairing gate before enabling (a
+  refusal writes nothing) and reloading Pi only when that settings entry
+  actually changed. `/herdr-gentle:customize status` prints one read-only line
+  (`customize status: sidebar=<on|off|unknown> moshi=<on|off>`); an unknown
+  argument, Esc, or a cancelled menu writes nothing. The run-by-hand
+  equivalents are the CLI and the flag file shown below.
 - Optional Moshi replacement (off by default): one flag file,
   `<state dir>/gentle-moshi.json` containing `{"enabled":true}` (the state dir
   is `GENTLE_STATUS_STATE_DIR`, else the stored `herdr-gentle-agents` state dir
@@ -435,6 +470,11 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   dir="${GENTLE_STATUS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr/plugins/herdr-gentle-agents}"
   mkdir -p "$dir" && echo '{"enabled":true}' > "$dir/gentle-moshi.json"
   ```
+
+  `/herdr-gentle:customize` → `Moshi notifications` writes this flag for you,
+  and enabling there first requires the `moshi-hook` CLI on `PATH` with
+  `moshi-hook status --json` reporting `paired: true` (an unpaired host is
+  refused and nothing is written).
 
   With the flag on, this plugin **replaces the
   Moshi-managed Pi hook**: the same Moshi integration (Chat View, Live Activity,
@@ -467,8 +507,9 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   **normal panel**. Panel kind is decided from git, the pane Herdr names is
   verified to belong to its workspace and to sit in the requested path before
   Pi starts, and (unless `notify: false`) the caller is woken when that session
-  really finishes. The other worktree tools, the ODD and issues panels and the
-  Customize panel live in `odd-worktree` now. See
+  really finishes. The other worktree tools and the ODD and issues panels live
+  in `odd-worktree` now; the sidebar and Moshi switches stayed here and are
+  reached through `/herdr-gentle:customize`. See
   [docs/herdr-session-open.md](docs/herdr-session-open.md).
 
 ## Documentation

@@ -1,15 +1,17 @@
 'use strict';
-// Surviving surface of the Herdr package after the plugin-tools / customize /
-// worktree / warp / ODD / issues removal (odd/tasks/split-odd-worktree.md
-// S1, S3).
+// Surviving surface of the Herdr package after the plugin-tools / worktree /
+// warp / ODD / issues removal (odd/tasks/split-odd-worktree.md S1, S3).
 //
 // What must survive: the Herdr/Pi integration (the producer sidecar, its
-// token contract, the Herdr runtime plugin under herdr-plugin/) and the Moshi
-// notification channel. What must be gone: the worktree tools extension, its
-// libraries, its commands and its documentation. These assertions read the
-// shipped artifacts the installer and Pi consume, so a leftover file, a
-// dangling manifest entry, or a document that still teaches a removed command
-// fails here instead of after an install.
+// token contract, the Herdr runtime plugin under herdr-plugin/), the Moshi
+// notification channel, and the `/herdr-gentle:customize` command restored
+// with its two local switches (sidebar agent rows, Moshi notifications). What
+// must be gone: the worktree tools extension, its libraries, its commands and
+// its documentation, plus the removed `Plugin tools` provider slot those
+// switches used to hang off. These assertions read the shipped artifacts the
+// installer and Pi consume, so a leftover file, a dangling manifest entry, or
+// a document that still teaches a removed command fails here instead of after
+// an install.
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -113,10 +115,17 @@ describe('state sidecar', () => {
     assert.ok(source.includes('gentle-moshi.json'), 'Moshi flag file contract left the producer');
   });
 
-  test('no longer registers the customize provider slot', () => {
+  test('keeps the two-switch command but not the removed provider slot', () => {
+    // The command itself is back (sidebar agent rows + Moshi only). The
+    // cross-extension provider slot and its registrar are not: they carried the
+    // worktree/ODD/issues switches this package no longer contains.
     assert.equal(source.includes('herdr-gentle.customize.v1'), false);
     assert.equal(source.includes('registerCustomizeProviders'), false);
-    assert.equal(source.includes('/herdr-gentle:customize'), false);
+    const registered = source.indexOf('pi.registerCommand("herdr-gentle:customize"');
+    const gate = source.indexOf('if (!enabled()) return;');
+    assert.ok(registered > 0, '/herdr-gentle:customize left the producer');
+    assert.ok(gate > 0, 'the enabled() pane gate left the producer');
+    assert.ok(registered < gate, 'the command must register before the enabled() pane gate');
   });
 
   test('no longer carries worktree, ODD or issues surfaces', () => {
@@ -132,7 +141,6 @@ describe('documentation', () => {
       .filter((name) => name.endsWith('.md'))
       .map((name) => path.join('docs', name))];
     const banned = [
-      '/herdr-gentle:customize',
       '/herdr-gentle:odd',
       '/herdr-gentle:issues',
       '/herdr-gentle:warp',
@@ -166,7 +174,9 @@ describe('documentation', () => {
 describe('installer', () => {
   const installer = fs.readFileSync(path.join(ROOT, 'install.sh'), 'utf8');
 
-  test('points sidebar convergence at the shipped CLI, not the removed panel', () => {
+  test('points sidebar convergence at the shipped CLI, not the interactive command', () => {
+    // The installer is non-interactive: it drives the CLI instead of asking the
+    // user to run the Pi command.
     assert.equal(installer.includes('/herdr-gentle:customize'), false);
     assert.ok(installer.includes('bin/gentle-sidebar.js'), 'installer lost the sidebar CLI route');
   });
