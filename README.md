@@ -222,7 +222,7 @@ acceptable. Row 1 holds 3 native cells and row 2 holds 14 cells (11 state
 # row 1 native state_icon + workspace + agent, row 2 state word + changes.
 # The parent [ui.sidebar.agents] table is user-owned and never touched here.
 [ui.sidebar.agents.rows_by_agent]
-pi = [["state_icon", "workspace", "agent"], [{ token = "$gentle_title_working", fg = "#f9e2af" }, { token = "$gentle_title_orchestrating", fg = "#f5c2e7" }, { token = "$gentle_title_explorer", fg = "#89b4fa" }, { token = "$gentle_title_worker", fg = "#f9e2af" }, { token = "$gentle_title_verify", fg = "#94e2d5" }, { token = "$gentle_title_judge", fg = "#cba6f7" }, { token = "$gentle_title_ask", fg = "#fab387" }, { token = "$gentle_title_review", fg = "#89b4fa" }, { token = "$gentle_title_error", fg = "#f38ba8" }, { token = "$gentle_title_done", fg = "#a6e3a1" }, { token = "$gentle_title_idle", fg = "#7c7f93" }, { token = "$gentle_changes_added", fg = "#a6e3a1" }, { token = "$gentle_changes_deleted", fg = "#f38ba8" }, { token = "$gentle_changes_pull", fg = "#89b4fa" }]]
+pi = [["state_icon", "workspace", "agent"], [{ token = "$gentle_title_working", fg = "#f9e2af" }, { token = "$gentle_title_orchestrating", fg = "#f5c2e7" }, { token = "$gentle_title_job", fg = "#f5c2e7" }, { token = "$gentle_title_explorer", fg = "#89b4fa" }, { token = "$gentle_title_worker", fg = "#f9e2af" }, { token = "$gentle_title_verify", fg = "#94e2d5" }, { token = "$gentle_title_judge", fg = "#cba6f7" }, { token = "$gentle_title_ask", fg = "#fab387" }, { token = "$gentle_title_review", fg = "#89b4fa" }, { token = "$gentle_title_error", fg = "#f38ba8" }, { token = "$gentle_title_done", fg = "#a6e3a1" }, { token = "$gentle_title_idle", fg = "#7c7f93" }, { token = "$gentle_changes_added", fg = "#a6e3a1" }, { token = "$gentle_changes_deleted", fg = "#f38ba8" }, { token = "$gentle_changes_pull", fg = "#89b4fa" }]]
 # END herdr-gentle-agents
 ```
 
@@ -361,13 +361,20 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   managed Herdr rows and records the owned native-extension exclusion;
   `disable` removes only our owned rows and exclusion, never a user table.
   See [docs/sidebar-control.md](docs/sidebar-control.md).
-- In-Pi switches (`/herdr-gentle:customize`): exactly two toggles, both local
+- In-Pi switches (`/herdr-gentle:customize`): two switches, both local
   state and both reachable from a plain Pi session outside a Herdr pane. With
-  no argument the command opens the restored floating two-pane panel
-  (`Herdr Sidebar` and `Moshi notifications`; `←/→` or `Tab` moves between the
-  category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter` toggles the
-  focused switch and `Esc` closes). Each switch is one row that reads its stored
-  state, so `On` becomes `Off` and back in a single key press. The plain two-step menu stays as the fallback
+  no argument the command opens the floating panel in Gentle Shell's own
+  layout: one left `CATEGORIES` list (`Herdr Sidebar`, `Moshi notifications`)
+  and one right pane headed `<Category> · n/m` with its setting rows, each row
+  painting the stored value with `●` and the other with `○`; the footer reads
+  `Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`, and `←/→` or
+  `Tab` moves between the category and value panes, `↑/↓` or `j/k` moves the
+  cursor while `Esc` closes. A click on a category selects it and a click on a
+  row applies it, exactly like `Enter` on the focused row; clicks outside the
+  panes are ignored. The notifications switch appears twice — as its own
+  `Moshi notifications` category and as a `Notifications` row inside
+  `Herdr Sidebar` — and both rows read the one flag below, so the state they
+  show can never disagree. The plain two-step menu stays as the fallback
   when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
   (`--check` to read, `--apply --reload` / `--uninstall --reload` to change) and
@@ -392,10 +399,11 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   mkdir -p "$dir" && echo '{"enabled":true}' > "$dir/gentle-moshi.json"
   ```
 
-  `/herdr-gentle:customize` → `Moshi notifications` writes this flag for you,
-  and enabling there first requires the `moshi-hook` CLI on `PATH` with
-  `moshi-hook status --json` reporting `paired: true` (an unpaired host is
-  refused and nothing is written).
+  `/herdr-gentle:customize` → `Moshi notifications` (or the `Notifications` row
+  inside `Herdr Sidebar`) writes this flag for you, and enabling there first
+  requires the `moshi-hook` CLI on `PATH` with `moshi-hook status --json`
+  reporting `paired: true` (an unpaired host is refused and nothing is
+  written).
 
   With the flag on, this plugin **replaces the
   Moshi-managed Pi hook**: the same Moshi integration (Chat View, Live Activity,

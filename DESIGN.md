@@ -319,6 +319,29 @@ gentle_principal_v1   = sessionHash ":" expiry
                     ; principal settles; decides working vs idle in §5.2
                     ; while the native status keeps its aggregate meaning
                     ; (running delegate / pending launch / live job = working)
+gentle_done_v1        = sessionHash ":" expiry
+                    ; synthesized finish signal, no count — minted ONCE at the
+                    ; settled-and-empty edge (principal settled, zero
+                    ; running/queued delegates, zero pending launches, zero
+                    ; live background jobs, no ask/review/error leg), then
+                    ; republished with the SAME expiry (never refreshed) until
+                    ; it lapses; null (clear) whenever work reappears or the
+                    ; session resets. Its expiry IS the done hold: default
+                    ; 60 s, overridden by GENTLE_HERDR_DONE_HOLD_MS clamped to
+                    ; [1000, 300000], and the consumer accepts no expiry beyond
+                    ; now+300000 at read (the only token whose ceiling is not
+                    ; the 60 s TTL). A session that never worked never mints
+                    ; one.
+gentle_jobs_v1        = sessionHash ":" count ":" expiry
+                    ; pending background-job count (bash_background /
+                    ; monitor) from Gentle Shell's own session-scoped bus
+                    ; snapshot, session-bound + TTL-fresh like gentle_work_v1;
+                    ; emitted ONLY while the session is purely waiting on those
+                    ; jobs — principal settled, no running/queued delegate, no
+                    ; pending launch — and null (clear) the beat the principal
+                    ; resumes, a delegate starts, or the last job ends. Never
+                    ; a delegate count and never a finish: a settled session
+                    ; with a job pending is unfinished work.
 gentle_ask_v1         = sessionHash ":" intentId ":" expiry
                     ; durable ask signal, session-bound + TTL-fresh like
                     ; gentle_orchestrating_v1 — emitted on every beat while
@@ -343,7 +366,9 @@ left it.
 
 Validation: consumers MUST reject tokens failing the grammar (wrong hash
 length, `expiry` in the past or `> now+60000` at read, non-numeric counts)
-and treat the pane as `unknown → idle` for that signal (§7).
+and treat the pane as `unknown → idle` for that signal (§7). `gentle_done_v1`
+is the one ceiling exception: it is validated against `now+300000` so an
+overridden hold stays readable, and it still fails closed on a past expiry.
 
 ### 4.4 Examples
 
@@ -422,6 +447,11 @@ carry it as a suffix only when above one), `gentle_orchestrating_v1` (root-only 
 + freshness gate for the `orchestrating` display — never rendered as a
 count), `gentle_principal_v1` (principal-only activity marker + freshness
 gate for the working-vs-idle decision — never rendered as a count),
+`gentle_done_v1` (synthesized finish signal + its own hold freshness gate
+for the reachable `done` display — the host never reports `done`, §4.3),
+`gentle_jobs_v1` (pending background-job count + freshness gate for the pink
+`job` wait — published only while the principal is settled with no delegate
+running or launching, §4.3),
 `gentle_roles_v1` (authoritative activity roles,
 oldest-first by immutable firstSeen), `gentle_names_v1` (compat transport only — never
 rendered), `gentle_changes_v2` (normative; a
@@ -459,20 +489,40 @@ orchestrating := gentle_orchestrating_v1 fresh with no role word above
                  a working principal, and role words stay higher)
 working(main) := gentle_work_v1 fresh AND count > 0 with no role word
                  OR (gentle_work_v1 fresh AND count = 0 AND agent not settled)
-done          := native done AND gentle_work_v1 fresh with count = 0
-                 (no running delegates) AND no roles AND no fresh
-                 gentle_orchestrating_v1 — count 0 alone never implies
-                 empty, since the running-only count excludes queued subs
-                 the fresh marker still covers; a fresh marker or any roles
-                 veto terminal (queued cover, pending-launch hint)
+job           := fresh `gentle_jobs_v1` with count > 0 AND `gentle_work_v1`
+                 fresh with count = 0 (no running delegates) AND no roles AND
+                 no fresh `gentle_principal_v1` — the principal settled with no
+                 delegate running or launching while at least one background
+                 job still waits. Evaluated BEFORE `done` (a finish with a job
+                 pending is not finished) and below every attention state; a
+                 fresh `gentle_orchestrating_v1` does not block it (the marker
+                 stays live while the job runs). Any stale count, or a count
+                 that arrives beside a working principal/role, is ignored
+                 (fail closed).
+done          := (native done OR fresh gentle_done_v1) AND gentle_work_v1
+                 fresh with count = 0 (no running delegates) AND no roles AND
+                 no fresh gentle_orchestrating_v1 AND no fresh
+                 gentle_principal_v1 — count 0 alone never implies empty,
+                 since the running-only count excludes queued subs the fresh
+                 marker still covers; a fresh marker, any roles, or a working
+                 principal veto terminal (queued cover, pending-launch hint).
+                 The producer's finish token is the reachable path (the host
+                 never emits done); its expiry is the hold, so `done` recedes
+                 to `idle` when it lapses and is never skipped in between
 idle          := otherwise (native fallback; also all-gentle-tokens-missing-or-expired)
 ```
 
-Priority: `error > ask > review > done > principal working > role > orchestrating > working(main) > idle`.
+Priority: `error > ask > review > job > done > principal working > role > orchestrating > working(main) > idle`.
+`job` is matched before `done` (a pending job is unfinished work) and both are
+matched before the principal/role branches in the reducer; they are listed here
+below the activity branches only so their settled-and-empty preconditions read
+together.
 `blocked` labels are namespaced, so simultaneous
 `ask:` + `review:` resolves deterministically to `ask`. Attention states
 (error/ask/review) and the terminal `done` state always outrank principal
-status and activity roles. Below them the principal's own activity decides,
+status and activity roles. The pending-job `job` wait sits just above the
+terminal `done` and below every attention state and every live activity
+signal. Below them the principal's own activity decides,
 never the delegate count and never the aggregate native status: a **working
 principal** renders `gentle` (pink
 `orchestrating` while a fresh root marker is live) and outranks every
@@ -483,7 +533,8 @@ signal (it stays live while the principal is idle with queued or running
 delegates), so it never outranks a role word. An in-flight attention `review`
 (fresh `review:` label or durable `gentle_review_v1` token) overrides the
 role list; a settled session renders `done` even against a stale-fresh
-marker.
+marker, and only after the minted finish hold lapses does it recede to
+`idle` (§4.3).
 
 ### 5.3 Publication (sidebar tokens)
 
@@ -496,17 +547,19 @@ marker.
   custom `$gentle_heading_*` / `$gentle_project` / `$gentle_agent` cells
   stay published and owned for compatibility but are wired into no visible
   row. Deleted lines stay red and added lines stay green (never swapped).
-  The visible second row is structural, with no rules: the eleven
+  The visible second row is structural, with no rules: the twelve
   presence-encoded
-  `gentle_title_<working|orchestrating|explorer|worker|verify|judge|ask|review|error|done|idle>`
+  `gentle_title_<working|orchestrating|job|explorer|worker|verify|judge|ask|review|error|done|idle>`
   state tokens (state word only: `working` / `gentle` (machine key
-  `orchestrating`) / `explorer` / `worker` /
+  `orchestrating`) / `job` / `explorer` / `worker` /
   `verify` / `judge` / `ask` / `blocked` / `done` / `idle` / `review`;
-  role words carry a running-count suffix above one).
+  role words carry a running-count suffix above one, and the `job` word carries
+  the pending-job count the same way).
   Only the current display's title token carries a value; the rest are null.
   Each state cell carries its state's semantic color as its base fg with
   no rules — working/worker golden `#f9e2af`, orchestrating pink fuchsia
-  `#f5c2e7`, explorer blue `#89b4fa`, verify teal `#94e2d5`, judge purple
+  `#f5c2e7`, job the same pink fuchsia `#f5c2e7` (a second pink wait state,
+  distinct by wording from `gentle`), explorer blue `#89b4fa`, verify teal `#94e2d5`, judge purple
   `#cba6f7` (distinct from explorer blue, verify teal, orchestrating pink),
   ask orange `#fab387`, blocked red `#f38ba8`, done green `#a6e3a1`,
   idle grey `#7c7f93` (recedes), review blue `#89b4fa` (same as
@@ -524,7 +577,11 @@ marker.
   unsalvageable role shapes) |
   `gentle` (user-facing word for the `orchestrating` machine key — fresh
   root-session marker while the principal works, with or without active
-  delegation, even with zero subagents; pink palette unchanged) | `explorer` / `worker` / `verify` / `judge` (oldest
+  delegation, even with zero subagents; pink palette unchanged) | `job` (the
+  pending background-job wait: principal settled, no delegate running or
+  launching, at least one `bash_background` / `monitor` job still live; pink,
+  with the pending total in parentheses above one; gone the beat the principal
+  resumes or a delegate starts) | `explorer` / `worker` / `verify` / `judge` (oldest
   TaskStore role word while the principal itself is idle, however many
   delegates run) | `ask` | `rdd` (user-facing word for the `review`
   machine key; a delegated rdd and a tool-only review both render `rdd` —
@@ -535,7 +592,7 @@ marker.
   running delegates keeps the role word) | `idle`. Role labels append the
   total count when at least two delegates run.
 - Row-2 changes: the nonempty `+N`/`-N`/`↑N` segments ride as their own
-  structural row-2 cells after the eleven title cells (each its own color
+  structural row-2 cells after the twelve title cells (each its own color
   cell with no rules — added green, deleted red, pull blue, never
   swapped; empty segments collapse so nothing renders). `+N`/`-N` come
   from fresh `gentle_changes_v2`
@@ -555,8 +612,8 @@ marker.
   badge is never emitted (see the §4.3 versioning rule).
 - Placement: exactly two pi-only rows — row 1 the native `state_icon` +
   `workspace` + `agent` strings (3 cells, no custom wiring, no plugin
-  colors), row 2 the eleven `gentle_title_*` state cells plus the three
-  change-segment cells (14 cells: 11 state + 3 changes), each row within
+  colors), row 2 the twelve `gentle_title_*` state cells plus the three
+  change-segment cells (15 cells: 12 state + 3 changes), each row within
   Herdr's 16-token per-row ceiling — with the
   herdr-pi-tree palette (added green `#a6e3a1`,
   removed red `#f38ba8`, pull blue `#89b4fa`, working golden `#f9e2af`, ask
@@ -631,9 +688,11 @@ other two). All gentle signals stale/missing → `idle` (native fallback, O5).
   `intentId`, subtitle `Answer in terminal`, title `Gentle ask: <project>`,
   message `<project> has a question and is waiting for your answer. Return
   to Pi to respond.`) and
-  `task_complete` once per real finish (the native transition into `idle`:
-  settled plus zero running/queued plus zero pending plus zero live
-  background jobs plus no human wait),
+  `task_complete` once per real finish (the synthesized `done` edge: the beat
+  that delivers a fresh minted `gentle_done_v1` — settled plus zero
+  running/queued plus zero pending plus zero live background jobs plus no
+  human wait — never a raw native `working → idle` transition, which fires
+  with work still left and skipped `done` entirely),
   never per prompt and never per turn. A `session.closed` (`session_ended`)
   envelope closes the row on shutdown, and the host-awaited handler flushes
   in-flight sends. `task_complete` carries title `Gentle finished: <project>`
@@ -673,7 +732,7 @@ report after a Pi restart or `/new` (both recreate the extension runtime)
 lose, freezing the pane's `agent_session` binding at the old session while
 the producer keeps beating for the new one — the consumer then rejects those
 fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
-report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning (it reads `working` while any delegate runs, which is what Herdr's own pane state means): the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` instead (§5.2), so an idle principal with a running delegate shows the delegate role word rather than `gentle`. Single publisher by design: the managed native extension file is excluded
+report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped; an absent Gentle Shell simply reports none (today's behavior). While such a job waits with the principal settled and no delegate running or launching, the producer publishes the pending count as `gentle_jobs_v1` so the sidebar shows the pink `job` wait (§5.2); the count clears on the beat the principal resumes, a delegate starts, or the last job ends. `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning (it reads `working` while any delegate runs, which is what Herdr's own pane state means): the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` instead (§5.2), so an idle principal with a running delegate shows the delegate role word rather than `gentle`. Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
   preserved on disk, never auto-loaded next to ours). `node
   bin/gentle-sidebar.js (enable|disable|status|toggle)` selects the
@@ -711,13 +770,25 @@ nothing:
 
 `/herdr-gentle:customize status` prints one read-only line; an unknown
 argument, Esc, or a cancelled menu writes nothing. With no argument the
-command opens the recovered floating two-pane panel
-(`lib/customize-panel.js`, painted through its own palette)
-over `ctx.ui.custom`: `←/→` or `Tab` moves between the category and value panes,
-`↑/↓` or `j/k` moves the cursor, `Enter` toggles the focused switch and `Esc`
-closes without a write. Each switch renders exactly one row that reads its
-stored state and carries the opposite value, so `Enter` is the whole toggle.
-An inconclusive sidebar verdict (`unknown`) renders as `Unknown` with a note
+command opens the floating panel (`lib/customize-panel.js`, painted through its
+own palette) over `ctx.ui.custom` in Gentle Shell's own layout: one left
+`CATEGORIES` list, one right pane headed `<Category> · n/m` with its setting
+rows, each row painting the stored value with `●` and the other with `○`, and
+the footer
+`Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`. There is no
+`Preview · …` band and no `p profiles` key: this plugin owns no profiles
+concept, so the footer advertises nothing it cannot do. `←/→` or `Tab` moves
+between the category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter`
+applies the focused row and `Esc` closes without a write; a click on a category
+selects it, a click on a row applies it, and a click outside the panes is
+ignored (a press only captures the gesture, so a drag never applies a row).
+Each switch is one row that paints the stored state and carries the opposite
+value. The notifications switch appears under both `Herdr Sidebar` (as
+`Notifications`, where the plugin's own switches are looked for) and its own
+`Moshi notifications` category: a row names the switch it drives, so both
+apply the one `gentle-moshi.json` flag through `applyMoshiNotifications` and
+whosever change it was is what both rows read on the next render.
+An inconclusive sidebar verdict (`unknown`) renders as `● Unknown` with a note
 instead of hiding the row: toggling still attempts the repair and reports the
 apply step's own error, exactly like the menu. The plain
 two-step `ctx.ui.select` menu remains the
@@ -730,17 +801,18 @@ exactly one mechanism writes each piece of state.
 ## 8. Limits
 
 - Token budget: ≤ 16 tokens per report per pane (E8 discipline); the
-  producer emits at most 10 tokens per beat (including the retired-token clear) (`gentle_work_v1`,
+  producer emits at most 12 tokens per beat (including the retired-token clear) (`gentle_work_v1`,
   `gentle_roles_v1`, `gentle_names_v1`,
-  `gentle_orchestrating_v1`, `gentle_principal_v1`,
-  `gentle_ask_v1`, `gentle_review_v1`, `gentle_changes_v2`,
-  `gentle_changes_v1`) and the daemon publishes its 72-token owned family
+  `gentle_orchestrating_v1`, `gentle_principal_v1`, `gentle_done_v1`,
+  `gentle_jobs_v1`, `gentle_ask_v1`, `gentle_review_v1`, `gentle_changes_v2`,
+  `gentle_changes_v1`) and the daemon publishes its 78-token owned family
   chunked ≤ 16 per report (row 1 is the 3 native tokens
-  `state_icon`/`workspace`/`agent`; the legacy 11 `gentle_heading_*` compat
-  family stays published but wired into no visible row. Row 2 wires 11
-  title + 3 change cells = 14 — each within the per-row ceiling). Names are
+  `state_icon`/`workspace`/`agent`; the legacy 12 `gentle_heading_*` compat
+  family stays published but wired into no visible row. Row 2 wires 12
+  title + 3 change cells = 15 — each within the per-row ceiling). Names are
   advisory; roles are authoritative for display and role labels carry the
-  running total as a suffix when at least two delegates run.
+  running total as a suffix when at least two delegates run, the job label the
+  pending-job total the same way.
 - TTL: `expiry <= now + 60000` at write; readers use `now` at read.
   Clock skew assumption ≤ 5 s (documented; not compensated).
 - Field bounds: `count` ≤ 16 digits; `label` ≤ 64 chars; names/roles
@@ -766,12 +838,13 @@ exactly one mechanism writes each piece of state.
 
 - Additive only in v1: new token names (`gentle_work_v1`,
   `gentle_roles_v1`, `gentle_names_v1`,
-  `gentle_orchestrating_v1`, `gentle_principal_v1`,
+  `gentle_orchestrating_v1`, `gentle_principal_v1`, `gentle_done_v1`,
+  `gentle_jobs_v1`,
   `gentle_ask_v1`, `gentle_review_v1`, `gentle_changes_v1`, `gentle_changes_v2`,
   `gentle_state_*`, `gentle_title_*`, `gentle_agent_*`, `gentle_agent`,
   `gentle_icon_*`,
   `gentle_heading_*`, `gentle_project`, `gentle_row_*` (each family now
-  includes the `judge` display alongside the original ten), plus display-only
+  includes the `judge` and `job` displays alongside the original ten), plus display-only
   `gentle_changes_added`, `gentle_changes_deleted`,
   `gentle_changes_pull`, `gentle_changes_summary`); no change to `pi_subagents_work_v1`, `state_*`,
   `title_*`, or native `working`/`blocked`/`idle` semantics.

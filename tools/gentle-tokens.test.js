@@ -404,7 +404,7 @@ describe('idle principal + marker keeps the delegate role word', () => {
 describe('orchestrating display family', () => {
   it('display key stays orchestrating; label, icon, heading, row use gentle', () => {
     assert.ok(tokens.DISPLAYS.includes('orchestrating'));
-    assert.equal(tokens.DISPLAYS.length, 11);
+    assert.equal(tokens.DISPLAYS.length, 12);
     assert.equal(tokens.DISPLAY_LABELS.orchestrating, 'gentle');
     assert.equal(tokens.iconValueFor('orchestrating'), '●');
     assert.equal(tokens.headingValueFor('orchestrating', 'myproj'), '● myproj');
@@ -440,8 +440,8 @@ describe('orchestrating display family', () => {
     }
   });
 
-  it('owned and sweep lists include judge (66 + 6 = 72)', () => {
-    assert.equal(tokens.OWNED_TOKENS.length, 72);
+  it('owned and sweep lists include judge (66 + 6 = 72; job adds 6 more)', () => {
+    assert.equal(tokens.OWNED_TOKENS.length, 78);
     const names = [
       'gentle_state_orchestrating',
       'gentle_title_orchestrating',
@@ -614,6 +614,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
     const order = [
       '$gentle_title_working',
       '$gentle_title_orchestrating',
+      '$gentle_title_job',
       '$gentle_title_explorer',
       '$gentle_title_worker',
       '$gentle_title_verify',
@@ -633,7 +634,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
       assert.ok(idx > prev, token + ' in order on row 2');
       prev = idx;
     }
-    assert.equal(cells(row2), 14);
+    assert.equal(cells(row2), 15);
     assert.ok(!row2.includes('rules'));
     assert.ok(!row2.includes('$gentle_heading_'));
     assert.ok(!row2.includes('$gentle_project'));
@@ -646,6 +647,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
     const expected = [
       ['$gentle_title_working', 'SIDEBAR_AMBER'],
       ['$gentle_title_orchestrating', 'SIDEBAR_FUCHSIA'],
+      ['$gentle_title_job', 'SIDEBAR_FUCHSIA'],
       ['$gentle_title_explorer', 'SIDEBAR_BLUE'],
       ['$gentle_title_worker', 'SIDEBAR_AMBER'],
       ['$gentle_title_verify', 'SIDEBAR_TEAL'],
@@ -1125,9 +1127,9 @@ describe('T2b role words and running delegate count', () => {
     assert.equal(reduced.label, 'idle');
   });
 
-  it('owned/sweep families include judge (72 total) and row 2 holds 14 cells', () => {
-    assert.equal(tokens.DISPLAYS.length, 11);
-    assert.equal(tokens.OWNED_TOKENS.length, 72);
+  it('owned/sweep families include judge (72 total, 78 with job) and row 2 holds 15 cells', () => {
+    assert.equal(tokens.DISPLAYS.length, 12);
+    assert.equal(tokens.OWNED_TOKENS.length, 78);
     assert.ok(tokens.OWNED_TOKENS.includes('gentle_state_judge'));
     assert.ok(tokens.OWNED_TOKENS.includes('gentle_title_judge'));
     assert.ok(tokens.SWEEP_TOKENS.includes('gentle_title_judge'));
@@ -1391,5 +1393,278 @@ describe('principal interleave precedence (working principal outranks roles)', (
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'working');
     assert.equal(reduced.label, 'gentle');
+  });
+});
+
+// S2/D2: the host never reports `done`, so the producer synthesizes the finish
+// itself — a session-bound `gentle_done_v1` token minted once at the
+// settled-and-empty edge (principal settled, no delegates, no pending launch,
+// no live job). The consumer reads it as `done` while it is fresh and lets the
+// pane recede to `idle` when it expires, so `done` is never skipped.
+describe('synthesized finish signal (gentle_done_v1): done then idle', () => {
+  function finishEntry({ expiry = EXPIRY, roles = '', count = 0, status = 'idle' } = {}) {
+    const built = roleEntry(roles, { count });
+    built.entry.tokens[tokens.DONE_TOKEN] = `${built.hash}:${expiry}`;
+    built.entry.agent_status = status;
+    return built;
+  }
+
+  it('a fresh finish token makes done reachable although the host never reports done', () => {
+    assert.equal(tokens.DONE_TOKEN, 'gentle_done_v1');
+    const { entry } = finishEntry();
+    assert.equal(entry.agent_status, 'idle');
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'done');
+    assert.equal(reduced.label, 'done');
+    assert.equal(reduced.owned, true);
+    assert.equal(reduced.notify, null);
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.STATE_TOKENS.done], 'done');
+    assert.equal(patch[tokens.TITLE_TOKENS.done], 'done');
+    for (const display of tokens.DISPLAYS) {
+      if (display === 'done') continue;
+      assert.equal(patch[tokens.TITLE_TOKENS[display]], null);
+    }
+  });
+
+  it('done outranks the host aggregate status at the settle edge (never skipped)', () => {
+    // The producer publishes the finish token on the same beat that reports
+    // native idle; a host still holding the aggregate `working` (a delegate or
+    // job that just ended) must not erase the finish.
+    for (const status of ['idle', 'working', 'unknown']) {
+      const { entry } = finishEntry({ status });
+      assert.equal(tokens.reducePane(entry, NOW).display, 'done', status);
+    }
+  });
+
+  it('done holds while fresh and recedes to idle only at the expiry', () => {
+    const { entry } = finishEntry();
+    for (const now of [NOW, NOW + 1, EXPIRY - 1]) {
+      assert.equal(tokens.reducePane(entry, now).display, 'done', `${now - NOW}ms into the hold`);
+    }
+    assert.equal(tokens.reducePane(entry, EXPIRY).display, 'idle');
+    assert.equal(tokens.reducePane(entry, EXPIRY + 1).display, 'idle');
+  });
+
+  it('stale, foreign, malformed, or over-horizon finish tokens fail closed', () => {
+    const { hash } = finishEntry();
+    const foreign = sessionHashFor(
+      baseEntry({ agent_session: { agent: 'pi', kind: 'path', value: '/other/finish' } }),
+    );
+    for (const bad of [
+      `${hash}:${NOW}`,
+      `${hash}:0`,
+      `${foreign}:${EXPIRY}`,
+      `${hash}:${EXPIRY}:extra`,
+      `${hash}:${NOW + tokens.FINISH_HOLD_MAX_MS + 1000}`,
+      'done',
+      '',
+      null,
+    ]) {
+      assert.equal(tokens.parseDone(bad, hash, NOW), null, String(bad));
+    }
+    assert.equal(tokens.parseDone(`${hash}:${EXPIRY}`, hash, NOW) !== null, true);
+    assert.equal(tokens.parseDone(`${hash}:${EXPIRY}`, null, NOW), null, 'no session binding, no signal');
+
+    const stale = finishEntry({ expiry: NOW });
+    assert.equal(tokens.reducePane(stale.entry, NOW).display, 'idle');
+    const overlong = finishEntry({ expiry: NOW + tokens.FINISH_HOLD_MAX_MS + 1000 });
+    assert.equal(tokens.reducePane(overlong.entry, NOW).display, 'idle');
+    const foreignBuilt = finishEntry();
+    foreignBuilt.entry.tokens[tokens.DONE_TOKEN] = `${foreign}:${EXPIRY}`;
+    assert.equal(tokens.reducePane(foreignBuilt.entry, NOW).display, 'idle');
+  });
+
+  it('live evidence outranks the finish token (precedence regression guard)', () => {
+    // A delegated agent, a principal turn, a queued-sub marker, or an
+    // attention leg appearing during the hold always wins over `done`.
+    const role = finishEntry({ roles: 'worker', count: 1 });
+    assert.equal(tokens.reducePane(role.entry, NOW).display, 'worker');
+
+    const counted = finishEntry({ count: 2 });
+    assert.equal(tokens.reducePane(counted.entry, NOW).display, 'working');
+
+    const principal = finishEntry();
+    principal.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(principal.hash);
+    assert.equal(tokens.reducePane(principal.entry, NOW).display, 'working');
+
+    const marker = finishEntry();
+    marker.entry.tokens[tokens.ORCH_TOKEN] = `${marker.hash}:${EXPIRY}`;
+    assert.equal(tokens.reducePane(marker.entry, NOW).display, 'orchestrating');
+
+    const ask = finishEntry();
+    ask.entry.state_labels = { 0: 'ask:q9' };
+    const askReduced = tokens.reducePane(ask.entry, NOW);
+    assert.equal(askReduced.display, 'ask');
+    assert.deepEqual(askReduced.notify, { sessionHash: ask.hash, intentId: 'q9', expiry: EXPIRY });
+
+    const review = finishEntry();
+    review.entry.tokens[tokens.REVIEW_TOKEN] = `${review.hash}:r3:${EXPIRY}`;
+    assert.equal(tokens.reducePane(review.entry, NOW).display, 'review');
+
+    const error = finishEntry();
+    error.entry.state_labels = { 0: 'error:e9' };
+    const errorReduced = tokens.reducePane(error.entry, NOW);
+    assert.equal(errorReduced.display, 'error');
+    assert.equal(errorReduced.notify, null);
+  });
+
+  it('a stale finish token with a fresh role keeps the role word', () => {
+    const { entry } = finishEntry({ expiry: NOW, roles: 'verify', count: 1 });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'verify');
+    assert.equal(reduced.label, 'verify');
+  });
+});
+
+// S5/D4: while the principal is settled with no delegate running and at least
+// one Gentle Shell background job (`bash_background` / `monitor`) still waits,
+// the row shows the pink `job` state instead of generic `gentle`. It outranks
+// the terminal `done` and disappears the moment the principal resumes or a
+// delegate starts — the producer only publishes the count during that wait, and
+// the precondition checks below refuse a stale one.
+describe('pending background job wait (gentle_jobs_v1): pink job state', () => {
+  function jobEntry({ jobs = 1, count = 0, roles = '', principal = false, marker = false, status = 'working', expiry = EXPIRY } = {}) {
+    const built = roleEntry(roles, { count });
+    built.entry.tokens[tokens.JOBS_TOKEN] = `${built.hash}:${jobs}:${expiry}`;
+    if (principal) built.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(built.hash);
+    if (marker) built.entry.tokens[tokens.ORCH_TOKEN] = `${built.hash}:${EXPIRY}`;
+    built.entry.agent_status = status;
+    return built;
+  }
+
+  it('a settled principal waiting on one job shows job with no count', () => {
+    assert.equal(tokens.JOBS_TOKEN, 'gentle_jobs_v1');
+    const { entry } = jobEntry();
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'job');
+    assert.equal(reduced.label, 'job');
+    assert.equal(reduced.notify, null);
+    assert.equal(reduced.owned, true);
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.STATE_TOKENS.job], 'job');
+    assert.equal(patch[tokens.TITLE_TOKENS.job], 'job');
+    for (const display of tokens.DISPLAYS) {
+      if (display === 'job') continue;
+      assert.equal(patch[tokens.TITLE_TOKENS[display]], null);
+    }
+  });
+
+  it('two or more pending jobs carry the count in parentheses', () => {
+    for (const jobs of [2, 3]) {
+      const { entry } = jobEntry({ jobs });
+      const reduced = tokens.reducePane(entry, NOW);
+      assert.equal(reduced.display, 'job');
+      assert.equal(reduced.label, `job (${jobs})`);
+      assert.equal(tokens.displayTokens(reduced)[tokens.TITLE_TOKENS.job], `job (${jobs})`);
+    }
+    const { entry: single } = jobEntry({ jobs: 1 });
+    assert.doesNotMatch(tokens.reducePane(single, NOW).label, /\(/);
+  });
+
+  it('the job word keeps the pink sibling shape: ● icon, heading, row', () => {
+    assert.equal(tokens.DISPLAY_LABELS.job, 'job');
+    assert.equal(tokens.iconValueFor('job'), '●');
+    assert.equal(tokens.headingValueFor('job', 'myproj'), '● myproj');
+    assert.equal(tokens.rowValueFor('job', 'pi', 'job (2)'), 'pi · job (2)');
+    for (const name of [
+      'gentle_state_job',
+      'gentle_title_job',
+      'gentle_agent_job',
+      'gentle_icon_job',
+      'gentle_heading_job',
+      'gentle_row_job',
+    ]) {
+      assert.ok(tokens.OWNED_TOKENS.includes(name), name);
+      assert.ok(tokens.SWEEP_TOKENS.includes(name), name);
+    }
+  });
+
+  it('job outranks done (a finish with a job pending is not finished)', () => {
+    const built = jobEntry({ jobs: 2 });
+    built.entry.tokens[tokens.DONE_TOKEN] = `${built.hash}:${EXPIRY}`;
+    const reduced = tokens.reducePane(built.entry, NOW);
+    assert.equal(reduced.display, 'job');
+    assert.equal(reduced.label, 'job (2)');
+  });
+
+  it('job disappears the moment the principal resumes or a delegate starts', () => {
+    const principal = jobEntry({ principal: true });
+    assert.equal(tokens.reducePane(principal.entry, NOW).display, 'working');
+
+    const role = jobEntry({ roles: 'worker', count: 1 });
+    assert.equal(tokens.reducePane(role.entry, NOW).display, 'worker');
+
+    const queued = jobEntry({ roles: 'explorer', count: 0 });
+    assert.equal(tokens.reducePane(queued.entry, NOW).display, 'explorer');
+
+    const counted = jobEntry({ count: 1 });
+    assert.equal(tokens.reducePane(counted.entry, NOW).display, 'working');
+  });
+
+  it('the live orchestrating marker does not block job, and attention still wins', () => {
+    const marker = jobEntry({ marker: true });
+    assert.equal(tokens.reducePane(marker.entry, NOW).display, 'job');
+
+    const ask = jobEntry();
+    ask.entry.state_labels = { 0: 'ask:q4' };
+    const askReduced = tokens.reducePane(ask.entry, NOW);
+    assert.equal(askReduced.display, 'ask');
+    assert.deepEqual(askReduced.notify, { sessionHash: ask.hash, intentId: 'q4', expiry: EXPIRY });
+
+    const error = jobEntry();
+    error.entry.state_labels = { 0: 'error:e4' };
+    assert.equal(tokens.reducePane(error.entry, NOW).display, 'error');
+
+    const review = jobEntry();
+    review.entry.tokens[tokens.REVIEW_TOKEN] = `${review.hash}:r4:${EXPIRY}`;
+    assert.equal(tokens.reducePane(review.entry, NOW).display, 'review');
+  });
+
+  it('stale, foreign, malformed, or zero job counts fail closed', () => {
+    const { hash } = jobEntry();
+    const foreign = sessionHashFor(
+      baseEntry({ agent_session: { agent: 'pi', kind: 'path', value: '/other/jobs' } }),
+    );
+    for (const bad of [
+      `${hash}:${NOW}`,
+      `${foreign}:2:${EXPIRY}`,
+      `${hash}:2`,
+      `${hash}:x:${EXPIRY}`,
+      `${hash}:2:${EXPIRY}:extra`,
+      null,
+      '',
+    ]) {
+      assert.equal(tokens.parseJobs(bad, hash, NOW), null, String(bad));
+    }
+    assert.deepEqual(tokens.parseJobs(`${hash}:3:${EXPIRY}`, hash, NOW), { count: 3, expiry: EXPIRY });
+
+    assert.notEqual(tokens.reducePane(jobEntry({ jobs: 0 }).entry, NOW).display, 'job');
+    assert.notEqual(tokens.reducePane(jobEntry({ expiry: NOW }).entry, NOW).display, 'job');
+    const foreignBuilt = jobEntry();
+    foreignBuilt.entry.tokens[tokens.JOBS_TOKEN] = `${foreign}:2:${EXPIRY}`;
+    assert.notEqual(tokens.reducePane(foreignBuilt.entry, NOW).display, 'job');
+  });
+
+  it('the job branch needs a live work beat (no beat, no signal)', () => {
+    const entry = baseEntry({ agent_status: 'working' });
+    const hash = sessionHashFor(entry);
+    entry.tokens = { [tokens.JOBS_TOKEN]: `${hash}:2:${EXPIRY}` };
+    assert.equal(tokens.reducePane(entry, NOW).display, 'idle');
+  });
+});
+
+// The interruption ledgers treat every non-terminal reducer display as
+// unfinished owned work, so a pane whose producer dies mid-wait is still
+// reported. `job` joined the vocabulary with S5/D4; a display added to
+// `DISPLAYS` without joining both sets would silently drop that wait.
+describe('unfinished displays match the non-terminal reducer vocabulary', () => {
+  it('includes the pink job wait in the interruptions and diagnostics ledgers', () => {
+    const interruptions = require('../herdr-plugin/lib/gentle-interruptions.js');
+    const diagnostics = require('../herdr-plugin/lib/gentle-diagnostics.js');
+    const expected = tokens.DISPLAYS.filter((display) => display !== 'done' && display !== 'idle').sort();
+    assert.ok(expected.includes('job'), 'the reducer vocabulary carries the pink job wait');
+    assert.deepEqual([...interruptions.UNFINISHED_DISPLAYS].sort(), expected);
+    assert.deepEqual([...diagnostics.UNFINISHED_DISPLAYS].sort(), expected);
   });
 });

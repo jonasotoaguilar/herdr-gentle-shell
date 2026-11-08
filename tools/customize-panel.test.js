@@ -1,20 +1,25 @@
 'use strict';
-// The restored floating Customize panel (odd/tasks/restore-customize-panel.md
-// T1, S1/S2).
+// The floating Customize panel (odd/tasks/restore-customize-panel.md T1,
+// S1/S2) after the Shell-layout port (odd/tasks/customize-parity-done-idle.md
+// T1/T3, S1/S4).
 //
-// The panel is the former two-pane card recovered from commit 0e92869, reduced
-// to the two switches this package still owns: the managed Herdr sidebar rows
-// and the Moshi notification channel. These tests pin, through the component's
-// public contract only (render(width) and handleInput(data) plus the done()
-// result the host receives):
-// - the restored copy, geometry and footer legend, with none of the removed
-//   worktree / ODD / Issues / Reset sections;
-// - the active value's → marker and the focus ▸ marker;
+// The panel is the two-pane card reduced to the switches this package owns: the
+// managed Herdr sidebar rows and the notification channel, the latter reachable
+// from BOTH its own category and the `Herdr Sidebar` category. These tests pin,
+// through the component's public contract only (render(width),
+// handleInput(data), handleMouse(event) and the done() result the host
+// receives):
+// - the Shell's layout: left `CATEGORIES` list, right `<Category> · n/m`
+//   heading, pill rows (`●` stored / `○` other), no `Preview · …` band and the
+//   Shell's footer wording with no invented `p profiles` key;
+// - the notification row inside `Herdr Sidebar` reading the same stored value
+//   as the `Moshi notifications` category;
 // - category and value navigation (↑/↓ or j/k, ←/→ or Tab) without finishing;
 // - Enter resolving the focused row and Esc resolving null;
-// - the key-release guard, the narrow single-pane fallback, the unavailable
-//   note and short-terminal clipping;
-// - a hostile theme degrading to plain text instead of breaking the render.
+// - mouse hits: a category click selects, a row click applies, anything outside
+//   the panes is ignored and a press alone applies nothing;
+// - the key-release guard, the narrow single-pane fallback, the unknown note,
+//   short-terminal clipping and a hostile theme degrading to plain text.
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -32,6 +37,8 @@ const stubTui = {
   matchesKey: (key, name) => key === name,
   isKeyRelease: (key) => key === 'release',
 };
+
+const FOOTER = 'Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close';
 
 function makeHostTui() {
   const paints = [];
@@ -51,6 +58,7 @@ function open({ model, host, rowsAvailable, theme = {}, helpers = stubTui } = {}
   });
   assert.equal(typeof component.render, 'function');
   assert.equal(typeof component.handleInput, 'function');
+  assert.equal(typeof component.handleMouse, 'function');
   assert.equal(typeof component.invalidate, 'function');
   return { component, host: hostTui, done: () => settled };
 }
@@ -59,44 +67,105 @@ function seenAt(component, width) {
   return component.render(width).join('\n');
 }
 
+// A pointer event on the rendered line that carries `needle`, at the column
+// where that needle starts — the way the host reports a local-frame click.
+function click(component, width, needle, { type = 'click', column } = {}) {
+  const lines = component.render(width);
+  const y = lines.findIndex((line) => line.includes(needle));
+  assert.ok(y >= 0, `no rendered line carries ${needle}`);
+  const x = column === undefined ? lines[y].indexOf(needle) : column;
+  return component.handleMouse({
+    type,
+    button: 'left',
+    x,
+    y,
+    width,
+    height: lines.length,
+    shift: false,
+    alt: false,
+    ctrl: false,
+  });
+}
+
 describe('customize panel model', () => {
-  test('carries only the two surviving switches with their stored values', () => {
+  test('carries the two categories and the switches each one shows', () => {
     const model = customizePanelModel({ sidebar: 'off', moshi: 'on' });
     assert.deepEqual(model.map((category) => category.id), ['sidebar', 'moshi']);
     assert.deepEqual(model.map((category) => category.title), ['Herdr Sidebar', 'Moshi notifications']);
-    assert.deepEqual(model.map((category) => category.active), ['off', 'on']);
-    assert.deepEqual(model.map((category) => category.note), [undefined, undefined], 'a stored value needs no note');
-    // One toggle row per switch: it shows the stored state and carries the
+    // The notifications row lives under `Herdr Sidebar` as well, and both rows
+    // are driven by the one moshi switch.
+    assert.deepEqual(model[0].rows.map((row) => row.setting), ['Sidebar agent rows', 'Notifications']);
+    assert.deepEqual(model[0].rows.map((row) => row.switchId), ['sidebar', 'moshi']);
+    assert.deepEqual(model[1].rows.map((row) => row.setting), ['Notifications']);
+    assert.deepEqual(model[1].rows.map((row) => row.switchId), ['moshi']);
+    // One toggle row per switch: it paints the stored value and carries the
     // value Enter applies, so a single row is the whole interaction.
-    assert.deepEqual(model[0].rows.map((row) => row.id), ['on'], 'sidebar off toggles back on');
-    assert.deepEqual(model[0].rows.map((row) => row.label), ['Off']);
-    assert.deepEqual(model[1].rows.map((row) => row.id), ['off'], 'moshi on toggles off');
-    assert.deepEqual(model[1].rows.map((row) => row.label), ['On']);
+    assert.deepEqual(model[0].rows.map((row) => row.id), ['on', 'off'], 'sidebar off toggles back on');
+    assert.deepEqual(model[0].rows.map((row) => row.current), ['off', 'on']);
+    assert.deepEqual(model[0].rows.map((row) => row.currentLabel), ['Off', 'On']);
+  });
+
+  test('both notification rows read the one stored flag', () => {
+    const off = customizePanelModel({ sidebar: 'on', moshi: 'off' });
+    assert.equal(off[0].rows[1].current, 'off');
+    assert.equal(off[1].rows[0].current, 'off');
+    assert.equal(off[0].rows[1].id, 'on', 'Off toggles on from either place');
+    assert.equal(off[1].rows[0].id, 'on');
+    const on = customizePanelModel({ sidebar: 'on', moshi: 'on' });
+    assert.equal(on[0].rows[1].current, 'on');
+    assert.equal(on[1].rows[0].current, 'on');
+    assert.equal(on[0].rows[1].id, 'off', 'On toggles off from either place');
+    assert.equal(on[1].rows[0].id, 'off');
   });
 
   test('an unknown sidebar state carries a note but stays repairable', () => {
     const model = customizePanelModel({ sidebar: 'unknown', moshi: 'off' });
-    assert.equal(model[0].active, null, 'unknown is not a guessed value');
-    assert.match(model[0].note, /state unknown/);
-    assert.equal(model[1].active, 'off');
+    assert.equal(model[0].rows[0].current, null, 'unknown is not a guessed value');
+    assert.equal(model[0].rows[0].currentLabel, 'Unknown');
+    assert.equal(model[0].rows[0].id, 'on', 'the repair is still one key away');
+    assert.match(model[0].rows[0].note, /state unknown/);
   });
 });
 
 describe('customize panel render', () => {
-  test('renders the restored two-pane card and the footer legend', () => {
+  test('renders the Shell layout: headers, pill rows, footer and no preview band', () => {
     const { component } = open();
     const seen = seenAt(component, 100);
     for (const copy of [
       'Customize · Herdr Gentle Shell',
       'CATEGORIES',
-      'Herdr Sidebar',
-      'Moshi notifications',
-      '→ On',
-      'Preview · On',
-      '←/→ or Tab panes · ↑/↓ or j/k move · Enter toggle · Esc close',
+      'Herdr Sidebar · 1/2',
+      'Sidebar agent rows',
+      'Notifications',
+      '● On',
+      '○ Off',
+      FOOTER,
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }
+    for (const gone of ['Preview', 'p profiles', 'Enter toggle', 'j/k']) {
+      assert.equal(seen.includes(gone), false, `the Shell layout has no ${gone}`);
+    }
+  });
+
+  test('the notification row is reachable inside the Herdr Sidebar category', () => {
+    const { component } = open();
+    const lines = component.render(100);
+    const heading = lines.find((line) => line.includes('Herdr Sidebar ·'));
+    assert.ok(heading, 'the right pane is headed by the category and its row count');
+    const sidebarRow = lines.find((line) => line.includes('Sidebar agent rows'));
+    const notificationRow = lines.find((line) => line.includes('Notifications'));
+    assert.ok(sidebarRow.includes('● On'), 'the first sidebar row paints the stored On');
+    assert.ok(notificationRow.includes('● Off'), 'the notifications row paints the stored Off');
+    assert.ok(notificationRow.includes('○ On'), 'and the other value as the target');
+  });
+
+  test('the Moshi notifications category keeps its own row and heading', () => {
+    const { component } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'on' }) });
+    component.handleInput('down');
+    const seen = seenAt(component, 100);
+    assert.ok(seen.includes('Moshi notifications · 1/1'));
+    assert.ok(seen.includes('▸ Moshi notifications'), 'the category cursor moved');
   });
 
   test('offers none of the removed sections', () => {
@@ -107,36 +176,28 @@ describe('customize panel render', () => {
     }
   });
 
-  test('marks the stored value with → and the focused category with ▸', () => {
+  test('marks the focused category with ▸ and the focused row in the values pane', () => {
     const { component } = open();
-    const seen = seenAt(component, 100);
-    assert.ok(seen.includes('▸ Herdr Sidebar'), 'focus starts on the first category');
-    assert.equal(seen.includes('▸ Moshi notifications'), false);
-    assert.ok(seen.includes('→ On'), 'the active sidebar row carries the → mark');
+    assert.ok(seenAt(component, 100).includes('▸ Herdr Sidebar'), 'focus starts on the first category');
+    assert.equal(seenAt(component, 100).includes('▸ Moshi notifications'), false, 'the category list starts focused');
+    component.handleInput('right');
+    assert.ok(seenAt(component, 100).includes('▸ Sidebar agent rows'), 'the first row takes the focus marker');
   });
 
-  test('paints the stored Moshi state when its category is focused', () => {
-    const { component } = open({ model: customizePanelModel({ sidebar: 'off', moshi: 'on' }) });
-    component.handleInput('down');
-    const seen = seenAt(component, 100);
-    assert.ok(seen.includes('▸ Moshi notifications'));
-    assert.ok(seen.includes('→ On'));
-    assert.ok(seen.includes('Preview · On'));
-  });
-
-  test('a narrow terminal falls back to one navigable pane', () => {
+  test('a narrow terminal falls back to one navigable pane and keeps the pills', () => {
     const { component } = open();
     const seen = seenAt(component, 50);
     assert.equal(seen.includes('CATEGORIES'), false, 'the left column is gone at 50 columns');
     assert.ok(seen.includes('Categories'));
     assert.ok(seen.includes('Herdr Sidebar'));
-  });
-
-  test('at 50 columns the categories stay visible and keep their focus', () => {
-    const { component } = open();
     assert.ok(seenAt(component, 50).includes('▸ Herdr Sidebar'), 'the focus marker is visible at 50 columns');
     component.handleInput('down');
     assert.ok(seenAt(component, 50).includes('▸ Moshi notifications'), 'focus moves at 50 columns');
+    component.handleInput('right');
+    const values = seenAt(component, 50);
+    assert.ok(values.includes('● Off'), 'the stored value still renders at 50 columns');
+    assert.ok(values.includes('○ On'), 'and the other value stays visible');
+    assert.ok(values.includes('Moshi notifications · 1/1'));
   });
 
   test('at the 60-column breakpoint the two panes are back', () => {
@@ -144,6 +205,7 @@ describe('customize panel render', () => {
     assert.ok(seen.includes('CATEGORIES'));
     assert.ok(seen.includes('Herdr Sidebar') && seen.includes('Moshi notifications'));
     assert.ok(seen.includes('│'), 'the pane divider is visible at 60 columns');
+    assert.ok(seen.includes('● On'), 'the pills fit at 60 columns');
   });
 
   test('short terminals clip to the rows available', () => {
@@ -153,13 +215,13 @@ describe('customize panel render', () => {
     assert.ok(lines.join('\n').includes('Customize · Herdr Gentle Shell'), 'the title survives');
   });
 
-  test('an unknown sidebar state reads its note and keeps the row actionable', () => {
+  test('an unknown sidebar state reads its note and paints Unknown as the stored pill', () => {
     const { component } = open({ model: customizePanelModel({ sidebar: 'unknown', moshi: 'off' }) });
     const seen = seenAt(component, 100);
     assert.ok(seen.includes('state unknown'), 'the note explains the inconclusive state');
     assert.equal(seen.includes('(unavailable in this session)'), false, 'the repair is never blocked');
-    assert.ok(seen.includes('→ Unknown'), 'an unreadable state is named, never guessed');
-    assert.equal(seen.includes('→ Off'), false);
+    assert.ok(seen.includes('● Unknown'), 'an unreadable state is named, never guessed');
+    assert.ok(seen.includes('○ On'), 'and On stays the actionable value');
   });
 
   test('a hostile theme degrades to plain text', () => {
@@ -172,6 +234,7 @@ describe('customize panel render', () => {
     const seen = seenAt(component, 100);
     assert.ok(seen.includes('Customize · Herdr Gentle Shell'));
     assert.ok(seen.includes('Moshi notifications'));
+    assert.ok(seen.includes('● On'));
   });
 });
 
@@ -189,31 +252,40 @@ describe('customize panel navigation', () => {
   test('←/→ or Tab switches panes and ↑/↓ moves within the values', () => {
     const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     component.handleInput('right');
+    assert.ok(seenAt(component, 100).includes('▸ Sidebar agent rows'));
     component.handleInput('down');
-    const seen = seenAt(component, 100);
-    assert.match(seen, /▸\s+→ On/, 'the single toggle row keeps focus');
+    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the second sidebar row takes the focus');
     component.handleInput('tab');
     component.handleInput('k');
     assert.equal(done(), 'pending');
   });
 
-  test('Enter toggles the focused switch and closes the overlay', () => {
+  test('Enter applies the focused switch and closes the overlay', () => {
     const first = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     first.component.handleInput('enter');
-    assert.deepEqual(first.done(), { categoryId: 'sidebar', valueId: 'off' }, 'On toggles off');
+    assert.deepEqual(first.done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' }, 'On toggles off');
 
     const second = open({ model: customizePanelModel({ sidebar: 'off', moshi: 'off' }) });
     second.component.handleInput('enter');
-    assert.deepEqual(second.done(), { categoryId: 'sidebar', valueId: 'on' }, 'Off toggles on');
+    assert.deepEqual(second.done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'on' }, 'Off toggles on');
   });
 
-  test('Enter in the values pane resolves that pane row', () => {
+  test('Enter on the notifications row applies the moshi switch from the sidebar category', () => {
+    const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    component.handleInput('right');
+    component.handleInput('down');
+    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the sidebar category holds the notifications row');
+    component.handleInput('enter');
+    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
+  });
+
+  test('Enter in the Moshi notifications category still resolves that pane row', () => {
     const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     component.handleInput('down');
     component.handleInput('right');
     component.handleInput('up');
     component.handleInput('enter');
-    assert.deepEqual(done(), { categoryId: 'moshi', valueId: 'on' }, 'a stored Off toggles on');
+    assert.deepEqual(done(), { categoryId: 'moshi', switchId: 'moshi', valueId: 'on' }, 'a stored Off toggles on');
   });
 
   test('Esc and ctrl+c close with null', () => {
@@ -232,6 +304,71 @@ describe('customize panel navigation', () => {
     component.handleInput('release');
     assert.equal(host.paints.length, 0);
     assert.equal(seenAt(component, 100), before);
+    assert.equal(done(), 'pending');
+  });
+});
+
+describe('customize panel mouse', () => {
+  test('clicking a category selects it without finishing', () => {
+    const { component, done } = open();
+    const result = click(component, 100, 'Moshi notifications');
+    assert.deepEqual(result, { handled: true, render: true });
+    assert.ok(seenAt(component, 100).includes('▸ Moshi notifications'));
+    assert.ok(seenAt(component, 100).includes('Moshi notifications · 1/1'));
+    assert.equal(done(), 'pending', 'selecting a category is not applying a row');
+  });
+
+  test('clicking a row applies it, including the notifications row under Herdr Sidebar', () => {
+    const sidebar = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    click(sidebar.component, 100, 'Sidebar agent rows');
+    assert.deepEqual(sidebar.done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' });
+
+    const notifications = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    click(notifications.component, 100, 'Notifications');
+    assert.deepEqual(notifications.done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
+  });
+
+  test('clicking outside the panes is ignored', () => {
+    const { component, done } = open();
+    const lines = component.render(100);
+    const height = lines.length;
+    const base = { button: 'left', width: 100, height, shift: false, alt: false, ctrl: false };
+    // The card border row.
+    assert.equal(component.handleMouse({ ...base, type: 'click', x: 5, y: 0 }), undefined);
+    // The title row.
+    assert.equal(component.handleMouse({ ...base, type: 'click', x: 5, y: 1 }), undefined);
+    // The footer row.
+    assert.equal(component.handleMouse({ ...base, type: 'click', x: 5, y: height - 2 }), undefined);
+    // The pane divider between the two panes.
+    const divider = lines.find((line) => line.includes('│'));
+    assert.equal(
+      component.handleMouse({ ...base, type: 'click', x: divider.indexOf('│'), y: lines.indexOf(divider) }),
+      undefined,
+    );
+    assert.equal(done(), 'pending');
+  });
+
+  test('a press only captures the gesture; the click applies', () => {
+    const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    assert.deepEqual(click(component, 100, 'Notifications', { type: 'press' }), {
+      handled: true,
+      capture: true,
+      render: false,
+    });
+    assert.equal(done(), 'pending', 'a drag that never becomes a click applies nothing');
+    click(component, 100, 'Notifications');
+    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
+  });
+
+  test('events that do not match the rendered frame are ignored', () => {
+    const { component, done } = open();
+    const lines = component.render(100);
+    const y = lines.findIndex((line) => line.includes('Sidebar agent rows'));
+    const x = lines[y].indexOf('Sidebar agent rows');
+    const base = { type: 'click', button: 'left', x, y, shift: false, alt: false, ctrl: false };
+    assert.equal(component.handleMouse({ ...base, width: 80, height: lines.length }), undefined);
+    assert.equal(component.handleMouse({ ...base, width: 100, height: lines.length + 4 }), undefined);
+    assert.equal(component.handleMouse({ ...base, width: 100, height: lines.length, button: 'right' }), undefined);
     assert.equal(done(), 'pending');
   });
 });
