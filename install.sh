@@ -877,13 +877,13 @@ EOF
         [ -n "$_excl_out" ] && info "$_excl_out"
       else
         [ -n "$_excl_out" ] && printf '%s\n' "$_excl_out" >&2
-        warn "could not record native extension exclusion for $PI_SETTINGS; open /herdr-gentle:customize inside Pi and apply the sidebar row to converge it"
+        warn "could not record native extension exclusion for $PI_SETTINGS; run: node \"$_pi_root/bin/gentle-sidebar.js\" enable"
       fi
     else
-      warn "exclusion helper unavailable ($_pi_helper); open /herdr-gentle:customize inside Pi and apply the sidebar row to converge the sidebar exclusion"
+      warn "exclusion helper unavailable ($_pi_helper); run: node \"$_pi_root/bin/gentle-sidebar.js\" enable"
     fi
   else
-    warn "could not resolve the installed Pi package root from 'pi list'; open /herdr-gentle:customize inside Pi and apply the sidebar row to converge the sidebar exclusion"
+    warn "could not resolve the installed Pi package root from 'pi list'; run the installed package's bin/gentle-sidebar.js enable to converge the sidebar exclusion"
   fi
 
   # 10. Best-effort configure, reload, and daemon restart.

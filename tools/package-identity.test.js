@@ -35,10 +35,12 @@ describe('Pi package identity', () => {
 
   it('declares the Pi extensions and every declared file exists', () => {
     const declared = PKG.pi?.extensions ?? [];
-    // The package ships more than one extension now (the state producer and
-    // the worktree tools), so this pins membership rather than a closed list.
-    assert.ok(declared.includes('./extensions/gentle-herdr-state.ts'), `declared: ${declared.join(', ')}`);
-    assert.ok(declared.includes('./extensions/gentle-worktree-tools.ts'), `declared: ${declared.join(', ')}`);
+    // Two extensions: the Herdr state producer, and the worktree session
+    // opener that stays with Herdr (S6). Everything else was removed.
+    assert.deepEqual(declared, [
+      './extensions/gentle-herdr-state.ts',
+      './extensions/herdr-session-open.ts',
+    ]);
     for (const rel of declared) {
       assert.ok(fs.existsSync(path.join(REPO_ROOT, rel)), `missing extension ${rel}`);
     }
@@ -46,7 +48,7 @@ describe('Pi package identity', () => {
 
   it('ships only Pi-side surfaces in the npm tarball', () => {
     assert.ok(Array.isArray(PKG.files) && PKG.files.length > 0, 'package.json must declare files[]');
-    for (const required of ['extensions', 'bin', 'lib', 'docs', 'rules', 'README.md', 'DESIGN.md']) {
+    for (const required of ['extensions', 'bin', 'lib', 'docs', 'README.md', 'DESIGN.md']) {
       assert.ok(PKG.files.includes(required), `files[] must include ${required}`);
     }
     for (const excluded of ['herdr-plugin', 'tools', 'scripts', 'odd']) {
@@ -54,9 +56,9 @@ describe('Pi package identity', () => {
     }
   });
 
-  it('ships the worktree rules file, which the package injects only when asked', () => {
-    assert.ok(PKG.files.includes('rules'), 'files[] must include rules, or rules/worktrees.md never ships');
-    assert.ok(fs.existsSync(path.join(REPO_ROOT, 'rules', 'worktrees.md')), 'rules/worktrees.md must exist');
+  it('ships no rules directory: the worktree rules document is gone', () => {
+    assert.ok(!PKG.files.includes('rules'), 'files[] must not include rules');
+    assert.equal(fs.existsSync(path.join(REPO_ROOT, 'rules')), false, 'rules/ must not exist');
   });
 
   it('declares the repository a provenance attestation binds to', () => {

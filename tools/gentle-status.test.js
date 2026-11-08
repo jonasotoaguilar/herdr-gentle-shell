@@ -21,7 +21,7 @@ const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DAEMON_BIN = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
-const WORKTREE_MODE = require('../lib/worktree-mode.js');
+const SIDEBAR = require('../lib/gentle-sidebar.js');
 
 const FAKE_HERDR = `#!/bin/sh
 if [ "$1" = "agent" ] && [ "$2" = "list" ]; then printf '{"result":{"agents":[]}}\\n'; exit 0; fi
@@ -156,14 +156,9 @@ describe('daemon state-dir probe family', () => {
     });
   }
 
-  it('a stored disabled toggle stays disabled after the pidfile write (fail-open regression)', async () => {
-    await daemonCycle('plugin-tools', { 'gentle-plugin-tools.json': '{"version":1,"odd":false,"issues":false}\n' }, (cycle) => {
-      assert.deepEqual(
-        WORKTREE_MODE.readPluginTools(cycle.env),
-        { state: 'ok', odd: false, issues: false },
-        'the disabled toggles stay disabled; they never fall back to the enabled default',
-      );
-      assert.equal(WORKTREE_MODE.stateDir(cycle.env), cycle.stored, 'resolution does not flip after the pidfile write');
+  it('a stored known file keeps the resolution on the stored dir after the pidfile write (fail-open regression)', async () => {
+    await daemonCycle('known-family', { 'gentle-plugin-tools.json': '{"version":1,"odd":false,"issues":false}\n' }, (cycle) => {
+      assert.equal(SIDEBAR.stateDir(cycle.env), cycle.stored, 'resolution does not flip after the pidfile write');
     });
   });
 });

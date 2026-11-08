@@ -20,7 +20,8 @@
 // - an over-long line is truncated with a marker instead of being dropped;
 // - every entry point returns instead of throwing when the state dir cannot be
 //   written;
-// - the state directory is the one lib/worktree-mode.js already resolves;
+// - the state directory is the package's one shared resolution (the same
+//   known-file family the sidebar switch and the Herdr daemon use);
 // - no flag file, flag name, trace-mode reader/writer or test cache survives
 //   (S24): the switch is a shell-level act, not a package-owned file.
 
@@ -30,7 +31,6 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const modeLib = require('../lib/worktree-mode.js');
 const trace = require('../lib/perf-trace.js');
 
 const roots = [];
@@ -381,17 +381,15 @@ describe('perf trace unwritable state dir', { concurrency: false }, () => {
 });
 
 describe('perf trace state dir resolution', { concurrency: false }, () => {
-  test('the log lives in the dir lib/worktree-mode.js already resolves', () => {
+  test('an explicit GENTLE_STATUS_STATE_DIR wins and resolving writes nothing', () => {
     const { dir, env } = scratchEnv();
-    assert.equal(modeLib.stateDir(env), dir);
     assert.equal(fs.existsSync(dir), false, 'resolving a path writes nothing');
-    assert.equal(trace.tracePath(env), path.join(modeLib.stateDir(env), trace.LOG_NAME));
+    assert.equal(trace.tracePath(env), path.join(dir, trace.LOG_NAME));
   });
 
-  test('the XDG state fallback is the shared one, not a second resolver', () => {
+  test('the XDG state fallback keeps the stored herdr-gentle-agents segment', () => {
     const xdg = scratch('perf-trace-xdg-');
     const env = { XDG_STATE_HOME: xdg };
-    assert.equal(trace.tracePath(env), path.join(modeLib.stateDir(env), trace.LOG_NAME));
     assert.equal(
       trace.tracePath(env),
       path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents', trace.LOG_NAME),

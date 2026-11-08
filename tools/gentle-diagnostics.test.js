@@ -9,6 +9,7 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -40,6 +41,18 @@ exit 1
 const HASH_A = '8DmJRuXgoClQcF4N7ASyZid8BmMy814HvGqtB0bZpAo';
 const HASH_B = '3vEd-s5_ptFOwss1ASj2wA1k0mSwVNLw26NZT4rZckM';
 
+function paneSessionValue(paneId) {
+  return `/sessions/${paneId.replace(/:/g, '_')}.jsonl`;
+}
+
+// Panes are bound by base64url(sha256(agent_session path)) and every token is
+// checked against it, so a fixture that reports a healthy pane must carry this
+// exact hash. HASH_A/HASH_B stay synthetic on purpose: the fixtures still using
+// them are describing a binding mismatch, never a parsed token.
+function boundHashFor(paneId, sessionValue = paneSessionValue(paneId)) {
+  return createHash('sha256').update(sessionValue, 'utf8').digest('base64url');
+}
+
 function freshWork(hash, count, ttlMs = 55000) {
   return `${hash}:${count}:${Date.now() + ttlMs}`;
 }
@@ -53,7 +66,7 @@ function ownedEntry(paneId, hash, opts = {}) {
     pane_id: paneId,
     workspace_id: opts.workspaceId ?? 'wBG',
     agent: 'pi',
-    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: opts.sessionValue ?? `/sessions/${paneId.replace(/:/g, '_')}.jsonl` },
+    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: opts.sessionValue ?? paneSessionValue(paneId) },
     agent_status: opts.agentStatus ?? 'working',
     group: opts.group ?? 'myproj',
     cwd: '/repo/myproj',
@@ -211,7 +224,7 @@ describe('doctor sidebar-mode handoff', () => {
     const before = stateSnapshot();
     const r = run(DOCTOR, []);
     assert.equal(r.status, 1);
-    assert.equal(r.stdout, 'fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and /herdr-gentle:customize status before changing modes\n');
+    assert.equal(r.stdout, 'fail: sidebar mode invalid (Gentle publishing disabled)\nremedy: inspect gentle-sidebar-mode.json and node bin/gentle-sidebar.js status before changing modes\n');
     assert.equal(r.stderr, 'gentle-doctor: one or more checks failed\n');
     assert.equal(callCount(), 0);
     assert.deepEqual(stateSnapshot(), before);
@@ -220,7 +233,7 @@ describe('doctor sidebar-mode handoff', () => {
   it('explicit Gentle mode retains the previous live checks and leaves its flag unchanged', () => {
     fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
     fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid));
-    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    writeAgents([ownedEntry('wBG:p1', boundHashFor('wBG:p1'))]);
     fs.writeFileSync(configFile, '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n');
     const before = stateSnapshot();
     const r = run(DOCTOR, []);
@@ -256,7 +269,7 @@ describe('doctor sidebar-mode handoff', () => {
     fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
     fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
     fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid));
-    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    writeAgents([ownedEntry('wBG:p1', boundHashFor('wBG:p1'))]);
     fs.writeFileSync(configFile, '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n');
     const before = stateSnapshot();
     const r = run(DOCTOR, [], { HERDR_PLUGIN_STATE_DIR: path.join(dir, 'injected-shell') });
@@ -291,7 +304,7 @@ describe('gentle-doctor', () => {
 
   it('happy path: live pid + fresh owned pane + managed override yields pass lines, exit 0', () => {
     fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid), 'utf8');
-    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    writeAgents([ownedEntry('wBG:p1', boundHashFor('wBG:p1'))]);
     fs.writeFileSync(
       configFile,
       '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n',
@@ -743,7 +756,7 @@ describe('daemon stored-dir fallback (S15)', () => {
 
 /* S15 daemon pid placement (black-box): the started daemon must write its
    pidfile into the stored dir when stored holds only the worktree disabled
-   flag, keep the flag disabled across pid creation, and stop without
+   flag, keep that flag readable across pid creation, and stop without
    orphans. Fully isolated (HOME/XDG/config/socket/fake herdr); the host
    daemon is never touched. */
 const DAEMON_BIN = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
@@ -773,15 +786,14 @@ async function pollFor(fn, timeoutMs, label) {
 }
 
 describe('daemon pid placement under an injected dir (S15)', () => {
-  it('starts stored, stays disabled across pid creation, stops without orphans', async () => {
-    const modeLib = require('../lib/worktree-mode.js');
+  it('starts stored, keeps the stored marker across pid creation, stops without orphans', async () => {
     const sb = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-bb-'));
     const xdg = path.join(sb, 'xdg');
     const stored = path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents');
     const injected = path.join(sb, 'injected-shell');
     fs.mkdirSync(stored, { recursive: true });
     fs.mkdirSync(injected, { recursive: true });
-    fs.writeFileSync(path.join(stored, 'gentle-worktree-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    fs.writeFileSync(path.join(stored, 'gentle-plugin-tools.json'), JSON.stringify({ version: 1 }));
     const fake = path.join(sb, 'herdr');
     fs.writeFileSync(fake, FAKE_DAEMON_HERDR, { mode: 0o755 });
     const env = { ...process.env };
@@ -795,7 +807,6 @@ describe('daemon pid placement under an injected dir (S15)', () => {
       HERDR_CONFIG_PATH: path.join(sb, 'config.toml'),
       COLUMNS: '80',
     });
-    const fb = { HERDR_PLUGIN_STATE_DIR: injected, XDG_STATE_HOME: xdg };
     const storedPid = path.join(stored, 'gentle-status.pid');
     const injectedPid = path.join(injected, 'gentle-status.pid');
     const readPids = () => {
@@ -810,7 +821,7 @@ describe('daemon pid placement under an injected dir (S15)', () => {
       }
       return out;
     };
-    assert.deepEqual(modeLib.readMode(fb), { state: 'disabled', enabled: false }, 'pre-start disabled');
+    assert.ok(fs.existsSync(path.join(stored, 'gentle-plugin-tools.json')), 'the stored marker reveals the dir');
     try {
       const start = spawnSync('node', [DAEMON_BIN], { encoding: 'utf8', timeout: 15000, env });
       assert.equal(start.status, 0, `ensure failed: stdout=${start.stdout} stderr=${start.stderr}`);
@@ -825,7 +836,7 @@ describe('daemon pid placement under an injected dir (S15)', () => {
       const pid = Number(fs.readFileSync(storedPid, 'utf8').trim());
       assert.ok(Number.isSafeInteger(pid) && pid > 0, 'stored pid parses');
       assert.doesNotThrow(() => process.kill(pid, 0), 'daemon child is alive');
-      assert.deepEqual(modeLib.readMode(fb), { state: 'disabled', enabled: false }, 'disabled after pid creation');
+      assert.ok(fs.existsSync(path.join(stored, 'gentle-plugin-tools.json')), 'the stored marker survives pid creation');
       assert.ok(!fs.existsSync(injectedPid), 'no pidfile leaks into the injected dir');
     } finally {
       try {

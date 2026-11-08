@@ -39,14 +39,25 @@
 //                       null / clear once the main session settles (or any
 //                       non-root session). Never alters the authoritative
 //                       work count or the roles CSV.)
+//   gentle_principal_v1 = <hash>:<expiry>
+//                       (principal-only activity marker, same session binding
+//                       and TTL discipline as gentle_orchestrating_v1 but
+//                       carrying no count: emitted while THIS session's own
+//                       agent is active (agentActive) — the principal input
+//                       of computeNativeState, never its delegate aggregate
+//                       — and null / clear once the principal settles, so an
+//                       idle principal with running delegates never looks
+//                       busy. The consumer uses it for the working-vs-idle
+//                       decision; the aggregate native status keeps its own
+//                       meaning. Never alters the work count or roles CSV.)
 //   gentle_changes_v2 = <hash>:<files>:<added>:<deleted>:<expiry>
 //                       (normative; exact added/deleted totals kept separate)
 //   gentle_changes_v1 = <hash>:<files>:<added+deleted>:<expiry>
 //                       (dual-emitted for rollback consumers only)
 //   gentle_names_v1   = CSV of TaskRecord.label/agent (sanitized, ≤64 chars
-//                       each, oldest-first, total ≤ ~512 chars; excess
-//                       advisory names are dropped, never chunked — the §4.5
-//                       #p= overflow form never triggers by construction)
+//                       each, oldest-first, total ≤ 512 UTF-8 BYTES; excess
+//                       advisory names are dropped whole, never chunked — the
+//                       §4.5 #p= overflow form never triggers by construction)
 //                       Compatibility transport only: the consumer renders
 //                       roles, never names. Null (clear) when the active
 //                       TaskStore list has no labels; null change tokens when the session model has
@@ -293,7 +304,11 @@ function presenceSafeDirectory(path, owned, ownerMask) {
   return true;
 }
 
-export function resolvePresenceProfile(env = process.env, home = homedir()) {
+// Gentle Shell agent home (GENTLE_PI_AGENT_HOME, else PI_CODING_AGENT_DIR,
+// else `~/.pi/agent`), tilde-expanded and realpathed. Undefined when the two
+// env vars disagree or the path cannot be resolved, so every caller degrades
+// instead of guessing.
+function resolveAgentHome(env = process.env, home = homedir()) {
   const gentle = env?.GENTLE_PI_AGENT_HOME;
   const piDir = env?.PI_CODING_AGENT_DIR;
   const hasGentle = typeof gentle === "string" && gentle.length > 0;
@@ -306,12 +321,16 @@ export function resolvePresenceProfile(env = process.env, home = homedir()) {
   else if (selected.startsWith("~/") || (process.platform === "win32" && selected.startsWith("~\\"))) {
     expanded = join(home, selected.slice(2));
   }
-  let real;
   try {
-    real = fs.realpathSync(resolvePath(expanded));
+    return fs.realpathSync(resolvePath(expanded));
   } catch {
     return undefined;
   }
+}
+
+export function resolvePresenceProfile(env = process.env, home = homedir()) {
+  const real = resolveAgentHome(env, home);
+  if (real === undefined) return undefined;
   const shared = join(real, "gentle-agents");
   const presenceRoot = join(shared, "presence");
   if (!presenceSafeDirectory(real, false, 0)) return undefined;
@@ -672,8 +691,17 @@ const TTL_MS = 60000;
 const BEAT_MS = 15000;
 const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
-const MAX_NAMES_CHARS = 512;
-const MAX_ROLES_CHARS = 512;
+// Herdr's wire ceiling for a single pane-metadata token value, measured in
+// UTF-8 BYTES: one value over it rejects the WHOLE `pane.report_metadata`
+// beat, so nothing in that report lands and the pane falls back to its 60 s
+// TTL. Character counts are not a substitute — eight 64-character Japanese
+// labels are inside every character cap and ~1.3 KB on the wire — so every
+// published value is bounded in bytes (Buffer.byteLength), never in JS
+// characters. The session-bound values (`<hash>:<count>:<expiry>` families,
+// markers, ask/review) are ASCII and ≤ 125 bytes by construction; the CSV
+// values (names, roles, subs) are the only ones that can carry multibyte
+// text, and they are measured against this ceiling as they are built.
+const MAX_TOKEN_BYTES = 512;
 const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
 const TRANSPORT_FAIL_LATCH = 3;
@@ -737,6 +765,12 @@ const ASK_TOKEN = "gentle_ask_v1";
 // review is active (acknowledged capture/group execution only). Null /
 // clear the beat the last execution resolves — NO GRACE, no timers.
 const REVIEW_TOKEN = "gentle_review_v1";
+// Principal-only activity marker (DESIGN §4.3): session-bound + TTL-fresh
+// `<hash>:<expiry>`, emitted while this session's own agent is active and
+// cleared when it settles. It carries the principal input of
+// computeNativeState alone — the aggregate native status answers `working`
+// for any delegate, so the consumer cannot use it to decide the row.
+const PRINCIPAL_TOKEN = "gentle_principal_v1";
 
 const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
 const COUNT_RE = /^(0|[1-9]\d{0,15})$/;
@@ -788,14 +822,48 @@ function sanitizeId(value, fallbackPrefix) {
   return `${fallbackPrefix}${rand}`;
 }
 
+function utf8Bytes(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+
+// Cap a label at MAX_LABEL_CHARS UTF-16 units — the same unit the consumer's
+// `parseNames` checks, so a label the producer writes is never one the
+// consumer drops — while backing off one unit when the cut would split a
+// surrogate pair and leave a lone half behind.
+function truncateChars(value, maxChars) {
+  if (value.length <= maxChars) return value;
+  let cut = maxChars;
+  const last = value.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return value.slice(0, cut);
+}
+
+// Truncate on a character boundary so the result is always valid UTF-8 and
+// never exceeds `maxBytes`. Only the last-resort wire clamp needs this: the
+// CSV builders below drop whole entries instead of chunking one.
+function truncateBytes(value, maxBytes) {
+  if (utf8Bytes(value) <= maxBytes) return value;
+  let out = "";
+  let used = 0;
+  for (const char of value) {
+    const size = utf8Bytes(char);
+    if (used + size > maxBytes) break;
+    out += char;
+    used += size;
+  }
+  return out;
+}
+
 function sanitizeLabel(value, fallback) {
   const raw = typeof value === "string" && value.length > 0 ? value : fallback;
-  const clean = String(raw)
-    .replace(/[\x00-\x1f\x7f-\x9f]/g, "")
-    .replace(/[,\"\n\r]/g, " ")
-    .trim()
-    .slice(0, MAX_LABEL_CHARS);
-  return clean.length > 0 ? clean : String(fallback).slice(0, MAX_LABEL_CHARS);
+  const clean = truncateChars(
+    String(raw)
+      .replace(/[\x00-\x1f\x7f-\x9f]/g, "")
+      .replace(/[,\"\n\r]/g, " ")
+      .trim(),
+    MAX_LABEL_CHARS,
+  );
+  return clean.length > 0 ? clean : truncateChars(String(fallback), MAX_LABEL_CHARS);
 }
 
 // Unknown-agent fallback (slug rules, 32-char bound): a delegation agent
@@ -878,7 +946,15 @@ async function sendTokens(tokens) {
   const names = Object.keys(tokens);
   for (let at = 0; at < names.length; at += MAX_TOKENS_PER_REPORT) {
     const patch = {};
-    for (const name of names.slice(at, at + MAX_TOKENS_PER_REPORT)) patch[name] = tokens[name];
+    for (const name of names.slice(at, at + MAX_TOKENS_PER_REPORT)) {
+      const value = tokens[name];
+      // Last-resort net at the wire boundary: Herdr rejects the whole beat for
+      // one over-cap value, so a value that ever escapes the builders is
+      // clamped on a character boundary instead of taking every sibling token
+      // (work, roles, subs, markers) down with it. The builders above already
+      // keep their values inside the ceiling, so this never fires in practice.
+      patch[name] = typeof value === "string" ? truncateBytes(value, MAX_TOKEN_BYTES) : value;
+    }
     const delivered =
       (await sendRequestAttempt(
         {
@@ -1389,31 +1465,20 @@ export async function liveSummarizeRoots(roots) {
 // Extension
 // ---------------------------------------------------------------------------
 
-// Optional Moshi notification mirror toggle (DESIGN §7). The producer
-// extension owns this flag file; the consumer daemon never publishes to
-// Moshi (single emitter). This command is the Pi-side switch. Enabling also
-// excludes the Moshi-managed Pi hook (`extensions/moshi-hooks.ts`) so Moshi
-// stops notifying per prompt and per turn, and disabling removes that
-// exclusion again. Both settings edits happen only while that hook file
-// exists. The flag path mirrors the daemon's stateRoot() resolution
-// (GENTLE_STATUS_STATE_DIR / HERDR_PLUGIN_STATE_DIR / XDG_STATE_HOME /
-// ~/.local/state/herdr), so both sides agree without a shared helper — this
-// file must stay self-contained.
-const MOSHI_HOOKS_REL = "extensions/moshi-hooks.ts";
-const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
-
-// S15 identity rename: the active plugin lookup id is herdr-gentle-shell,
-// but every stored state path keeps the herdr-gentle-agents segment (no
-// migration step, no orphaned flags). GENTLE_STATUS_STATE_DIR (explicit
-// user override) is used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected
-// and changes with the plugin id, so when it holds none of our files
-// while the stored dir does, the stored dir wins. Fresh installs with no
+// Producer state, resolved once for both flag files below. GENTLE_STATUS_STATE_DIR
+// (explicit user override) is used as-is; HERDR_PLUGIN_STATE_DIR is
+// Herdr-injected and changes with the plugin id, so when it holds none of our
+// files while the stored dir does, the stored dir wins. Fresh installs with no
 // stored files converge on the injected dir.
-// This family is IDENTICAL in lib/worktree-mode.js, lib/gentle-sidebar.js,
-// herdr-plugin/bin/gentle-status.js and herdr-plugin/lib/gentle-diagnostics.js:
-// the files this extension writes (sidebar mode, moshi flag) and the shared
-// ODD/Issues toggle must all prove the same dir, or the state splits across
-// both and a stored disabled toggle reads as missing (missing means enabled).
+//
+// S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
+// every stored state path keeps the herdr-gentle-agents segment (no migration
+// step, no orphaned flags). This family is IDENTICAL in lib/worktree-mode.js,
+// lib/gentle-sidebar.js, herdr-plugin/bin/gentle-status.js and
+// herdr-plugin/lib/gentle-diagnostics.js, so every consumer agrees on which
+// directory is ours. Entries are kept even for flags this package no longer
+// writes: an upgraded install still carries them, and a family that differs
+// between consumers splits the state across both dirs.
 const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
@@ -1472,6 +1537,14 @@ function sidebarEffectiveDir() {
   return injected;
 }
 
+// Optional Moshi notification mirror (DESIGN §7): one flag file, read per
+// event. The producer extension owns it; the consumer daemon never publishes
+// to Moshi (single emitter). Enabling is the flag plus, while
+// `extensions/moshi-hooks.ts` is installed, adding `-extensions/moshi-hooks.ts`
+// to the Pi settings `extensions` list so the Moshi-managed hook cannot notify
+// in parallel. The flag path mirrors the daemon's stateRoot() resolution above,
+// so both sides agree without a shared helper — this file must stay
+// self-contained.
 function moshiFlagPath() {
   return join(sidebarEffectiveDir(), "gentle-moshi.json");
 }
@@ -1485,173 +1558,17 @@ function moshiFlagEnabled(path) {
   }
 }
 
-function writeMoshiFlag(path, enabled) {
-  fs.mkdirSync(dirname(path), { recursive: true });
-  fs.writeFileSync(path, `${JSON.stringify({ enabled, updatedAt: new Date().toISOString() })}\n`);
-}
-
-// Pi agent dir, resolved like resolvePresenceProfile: an explicit agent home
-// wins, then Pi's own override, then the default.
-function piAgentDir() {
-  const env = process.env;
-  const selected = env.GENTLE_PI_AGENT_HOME ?? env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-  if (selected === "~") return homedir();
-  if (selected.startsWith("~/")) return join(homedir(), selected.slice(2));
-  return selected;
-}
-
-function moshiHooksPath() {
-  return join(piAgentDir(), "extensions", "moshi-hooks.ts");
-}
-
-function piSettingsPath() {
-  return join(piAgentDir(), "settings.json");
-}
-
-// Fail closed: null means "do not touch it" (unreadable, invalid JSON, a
-// non-object document, or an `extensions` value that is not a list of
-// strings). A missing file yields an empty document, exactly like Pi.
-function readSettingsDoc(path) {
-  let raw;
-  try {
-    raw = fs.readFileSync(path, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return { doc: {}, exists: false };
-    return null;
-  }
-  let doc;
-  try {
-    doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
-  } catch {
-    return null;
-  }
-  if (!isRecord(doc)) return null;
-  if (doc.extensions !== undefined && !Array.isArray(doc.extensions)) return null;
-  if (Array.isArray(doc.extensions) && doc.extensions.some((entry) => typeof entry !== "string")) return null;
-  return { doc, exists: true };
-}
-
-function moshiExclusionPresent() {
-  const loaded = readSettingsDoc(piSettingsPath());
-  if (loaded === null) return null;
-  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
-  return list.includes(MOSHI_EXCLUSION_ENTRY);
-}
-
-// Atomic and mode-preserving. A symlinked settings.json keeps pointing at its
-// target because the temp file is created next to the resolved target.
-function writeSettingsDoc(path, doc) {
-  let target = path;
-  try {
-    target = fs.realpathSync(path);
-  } catch {
-    // Missing or dangling: write where the path points.
-  }
-  let mode = 0o600;
-  try {
-    mode = fs.statSync(target).mode & 0o777;
-  } catch {
-    // Fresh file.
-  }
-  const temp = join(dirname(target), `.settings.json.gentle-${randomUUID().slice(0, 8)}.tmp`);
-  try {
-    fs.writeFileSync(temp, `${JSON.stringify(doc, null, 2)}\n`, { mode });
-    fs.renameSync(temp, target);
-  } catch (error) {
-    try {
-      fs.rmSync(temp, { force: true });
-    } catch {}
-    throw error;
-  }
-}
-
-// Only ever appends or removes the exact entry, preserving every other key,
-// value, and entry. Both directions are gated on the Moshi-managed hook
-// existing: with no hook file there is nothing to exclude, so settings.json
-// is never touched.
-function setMoshiExclusion(want) {
-  if (!fs.existsSync(moshiHooksPath())) {
-    return { ok: true, note: `${MOSHI_HOOKS_REL} is not installed; settings.json untouched.` };
-  }
-  const settings = piSettingsPath();
-  const loaded = readSettingsDoc(settings);
-  if (loaded === null) {
-    return { ok: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
-  }
-  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
-  const present = list.includes(MOSHI_EXCLUSION_ENTRY);
-  if (want === present) {
-    return { ok: true, note: want ? "exclusion already present." : "no exclusion to remove." };
-  }
-  const next = want
-    ? [...list, MOSHI_EXCLUSION_ENTRY]
-    : list.filter((entry) => entry !== MOSHI_EXCLUSION_ENTRY);
-  try {
-    writeSettingsDoc(settings, { ...loaded.doc, extensions: next });
-  } catch (error) {
-    return { ok: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
-  }
-  return { ok: true, note: want ? `added ${MOSHI_EXCLUSION_ENTRY}.` : `removed ${MOSHI_EXCLUSION_ENTRY}.` };
-}
-
-// ---------------------------------------------------------------------------
-// Sidebar integration switch (S7): OUR sidebar versus the native Herdr
-// sidebar. Reached through the `/herdr-gentle:customize` panel's sidebar
-// rows (the old `toggle|enable|disable|status` command is removed); the
-// provider slot below drives `sidebarEnable`/`sidebarDisable`.
-// Enable means OURS (owned native exclusion + managed `configure` rows);
-// disable means NATIVE (only the owned exclusion removed + managed rows
-// unconfigured, so the native sidebar renders again). This block is
-// self-contained like the rest of this file: the installed copy ships
-// without sibling modules, so the marker-bound exclusion below mirrors
-// lib/pi-extension-exclusion.js semantics inline (exact entry, canonical
-// target binding, foreign/misbound refusal, byte-identical rollback)
-// without importing it. Row convergence runs the installed plugin's own
-// bin/configure.js synchronously after resolving its root through the
-// read-only plugin list; only a zero exit plus a re-read managed-row
-// effect commits the mode or exclusion, and Pi sessions always need
-// /reload.
-const SIDEBAR_NATIVE_REL = "extensions/herdr-agent-state.ts";
-const SIDEBAR_NATIVE_ENTRY = "-extensions/herdr-agent-state.ts";
+// Sidebar mode file under the same resolved state directory:
+// {version:1,enabled:boolean}. Missing defaults to enabled for current-install
+// compatibility; malformed never publishes. The switch that writes it ships as
+// the package CLI (bin/gentle-sidebar.js), which owns the managed Herdr rows and
+// the owned native-extension exclusion.
 const SIDEBAR_MODE_VERSION = 1;
-const SIDEBAR_MARKER_VERSION = 1;
-const SIDEBAR_PLUGIN_ID = "herdr-gentle-shell";
-const SIDEBAR_LEGACY_PLUGIN_ID = "herdr-gentle-agents";
-const SIDEBAR_MARKER_NAME = "pi-extension-exclusion-owned";
-const SIDEBAR_MANAGED_BEGIN = "# BEGIN herdr-gentle-agents (managed; do not edit)";
-const SIDEBAR_MANAGED_END = "# END herdr-gentle-agents";
 
-// Shared mode file under the existing resolved state directory (same
-// resolution as the Moshi flag above): {version:1,enabled:boolean}.
-// Missing defaults to enabled for current-install compatibility.
 function sidebarModePath() {
   return join(sidebarEffectiveDir(), "gentle-sidebar-mode.json");
 }
 
-function sidebarMarkerPath() {
-  return join(dirname(sidebarModePath()), SIDEBAR_MARKER_NAME);
-}
-
-function sidebarNativePath() {
-  return join(piAgentDir(), "extensions", "herdr-agent-state.ts");
-}
-
-function sidebarHerdrBin() {
-  const override = process.env.HERDR_BIN_PATH;
-  return typeof override === "string" && override.length > 0 ? override : "herdr";
-}
-
-// Read-only Herdr config location (same resolution as bin/configure.js).
-// Used only for the status rows probe; this file never writes it.
-function sidebarConfigPath() {
-  if (process.env.HERDR_CONFIG_PATH) return process.env.HERDR_CONFIG_PATH;
-  const xdg = process.env.XDG_CONFIG_HOME;
-  if (xdg) return join(xdg, "herdr", "config.toml");
-  return join(homedir(), ".config", "herdr", "config.toml");
-}
-
-// Missing means enabled (compatibility); malformed never enables
-// (fail closed, reported by the command paths below).
 function readSidebarMode() {
   let raw;
   try {
@@ -1680,544 +1597,9 @@ function sidebarPublishingEnabled() {
   }
 }
 
-function writeSidebarMode(enabled) {
-  const file = sidebarModePath();
-  fs.mkdirSync(dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify({ version: SIDEBAR_MODE_VERSION, enabled })}\n`);
-}
-
-function sidebarBasename(p) {
-  const parts = String(p).split(/[\\/]/);
-  return parts.length > 0 ? parts[parts.length - 1] : String(p);
-}
-
-// Canonical ownership target through symlinks (parent-resolved when the
-// file is absent), mirroring lib/pi-extension-exclusion.js. Null when
-// unresolvable: the caller fails closed.
-function sidebarCurrentTarget(settings) {
-  try {
-    return fs.realpathSync(settings);
-  } catch (error) {
-    if (error?.code !== "ENOENT") return null;
-    try {
-      return join(fs.realpathSync(dirname(settings)), sidebarBasename(settings));
-    } catch {
-      return null;
-    }
-  }
-}
-
-// Validate the ownership record against this exact entry and settings
-// target. Absent means never owned (caller decides); foreign, invalid,
-// or misbound fails closed without touching settings.
-function checkSidebarMarker(settings) {
-  const marker = sidebarMarkerPath();
-  let markerRaw;
-  try {
-    markerRaw = fs.readFileSync(marker, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return { ok: true, owned: false };
-    return { ok: false, note: `cannot read ownership record ${marker}: ${error?.message ?? error}.` };
-  }
-  let record = null;
-  try {
-    record = JSON.parse(markerRaw);
-  } catch {
-    record = null;
-  }
-  if (
-    !isRecord(record) ||
-    record.version !== SIDEBAR_MARKER_VERSION ||
-    typeof record.entry !== "string" ||
-    record.entry === "" ||
-    typeof record.settings !== "string" ||
-    record.settings === ""
-  ) {
-    return { ok: false, note: `ownership record ${marker} is foreign or invalid; delete the record or the entry manually.` };
-  }
-  if (record.entry !== SIDEBAR_NATIVE_ENTRY) {
-    return { ok: false, note: `ownership record ${marker} authorizes a different entry (${record.entry}); delete the record or the entry manually.` };
-  }
-  const current = sidebarCurrentTarget(settings);
-  if (current === null || current !== record.settings) {
-    return { ok: false, note: `ownership record ${marker} is bound to ${record.settings}, not ${settings}; delete the record or the entry manually.` };
-  }
-  return { ok: true, owned: true };
-}
-
-function writeSidebarMarker(settings) {
-  const canon = sidebarCurrentTarget(settings);
-  if (canon === null) return false;
-  try {
-    const marker = sidebarMarkerPath();
-    fs.mkdirSync(dirname(marker), { recursive: true });
-    fs.writeFileSync(marker, `${JSON.stringify({ version: SIDEBAR_MARKER_VERSION, entry: SIDEBAR_NATIVE_ENTRY, settings: canon })}\n`);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function removeSidebarMarker() {
-  try {
-    fs.rmSync(sidebarMarkerPath(), { force: true });
-  } catch {
-    // Best-effort marker cleanup.
-  }
-}
-
-// Byte-identical settings restore after a failed marker write: a failed
-// ensure never leaves a changed settings file behind while claiming
-// otherwise. Null `before` means this run created the file.
-function restoreSidebarSettings(settings, before) {
-  try {
-    const target = sidebarCurrentTarget(settings) ?? settings;
-    if (before === null) fs.rmSync(target, { force: true });
-    else fs.writeFileSync(target, before);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Only ever appends the exact native entry, preserving every other key,
-// value, and entry. Gated on the native hook file existing (with no hook
-// there is nothing to exclude); a pre-existing user entry without our
-// marker is left as-is and never adopted.
-function ensureSidebarExclusion() {
-  if (!fs.existsSync(sidebarNativePath())) {
-    return { ok: true, changed: false, note: `${SIDEBAR_NATIVE_REL} is not installed; settings.json untouched.` };
-  }
-  const settings = piSettingsPath();
-  const binding = checkSidebarMarker(settings);
-  if (!binding.ok) return { ok: false, changed: false, note: `refusing to record ${SIDEBAR_NATIVE_ENTRY}: ${binding.note}` };
-  const loaded = readSettingsDoc(settings);
-  if (loaded === null) {
-    return { ok: false, changed: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
-  }
-  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
-  if (list.includes(SIDEBAR_NATIVE_ENTRY)) {
-    return {
-      ok: true,
-      changed: false,
-      note: binding.owned
-        ? "exclusion already present."
-        : "exclusion already present (pre-existing user entry, not owned; left as-is).",
-    };
-  }
-  let before = null;
-  try {
-    before = fs.readFileSync(settings, "utf8");
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      return { ok: false, changed: false, note: `could not read ${settings}: ${error?.message ?? error}.` };
-    }
-  }
-  try {
-    fs.mkdirSync(dirname(settings), { recursive: true });
-    writeSettingsDoc(settings, { ...loaded.doc, extensions: [...list, SIDEBAR_NATIVE_ENTRY] });
-  } catch (error) {
-    return { ok: false, changed: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
-  }
-  if (!writeSidebarMarker(settings)) {
-    const restored = restoreSidebarSettings(settings, before);
-    return {
-      ok: false,
-      changed: false,
-      note: restored
-        ? `could not record ownership (${sidebarMarkerPath()}); settings restored unchanged.`
-        : `could not record ownership (${sidebarMarkerPath()}); settings could NOT be restored, remove ${SIDEBAR_NATIVE_ENTRY} manually or re-run enable.`,
-    };
-  }
-  return { ok: true, changed: true, note: `added ${SIDEBAR_NATIVE_ENTRY}.` };
-}
-
-// Removes only the plugin-owned entry. A pre-existing user entry (no
-// marker) and any foreign/misbound record are preserved, failing closed.
-function removeSidebarExclusion() {
-  if (!fs.existsSync(sidebarNativePath())) {
-    return { ok: true, changed: false, note: `${SIDEBAR_NATIVE_REL} is not installed; settings.json untouched.` };
-  }
-  const settings = piSettingsPath();
-  const binding = checkSidebarMarker(settings);
-  if (!binding.ok) return { ok: false, changed: false, note: `refusing to remove ${SIDEBAR_NATIVE_ENTRY}: ${binding.note}` };
-  if (!binding.owned) {
-    return { ok: true, changed: false, note: "no owned exclusion; settings.json untouched." };
-  }
-  try {
-    fs.lstatSync(settings);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      removeSidebarMarker();
-      return { ok: true, changed: false, note: "settings.json already absent; stale ownership dropped." };
-    }
-    return { ok: false, changed: false, note: `cannot stat ${settings}: ${error?.message ?? error}.` };
-  }
-  const loaded = readSettingsDoc(settings);
-  if (loaded === null) {
-    return { ok: false, changed: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
-  }
-  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
-  if (!list.includes(SIDEBAR_NATIVE_ENTRY)) {
-    removeSidebarMarker();
-    return { ok: true, changed: false, note: "no exclusion to remove." };
-  }
-  const kept = list.filter((entry) => entry !== SIDEBAR_NATIVE_ENTRY);
-  const next = { ...loaded.doc };
-  if (kept.length === 0) delete next.extensions;
-  else next.extensions = kept;
-  try {
-    writeSettingsDoc(settings, next);
-  } catch (error) {
-    return { ok: false, changed: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
-  }
-  removeSidebarMarker();
-  return { ok: true, changed: true, note: `removed ${SIDEBAR_NATIVE_ENTRY}.` };
-}
-
-// Row convergence through the installed plugin's own configure script,
-// run synchronously: the plugin root is resolved via the read-only
-// `herdr plugin list --json` shape (the same lookup install.sh uses),
-// then `<root>/bin/configure.js --apply|--uninstall --reload` runs under
-// this process's node with a bounded timeout. Exit 0 alone is still not
-// the commit gate — the managed-row effect is re-read from the Herdr
-// config and must match (present for enable, absent for disable) before
-// the mode or exclusion changes. An accepted-but-incomplete run therefore
-// never commits state and never claims success.
-// One read-only entry query per plugin id, sharing the exact lookup shape and
-// failure notes with the root resolver below. `enabled` is kept because the
-// enable gate needs it (a missing enabled field means enabled, like the
-// startup check).
-function querySidebarPluginEntries(id) {
-  let result;
-  try {
-    result = spawnSync(
-      sidebarHerdrBin(),
-      ["plugin", "list", "--plugin", id, "--json"],
-      { encoding: "utf8", timeout: 15000, windowsHide: true },
-    );
-  } catch (error) {
-    return { ok: false, entries: [], note: `could not resolve the installed plugin root: ${error?.message ?? error}.` };
-  }
-  if (result.error) {
-    return { ok: false, entries: [], note: `could not resolve the installed plugin root: ${result.error.message}.` };
-  }
-  if (result.status !== 0) {
-    return { ok: false, entries: [], note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
-  }
-  try {
-    const doc = JSON.parse(result.stdout || "");
-    const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
-    if (!Array.isArray(arr)) throw new Error("no plugins array");
-    return {
-      ok: true,
-      entries: arr.filter((p) => p && (p.plugin_id === id || p.id === id)),
-      note: null,
-    };
-  } catch (error) {
-    return { ok: false, entries: [], note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
-  }
-}
-
-// Resolve the installed plugin root via read-only `herdr plugin list
-// --json` (verified shape: result.plugins[] with plugin_id/plugin_root).
-// The active (renamed) id is queried first; a zero match falls through to
-// one explicit lookup by the retired id so pre-rename installs keep
-// working. Ambiguous roots fail closed on either id — the legacy lookup
-// is never a silent weak fallback. Other failures (spawn, exit, parse)
-// fail closed on the id that produced them.
-function querySidebarPluginRoots(id) {
-  const queried = querySidebarPluginEntries(id);
-  if (!queried.ok) return { ok: false, note: queried.note };
-  const roots = [...new Set(queried.entries.map((h) => h.plugin_root).filter((r) => typeof r === "string" && r.length > 0))];
-  return { ok: true, roots };
-}
-
-function checkSidebarPluginRoot(root) {
-  if (!root.startsWith("/")) {
-    return { ok: false, note: `could not resolve the installed plugin root (ambiguous or non-absolute).` };
-  }
-  if (!fs.existsSync(join(root, "bin", "configure.js"))) {
-    return { ok: false, note: `could not resolve the installed plugin root (${root} has no bin/configure.js).` };
-  }
-  return { ok: true, root };
-}
-
-function resolveSidebarPluginRoot() {
-  const active = querySidebarPluginRoots(SIDEBAR_PLUGIN_ID);
-  if (!active.ok) return active;
-  if (active.roots.length === 1) return checkSidebarPluginRoot(active.roots[0]);
-  if (active.roots.length > 1) {
-    return { ok: false, note: `could not resolve the installed plugin root (ambiguous for ${SIDEBAR_PLUGIN_ID}).` };
-  }
-  const legacy = querySidebarPluginRoots(SIDEBAR_LEGACY_PLUGIN_ID);
-  if (!legacy.ok) return legacy;
-  if (legacy.roots.length === 1) return checkSidebarPluginRoot(legacy.roots[0]);
-  if (legacy.roots.length > 1) {
-    return { ok: false, note: `could not resolve the installed plugin root (ambiguous for retired id ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
-  }
-  return { ok: false, note: `could not resolve the installed plugin root (no match for ${SIDEBAR_PLUGIN_ID} or ${SIDEBAR_LEGACY_PLUGIN_ID}).` };
-}
-
-/* -------------------------------------------------- sidebar enable gate */
-
-// Sidebar enable prerequisite (S3/S4), modelled on the Moshi gate: the Gentle
-// sidebar cannot be enabled without the installed, enabled Herdr plugin,
-// because enabling converges the plugin-owned config.toml rows through the
-// plugin's own bin/configure.js. Fail-closed: missing, disabled, or an
-// inconclusive lookup all refuse BEFORE any write, so nothing changes and the
-// switch stays native; a retry re-emits the same message; DISABLING never
-// consults this (a missing prerequisite may block turning the sidebar ON,
-// never OFF). The install command is the versionless shape the README and
-// install.sh document (install.sh resolves the newest herdr-vX.Y.Z tag when
-// --ref is omitted), and the refusal literal is kept byte-identical with
-// lib/herdr-plugin-check.js (a test pins both).
-const SIDEBAR_PLUGIN_REPO_PATH = "jonasotoaguilar/herdr-gentle-agents/herdr-plugin";
-const SIDEBAR_PLUGIN_INSTALL_COMMAND =
-  `herdr plugin install ${SIDEBAR_PLUGIN_REPO_PATH} && herdr plugin enable ${SIDEBAR_PLUGIN_ID}`;
-
-function sidebarEnableRefusalText(status) {
-  if (status === "disabled") {
-    return `The Gentle sidebar cannot be enabled: the ${SIDEBAR_PLUGIN_ID} Herdr plugin is installed but disabled; enable it with: herdr plugin enable ${SIDEBAR_PLUGIN_ID}`;
-  }
-  if (status === "unknown") {
-    return `The Gentle sidebar cannot be enabled: could not determine whether the ${SIDEBAR_PLUGIN_ID} Herdr plugin is installed; make sure it is installed with: ${SIDEBAR_PLUGIN_INSTALL_COMMAND}`;
-  }
-  return `The Gentle sidebar cannot be enabled: the ${SIDEBAR_PLUGIN_ID} Herdr plugin is not installed; install it with: ${SIDEBAR_PLUGIN_INSTALL_COMMAND}`;
-}
-
-// Verdict for the enable gate. Never throws. The active (renamed) id is read
-// first; only when it has no entry is the retired id read, so a pre-rename
-// install still counts as installed. Any read failure is inconclusive and
-// refuses fail-closed.
-function sidebarPluginPrereq() {
-  let queried;
-  try {
-    queried = querySidebarPluginEntries(SIDEBAR_PLUGIN_ID);
-  } catch {
-    return { ok: false, status: "unknown" };
-  }
-  if (!queried.ok) return { ok: false, status: "unknown" };
-  let entries = queried.entries;
-  if (entries.length === 0) {
-    let legacy;
-    try {
-      legacy = querySidebarPluginEntries(SIDEBAR_LEGACY_PLUGIN_ID);
-    } catch {
-      return { ok: false, status: "unknown" };
-    }
-    if (!legacy.ok) return { ok: false, status: "unknown" };
-    entries = legacy.entries;
-  }
-  if (entries.length === 0) return { ok: false, status: "missing" };
-  const entry = entries[0];
-  if (entry && entry.enabled === false) return { ok: false, status: "disabled" };
-  return { ok: true, status: "ok" };
-}
-
-// Run the installed configure script synchronously (fixed argv, no
-// shell; config path and reload binary resolve inside that script from
-// the inherited environment). Returns the exit and bounded output.
-function runSidebarConfigure(root, op, reload) {
-  const args = [join(root, "bin", "configure.js"), op];
-  if (reload) args.push("--reload");
-  let result;
-  try {
-    result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60000, windowsHide: true });
-  } catch (error) {
-    return { exit: -1, output: `configure ${op} could not start: ${error?.message ?? error}.` };
-  }
-  if (result.error) {
-    return { exit: -1, output: `configure ${op} could not start: ${result.error.message}.` };
-  }
-  const output = `${result.stdout || ""}${result.stderr || ""}`.trim().slice(0, 300);
-  return { exit: result.status, output };
-}
-
-function readSidebarConfig() {
-  try {
-    return { ok: true, text: fs.readFileSync(sidebarConfigPath(), "utf8") };
-  } catch (error) {
-    if (error?.code === "ENOENT") return { ok: true, text: null };
-    return { ok: false, text: null, note: `config ${sidebarConfigPath()} unreadable: ${error?.message ?? error}.` };
-  }
-}
-
-function sidebarRowsManaged(text) {
-  return typeof text === "string" && text.includes(SIDEBAR_MANAGED_BEGIN) && text.includes(SIDEBAR_MANAGED_END);
-}
-
-async function sidebarEnable(ctx) {
-  const notify = ctx?.ui?.notify;
-  const reRun = "Retry via /herdr-gentle:customize to converge.";
-  // Preflight before any mutation: unreadable settings or a
-  // foreign/misbound record fails closed with nothing touched. Read-only, so
-  // the plugin gate below still runs before every write.
-  if (fs.existsSync(sidebarNativePath())) {
-    if (readSettingsDoc(piSettingsPath()) === null) {
-      notify?.(`Could not enable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
-      return;
-    }
-    const binding = checkSidebarMarker(piSettingsPath());
-    if (!binding.ok) {
-      notify?.(`Could not enable: ${binding.note} Re-run after resolving it.`, "error");
-      return;
-    }
-  }
-  // S3/S4: consult the plugin BEFORE any write. A missing, disabled, or
-  // inconclusive install refuses fail-closed with the install command; nothing
-  // is written and the switch stays native. The disable path never reaches here.
-  const prereq = sidebarPluginPrereq();
-  if (!prereq.ok) {
-    notify?.(sidebarEnableRefusalText(prereq.status), "error");
-    return;
-  }
-  // Completion proof before any local state changes: resolve the
-  // installed root, run its configure synchronously, and re-read the
-  // managed-row effect. Exclusion and mode only change after this.
-  const resolved = resolveSidebarPluginRoot();
-  if (!resolved.ok) {
-    notify?.(`Could not enable: ${resolved.note} ${reRun}`, "error");
-    return;
-  }
-  const before = readSidebarConfig();
-  if (!before.ok) {
-    notify?.(`Could not enable: ${before.note} ${reRun}`, "error");
-    return;
-  }
-  const hadManaged = sidebarRowsManaged(before.text);
-  const ran = runSidebarConfigure(resolved.root, "--apply", true);
-  const after = readSidebarConfig();
-  const nowManaged = after.ok && sidebarRowsManaged(after.text);
-  if (ran.exit !== 0 || !nowManaged) {
-    // Bounded rows restore: only our own markers are ever removed, so
-    // user tables and concurrent edits outside them are preserved.
-    let restored = "rows left as found";
-    if (!hadManaged && nowManaged) {
-      const undone = runSidebarConfigure(resolved.root, "--uninstall", false);
-      const check = readSidebarConfig();
-      restored = undone.exit === 0 && check.ok && !sidebarRowsManaged(check.text)
-        ? "stranded rows removed again"
-        : "rows could NOT be restored; remove the managed block manually or re-run enable";
-    }
-    const detail = ran.exit !== 0
-      ? `configure exited ${ran.exit}${ran.output ? `: ${ran.output}` : "."}`
-      : "managed rows missing after configure.";
-    notify?.(`Could not enable: ${detail} ${restored}; mode and exclusion unchanged. ${reRun}`, "error");
-    return;
-  }
-  const exclusion = ensureSidebarExclusion();
-  if (!exclusion.ok) {
-    if (!hadManaged) runSidebarConfigure(resolved.root, "--uninstall", false);
-    notify?.(`Could not enable: ${exclusion.note} Rows rolled back; mode unchanged. ${reRun}`, "error");
-    return;
-  }
-  try {
-    writeSidebarMode(true);
-  } catch (error) {
-    if (exclusion.changed) removeSidebarExclusion();
-    if (!hadManaged) runSidebarConfigure(resolved.root, "--uninstall", false);
-    notify?.(`Could not enable: cannot write ${sidebarModePath()}: ${error?.message ?? error}. State rolled back. ${reRun}`, "error");
-    return;
-  }
-  notify?.(
-    `Gentle sidebar enabled (ours). ${exclusion.note} Managed rows applied and verified (configure exit 0). Sessions already running need /reload to pick up the extension-list change.`,
-    "info",
-  );
-}
-
-async function sidebarDisable(ctx) {
-  const notify = ctx?.ui?.notify;
-  const reRun = "Retry via /herdr-gentle:customize to converge.";
-  if (fs.existsSync(sidebarNativePath())) {
-    if (readSettingsDoc(piSettingsPath()) === null) {
-      notify?.(`Could not disable: ${piSettingsPath()} is unreadable or invalid JSON; fix or remove it, then retry via /herdr-gentle:customize.`, "error");
-      return;
-    }
-    const binding = checkSidebarMarker(piSettingsPath());
-    if (!binding.ok) {
-      notify?.(`Could not disable: ${binding.note} Re-run after resolving it.`, "error");
-      return;
-    }
-  }
-  const resolved = resolveSidebarPluginRoot();
-  const before = readSidebarConfig();
-  if (!before.ok) {
-    notify?.(`Could not disable: ${before.note} ${reRun}`, "error");
-    return;
-  }
-  const hadManaged = sidebarRowsManaged(before.text);
-  // S2: a missing prerequisite may block turning the sidebar ON, never OFF.
-  // A DEFINITE no-match (the plugin is absent) no longer aborts the disable:
-  // without a plugin root there is no configure.js to run, so the plugin-owned
-  // managed rows are left as found (the absent plugin is the only thing that
-  // converges them) while the owned exclusion and the mode still converge. An
-  // INCONCLUSIVE lookup (no Herdr CLI, spawn/parse error) keeps the historical
-  // fail-closed refusal: we cannot tell whether rows still need the plugin.
-  if (!resolved.ok) {
-    if (sidebarPluginPrereq().status !== "missing") {
-      notify?.(`Could not disable: ${resolved.note} ${reRun}`, "error");
-      return;
-    }
-    const exclusion = removeSidebarExclusion();
-    if (!exclusion.ok) {
-      notify?.(`Could not disable: ${exclusion.note} Mode unchanged. ${reRun}`, "error");
-      return;
-    }
-    try {
-      writeSidebarMode(false);
-    } catch (error) {
-      if (exclusion.changed) ensureSidebarExclusion();
-      notify?.(`Could not disable: cannot write ${sidebarModePath()}: ${error?.message ?? error}. Mode unchanged. ${reRun}`, "error");
-      return;
-    }
-    notify?.(
-      `Gentle sidebar disabled (native renders again). ${exclusion.note} Managed rows left as found (the plugin that converges them is not resolvable).`,
-      "info",
-    );
-    return;
-  }
-  const ran = runSidebarConfigure(resolved.root, "--uninstall", true);
-  const after = readSidebarConfig();
-  const nowAbsent = after.ok && !sidebarRowsManaged(after.text);
-  if (ran.exit !== 0 || !nowAbsent) {
-    // Bounded rows restore (marker-scoped re-apply only): user tables
-    // and concurrent edits outside our markers are preserved.
-    let restored = "rows left as found";
-    if (hadManaged && after.ok && !sidebarRowsManaged(after.text)) {
-      const redone = runSidebarConfigure(resolved.root, "--apply", false);
-      const check = readSidebarConfig();
-      restored = redone.exit === 0 && check.ok && sidebarRowsManaged(check.text)
-        ? "prior owned rows restored"
-        : "rows could NOT be restored; re-run disable or apply the managed block manually";
-    }
-    const detail = ran.exit !== 0
-      ? `configure exited ${ran.exit}${ran.output ? `: ${ran.output}` : "."}`
-      : "managed rows still present after configure.";
-    notify?.(`Could not disable: ${detail} ${restored}; exclusion and mode unchanged. ${reRun}`, "error");
-    return;
-  }
-  const exclusion = removeSidebarExclusion();
-  if (!exclusion.ok) {
-    notify?.(`Could not disable: ${exclusion.note} Rows are native; mode unchanged. ${reRun}`, "error");
-    return;
-  }
-  try {
-    writeSidebarMode(false);
-  } catch (error) {
-    if (exclusion.changed) ensureSidebarExclusion();
-    notify?.(`Could not disable: cannot write ${sidebarModePath()}: ${error?.message ?? error}. Exclusion restored; rows are native. ${reRun}`, "error");
-    return;
-  }
-  notify?.(
-    `Gentle sidebar disabled (native renders again). ${exclusion.note} Managed rows removed and verified (configure exit 0). Sessions already running need /reload to pick up the extension-list change.`,
-    "info",
-  );
-}
-
 /* ------------------------------------------------------------ moshi */
 
-// Optional Moshi replacement (DESIGN §7). With the toggle on, this extension
+// Optional Moshi replacement (DESIGN §7). With the flag on, this extension
 // takes over the whole integration the Moshi-managed Pi hook used to provide
 // — the same `session.update` envelopes over the Moshi daemon socket — so
 // Chat View, Live Activity, the session row and the terminal context keep
@@ -2450,137 +1832,299 @@ function lastFinishedLabel(taskMap) {
 }
 
 // ---------------------------------------------------------------------------
-// Customize panel providers (customize-command S6, T1).
+// `/herdr-gentle:customize`: exactly two switches, nothing else.
 //
-// The sidebar and moshi actions stay inline above — nothing is extracted
-// or rewritten here. This block only registers the two actions once at
-// load into the single cross-extension provider slot the worktree
-// extension reads when the panel opens. `Symbol.for` yields the same
-// symbol in both modules without a shared import, so the key literal is
-// the contract: it must stay byte-identical in both files (a test asserts
-// it). Provider contract: read() returns the active value id;
-// apply(value, ctx) returns {changed, needsReload, text} through the
-// existing sidebarEnable/sidebarDisable and writeMoshiFlag/
-// setMoshiExclusion/moshiFlagEnabled paths unchanged. No text here ever
-// asks the user to run /reload (S5): the command notifies once itself
-// and reloads on its own when the verdict says so.
+// The command is registered BEFORE the `enabled()` gate in the factory below,
+// so it stays reachable from a plain Pi session outside a Herdr pane; the
+// producer itself still needs a pane. The two switches are:
+//
+// - Sidebar agent rows. The marked `[ui.sidebar.agents.rows_by_agent]` block
+//   belongs to the Herdr plugin's own `bin/configure.js`, which is installed as
+//   its own package, so this command only drives it — `--check` to read the
+//   current state, `--apply --reload` / `--uninstall --reload` to change it —
+//   and re-reads `--check` as the completion proof instead of trusting an exit
+//   code. This file never edits the Herdr config itself.
+// - Moshi notifications. The flag file plus, while `extensions/moshi-hooks.ts`
+//   is installed, the `-extensions/moshi-hooks.ts` exclusion in Pi's
+//   settings.json, so the Moshi-managed hook cannot notify in parallel.
+//   Enabling runs the `moshi-hook` prerequisite gate first (exact-name PATH scan
+//   plus `moshi-hook status --json` reporting `paired: true`); a refusal writes
+//   nothing at all. Disabling skips the gate and stays unconditional. A Pi
+//   reload is requested only when the settings entry actually changed, because
+//   that entry is the only part that waits for the next Pi extension load.
+//
+// The removed `Plugin tools` and `Reset` sections, the two-pane TUI and the
+// cross-extension provider slot the old panel read are deliberately NOT
+// restored: they switched worktree/ODD/issues surfaces this package no longer
+// contains, and a flat `ctx.ui.select` menu is the whole interaction.
 // ---------------------------------------------------------------------------
 
-function customizeSidebarRead() {
+const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
+const CUSTOMIZE_SIDEBAR_LABEL = "Sidebar agent rows";
+const CUSTOMIZE_MOSHI_LABEL = "Moshi notifications";
+const CUSTOMIZE_ON = "On";
+const CUSTOMIZE_OFF = "Off";
+
+// bin/configure.js lives in the Herdr plugin (installed as its own package), so
+// the Pi side resolves that root exactly like lib/gentle-sidebar.js does:
+// read-only `herdr plugin list --json`, with GENTLE_HERDR_PLUGIN_ROOT as the
+// documented override for isolated runs. The active (renamed) id is queried
+// first; a zero match falls through to one explicit lookup by the retired id.
+// Ambiguous roots fail closed on either id.
+const HERDR_PLUGIN_ACTIVE_ID = "herdr-gentle-shell";
+const HERDR_PLUGIN_LEGACY_ID = "herdr-gentle-agents";
+
+function herdrPluginRoots(id) {
+  let result;
   try {
-    return readSidebarMode().publish ? "gentle" : "native";
-  } catch {
-    return "native";
+    result = spawnSync(
+      process.env.HERDR_BIN_PATH || "herdr",
+      ["plugin", "list", "--plugin", id, "--json"],
+      { encoding: "utf8", timeout: 15000, windowsHide: true },
+    );
+  } catch (error) {
+    return { ok: false, note: `could not resolve the installed plugin root: ${error?.message ?? error}.` };
+  }
+  if (result.error) {
+    return { ok: false, note: `could not resolve the installed plugin root: ${result.error.message}.` };
+  }
+  if (result.status !== 0) {
+    return { ok: false, note: `could not resolve the installed plugin root (plugin list exited ${result.status}).` };
+  }
+  try {
+    const doc = JSON.parse(result.stdout || "");
+    const arr = (doc && doc.result && doc.result.plugins) || doc.plugins || [];
+    if (!Array.isArray(arr)) throw new Error("no plugins array");
+    const hits = arr.filter((p) => p && (p.plugin_id === id || p.id === id));
+    const roots = [...new Set(hits.map((hit) => hit.plugin_root).filter((root) => typeof root === "string" && root.length > 0))];
+    return { ok: true, roots };
+  } catch (error) {
+    return { ok: false, note: `could not resolve the installed plugin root: malformed plugin list (${error?.message ?? error}).` };
   }
 }
 
-// Read-only convergence probe for the startup auto-disable message: whether the
-// plugin-owned managed rows are still present in the Herdr config after a
-// disable that could not run configure.js (T1). Never throws.
-function customizeSidebarRowsManaged() {
-  try {
-    const config = readSidebarConfig();
-    return config.ok && sidebarRowsManaged(config.text);
-  } catch {
-    return false;
+function checkConfigureScript(roots) {
+  if (roots.length !== 1 || !pathIsAbsolute(roots[0])) {
+    const why = roots.length === 0 ? "no match" : "ambiguous or non-absolute";
+    return { ok: false, note: `could not resolve the installed plugin root (${why}).` };
   }
+  const script = join(roots[0], "bin", "configure.js");
+  if (!fs.existsSync(script)) {
+    return { ok: false, note: `could not resolve the installed plugin root (${roots[0]} has no bin/configure.js).` };
+  }
+  return { ok: true, script };
 }
 
-async function customizeSidebarApply(value, ctx) {
-  if (value !== "gentle" && value !== "native") {
-    return { changed: false, needsReload: false, text: `Unknown sidebar value ${JSON.stringify(value)}; nothing was changed.` };
+function resolveConfigureScript() {
+  const override = process.env.GENTLE_HERDR_PLUGIN_ROOT;
+  if (typeof override === "string" && override.length > 0) {
+    return { ok: true, script: join(resolvePath(override), "bin", "configure.js") };
   }
-  let current = null;
+  const active = herdrPluginRoots(HERDR_PLUGIN_ACTIVE_ID);
+  if (!active.ok) return active;
+  if (active.roots.length > 0) return checkConfigureScript(active.roots);
+  const legacy = herdrPluginRoots(HERDR_PLUGIN_LEGACY_ID);
+  if (!legacy.ok) return legacy;
+  if (legacy.roots.length > 0) return checkConfigureScript(legacy.roots);
+  return { ok: false, note: `could not resolve the installed plugin root (no match for ${HERDR_PLUGIN_ACTIVE_ID} or ${HERDR_PLUGIN_LEGACY_ID}).` };
+}
+
+// Fixed argv, no shell, bounded time. `--check` output is only used to explain a
+// refusal, so it is trimmed and capped.
+function runConfigureScript(script, op, reload) {
+  const args = [script, op];
+  if (reload) args.push("--reload");
+  let result;
   try {
-    current = customizeSidebarRead();
-  } catch {
-    current = null;
+    result = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60000, windowsHide: true });
+  } catch (error) {
+    return { exit: -1, output: `configure ${op} could not start: ${error?.message ?? error}.` };
   }
-  if (current === value) {
+  if (result.error) {
+    return { exit: -1, output: `configure ${op} could not start: ${result.error.message}.` };
+  }
+  const output = `${result.stdout || ""}${result.stderr || ""}`.trim().slice(0, 300);
+  return { exit: result.status, output };
+}
+
+// `--check` verdict: 0 = managed rows present and current, 1 = absent (needs
+// --apply), anything else = refuse (unmanaged override, unreadable config).
+function readSidebarRows(script) {
+  const ran = runConfigureScript(script, "--check", false);
+  if (ran.exit === 0) return { state: "on", output: ran.output };
+  if (ran.exit === 1) return { state: "off", output: ran.output };
+  return { state: "unknown", output: ran.output };
+}
+
+// Never throws: an unresolvable plugin root or an inconclusive check reports
+// `unknown` instead of guessing, and nothing is written by a read.
+function sidebarRowsState() {
+  const resolved = resolveConfigureScript();
+  if (!resolved.ok) return { state: "unknown", note: resolved.note };
+  return readSidebarRows(resolved.script);
+}
+
+async function applySidebarRows(want) {
+  const verb = want ? "enable" : "disable";
+  const target = want ? "on" : "off";
+  const resolved = resolveConfigureScript();
+  if (!resolved.ok) {
+    return { changed: false, needsReload: false, level: "error", text: `Could not ${verb} the sidebar agent rows: ${resolved.note}` };
+  }
+  const before = readSidebarRows(resolved.script);
+  if (before.state === target) {
     return {
       changed: false,
       needsReload: false,
-      text: value === "gentle"
-        ? "Gentle sidebar already enabled (ours); nothing was changed."
-        : "Native sidebar already active; nothing was changed.",
+      level: "info",
+      text: `Sidebar agent rows already ${target === "on" ? "enabled" : "disabled"}; nothing was changed.`,
     };
   }
-  // The existing enable/disable paths notify through ctx while the panel
-  // notifies once itself, so they run against a capturing ctx here and
-  // only their outcome — the re-read mode — decides the verdict.
-  const seen = [];
-  const capture = ctx && typeof ctx === "object"
-    ? { ...ctx, ui: { ...((ctx.ui) ?? {}), notify: (message, level) => { seen.push([message, level]); } } }
-    : ctx;
-  try {
-    if (value === "gentle") await sidebarEnable(capture);
-    else await sidebarDisable(capture);
-  } catch (err) {
-    return { changed: false, needsReload: false, text: `Could not update the sidebar: ${(err && err.message) || err}; nothing was changed.` };
+  const ran = runConfigureScript(resolved.script, want ? "--apply" : "--uninstall", true);
+  const after = readSidebarRows(resolved.script);
+  if (after.state !== target) {
+    const detail = ran.exit !== 0
+      ? `configure exited ${ran.exit}${ran.output ? `: ${ran.output}` : "."}`
+      : `configure reported success but the managed rows are still ${after.state}.`;
+    return { changed: false, needsReload: false, level: "error", text: `Could not ${verb} the sidebar agent rows: ${detail} Nothing was changed.` };
   }
-  let after = null;
-  try {
-    after = customizeSidebarRead();
-  } catch {
-    after = null;
-  }
-  if (after !== value) {
-    return {
-      changed: false,
-      needsReload: false,
-      text: seen.length > 0 ? String(seen[seen.length - 1][0]) : "Could not update the sidebar; nothing was changed.",
-    };
-  }
-  // S6 reload matrix: the Pi settings exclusion and the native sidebar
-  // only take effect on the next Pi extension load, so a successful
-  // switch ALWAYS reloads.
   return {
     changed: true,
-    needsReload: true,
-    text: value === "gentle"
-      ? "Gentle sidebar enabled (ours)."
-      : "Gentle sidebar disabled (native renders again).",
+    needsReload: false,
+    level: "info",
+    text: want
+      ? "Sidebar agent rows enabled; the managed block is in place and Herdr reloaded its config."
+      : "Sidebar agent rows disabled; the managed block is gone and Herdr reloaded its config.",
   };
 }
 
-// Moshi enable prerequisites (customize-command S38). Before the switch
-// flips to On, the enable path verifies (a) the `moshi-hook` CLI resolves
-// on PATH by exact name, and (b) `moshi-hook status --json` (fixed argv,
-// short timeout) reports a top-level `paired: true`. Pairing is what lets
-// a notification reach the phone; the token itself is only consumed by
-// `moshi-hook pair --token` and is never read, logged, stored, or
-// returned here — only the `paired` flag the CLI reports. Either check
-// missing refuses with one message naming the fix, and changes NOTHING:
-// no flag write, no settings write, no exclusion entry, no reload, and
-// the switch stays Off. The `pi` hooks entry is deliberately NOT
-// required: enabling excludes `extensions/moshi-hooks.ts` on purpose, so
-// this plugin is the single notifier. The disable path never calls here;
-// disabling stays unconditional.
-//
-// Self-contained like the rest of this file: the installed copy ships
-// without sibling modules, so this mirrors lib/moshi-prereq.js inline
-// (keep the three refusal literals byte-identical in both files) instead
-// of importing it. The two seams below are the injectable test surface
-// (mirroring the customizeTuiLoader pattern): production uses the real
-// PATH scan + spawnSync, tests replace either seam so no real
-// `moshi-hook` — which may talk to a daemon — is ever spawned.
+// Moshi flag + exclusion. Both helpers mirror what the Moshi switch needs and
+// nothing else: the flag file is re-read per event, the settings entry is the
+// only edit that waits for the next Pi load.
+const MOSHI_HOOKS_REL = "extensions/moshi-hooks.ts";
+const MOSHI_EXCLUSION_ENTRY = "-extensions/moshi-hooks.ts";
+
+function writeMoshiFlag(path, enabled) {
+  fs.mkdirSync(dirname(path), { recursive: true });
+  fs.writeFileSync(path, `${JSON.stringify({ enabled, updatedAt: new Date().toISOString() })}\n`);
+}
+
+function piAgentDir() {
+  const env = process.env;
+  const selected = env.GENTLE_PI_AGENT_HOME ?? env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  if (selected === "~") return homedir();
+  if (selected.startsWith("~/")) return join(homedir(), selected.slice(2));
+  return selected;
+}
+
+function moshiHooksPath() {
+  return join(piAgentDir(), "extensions", "moshi-hooks.ts");
+}
+
+function piSettingsPath() {
+  return join(piAgentDir(), "settings.json");
+}
+
+// Fail closed: null means "do not touch it" (unreadable, invalid JSON, a
+// non-object document, or an `extensions` value that is not a list of strings).
+// A missing file yields an empty document, exactly like Pi.
+function readSettingsDoc(path) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return { doc: {}, exists: false };
+    return null;
+  }
+  let doc;
+  try {
+    doc = JSON.parse(raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw);
+  } catch {
+    return null;
+  }
+  if (!isRecord(doc)) return null;
+  if (doc.extensions !== undefined && !Array.isArray(doc.extensions)) return null;
+  if (Array.isArray(doc.extensions) && doc.extensions.some((entry) => typeof entry !== "string")) return null;
+  return { doc, exists: true };
+}
+
+// Atomic and mode-preserving. A symlinked settings.json keeps pointing at its
+// target because the temp file is created next to the resolved target.
+function writeSettingsDoc(path, doc) {
+  let target = path;
+  try {
+    target = fs.realpathSync(path);
+  } catch {
+    // Missing or dangling: write where the path points.
+  }
+  let mode = 0o600;
+  try {
+    mode = fs.statSync(target).mode & 0o777;
+  } catch {
+    // Fresh file.
+  }
+  const temp = join(dirname(target), `.settings.json.gentle-${randomUUID().slice(0, 8)}.tmp`);
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(doc, null, 2)}\n`, { mode });
+    fs.renameSync(temp, target);
+  } catch (error) {
+    try {
+      fs.rmSync(temp, { force: true });
+    } catch {}
+    throw error;
+  }
+}
+
+function moshiExclusionPresent() {
+  const loaded = readSettingsDoc(piSettingsPath());
+  if (loaded === null) return null;
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  return list.includes(MOSHI_EXCLUSION_ENTRY);
+}
+
+// Only ever appends or removes the exact entry, preserving every other key,
+// value and entry. Both directions are gated on the Moshi-managed hook
+// existing: with no hook file there is nothing to exclude, so settings.json is
+// never touched.
+function setMoshiExclusion(want) {
+  if (!fs.existsSync(moshiHooksPath())) {
+    return { ok: true, note: `${MOSHI_HOOKS_REL} is not installed; settings.json untouched.` };
+  }
+  const settings = piSettingsPath();
+  const loaded = readSettingsDoc(settings);
+  if (loaded === null) {
+    return { ok: false, note: `could not update ${settings}: unreadable or invalid JSON.` };
+  }
+  const list = Array.isArray(loaded.doc.extensions) ? loaded.doc.extensions : [];
+  const present = list.includes(MOSHI_EXCLUSION_ENTRY);
+  if (want === present) {
+    return { ok: true, note: want ? "exclusion already present." : "no exclusion to remove." };
+  }
+  const next = want
+    ? [...list, MOSHI_EXCLUSION_ENTRY]
+    : list.filter((entry) => entry !== MOSHI_EXCLUSION_ENTRY);
+  try {
+    writeSettingsDoc(settings, { ...loaded.doc, extensions: next });
+  } catch (error) {
+    return { ok: false, note: `could not write ${settings}: ${error?.message ?? error}.` };
+  }
+  return { ok: true, note: want ? `added ${MOSHI_EXCLUSION_ENTRY}.` : `removed ${MOSHI_EXCLUSION_ENTRY}.` };
+}
+
+// Moshi enable prerequisites. Before the switch flips to On: (a) `moshi-hook`
+// resolves on PATH by exact name (join + stat, never a shell), and (b)
+// `moshi-hook status --json` (fixed argv, short timeout) reports a top-level
+// `paired: true`. Pairing is what lets a notification reach the phone; only the
+// `paired` flag is read, never a token. Either check missing refuses with one
+// message naming the fix and changes NOTHING: no flag write, no settings write,
+// no exclusion entry, no reload, and the switch stays Off. The `pi` hooks entry
+// is deliberately NOT required — enabling excludes `extensions/moshi-hooks.ts`
+// on purpose, so this plugin is the single notifier.
 const MOSHI_BIN_NAME = "moshi-hook";
 const MOSHI_STATUS_ARGS = ["status", "--json"];
 const MOSHI_STATUS_TIMEOUT_MS = 5000;
 
-let moshiHookResolver = null;
-let moshiStatusRunner = null;
-
-export function setMoshiHookResolver(fn) {
-  moshiHookResolver = typeof fn === "function" ? fn : null;
-}
-
-export function setMoshiStatusRunner(fn) {
-  moshiStatusRunner = typeof fn === "function" ? fn : null;
-}
-
-function defaultResolveMoshiHook() {
-  // Exact-name PATH scan; never through a shell (join + stat only).
+function resolveMoshiHook() {
   const names = process.platform === "win32"
     ? ["moshi-hook.exe", "moshi-hook.cmd", "moshi-hook.bat", MOSHI_BIN_NAME]
     : [MOSHI_BIN_NAME];
@@ -2599,9 +2143,7 @@ function defaultResolveMoshiHook() {
   return null;
 }
 
-function defaultRunMoshiStatus(cliPath) {
-  // Fixed argv, no shell, short timeout. Only the top-level `paired`
-  // flag is read; every other field (secretStore, hooks, ...) is ignored.
+function runMoshiStatus(cliPath) {
   let result;
   try {
     result = spawnSync(cliPath, [...MOSHI_STATUS_ARGS], {
@@ -2644,21 +2186,17 @@ function moshiStatusFailedText(reason, status) {
   return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from /herdr-gentle:customize.`;
 }
 
-async function checkMoshiEnablePrereqs() {
-  const resolve = moshiHookResolver ?? defaultResolveMoshiHook;
-  const run = moshiStatusRunner ?? defaultRunMoshiStatus;
+function checkMoshiEnablePrereqs() {
   let cliPath = null;
   try {
-    cliPath = await resolve();
+    cliPath = resolveMoshiHook();
   } catch {
     cliPath = null;
   }
-  if (typeof cliPath !== "string" || cliPath.length === 0) {
-    return { ok: false, text: moshiMissingCliText() };
-  }
+  if (typeof cliPath !== "string" || cliPath.length === 0) return { ok: false, text: moshiMissingCliText() };
   let status;
   try {
-    status = await run(cliPath);
+    status = runMoshiStatus(cliPath);
   } catch {
     status = { ok: false, reason: "spawn-failed" };
   }
@@ -2668,99 +2206,119 @@ async function checkMoshiEnablePrereqs() {
   return { ok: false, text: moshiStatusFailedText(reason, status ? status.status : null) };
 }
 
-function customizeMoshiRead() {
-  try {
-    return moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
-  } catch {
-    return "off";
-  }
-}
-
-async function customizeMoshiApply(value, ctx) {
-  if (value !== "on" && value !== "off") {
-    return { changed: false, needsReload: false, text: `Unknown Moshi value ${JSON.stringify(value)}; nothing was changed.` };
-  }
-  let current = null;
-  try {
-    current = customizeMoshiRead();
-  } catch {
-    current = null;
-  }
-  if (current === value) {
+function applyMoshiNotifications(want) {
+  const file = moshiFlagPath();
+  const current = moshiFlagEnabled(file);
+  if (current === want) {
     return {
       changed: false,
       needsReload: false,
-      text: `Moshi notifications already ${value === "on" ? "on" : "off"}; nothing was changed.`,
+      level: "info",
+      text: `Moshi notifications already ${want ? "on" : "off"}; nothing was changed.`,
     };
   }
-  const want = value === "on";
-  // S38: enabling requires the real prerequisites first. The gate runs
-  // before any write, so a refusal changes NOTHING (no flag file, no
-  // settings write, no exclusion entry, no reload) and the switch stays
-  // Off. Disabling skips the gate entirely and stays unconditional.
   if (want) {
-    let gate;
-    try {
-      gate = await checkMoshiEnablePrereqs();
-    } catch (err) {
-      gate = { ok: false, text: moshiStatusFailedText("spawn-failed", null) };
-    }
+    // The gate runs before any write, so a refusal leaves the flag, the
+    // settings file and the exclusion exactly as found.
+    const gate = checkMoshiEnablePrereqs();
     if (!gate || gate.ok !== true) {
       return {
         changed: false,
         needsReload: false,
+        level: "error",
         text: (gate && typeof gate.text === "string" && gate.text) || moshiStatusFailedText("spawn-failed", null),
       };
     }
   }
-  const file = moshiFlagPath();
-  let exclusionBefore = null;
-  try {
-    exclusionBefore = moshiExclusionPresent();
-  } catch {
-    exclusionBefore = null;
-  }
+  const exclusionBefore = moshiExclusionPresent();
   try {
     writeMoshiFlag(file, want);
-  } catch (err) {
-    return { changed: false, needsReload: false, text: `Could not write ${file}: ${(err && err.message) || err}; nothing was changed.` };
+  } catch (error) {
+    return { changed: false, needsReload: false, level: "error", text: `Could not write ${file}: ${error?.message ?? error}; nothing was changed.` };
   }
-  let exclusion = { ok: true, note: "settings.json untouched." };
+  let exclusion;
   try {
     exclusion = setMoshiExclusion(want);
-  } catch (err) {
-    exclusion = { ok: false, note: `could not update the Moshi hook exclusion: ${(err && err.message) || err}.` };
+  } catch (error) {
+    exclusion = { ok: false, note: `could not update the Moshi hook exclusion: ${error?.message ?? error}.` };
   }
-  let exclusionAfter = null;
-  try {
-    exclusionAfter = moshiExclusionPresent();
-  } catch {
-    exclusionAfter = null;
-  }
-  // S6 reload matrix: the flag is re-read per event (hot, immediate), so
-  // a reload is only needed when the exclusion entry actually changed —
-  // it applies at the next Pi load.
+  const exclusionAfter = moshiExclusionPresent();
   return {
     changed: true,
     needsReload: exclusionBefore !== exclusionAfter,
+    level: exclusion.ok === false ? "error" : "info",
     text: `Moshi notifications ${want ? "enabled" : "disabled"}. ${exclusion.note}`,
   };
 }
 
-function registerCustomizeProviders() {
-  try {
-    globalThis[Symbol.for("herdr-gentle.customize.v1")] = {
-      sidebar: { read: customizeSidebarRead, apply: customizeSidebarApply, rowsManaged: customizeSidebarRowsManaged },
-      moshi: { read: customizeMoshiRead, apply: customizeMoshiApply },
-    };
-  } catch {
-    // Fail closed: without the slot the panel renders both categories
-    // unavailable instead of throwing at load.
+// One apply path for both switches: notify once with the verdict and reload Pi
+// only when the Moshi settings entry actually changed.
+async function applyCustomizeSwitch(id, value, ctx) {
+  const result = id === "sidebar"
+    ? await applySidebarRows(value === "on")
+    : applyMoshiNotifications(value === "on");
+  const notify = ctx?.ui?.notify;
+  if (typeof notify === "function") {
+    notify(`${result.text}${result.needsReload ? " Reloading now to apply the change." : ""}`, result.level);
   }
+  if (result.needsReload && typeof ctx?.reload === "function") await ctx.reload();
+}
+
+async function executeCustomize(rawArgs, ctx) {
+  const notify = ctx?.ui?.notify;
+  const raw = String(rawArgs ?? "").trim();
+  const head = (raw.split(/\s+/).filter((part) => part.length > 0)[0] || "").toLowerCase();
+  if (head === "status") {
+    // One read-only line: nothing is written and nothing is reloaded.
+    const sidebar = sidebarRowsState();
+    const moshi = moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
+    if (typeof notify === "function") {
+      notify(`customize status: sidebar=${sidebar.state} moshi=${moshi}`, "info");
+    }
+    return;
+  }
+  if (head !== "") {
+    if (typeof notify === "function") {
+      notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
+    }
+    return;
+  }
+  const select = ctx?.ui?.select;
+  if (typeof select !== "function") return;
+  let picked = null;
+  try {
+    picked = await select(CUSTOMIZE_TITLE, [CUSTOMIZE_SIDEBAR_LABEL, CUSTOMIZE_MOSHI_LABEL]);
+  } catch {
+    picked = undefined;
+  }
+  // Esc/cancel (null or undefined) writes nothing and reloads nothing.
+  if (picked === undefined || picked === null) return;
+  const id = picked === CUSTOMIZE_SIDEBAR_LABEL ? "sidebar" : picked === CUSTOMIZE_MOSHI_LABEL ? "moshi" : null;
+  if (!id) return;
+  const current = id === "sidebar"
+    ? sidebarRowsState().state
+    : (moshiFlagEnabled(moshiFlagPath()) ? "on" : "off");
+  let choice = null;
+  try {
+    choice = await select(`${picked} (currently ${current})`, [CUSTOMIZE_ON, CUSTOMIZE_OFF]);
+  } catch {
+    choice = undefined;
+  }
+  if (choice !== CUSTOMIZE_ON && choice !== CUSTOMIZE_OFF) return;
+  await applyCustomizeSwitch(id, choice === CUSTOMIZE_ON ? "on" : "off", ctx);
 }
 
 export default function (pi) {
-  registerCustomizeProviders();
+  // Registered before the pane gate on purpose: the switches are local state and
+  // must stay reachable from a plain Pi session outside a Herdr pane.
+  if (typeof pi?.registerCommand === "function") {
+    pi.registerCommand("herdr-gentle:customize", {
+      description: "Customize Herdr Gentle Shell: sidebar agent rows and Moshi notifications",
+      handler: async (args, ctx) => {
+        await executeCustomize(args, ctx);
+      },
+    });
+  }
   if (!enabled()) return;
 
   let rootSession = false;
@@ -3161,14 +2719,19 @@ export default function (pi) {
     return merged;
   }
 
+  // Advisory names CSV, bounded in UTF-8 BYTES against Herdr's ceiling: an
+  // entry that would push the value past MAX_TOKEN_BYTES is dropped whole
+  // (never chunked, never truncated), so the consumer always sees whole
+  // labels. A single 64-character label is at most 256 bytes, so the first
+  // name always fits.
   function namesCsv(subs) {
     const parts = [];
     let length = 0;
     for (const sub of subs) {
       const name = sanitizeLabel(sub.label, sub.agent);
       if (parts.includes(name)) continue;
-      const add = (parts.length === 0 ? 0 : 1) + name.length;
-      if (length + add > MAX_NAMES_CHARS) break;
+      const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(name);
+      if (length + add > MAX_TOKEN_BYTES) break;
       parts.push(name);
       length += add;
     }
@@ -3231,8 +2794,8 @@ export default function (pi) {
     for (const sub of subs) {
       const role = agentToRole(sub.agent);
       if (!role || parts.includes(role)) continue;
-      const add = (parts.length === 0 ? 0 : 1) + role.length;
-      if (length + add > MAX_ROLES_CHARS) break;
+      const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(role);
+      if (length + add > MAX_TOKEN_BYTES) break;
       parts.push(role);
       length += add;
     }
@@ -3267,6 +2830,8 @@ export default function (pi) {
     const roles = rolesCsv(mergedRoleSubs());
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;
+    // Clear the retired disclosure token left by older producers.
+    tokens.gentle_subs_v1 = null;
     // Durable ask signal (DESIGN §4.3): session-bound + TTL-fresh
     // `<hash>:<intentId>:<expiry>`, emitted on every beat while ask is
     // active, null (clear) when inactive. Repairs a missed edge-triggered
@@ -3306,6 +2871,15 @@ export default function (pi) {
     } else {
       tokens.gentle_orchestrating_v1 = null;
     }
+    // Principal-only activity marker: session-bound freshness
+    // (<hash>:<expiry>, same discipline as gentle_orchestrating_v1) emitted
+    // while the principal's own agent is active — `agentActive` alone, the
+    // same principal input computeNativeState uses, never the delegate
+    // aggregate that native `working` carries — and null (clear) once it
+    // settles. A settled principal therefore never publishes it, no matter
+    // how many delegates keep running.
+    if (agentActive) tokens[PRINCIPAL_TOKEN] = `${sessionHash}:${expiry}`;
+    else tokens[PRINCIPAL_TOKEN] = null;
     if (changes.files > 0) {
       const files = String(changes.files);
       const added = String(changes.added);
@@ -3910,7 +3484,7 @@ export default function (pi) {
     if (!isRecord(input)) return undefined;
     const agent = typeof input.agent === "string" ? input.agent : "subagent";
     const label = sanitizeLabel(typeof input.label === "string" ? input.label : agent, agent);
-    return { agent: agent.slice(0, MAX_LABEL_CHARS), label };
+    return { agent: truncateChars(agent, MAX_LABEL_CHARS), label };
   }
 
   pi.on("tool_call", (event) => {
@@ -3920,7 +3494,10 @@ export default function (pi) {
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
       const parsed = launchInput(event.input);
       if (!parsed || typeof event.toolCallId !== "string") return;
-      pendingCalls.set(event.toolCallId, { ...parsed, at: Date.now() });
+      pendingCalls.set(event.toolCallId, {
+        ...parsed,
+        at: Date.now(),
+      });
       if (pendingCalls.size > MAX_TRACKED_TASKS) {
         const oldest = pendingCalls.keys().next().value;
         pendingCalls.delete(oldest);
@@ -4019,7 +3596,7 @@ export default function (pi) {
     }
     const incomingAgent =
       typeof details.agent === "string" && details.agent.length > 0
-        ? details.agent.slice(0, MAX_LABEL_CHARS)
+        ? truncateChars(details.agent, MAX_LABEL_CHARS)
         : undefined;
     // A stale read's agent is distrusted with its status, and a missing
     // agent keeps the previous record's agent (never reset to a guess).
@@ -4071,7 +3648,7 @@ export default function (pi) {
     const previous = tasks.get(details.taskId);
     const agent =
       typeof details.agent === "string" && details.agent.length > 0
-        ? details.agent.slice(0, MAX_LABEL_CHARS)
+        ? truncateChars(details.agent, MAX_LABEL_CHARS)
         : (previous?.agent ?? "subagent");
     // Record identity is immutable per taskId: firstSeen never moves (T2b
     // ordering only) whether this observation promotes a background start

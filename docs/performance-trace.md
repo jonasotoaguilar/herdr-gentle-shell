@@ -68,7 +68,7 @@ Five event kinds, one JSON object per line:
 | kind | fields | what it measures |
 | --- | --- | --- |
 | `session` | `piVersion`, `pid`, `uptimeMs`, `tuiMode` | the identity of the run |
-| `render` | `view`, `ms`, `width`, `height`, `rows` | **only** one frame of one of **this package's** views (`warp`, `odd`, `issues`, `create`, `detail`): the component's own `render()` duration and its size |
+| `render` | `view`, `ms`, `width`, `height`, `rows` | **only** one frame of one of **this package's** views: the component's own `render()` duration and its size. No view records this kind any more (the worktree, warp, ODD and issues readers were removed); older logs keep theirs |
 | `observer` | `view`, `frame`, `measuredAppends`, `prevAppendMs`, `hostFullRedrawsState`, `hostRenderMsState`, `hostFullRedraws`, `hostFullRedrawsDelta`, `processLoopState`, `processLoopUtilization`, `processLoopActiveMs`, `processLoopIdleMs`, `processLoopWindowMs` | the context one traced frame cannot answer on its own: what the trace writes cost, what the public host counter did, and how busy the Node event loop was |
 | `resource` | `frames`, `rssMB`, `heapUsedMB`, `heapTotalMB`, `externalMB`, `cpuUserMs`, `cpuSystemMs`, `windowMs`, `cpuPercent` | the Pi **process** cost: memory and CPU consumed, sampled at an interval |
 | `daemon` | `ms`, `panes`, `tokens` | one sidebar-daemon frame: its duration, the owned panes it reduced, and how many token names it published |
@@ -159,9 +159,11 @@ a frame the log already describes.
 - This measures **this package's views, its own tracing cost and the Pi
   process**. It does **not** measure Pi's transcript rendering, terminal writes
   or input handling, so it cannot show that the TUI itself got faster.
-- `render`/`observer`/`resource` cover warp, creation and the fullscreen ODD,
-  Issues and worktree-detail readers. They do not cover the customize panel
-  itself.
+- `render`/`observer`/`resource` were recorded by the view and snapshot
+  instrumentation that used to live in `extensions/gentle-worktree-tools.ts`.
+  That extension is gone, so a current run records no `render`, `observer`,
+  `resource` or `session` line; the daemon frame, the report CLI and the
+  reader stay, and older logs remain fully readable.
 - The trace itself costs something, and two or three lines per traced frame are
   part of that cost. `prevAppendMs` exists so the cost is visible in the same
   log it inflates; it is the package's own write cost, never a Pi measurement. A
@@ -278,9 +280,8 @@ From one isolated run in this repository's worktree, on the Node runtime in use
 - `lib/perf-analyze.js` — the pure reader: `analyzeLog(text)` per-run summaries
   and `compareRuns(a, b)` with its three comparability guards. No fs, no clock.
 - `lib/host-settings.js` — the read-only tui-mode reader. It has no write path.
-- `extensions/gentle-worktree-tools.ts` — the session snapshot hook and the
-  frame observer wired around the view factories (`perfTraceView`); with the
-  trace off it returns the component unwrapped.
+- `extensions/gentle-herdr-state.ts` — does not trace: the producer publishes
+  Herdr tokens and Moshi notifications only.
 - `herdr-plugin/bin/gentle-perf-report.js` — the read-only report CLI.
 - `herdr-plugin/bin/gentle-status.js` — the daemon frame event, gated by the
   same environment variable.

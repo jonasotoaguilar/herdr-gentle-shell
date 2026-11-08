@@ -650,10 +650,14 @@ async function loadWireFactory(sockPath, paneId) {
   }
 }
 
-async function startWireServer() {
+// `options.maxTokenBytes` mirrors Herdr's real rule: one token value over the
+// ceiling rejects the WHOLE `pane.report_metadata` beat. Rejected beats are
+// recorded in `rejections` and never counted as received.
+async function startWireServer(options = {}) {
   const net = require('node:net');
   const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-wire-')), 'herdr.sock');
   const received = [];
+  const rejections = [];
   const conns = new Set();
   const server = net.createServer((conn) => {
     conns.add(conn);
@@ -673,6 +677,22 @@ async function startWireServer() {
           continue;
         }
         if (req && req.method === 'pane.report_metadata' && req.params && typeof req.params.tokens === 'object') {
+          const over =
+            options.maxTokenBytes === undefined
+              ? []
+              : Object.entries(req.params.tokens).filter(
+                  ([, value]) =>
+                    typeof value === 'string' && Buffer.byteLength(value, 'utf8') > options.maxTokenBytes,
+                );
+          if (over.length > 0) {
+            rejections.push({ names: over.map(([name]) => name), tokens: req.params.tokens });
+            try {
+              conn.write(
+                `${JSON.stringify({ id: req.id, error: { message: `token value over ${options.maxTokenBytes} bytes` } })}\n`,
+              );
+            } catch {}
+            continue;
+          }
           received.push(req.params.tokens);
         }
         try {
@@ -702,7 +722,7 @@ async function startWireServer() {
     }
     await new Promise((r) => server.close(r));
   };
-  return { sockPath, received, waitForFrom, close };
+  return { sockPath, received, rejections, waitForFrom, close };
 }
 
 test('deferred chat: witnessed presence absence completes the last delegate', async () => {
@@ -1537,7 +1557,7 @@ test('T2b RED: judge agents map distinctly; oldest-first; progress never reorder
   }
 });
 
-test('T2b RED: queued/waiting/pending never count; mixed completion drops suffix', async () => {
+test('T2b RED: queued/waiting/pending never count; mixed completion keeps the survivor role', async () => {
   const wire = await startT2bWire('test-pane-t2b-count');
   try {
     const { createHash } = require('node:crypto');
@@ -1608,7 +1628,7 @@ test('T2b RED: queued/waiting/pending never count; mixed completion drops suffix
       5000,
       'single survivor counted once',
     );
-    assert.equal(single.gentle_roles_v1, 'explorer', 'one explorer left, no suffix at the producer (consumer renders bare)');
+    assert.equal(single.gentle_roles_v1, 'explorer', 'one explorer left (the consumer renders the bare role word)');
   } finally {
     process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
     process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
@@ -1648,6 +1668,168 @@ test('T2b RED: session reset clears prior running roles (no stale counts)', asyn
     process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
     process.env.HERDR_PANE_ID = wire.prevEnv.HERDR_PANE_ID;
     await wire.close();
+  }
+});
+
+// --- Herdr byte ceiling: every published token value ≤ 512 UTF-8 bytes -----
+// Herdr rejects the WHOLE `pane.report_metadata` beat when any single token
+// value exceeds 512 BYTES. The producer bounded its CSV values in JS
+// characters, so eight distinct 64-character Japanese labels (inside every
+// documented character cap, ~1500 bytes on the wire) published
+// `gentle_names_v1` far past the ceiling and Herdr dropped the entire beat —
+// names, roles, work and every marker together — leaving the pane on
+// its 60 s TTL.
+const MAX_HERDR_TOKEN_BYTES = 512;
+
+// 64 characters: two ASCII digits plus 62 CJK characters at 3 UTF-8 bytes
+// each, distinct per delegate and inside every documented character cap.
+function multibyteLabel(at) {
+  return `${String(at).padStart(2, '0')}${'作業'.repeat(31)}`;
+}
+
+function launchLabeled(h, callId, taskId, agent, label) {
+  h.fire('tool_call', { toolName: 'subagent_run', toolCallId: callId, input: { agent, label } });
+  h.fire('tool_result', {
+    toolName: 'subagent_run',
+    toolCallId: callId,
+    details: { gentleAgents: { taskId, agent, status: 'running' } },
+  });
+}
+
+function overCapTokens(tokens) {
+  return Object.entries(tokens)
+    .filter(([, value]) => typeof value === 'string' && Buffer.byteLength(value, 'utf8') > MAX_HERDR_TOKEN_BYTES)
+    .map(([name, value]) => ({ name, bytes: Buffer.byteLength(value, 'utf8') }));
+}
+
+// Use a throwaway agent home and enforce Herdr's byte ceiling on the wire.
+async function startByteBoundWire(paneId, sessionId, name, wireOptions = {}) {
+  const wire = await startWireServer(wireOptions);
+  const { factory, prevEnv } = await loadWireFactory(wire.sockPath, paneId);
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), `gentle-bytes-home-${name}-`));
+  const prevHome = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  const h = harness();
+  factory(h.pi);
+  const sessionFile = `/tmp/gentle-bytes-${name}-session`;
+  const { createHash } = require('node:crypto');
+  startT2bSession(h, sessionId, sessionFile);
+  return {
+    wire,
+    h,
+    prevEnv,
+    prevHome,
+    paneHash: createHash('sha256').update(sessionFile, 'utf8').digest('base64url'),
+  };
+}
+
+async function stopByteBoundWire(state) {
+  if (state.prevHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+  else process.env.GENTLE_PI_AGENT_HOME = state.prevHome;
+  process.env.HERDR_ENV = state.prevEnv.HERDR_ENV;
+  process.env.HERDR_SOCKET_PATH = state.prevEnv.HERDR_SOCKET_PATH;
+  process.env.HERDR_PANE_ID = state.prevEnv.HERDR_PANE_ID;
+  await state.wire.close();
+}
+
+test('Herdr byte ceiling: a multibyte session publishes only values at or under 512 bytes', async () => {
+  const state = await startByteBoundWire('test-pane-bytes', 'sess-bytes', 'multibyte');
+  const { wire, h, paneHash } = state;
+  try {
+    for (let index = 1; index <= 8; index += 1) {
+      launchLabeled(h, `run-m${index}`, `m${index}`, 'gentle-ai-worker', multibyteLabel(index));
+    }
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:8:`),
+      5000,
+      'eight running multibyte delegates',
+    );
+    assert.deepEqual(overCapTokens(beat), [], 'every published token value must fit 512 UTF-8 bytes');
+    // The byte bound must not cost the documented semantics: eight distinct
+    // one role word and advisory names that are whole labels. The retired
+    // disclosure token is explicitly cleared to remove stale pane metadata.
+    assert.equal(beat.gentle_subs_v1, null);
+    assert.equal(beat.gentle_roles_v1, 'worker');
+    const labels = Array.from({ length: 8 }, (_, at) => multibyteLabel(at + 1));
+    const names = beat.gentle_names_v1.split(',');
+    assert.ok(names.length >= 1, 'advisory names survive the byte bound');
+    for (const name of names) assert.ok(labels.includes(name), `whole label expected, saw ${name}`);
+  } finally {
+    await stopByteBoundWire(state);
+  }
+});
+
+test('Herdr byte ceiling: the widest documented beat is accepted whole, never partially', async () => {
+  const state = await startByteBoundWire('test-pane-bytes-wide', 'sess-bytes-wide', 'wide', {
+    maxTokenBytes: MAX_HERDR_TOKEN_BYTES,
+  });
+  const { wire, h, paneHash } = state;
+  try {
+    h.fire('agent_start', {});
+    for (let index = 1; index <= 8; index += 1) {
+      launchLabeled(h, `run-w${index}`, `w${index}`, 'gentle-ai-worker', multibyteLabel(index));
+    }
+    h.fire('tool_execution_start', { toolCallId: 'ask-wide', toolName: 'ask_user_choice', args: {} });
+    h.fire('tool_execution_start', {
+      toolCallId: 'review-wide',
+      toolName: 'gentle_review_capture',
+      args: { lineageId: 'lin-1', collectBinding: '{}', reviewerRunAcknowledged: true },
+    });
+    const beat = await wire.waitForFrom(
+      0,
+      (p) =>
+        p.gentle_ask_v1 !== null &&
+        p.gentle_review_v1 !== null &&
+        typeof p.gentle_work_v1 === 'string' &&
+        p.gentle_work_v1.startsWith(`${paneHash}:8:`),
+      5000,
+      'the widest documented beat',
+    );
+    assert.deepEqual(
+      wire.rejections.map((rejection) => rejection.names),
+      [],
+      'Herdr must accept the widest beat whole',
+    );
+    // Nothing is dropped with a sibling token: every documented value rides in
+    // the one accepted report instead of being cleared by a rejected beat.
+    for (const name of [
+      'gentle_work_v1',
+      'gentle_names_v1',
+      'gentle_roles_v1',
+      'gentle_ask_v1',
+      'gentle_review_v1',
+      'gentle_orchestrating_v1',
+      'gentle_principal_v1',
+    ]) {
+      assert.ok(name in beat, `${name} must ride in the accepted beat`);
+      assert.notEqual(beat[name], null, `${name} must not be cleared in the widest beat`);
+    }
+    assert.equal(beat.gentle_subs_v1, null);
+    assert.deepEqual(overCapTokens(beat), [], 'the accepted beat stays inside the ceiling');
+  } finally {
+    await stopByteBoundWire(state);
+  }
+});
+
+test('Herdr byte ceiling: an over-long astral label truncates on a character boundary', async () => {
+  const state = await startByteBoundWire('test-pane-bytes-astral', 'sess-bytes-astral', 'astral');
+  const { wire, h, paneHash } = state;
+  try {
+    // 80 astral characters: 160 UTF-16 units and 320 UTF-8 bytes. The 64-unit
+    // label cap must cut on a character boundary — 32 whole characters — and
+    // never leave a lone surrogate half on the wire.
+    launchLabeled(h, 'run-a1', 'a1', 'gentle-ai-worker', '🛠'.repeat(80));
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'one running delegate with an astral label',
+    );
+    assert.equal(beat.gentle_names_v1, '🛠'.repeat(32));
+    assert.deepEqual(overCapTokens(beat), []);
+  } finally {
+    await stopByteBoundWire(state);
   }
 });
 
@@ -1815,6 +1997,93 @@ test('T1: queued delegate after settle emits count0 with a fresh marker (never f
       'count0 with a fresh marker after settle (queued cover, vetoes done)',
     );
     assert.equal(settled.gentle_roles_v1, null, 'queued supplies no running role');
+  } finally {
+    process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
+    process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
+    process.env.HERDR_PANE_ID = wire.prevEnv.HERDR_PANE_ID;
+    await wire.close();
+  }
+});
+
+// --- Principal-only activity marker (gentle_principal_v1) ---------------
+// The row's working-vs-idle decision needs the principal's OWN activity: the
+// native status aggregates delegate activity (`computeNativeState` returns
+// working for any running delegate or pending launch), so it cannot say
+// whether the principal itself works. This token carries only `agentActive`
+// (the principal input of computeNativeState), session-bound and TTL-fresh
+// like the other gentle_* markers, and clears on settle even while delegates
+// keep running.
+
+test('principal marker carries only the principal activity, never the delegate aggregate', async () => {
+  const wire = await startT2bWire('test-pane-principal');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('principal');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    // The principal starts idle: a running delegate alone must never publish
+    // a principal marker (that is the aggregate signal this token replaces).
+    h.fire(
+      'session_start',
+      {},
+      {
+        mode: 'tui',
+        sessionManager: {
+          getSessionId: () => 'sess-principal',
+          getSessionFile: () => sessionFile,
+          getEntries: () => [],
+        },
+        isIdle: () => true,
+      },
+    );
+    launchRunning(h, 'run-p1', 'p1', 'gentle-ai-explore');
+    const idlePrincipal = await wire.waitForFrom(
+      0,
+      (p) =>
+        typeof p.gentle_work_v1 === 'string' &&
+        p.gentle_work_v1.startsWith(`${paneHash}:1:`) &&
+        'gentle_principal_v1' in p,
+      5000,
+      'running delegate beat with the principal token published',
+    );
+    assert.equal(idlePrincipal.gentle_principal_v1, null, 'idle principal publishes no marker');
+    assert.equal(idlePrincipal.gentle_roles_v1, 'explorer');
+    assert.equal(typeof idlePrincipal.gentle_orchestrating_v1, 'string', 'orchestrating marker unchanged');
+
+    // Principal starts working: the marker appears alongside the same delegate.
+    const beforeActive = wire.received.length;
+    h.fire('agent_start', {});
+    const workingPrincipal = await wire.waitForFrom(
+      beforeActive,
+      (p) => typeof p.gentle_principal_v1 === 'string',
+      5000,
+      'principal marker while the principal works',
+    );
+    const [markerHash, rawExpiry] = workingPrincipal.gentle_principal_v1.split(':');
+    assert.equal(markerHash, paneHash, 'marker is bound to the pane session hash');
+    assert.equal(workingPrincipal.gentle_principal_v1.split(':').length, 2, 'marker carries no count');
+    assert.ok(Number(rawExpiry) > Date.now(), 'marker expiry is in the future');
+    assert.ok(Number(rawExpiry) <= Date.now() + 60000, 'marker expiry stays inside the TTL horizon');
+    assert.equal(workingPrincipal.gentle_roles_v1, 'explorer', 'delegate role still published');
+
+    // Principal settles with the delegate still running: the marker clears
+    // while the delegate count, role, and orchestrating marker stay live.
+    const beforeSettle = wire.received.length;
+    h.fire('agent_settled', {}, { isIdle: () => true });
+    const settledPrincipal = await wire.waitForFrom(
+      beforeSettle,
+      (p) => 'gentle_principal_v1' in p && p.gentle_principal_v1 === null,
+      5000,
+      'settle clears the principal marker',
+    );
+    assert.equal(settledPrincipal.gentle_roles_v1, 'explorer', 'delegate role survives the clear');
+    assert.equal(
+      typeof settledPrincipal.gentle_work_v1 === 'string' &&
+        settledPrincipal.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      true,
+      'delegate count survives the clear',
+    );
   } finally {
     process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
     process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
