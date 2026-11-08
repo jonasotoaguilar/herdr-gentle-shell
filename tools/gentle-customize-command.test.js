@@ -419,3 +419,21 @@ describe('sidebar switch', () => {
     assert.equal(fs.readFileSync(env.callLog, 'utf8'), callsBefore);
   });
 });
+
+test('customize menu offers exactly the two switches and On/Off', async () => {
+  const h = harness();
+  const offered = [];
+  const queueNext = h.ctx.ui.select;
+  h.ctx.ui.select = async (title, options) => {
+    offered.push([title, options]);
+    return queueNext();
+  };
+  h.selections.push('Moshi notifications', 'Off');
+  await run(h, '');
+  assert.deepEqual(offered.map(([, options]) => options), [
+    ['Sidebar agent rows', 'Moshi notifications'],
+    ['On', 'Off'],
+  ]);
+  assert.equal(offered[0][0], 'Customize · Herdr Gentle Shell');
+  assert.equal(offered[1][0], 'Moshi notifications (currently off)');
+});
