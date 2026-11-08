@@ -18,9 +18,8 @@ never Herdr's aggregate native status (which reads `working` whenever any
 delegate runs): while the principal is working it
 reads `gentle` and no delegate role word wins; while the principal is idle
 the oldest running delegate role shows — `explorer`, `worker`, `verify`,
-`judge`, `rdd` — however many delegates run. No label carries a
-running-count suffix (the Herdr disclosure list shows the individual
-subagents, numbered by their position in this session),
+`judge`, `rdd` — with the total running count in parentheses when two or
+more subagents run, for example `explorer (3)`),
 `ask` (three independent event legs — choice, native questionnaire, legacy rpiv — plus
 executed `ask_user_question`/`ask_user_choice` tool calls (execution opens, end/result closes;
 proposals never block), tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD
@@ -270,7 +269,7 @@ cells, no colors wired here — row-1 glyph and identity coloring, including
 the native `state_icon`, is Herdr-native and not plugin-controlled); row 2
 wires the eleven presence-encoded `gentle_title_*` state cells (state word
 only, one current title per frame, each in its state's semantic color as
-base fg with no rules; no state word carries a running-count suffix)
+base fg with no rules; role words carry a running-count suffix above one)
 followed by the three
 change-segment tokens (added green `+N`, deleted red `-N`, pull blue `↑N`,
 each its own color cell with no rules, never swapped). The review leg
@@ -331,16 +330,8 @@ wins; an **idle principal** shows the oldest running TaskStore role
 Both yield to `ask`/`rdd`/`blocked` and terminal `done` — where `done` needs
 settled-plus-empty (principal settled with no running delegates and no
 pending launches; a settled principal with running delegates keeps the role
-word, never `done`). A role word is never a subagent name, and no label
-carries a running-count suffix: Herdr's disclosure list shows the individual
-subagents, each numbered by its position in this Gentle Shell session. That
-number is assigned once per subagent at launch and never reused (a finishing
-sibling never renumbers a running one, and gaps stay gaps), and the sequence
-is seeded at session start from Gentle Shell's persisted task roster
-(`<agentHome>/gentle-agents/tasks`, filtered by `parentSessionId`), so a
-mid-session extension reload continues the session's numbering — 6 finished
-launches means the next launch is 7 — instead of restarting at 1. A missing,
-unreadable, or malformed roster falls back to the in-process counter. The
+word, never `done`). A role word is not a subagent label; it carries the
+total running delegate count in parentheses when that count exceeds one. The
 work total is a direct projection of the
 Gentle Shell TaskStore `running` records (only `running` counts as
 executing; queued/waiting never count), never a calculated
@@ -424,9 +415,8 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   count or Herdr's aggregate native status; `gentle` (machine
   key `working`) for the principal's own working state; an unknown delegation
   keeps its original sanitized name, 32-char bound — never a generic
-  collapse), with no running-count suffix on any label (the Herdr disclosure
-  list shows the individual subagents, each numbered by its position in the
-  session), `ask` on blocked user input,
+  collapse), with a running-count suffix on role labels when two or more
+  delegates run, `ask` on blocked user input,
   `rdd` during native review execution (machine key stays `review`; execution
   is silent — desktop attention fires only for a waiting `ask` intent, as
   Herdr's native toast), and

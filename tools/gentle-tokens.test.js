@@ -276,7 +276,7 @@ describe('orchestrating reduction', () => {
     const { entry } = orchEntry('worker,explorer', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
     assert.equal(reduced.owned, true);
     assert.equal(reduced.notify, null);
   });
@@ -341,7 +341,7 @@ describe('orchestrating reduction', () => {
     const absentBuilt = roleEntry('verify,worker', { count: 2 });
     const absentReduced = tokens.reducePane(absentBuilt.entry, NOW);
     assert.equal(absentReduced.display, 'verify');
-    assert.equal(absentReduced.label, 'verify');
+    assert.equal(absentReduced.label, 'verify (2)');
 
     const workingBuilt = roleEntry('', { count: 3 });
     const workingReduced = tokens.reducePane(workingBuilt.entry, NOW);
@@ -391,7 +391,7 @@ describe('idle principal + marker keeps the delegate role word', () => {
   it('oldest role wins over a fresh marker', () => {
     const reduced = tokens.reducePane(markedRoleEntry('worker,explorer', 2), NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
   });
 
   it('marker still renders with no recognized role', () => {
@@ -924,7 +924,7 @@ describe('durable review token (gentle_review_v1)', () => {
   });
 });
 
-describe('T2b judge role and role words without a count', () => {
+describe('T2b role words and running delegate count', () => {
   it('grammar accepts judge; judge maps distinctly (not rdd)', () => {
     assert.deepEqual(tokens.parseRoles('judge'), ['judge']);
     assert.equal(tokens.roleToDisplay('judge'), 'judge');
@@ -952,14 +952,23 @@ describe('T2b judge role and role words without a count', () => {
     assert.equal(reduced.label, 'gentle');
   });
 
+  it('shows the total running delegates when two or more share the visible role', () => {
+    for (const count of [2, 3]) {
+      const { entry } = roleEntry('explorer,worker', { count });
+      const reduced = tokens.reducePane(entry, NOW);
+      assert.equal(reduced.label, `explorer (${count})`);
+      assert.equal(tokens.displayTokens(reduced)[tokens.TITLE_TOKENS.explorer], `explorer (${count})`);
+    }
+  });
+
   it('visible explorer label is exactly explorer (user-requested, not explore)', () => {
     const { entry } = roleEntry('explorer', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explorer');
+    assert.equal(reduced.label, 'explorer (3)');
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.TITLE_TOKENS.explorer], 'explorer');
-    assert.equal(patch[tokens.ROW_TOKENS.explorer], 'pi · explorer');
+    assert.equal(patch[tokens.TITLE_TOKENS.explorer], 'explorer (3)');
+    assert.equal(patch[tokens.ROW_TOKENS.explorer], 'pi · explorer (3)');
     assert.equal(tokens.rowValueFor('explorer', 'pi', 'explorer'), 'pi · explorer');
   });
 
@@ -967,7 +976,7 @@ describe('T2b judge role and role words without a count', () => {
     const { entry } = roleEntry('judge,worker,rdd', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'judge');
-    assert.equal(reduced.label, 'judge');
+    assert.equal(reduced.label, 'judge (3)');
   });
 
   it('visible review word is rdd; machine key stays review', () => {
@@ -980,13 +989,13 @@ describe('T2b judge role and role words without a count', () => {
     assert.equal(patch[tokens.ROW_TOKENS.review], 'pi · rdd');
   });
 
-  it('a delegated rdd with running count keeps the rdd word and no suffix', () => {
+  it('a delegated rdd with multiple delegates shows the count', () => {
     const { entry } = roleEntry('rdd', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'review');
-    assert.equal(reduced.label, 'rdd');
+    assert.equal(reduced.label, 'rdd (2)');
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.TITLE_TOKENS.review], 'rdd');
+    assert.equal(patch[tokens.TITLE_TOKENS.review], 'rdd (2)');
   });
 
   it('native done with zero count but a fresh marker settles to gentle (queued cover)', () => {
@@ -1003,7 +1012,7 @@ describe('T2b judge role and role words without a count', () => {
     entry.agent_status = 'done';
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
   });
 
   it('native done with zero running count settles to done', () => {
@@ -1014,26 +1023,25 @@ describe('T2b judge role and role words without a count', () => {
     assert.equal(reduced.label, 'done');
   });
 
-  it('three same-role running explorers use the oldest role word, never a count', () => {
+  it('three same-role running explorers show their total count', () => {
     const { entry } = roleEntry('explorer', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explorer');
-    assert.doesNotMatch(reduced.label, /\(/);
+    assert.equal(reduced.label, 'explorer (3)');
   });
 
   it('oldest explorer plus worker uses the oldest role word', () => {
     const { entry } = roleEntry('explorer,worker', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explorer');
+    assert.equal(reduced.label, 'explorer (2)');
   });
 
   it('oldest-first order: first CSV entry wins', () => {
     const { entry } = roleEntry('worker,explorer', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
   });
 
   it('a single running worker shows the worker word', () => {
@@ -1061,11 +1069,18 @@ describe('T2b judge role and role words without a count', () => {
     assert.equal(tokens.reducePane(idleBuilt.entry, NOW).label, 'idle');
   });
 
+  it('shows the running total for an active delegated review without changing tool-only review', () => {
+    const delegated = roleEntry('rdd', { count: 2, stateLabels: { 0: 'review:r1' } });
+    assert.equal(tokens.reducePane(delegated.entry, NOW).label, 'rdd (2)');
+    const toolOnly = roleEntry('', { count: 2, stateLabels: { 0: 'review:r1' } });
+    assert.equal(tokens.reducePane(toolOnly.entry, NOW).label, 'rdd');
+  });
+
   it('delegated rdd keeps the rdd word; tool-only review shows no count', () => {
     const { entry: delegated } = roleEntry('rdd', { count: 2 });
     const delegatedReduced = tokens.reducePane(delegated, NOW);
     assert.equal(delegatedReduced.display, 'review');
-    assert.equal(delegatedReduced.label, 'rdd');
+    assert.equal(delegatedReduced.label, 'rdd (2)');
     const toolOnly = baseEntry();
     const toolHash = sessionHashFor(toolOnly);
     toolOnly.tokens = { gentle_review_v1: `${toolHash}:r1:${EXPIRY}` };
@@ -1093,7 +1108,7 @@ describe('T2b judge role and role words without a count', () => {
     const { entry } = roleEntry('worker,,bogus!', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
     const { entry: bad } = roleEntry('bogus!', { count: 2 });
     const badReduced = tokens.reducePane(bad, NOW);
     assert.equal(badReduced.display, 'working');
@@ -1205,8 +1220,7 @@ describe('unknown delegation surfaces its sanitized name without own principal s
     const { entry } = roleEntry('my-custom-scout', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'working');
-    assert.equal(reduced.label, 'my-custom-scout');
-    assert.doesNotMatch(reduced.label, /\(/);
+    assert.equal(reduced.label, 'my-custom-scout (3)');
   });
 
   it('overlong role evidence falls back to gentle, never working', () => {
@@ -1220,7 +1234,7 @@ describe('unknown delegation surfaces its sanitized name without own principal s
     const { entry } = roleEntry('worker,my-custom-scout', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+    assert.equal(reduced.label, 'worker (2)');
   });
 });
 
@@ -1325,7 +1339,7 @@ describe('principal-only activity marker decides working vs idle', () => {
     const entry = principalEntry({ roles: 'verify,worker', count: 3, principal: false, status: 'working' });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'verify');
-    assert.equal(reduced.label, 'verify');
+    assert.equal(reduced.label, 'verify (3)');
   });
 
   it('a fresh orchestrating marker never turns an idle principal into gentle', () => {
@@ -1377,84 +1391,5 @@ describe('principal interleave precedence (working principal outranks roles)', (
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'working');
     assert.equal(reduced.label, 'gentle');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// gentle_subs_v1 disclosure list (agents sidebar feedback, plugin T3):
-// CSV of `<ordinal>:<agent>`, oldest launch first, at most 8 entries and 512
-// bytes. Parsing mirrors the sibling parsers: an anchored per-field grammar,
-// malformed entries dropped individually, an overlength or over-count value
-// rejected whole (never truncated into a plausible-looking list). Entries are
-// never merged — the launch ordinal is the only identity, so two runs of one
-// agent stay two entries.
-describe('gentle_subs_v1 disclosure list', () => {
-  it('exposes the token name the producer writes', () => {
-    assert.equal(tokens.SUBS_TOKEN, 'gentle_subs_v1');
-  });
-
-  it('parses launch-ordered entries without merging same-agent runs', () => {
-    assert.deepEqual(
-      tokens.parseSubs('1:gentle-ai-explore,2:gentle-ai-explore,3:gentle-ai-worker'),
-      [
-        { ordinal: 1, agent: 'gentle-ai-explore' },
-        { ordinal: 2, agent: 'gentle-ai-explore' },
-        { ordinal: 3, agent: 'gentle-ai-worker' },
-      ],
-    );
-  });
-
-  it('keeps the ordinals as launched, never renumbering a gap', () => {
-    assert.deepEqual(tokens.parseSubs('2:gentle-ai-worker,5:jd-judge-a'), [
-      { ordinal: 2, agent: 'gentle-ai-worker' },
-      { ordinal: 5, agent: 'jd-judge-a' },
-    ]);
-  });
-
-  it('drops malformed entries individually and keeps the valid ones', () => {
-    assert.deepEqual(tokens.parseSubs('0:a,:b,1:,2:ok,x:c,3:quo"te'), [
-      { ordinal: 2, agent: 'ok' },
-    ]);
-  });
-
-  it('drops a repeated ordinal (the ordinal is the entry identity)', () => {
-    assert.deepEqual(tokens.parseSubs('1:gentle-ai-worker,1:gentle-ai-explore'), [
-      { ordinal: 1, agent: 'gentle-ai-worker' },
-    ]);
-  });
-
-  it('rejects a value that is not a bounded CSV string', () => {
-    for (const value of [undefined, null, 7, '', '   ']) {
-      assert.deepEqual(tokens.parseSubs(value), []);
-    }
-  });
-
-  it('accepts the eight-entry cap and rejects more entries whole', () => {
-    const agent = 'a'.repeat(60);
-    const eight = Array.from({ length: 8 }, (_, at) => `${at + 1}:${agent}`).join(',');
-    assert.equal(eight.length <= 512, true);
-    assert.deepEqual(tokens.parseSubs(eight), [
-      ...Array.from({ length: 8 }, (_, at) => ({ ordinal: at + 1, agent })),
-    ]);
-    const nine = `${eight},9:${agent}`;
-    assert.deepEqual(tokens.parseSubs(nine), []);
-  });
-
-  it('rejects a value over 512 bytes whole', () => {
-    const eight = Array.from({ length: 8 }, (_, at) => `${at + 1}:${'a'.repeat(64)}`).join(',');
-    assert.equal(eight.length > 512, true);
-    assert.deepEqual(tokens.parseSubs(eight), []);
-  });
-
-  it('rejects a value over 512 UTF-8 bytes whole even when it is under 512 characters', () => {
-    // Six entries of 64 CJK characters: 401 characters, 1169 UTF-8 bytes — a
-    // value the character bound would have accepted and Herdr's byte bound
-    // rejects, so it is dropped whole instead of truncated into a plausible
-    // list the producer never wrote.
-    const agent = '作'.repeat(64);
-    const six = Array.from({ length: 6 }, (_, at) => `${at + 1}:${agent}`).join(',');
-    assert.equal(six.length <= 512, true);
-    assert.equal(Buffer.byteLength(six, 'utf8') > 512, true);
-    assert.deepEqual(tokens.parseSubs(six), []);
   });
 });

@@ -31,7 +31,7 @@ const CHANGES_V2_RE =
 // slugs derived from TaskRecord.agent (never task labels), oldest-first
 // by immutable first-seen, e.g. `worker,explorer` (worker oldest). The
 // consumer renders the oldest recognized role word whenever the principal
-// itself is not working; the label never carries a count suffix. Null
+// itself is not working; the label carries a count when above one. Null
 // (clear) when no active recognized roles. `review` is accepted as a legacy alias of `rdd` (rollback
 // producers); new producers emit `rdd`. `explore` is accepted as a legacy
 // wire alias of `explorer`; the machine key stays `explorer` and the
@@ -45,7 +45,7 @@ const ROLE_RE = /^(explorer|explore|worker|verify|judge|rdd|review)$/;
 const ROLE_PASSTHROUGH_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 // Herdr's ceiling for one pane-metadata token value, in UTF-8 BYTES: the
 // producer bounds every published value against it, so an over-cap value here
-// is foreign or malformed and is rejected whole (see parseRoles/parseSubs).
+// is foreign or malformed and is rejected whole (see parseRoles).
 const MAX_TOKEN_BYTES = 512;
 // Root-session orchestrating marker (DESIGN §4.3): `<hash>:<expiry>` — the
 // same session binding and TTL discipline as gentle_work_v1 but carrying no
@@ -70,23 +70,6 @@ const PRINCIPAL_TOKEN = 'gentle_principal_v1';
 // Presence-marker grammar shared by both markers above: `<hash>:<expiry>`,
 // no count.
 const MARKER_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
-// Subagent disclosure list (`agents sidebar feedback` T3): CSV of
-// `<ordinal>:<agent>` entries, oldest launch first, at most 8 entries and 512
-// UTF-8 bytes. `<agent>` is the FULL agent package name
-// (`gentle-ai-explore`), never a role word, and entries are never merged —
-// the launch ordinal is the entry identity, so two runs of one agent are two
-// entries. `<ordinal>` is the 1-based launch ordinal within the session; a gap
-// is normal (that subagent finished), so ordinals are never renumbered. The
-// producer clears the token below two running subagents. Herdr renders the
-// disclosure from this list (2+ entries only) as `{agent} · {ordinal}`; the
-// plugin only parses it.
-const SUBS_TOKEN = 'gentle_subs_v1';
-// Ordinal field: 1-based, never zero, same width bound as `count`.
-const SUBS_ORDINAL_RE = /^[1-9]\d{0,15}$/;
-// Agent field mirrors the producer's sanitizeSubAgent output: no control
-// chars, no CSV separators, no quotes (NAME_BAD_RE), 1-64 chars.
-const MAX_SUBS_AGENT_CHARS = 64;
-const MAX_SUBS_ENTRIES = 8;
 // Durable ask signal (DESIGN §4.3): `<hash>:<intentId>:<expiry>` — the same
 // session binding and TTL discipline as gentle_work_v1. Emitted on every
 // producer beat while ask is active (rpiv questionnaire or Gentle Shell
@@ -127,9 +110,8 @@ const TTL_MS = 60000;
 // principal renders `gentle` (pink `orchestrating` with a fresh marker) and
 // outranks a delegate role word, while an idle principal shows the oldest
 // role word however many delegates run. Attention states (ask/review/error)
-// and the terminal `done`/native-`blocked` states outrank both. No label
-// carries a running-count suffix: Herdr's disclosure list shows the
-// individual subagents.
+// and the terminal `done`/native-`blocked` states outrank both. Role labels
+// carry the running delegate total when it exceeds one.
 const DISPLAYS = ['working', 'orchestrating', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error', 'done', 'idle'];
 
 const STATE_TOKENS = {
@@ -246,7 +228,7 @@ const HEADING_TOKENS = {
 // no visible row, and the sweeper still clears them.
 // Values are built from the
 // snapshot's validated agent name plus the reduced role/state label — never
-// a subagent name. No label carries a running-count suffix. No icon is
+// a subagent name. Role labels may carry a running-count suffix. No icon is
 // wired in row 2; row 1 is native (`state_icon` carries the
 // Herdr-native glyph, not plugin-controlled), so no plugin icon alignment
 // is claimed.
@@ -293,8 +275,8 @@ const ROW_ICONS = {
 // User-facing words per display (DESIGN §5.3). The machine keys `review`,
 // `error`, `orchestrating`, `explorer`, and `working` stay stable; their rendered
 // words are `rdd`/`blocked`/`gentle`/`explorer`/`gentle` — visible generic
-// activity is always per-agent (`gentle`, never `working`). No label carries
-// a running-count suffix, and no label carries a subagent name.
+// activity is always per-agent (`gentle`, never `working`). Role labels
+// may carry a running-count suffix and never contain a subagent label.
 const DISPLAY_LABELS = {
   working: 'gentle',
   orchestrating: 'gentle',
@@ -598,38 +580,6 @@ function parseRoles(value) {
   return roles;
 }
 
-// gentle_subs_v1 = CSV of `<ordinal>:<agent>`. Bounded like parseRoles:
-// malformed entries are dropped individually (a field outside its anchored
-// grammar never becomes a guessed entry), a value over 512 bytes or over the
-// 8-entry cap is rejected whole (truncating would present a plausible-looking
-// list the producer never wrote), and a repeated ordinal is dropped because
-// the ordinal is the entry identity. Entries are never deduplicated by agent
-// name: two launches of one agent stay two entries, in the producer's
-// oldest-first order. A wholly unusable value yields [] (no disclosure).
-function parseSubs(value) {
-  if (typeof value !== 'string' || value.length === 0) return [];
-  if (Buffer.byteLength(value, 'utf8') > MAX_TOKEN_BYTES) return [];
-  const parts = value.split(',');
-  if (parts.length > MAX_SUBS_ENTRIES) return [];
-  const seen = new Set();
-  const entries = [];
-  for (const part of parts) {
-    const colon = part.indexOf(':');
-    if (colon <= 0 || colon === part.length - 1) continue;
-    const rawOrdinal = part.slice(0, colon);
-    const agent = part.slice(colon + 1);
-    if (!SUBS_ORDINAL_RE.test(rawOrdinal)) continue;
-    if (agent.length > MAX_SUBS_AGENT_CHARS) continue;
-    if (NAME_BAD_RE.test(agent)) continue;
-    const ordinal = Number(rawOrdinal);
-    if (!Number.isSafeInteger(ordinal)) continue;
-    if (seen.has(ordinal)) continue;
-    seen.add(ordinal);
-    entries.push({ ordinal, agent });
-  }
-  return entries;
-}
-
 // Canonical role word -> machine display key. `rdd` (and its legacy alias)
 // collapses onto the stable `review` display key, whose user-facing word is
 // `rdd` (DISPLAY_LABELS); `judge` stays distinct (never rdd/review);
@@ -709,8 +659,8 @@ function piTreeOwnsPane(tokens, sessionHash, now) {
 //   the principal is not working) > orchestrating (marker fallback) > main
 //   working (positive running count, no role) > idle. The deciding signal
 //   is the principal's own activity marker, never the delegate count and
-//   never the aggregate native status; role labels carry no running-count
-//   suffix.
+//   never the aggregate native status; role labels carry the running count
+//   as a suffix when above one.
 // `notify` is set only for ask (DESIGN §7; review/error stay silent).
 // A native `blocked` with no fresh gentle label clears our family (fail
 // closed): the block belongs to another writer or the producer died, so we
@@ -759,15 +709,11 @@ function reducePane(entry, now = Date.now()) {
     owned: true,
   });
 
-  // Role-hint label: the oldest role word, or the sanitized passthrough
-  // slug for an unknown delegation (label override).
-  // The label carries no running-count suffix: Herdr's disclosure list
-  // shows the individual subagents, so a `(n)` total would only repeat it.
-  // The label rides the title cell via displayTokens (which copies
-  // result.label), not just compat heading/row values.
+  // Role labels carry the total running-delegate count when above one.
+  // The label rides the title cell via displayTokens.
   const outRole = (display, labelOverride = null, notify = null) => ({
     display,
-    label: labelOverride ?? DISPLAY_LABELS[display] ?? display,
+    label: `${labelOverride ?? DISPLAY_LABELS[display] ?? display}${work !== null && work.count > 1 ? ` (${work.count})` : ''}`,
     agent,
     workspace,
     added,
@@ -777,6 +723,7 @@ function reducePane(entry, now = Date.now()) {
     owned: true,
   });
   const roles = parseRoles(tokens[ROLES_TOKEN]);
+  const hasDelegatedReview = roles.some((role) => role === 'rdd' || role === 'review');
 
   if (blocked !== null) {
     // The sidebar-facing words for error/review/orchestrating are
@@ -792,9 +739,8 @@ function reducePane(entry, now = Date.now()) {
     if (askToken !== null) {
       return out('ask', { sessionHash, intentId: askToken.intentId, expiry: askToken.expiry });
     }
-    // The remaining blocked kind is review: same visible word `rdd` for a
-    // delegated rdd role and for a tool-only review.
-    return out('review');
+    // Only a delegated review may display the running-delegate count.
+    return hasDelegatedReview ? outRole('review') : out('review');
   }
   // Edge-miss repair: the producer kept publishing work/orchestrating beats
   // but the `herdr:blocked` ask edge never reached state_labels. A fresh
@@ -810,7 +756,7 @@ function reducePane(entry, now = Date.now()) {
   // above; roles, the marker, and main working all rank below.
   // NO GRACE on this side either: a cleared/expired token simply stops
   // asserting review on the next frame.
-  if (reviewToken !== null) return out('review');
+  if (reviewToken !== null) return hasDelegatedReview ? outRole('review') : out('review');
   if (native === 'blocked') return out('idle');
   // Marker computed once, before the terminal gate: a session-bound fresh
   // marker is live activity evidence (it covers running/queued subs and
@@ -941,8 +887,8 @@ function agentValueFor(agent) {
 
 // Combined visible-row value for one display: `<agent> · <label>`
 // from the snapshot's validated agent name and the reduced role/state label
-// (role words like `worker`, never a subagent name, never a count — no
-// `(n)` suffix exists). With no
+// (role words like `worker`, never a subagent label, optionally with a
+// running-count suffix). With no
 // validated agent name the value degrades to `<label>` — never a
 // guessed vendor. No icon: the state glyph renders in the row-1
 // gentle_heading_* token. Null for any unknown display (fail-closed).
@@ -1016,7 +962,6 @@ module.exports = {
   DISPLAYS,
   DISPLAY_LABELS,
   ROLES_TOKEN,
-  SUBS_TOKEN,
   ORCH_TOKEN,
   PRINCIPAL_TOKEN,
   ASK_TOKEN,
@@ -1044,7 +989,6 @@ module.exports = {
   parseChangesV2,
   parseNames,
   parseRoles,
-  parseSubs,
   parseOrchestrating,
   parsePrincipal,
   parseAsk,

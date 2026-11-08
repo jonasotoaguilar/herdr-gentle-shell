@@ -1671,304 +1671,13 @@ test('T2b RED: session reset clears prior running roles (no stale counts)', asyn
   }
 });
 
-// --- T3 gentle_subs_v1 launch-ordinal disclosure list -----------------------
-// Producer wire: CSV of `<ordinal>:<agent>` entries, oldest launch first,
-// at most 8 entries and 512 bytes. `<agent>` is the full agent package name
-// and entries are never merged (two runs of one agent are two entries);
-// `<ordinal>` is the subagent's 1-based number in THIS Gentle Shell session
-// (seeded at session start from the persisted roster below), never reused
-// when an earlier subagent finishes. The token is cleared below two running
-// subagents so the consumer can never disclose a single child.
-// `gentle_names_v1` keeps its own dedupe and `gentle_roles_v1` its own
-// collapse — the new list rides alongside them unchanged.
-
-// Gentle Shell's only durable per-session roster of launches, including
-// finished ones: `<agentHome>/gentle-agents/tasks/<id>.json`, one JSON file
-// per task shaped `{ task: TaskRecord, thread }`. The tests write it directly
-// so session-true numbering is observable on the wire, with an explicit
-// throwaway agent home so the developer's real roster never leaks in.
-function t3RosterRecord(id, parentSessionId, createdAt) {
-  return {
-    id,
-    agent: 'gentle-ai-explore',
-    mode: 'task',
-    prompt: '',
-    label: `${id} work`,
-    cwd: '/tmp',
-    parentSessionId,
-    status: 'completed',
-    createdAt,
-    startedAt: createdAt,
-    endedAt: createdAt + 1000,
-    model: 'test-model',
-    sessionPath: null,
-    error: null,
-    result: null,
-    lastStep: '',
-    lastActivityAt: createdAt + 1000,
-    turns: 1,
-    toolCalls: 1,
-    tokens: 0,
-    cost: 0,
-  };
-}
-
-function t3RosterDir(agentHome) {
-  return path.join(agentHome, 'gentle-agents', 'tasks');
-}
-
-function writeT3Roster(agentHome, records) {
-  const dir = t3RosterDir(agentHome);
-  fs.mkdirSync(dir, { recursive: true });
-  for (const record of records) {
-    fs.writeFileSync(path.join(dir, `${record.id}.json`), JSON.stringify({ task: record, thread: { items: [] } }));
-  }
-}
-
-// `options.roster`: records already on disk for the session (or for other
-// sessions, which must never count). `options.rosterDirIsFile`: the roster
-// path exists but is not a directory (unreadable). `options.rosterFiles`: raw
-// file bodies written beside `options.roster` (malformed records).
-async function startT3Wire(paneId, sessionId, name, options = {}) {
-  const { createHash } = require('node:crypto');
-  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), `gentle-t3-home-${name}-`));
-  const prevHome = process.env.GENTLE_PI_AGENT_HOME;
-  process.env.GENTLE_PI_AGENT_HOME = agentHome;
-  if (options.roster) writeT3Roster(agentHome, options.roster);
-  if (options.rosterDirIsFile) {
-    fs.mkdirSync(path.dirname(t3RosterDir(agentHome)), { recursive: true });
-    fs.writeFileSync(t3RosterDir(agentHome), 'not a directory');
-  }
-  if (options.rosterFiles) {
-    fs.mkdirSync(t3RosterDir(agentHome), { recursive: true });
-    for (const [file, body] of Object.entries(options.rosterFiles)) {
-      fs.writeFileSync(path.join(t3RosterDir(agentHome), file), body);
-    }
-  }
-  const wire = await startT2bWire(paneId);
-  wire.agentHome = agentHome;
-  wire.prevHome = prevHome;
-  const h = harness();
-  wire.factory(h.pi);
-  const sessionFile = `/tmp/gentle-t3-${name}-session`;
-  const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
-  startT2bSession(h, sessionId, sessionFile);
-  return { wire, h, paneHash };
-}
-
-async function stopT3Wire(wire) {
-  if (wire.prevHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
-  else process.env.GENTLE_PI_AGENT_HOME = wire.prevHome;
-  process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
-  process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
-  process.env.HERDR_PANE_ID = wire.prevEnv.HERDR_PANE_ID;
-  await wire.close();
-}
-
-function completeSub(h, taskId, agent) {
-  h.fire('message_end', {
-    message: {
-      role: 'custom',
-      customType: 'gentle-agents.result',
-      details: { gentleAgents: { taskId, agent, status: 'completed' } },
-    },
-  });
-}
-
-test('T3: gentle_subs_v1 stays cleared with zero and with one running subagent', async () => {
-  const { wire, h, paneHash } = await startT3Wire('test-pane-t3-zero', 'sess-t3-zero', 'zero');
-  try {
-    const workIs = (count) => (p) =>
-      typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:${count}:`);
-    const zero = await wire.waitForFrom(0, workIs(0), 5000, 'no running delegate');
-    assert.equal(zero.gentle_subs_v1, null, 'no disclosure with no subagent');
-    launchRunning(h, 'run-e1', 'e1', 'gentle-ai-explore');
-    const single = await wire.waitForFrom(0, workIs(1), 5000, 'one running delegate');
-    assert.equal(single.gentle_subs_v1, null, 'one child never discloses');
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
-test('T3: two and three running subagents publish launch ordinals oldest-first', async () => {
-  const { wire, h, paneHash } = await startT3Wire('test-pane-t3-two', 'sess-t3-two', 'two');
-  try {
-    launchRunning(h, 'run-e1', 'e1', 'gentle-ai-explore');
-    launchRunning(h, 'run-e2', 'e2', 'gentle-ai-explore');
-    const two = await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '1:gentle-ai-explore,2:gentle-ai-explore',
-      5000,
-      'two-entry disclosure for two runs of one agent',
-    );
-    assert.ok(two.gentle_work_v1.startsWith(`${paneHash}:2:`));
-    // Same agent twice is two entries in the disclosure list, while the
-    // long-standing roles/names tokens keep their own collapsing untouched.
-    assert.equal(two.gentle_roles_v1, 'explorer');
-    assert.equal(two.gentle_names_v1, 'e1 work,e2 work');
-    launchRunning(h, 'run-w1', 'w1', 'gentle-ai-worker');
-    const three = await wire.waitForFrom(
-      0,
-      (p) =>
-        p.gentle_subs_v1 ===
-        '1:gentle-ai-explore,2:gentle-ai-explore,3:gentle-ai-worker',
-      5000,
-      'three entries keep launch order and full agent names',
-    );
-    assert.ok(three.gentle_work_v1.startsWith(`${paneHash}:3:`));
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
-test('T3: an ordinal is never reused after a sibling finishes, and one survivor clears', async () => {
-  const { wire, h, paneHash } = await startT3Wire('test-pane-t3-reuse', 'sess-t3-reuse', 'reuse');
-  try {
-    launchRunning(h, 'run-a1', 'a1', 'gentle-ai-explore');
-    launchRunning(h, 'run-a2', 'a2', 'gentle-ai-worker');
-    launchRunning(h, 'run-a3', 'a3', 'gentle-ai-verify');
-    await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '1:gentle-ai-explore,2:gentle-ai-worker,3:gentle-ai-verify',
-      5000,
-      'three launched subagents listed in launch order',
-    );
-    completeSub(h, 'a1', 'gentle-ai-explore');
-    const afterFirst = await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '2:gentle-ai-worker,3:gentle-ai-verify',
-      5000,
-      'finishing the oldest drops exactly its entry',
-    );
-    assert.ok(afterFirst.gentle_work_v1.startsWith(`${paneHash}:2:`));
-    launchRunning(h, 'run-a4', 'a4', 'gentle-ai-explore');
-    const noReuse = await wire.waitForFrom(
-      0,
-      (p) =>
-        p.gentle_subs_v1 ===
-        '2:gentle-ai-worker,3:gentle-ai-verify,4:gentle-ai-explore',
-      5000,
-      'the fourth launch takes ordinal 4, never the freed 1',
-    );
-    assert.ok(noReuse.gentle_work_v1.startsWith(`${paneHash}:3:`));
-    completeSub(h, 'a2', 'gentle-ai-worker');
-    completeSub(h, 'a3', 'gentle-ai-verify');
-    const survivor = await wire.waitForFrom(
-      0,
-      (p) =>
-        typeof p.gentle_work_v1 === 'string' &&
-        p.gentle_work_v1.startsWith(`${paneHash}:1:`) &&
-        p.gentle_subs_v1 === null,
-      5000,
-      'one running subagent left clears the list',
-    );
-    assert.equal(survivor.gentle_subs_v1, null);
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
-test('T3: numbering continues this session roster instead of restarting at one', async () => {
-  const sessionId = 'sess-t3-roster';
-  // Six subagents this session already ran (a reloaded extension must not
-  // number them 1..6 again), plus three from other sessions that never count.
-  const roster = [
-    ...Array.from({ length: 6 }, (_, at) => t3RosterRecord(`prior${at + 1}`, sessionId, 1000 + at)),
-    ...Array.from({ length: 3 }, (_, at) => t3RosterRecord(`other${at + 1}`, 'sess-t3-other', 2000 + at)),
-  ];
-  const { wire, h, paneHash } = await startT3Wire('test-pane-t3-roster', sessionId, 'roster', { roster });
-  try {
-    launchRunning(h, 'run-r1', 'r1', 'gentle-ai-explore');
-    launchRunning(h, 'run-r2', 'r2', 'gentle-ai-worker');
-    const resumed = await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '7:gentle-ai-explore,8:gentle-ai-worker',
-      5000,
-      'first launches after a reload continue at 7 and 8',
-    );
-    assert.ok(resumed.gentle_work_v1.startsWith(`${paneHash}:2:`));
-    assert.equal(resumed.gentle_roles_v1, 'explorer,worker');
-    launchRunning(h, 'run-r3', 'r3', 'gentle-ai-verify');
-    await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '7:gentle-ai-explore,8:gentle-ai-worker,9:gentle-ai-verify',
-      5000,
-      'session numbering keeps ascending from the roster seed',
-    );
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
-test('T3: an unreadable roster falls back to numbering from one', async () => {
-  const { wire, h } = await startT3Wire('test-pane-t3-unreadable', 'sess-t3-unreadable', 'unreadable', {
-    rosterDirIsFile: true,
-  });
-  try {
-    launchRunning(h, 'run-u1', 'u1', 'gentle-ai-explore');
-    launchRunning(h, 'run-u2', 'u2', 'gentle-ai-worker');
-    await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '1:gentle-ai-explore,2:gentle-ai-worker',
-      5000,
-      'unreadable roster still numbers the session from one',
-    );
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
-test('T3: a malformed roster record falls back to numbering from one', async () => {
-  const sessionId = 'sess-t3-malformed';
-  const roster = Array.from({ length: 4 }, (_, at) => t3RosterRecord(`m${at + 1}`, sessionId, 1000 + at));
-  const { wire, h } = await startT3Wire('test-pane-t3-malformed', sessionId, 'malformed', {
-    roster,
-    rosterFiles: {
-      // Unparseable JSON, and a parseable record without the session binding.
-      'broken-json.json': '{"task":',
-      'broken-record.json': JSON.stringify({ task: { id: 'nobind', agent: 'gentle-ai-explore', status: 'completed', createdAt: 1 } }),
-    },
-  });
-  try {
-    launchRunning(h, 'run-x1', 'x1', 'gentle-ai-explore');
-    launchRunning(h, 'run-x2', 'x2', 'gentle-ai-worker');
-    await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === '1:gentle-ai-explore,2:gentle-ai-worker',
-      5000,
-      'malformed roster never numbers from a partially read seed',
-    );
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
-test('T3: the disclosure list caps at eight entries', async () => {
-  const { wire, h } = await startT3Wire('test-pane-t3-cap', 'sess-t3-cap', 'cap');
-  try {
-    for (let index = 1; index <= 9; index += 1) {
-      launchRunning(h, `run-c${index}`, `c${index}`, 'gentle-ai-worker');
-    }
-    const expected = Array.from({ length: 8 }, (_, at) => `${at + 1}:gentle-ai-worker`).join(',');
-    const capped = await wire.waitForFrom(
-      0,
-      (p) => p.gentle_subs_v1 === expected,
-      5000,
-      'nine launches still publish at most eight entries',
-    );
-    assert.equal(capped.gentle_subs_v1.split(',').length, 8);
-  } finally {
-    await stopT3Wire(wire);
-  }
-});
-
 // --- Herdr byte ceiling: every published token value ≤ 512 UTF-8 bytes -----
 // Herdr rejects the WHOLE `pane.report_metadata` beat when any single token
 // value exceeds 512 BYTES. The producer bounded its CSV values in JS
 // characters, so eight distinct 64-character Japanese labels (inside every
 // documented character cap, ~1500 bytes on the wire) published
 // `gentle_names_v1` far past the ceiling and Herdr dropped the entire beat —
-// names, roles, work, subs and every marker together — leaving the pane on
+// names, roles, work and every marker together — leaving the pane on
 // its 60 s TTL.
 const MAX_HERDR_TOKEN_BYTES = 512;
 
@@ -1993,9 +1702,7 @@ function overCapTokens(tokens) {
     .map(([name, value]) => ({ name, bytes: Buffer.byteLength(value, 'utf8') }));
 }
 
-// Same wiring as startT3Wire (throwaway agent home so the developer's real
-// launch roster never seeds the ordinals), with the wire server's Herdr byte
-// ceiling available to the caller.
+// Use a throwaway agent home and enforce Herdr's byte ceiling on the wire.
 async function startByteBoundWire(paneId, sessionId, name, wireOptions = {}) {
   const wire = await startWireServer(wireOptions);
   const { factory, prevEnv } = await loadWireFactory(wire.sockPath, paneId);
@@ -2040,9 +1747,9 @@ test('Herdr byte ceiling: a multibyte session publishes only values at or under 
     );
     assert.deepEqual(overCapTokens(beat), [], 'every published token value must fit 512 UTF-8 bytes');
     // The byte bound must not cost the documented semantics: eight distinct
-    // disclosure entries, one role word, and advisory names that are whole
-    // labels — never a truncated or chunked fragment.
-    assert.equal(beat.gentle_subs_v1.split(',').length, 8);
+    // one role word and advisory names that are whole labels. The retired
+    // disclosure token is explicitly cleared to remove stale pane metadata.
+    assert.equal(beat.gentle_subs_v1, null);
     assert.equal(beat.gentle_roles_v1, 'worker');
     const labels = Array.from({ length: 8 }, (_, at) => multibyteLabel(at + 1));
     const names = beat.gentle_names_v1.split(',');
@@ -2090,7 +1797,6 @@ test('Herdr byte ceiling: the widest documented beat is accepted whole, never pa
       'gentle_work_v1',
       'gentle_names_v1',
       'gentle_roles_v1',
-      'gentle_subs_v1',
       'gentle_ask_v1',
       'gentle_review_v1',
       'gentle_orchestrating_v1',
@@ -2099,7 +1805,7 @@ test('Herdr byte ceiling: the widest documented beat is accepted whole, never pa
       assert.ok(name in beat, `${name} must ride in the accepted beat`);
       assert.notEqual(beat[name], null, `${name} must not be cleared in the widest beat`);
     }
-    assert.equal(beat.gentle_subs_v1.split(',').length, 8);
+    assert.equal(beat.gentle_subs_v1, null);
     assert.deepEqual(overCapTokens(beat), [], 'the accepted beat stays inside the ceiling');
   } finally {
     await stopByteBoundWire(state);

@@ -63,25 +63,6 @@
 //                       TaskStore list has no labels; null change tokens when the session model has
 //                       zero changed files — refreshed/cleared from the live
 //                       session model, never carried across sessions.
-//   gentle_subs_v1    = CSV of `<ordinal>:<agent>` entries, oldest launch
-//                       first, ≤ 8 entries and ≤ 512 UTF-8 BYTES; `<agent>` is the
-//                       full agent package name (`gentle-ai-explore`) and
-//                       entries are never merged — two runs of one agent are
-//                       two entries. `<ordinal>` is the subagent's 1-based
-//                       number in this session, assigned in launch order and
-//                       never reused: a subagent launched after an earlier
-//                       one finishes takes the next ordinal, never the freed
-//                       one, and gaps stay gaps. The sequence is seeded at
-//                       session start by counting this session's records in
-//                       Gentle Shell's persisted task roster
-//                       (`<agentHome>/gentle-agents/tasks`), so a mid-session
-//                       extension reload continues the session's numbering
-//                       instead of restarting at 1; a missing, unreadable, or
-//                       malformed roster falls back to the in-process counter.
-//                       Clear (null) below two running
-//                       subagents, so the consumer can never disclose a
-//                       single child. The subagent disclosure list — the
-//                       roles/names tokens keep their own collapsing.
 //   gentle_ask_v1         = <hash>:<intentId>:<expiry>
 //                       (durable ask signal, session-bound + TTL-fresh like
 //                       gentle_orchestrating_v1: emitted on every beat while
@@ -360,58 +341,6 @@ export function resolvePresenceProfile(env = process.env, home = homedir()) {
     if (dirname(path) === path) break;
   }
   return presenceRoot;
-}
-
-// Gentle Shell's only durable per-session launch roster: one JSON record per
-// task (finished ones included) at `<agentHome>/gentle-agents/tasks/<id>.json`,
-// shaped `{ task: TaskRecord, thread }` and pruned to `history_max_tasks`.
-// The live TaskStore projection cannot serve this purpose — it holds only
-// active tasks and nothing across a process reload — so a launch ordinal that
-// must be the subagent's number in THIS session is seeded from here.
-export const ROSTER_MAX_RECORDS = 1024;
-const ROSTER_MAX_RECORD_CHARS = 1 << 20;
-
-export function resolveRosterDirectory(env = process.env, home = homedir()) {
-  const agentHome = resolveAgentHome(env, home);
-  return agentHome === undefined ? undefined : join(agentHome, "gentle-agents", "tasks");
-}
-
-// Number of launches this session already made, from the persisted roster.
-// Undefined — never zero — when the answer is unknown (no directory, an
-// unreadable entry, or any malformed record), so the caller keeps its
-// in-process counter instead of claiming a session that has no history.
-export function sessionRosterLaunchCount(sessionId, directory = resolveRosterDirectory()) {
-  if (typeof sessionId !== "string" || sessionId.length === 0) return undefined;
-  if (typeof directory !== "string" || directory.length === 0) return undefined;
-  let names;
-  try {
-    names = fs.readdirSync(directory).filter((name) => name.endsWith(".json"));
-  } catch {
-    return undefined;
-  }
-  if (names.length > ROSTER_MAX_RECORDS) return undefined;
-  let launches = 0;
-  for (const name of names) {
-    let parsed;
-    try {
-      const raw = fs.readFileSync(join(directory, name), "utf8");
-      if (raw.length > ROSTER_MAX_RECORD_CHARS) return undefined;
-      parsed = JSON.parse(raw);
-    } catch {
-      return undefined;
-    }
-    if (!isRecord(parsed)) return undefined;
-    const task = isRecord(parsed.task) ? parsed.task : parsed;
-    if (
-      typeof task.id !== "string" ||
-      typeof task.parentSessionId !== "string" ||
-      typeof task.createdAt !== "number"
-    ) {
-      return undefined;
-    }
-    if (task.parentSessionId === sessionId) launches += 1;
-  }
-  return launches;
 }
 
 function presenceBoundedRead(path, limit) {
@@ -773,8 +702,6 @@ const MAX_LABEL_CHARS = 64;
 // values (names, roles, subs) are the only ones that can carry multibyte
 // text, and they are measured against this ceiling as they are built.
 const MAX_TOKEN_BYTES = 512;
-const SUBS_TOKEN = "gentle_subs_v1";
-const MAX_SUBS_ENTRIES = 8;
 const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
 const TRANSPORT_FAIL_LATCH = 3;
@@ -937,23 +864,6 @@ function sanitizeLabel(value, fallback) {
     MAX_LABEL_CHARS,
   );
   return clean.length > 0 ? clean : truncateChars(String(fallback), MAX_LABEL_CHARS);
-}
-
-// Full agent package name for the subagent disclosure list (`gentle-ai-explore`,
-// never a role word): the full name survives, only characters that would break
-// the CSV wire (control chars, `,`, `"`) are stripped, with the same 64-char
-// bound the task record already carries. Returns undefined when nothing
-// salvageable remains so the caller drops the entry instead of inventing a
-// name.
-function sanitizeSubAgent(agent) {
-  if (typeof agent !== "string" || agent.length === 0) return undefined;
-  const clean = truncateChars(
-    agent
-      .replace(/[\x00-\x1f\x7f-\x9f",]/g, "")
-      .trim(),
-    MAX_LABEL_CHARS,
-  );
-  return clean.length > 0 ? clean : undefined;
 }
 
 // Unknown-agent fallback (slug rules, 32-char bound): a delegation agent
@@ -2434,37 +2344,8 @@ export default function (pi) {
   // Finished/failed/cancelled/waiting entries may linger in the map but
   // never count; the map is cleared only on session reset (plus the
   // bounded-map guard) — never by a local staleness timeout.
-  const pendingCalls = new Map(); // toolCallId -> { agent, label, at, ordinal }
-  const tasks = new Map(); // taskId -> { agent, label, status, at, ordinal }
-
-  // gentle_subs_v1 launch ordinals (agents sidebar disclosure list):
-  // 1-based, minted at the launch observation (the pending tool call, so two
-  // in-flight launches keep call order) and bound to the task record when it
-  // arrives. Session-scoped, monotonic, never reused — a subagent launched
-  // after an earlier one finished takes the next ordinal, never the freed
-  // one. A resumed launch (`subagent_continue` allocates a new task id) is a
-  // fresh subagent and therefore a fresh ordinal. The sequence is seeded at
-  // session start from the persisted roster (seedLaunchOrdinals), so the
-  // number under a pane row is the subagent's position in this session, not
-  // a private counter that restarts when the extension reloads.
-  let launchCounter = 0;
-
-  // Session-true seeding: the roster keeps every finished launch of this
-  // session, so its count is the highest ordinal already handed out. A
-  // missing, unreadable, or malformed roster leaves the in-process counter
-  // alone (a fresh load numbers from one) — numbering must never fail the
-  // beat — and a seed never moves the counter backwards over ordinals
-  // already minted here.
-  function seedLaunchOrdinals() {
-    const seeded = sessionRosterLaunchCount(sessionId);
-    if (seeded === undefined) return;
-    launchCounter = Math.max(launchCounter, seeded);
-  }
-
-  function nextLaunchOrdinal() {
-    launchCounter += 1;
-    return launchCounter;
-  }
+  const pendingCalls = new Map(); // toolCallId -> { agent, label, at }
+  const tasks = new Map(); // taskId -> { agent, label, status, at }
 
   // Blocker legs. ask combines choice + native questionnaire + legacy
   // questionnaire + tool-gated confirmation + direct ask_user_* tool calls
@@ -2781,7 +2662,6 @@ export default function (pi) {
           agent: task.agent,
           label: task.label,
           at: task.at,
-          ordinal: task.ordinal,
           firstSeen: typeof task.firstSeen === "number" ? task.firstSeen : task.at,
         });
       }
@@ -2802,7 +2682,6 @@ export default function (pi) {
           agent: task.agent,
           label: task.label,
           at: task.at,
-          ordinal: task.ordinal,
           firstSeen: typeof task.firstSeen === "number" ? task.firstSeen : task.at,
         });
       }
@@ -2923,33 +2802,6 @@ export default function (pi) {
     return parts.join(",");
   }
 
-  // Bounded CSV of `<ordinal>:<agent>` entries for the subagent disclosure,
-  // oldest launch first (ordinal ascending == launch order) and capped at
-  // MAX_SUBS_ENTRIES / MAX_TOKEN_BYTES (UTF-8 bytes: an agent name may be
-  // multibyte). Entries are never merged or deduplicated: the ordinal is the
-  // entry identity, so two runs of one agent are two entries. Fewer than two
-  // usable entries yields an empty CSV so the caller clears the token — a
-  // malformed single name can never turn into a one-child disclosure.
-  function subsCsv(subs) {
-    const entries = [];
-    for (const sub of subs) {
-      const agent = sanitizeSubAgent(sub.agent);
-      if (!agent || typeof sub.ordinal !== "number") continue;
-      entries.push({ ordinal: sub.ordinal, agent });
-    }
-    entries.sort((a, b) => a.ordinal - b.ordinal);
-    const parts = [];
-    let length = 0;
-    for (const { ordinal, agent } of entries) {
-      const entry = `${ordinal}:${agent}`;
-      const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(entry);
-      if (parts.length >= MAX_SUBS_ENTRIES || length + add > MAX_TOKEN_BYTES) break;
-      parts.push(entry);
-      length += add;
-    }
-    return parts.length >= 2 ? parts.join(",") : "";
-  }
-
   function buildTokens() {
     if (!sessionHash) return {};
     const expiry = Date.now() + TTL_MS;
@@ -2978,14 +2830,8 @@ export default function (pi) {
     const roles = rolesCsv(mergedRoleSubs());
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;
-    // Subagent disclosure list (S1-S3): `<ordinal>:<agent>` CSV over the
-    // RUNNING delegates — the same executing set the visible count and roles
-    // use, so the disclosure can never disagree with the row it extends.
-    // Null (clear) below two running subagents, so a single child never
-    // discloses.
-    const subsList = subsCsv(running);
-    if (subsList.length > 0) tokens[SUBS_TOKEN] = subsList;
-    else tokens[SUBS_TOKEN] = null;
+    // Clear the retired disclosure token left by older producers.
+    tokens.gentle_subs_v1 = null;
     // Durable ask signal (DESIGN §4.3): session-bound + TTL-fresh
     // `<hash>:<intentId>:<expiry>`, emitted on every beat while ask is
     // active, null (clear) when inactive. Repairs a missed edge-triggered
@@ -3454,9 +3300,6 @@ export default function (pi) {
   function resetSessionState() {
     pendingCalls.clear();
     tasks.clear();
-    // Launch ordinals are session-scoped ("within the session"): a new
-    // session restarts at 1 with no carried task ids.
-    launchCounter = 0;
     choiceActive = false;
     questionActive = false;
     questionnaireActive = false;
@@ -3653,7 +3496,6 @@ export default function (pi) {
       if (!parsed || typeof event.toolCallId !== "string") return;
       pendingCalls.set(event.toolCallId, {
         ...parsed,
-        ordinal: nextLaunchOrdinal(),
         at: Date.now(),
       });
       if (pendingCalls.size > MAX_TRACKED_TASKS) {
@@ -3769,11 +3611,6 @@ export default function (pi) {
       status,
       at: now,
       firstSeen: typeof previous?.firstSeen === "number" ? previous.firstSeen : now,
-      // Launch ordinal for the subagent disclosure: the pending call's ordinal
-      // carries true launch order across overlapping in-flight launches, and a
-      // task id keeps the ordinal it was first given for the whole session
-      // (never reused, never renumbered).
-      ordinal: previous?.ordinal ?? pending?.ordinal ?? nextLaunchOrdinal(),
       epoch: taskEpochFor(previous, status, event.toolName === "subagent_continue"),
     });
     if (tasks.size > MAX_TRACKED_TASKS) {
@@ -3824,9 +3661,6 @@ export default function (pi) {
       at: Date.now(),
       firstSeen:
         typeof previous?.firstSeen === "number" ? previous.firstSeen : Date.now(),
-      // Background starts announce themselves through this path (no launch
-      // tool call), so a first sighting mints the ordinal here.
-      ordinal: previous?.ordinal ?? nextLaunchOrdinal(),
       epoch: taskEpochFor(previous, details.status, false),
     });
     if (tasks.size > MAX_TRACKED_TASKS) {
@@ -3855,7 +3689,6 @@ export default function (pi) {
     rootSession = true;
     sessionManager = ctx.sessionManager;
     refreshSessionRef(ctx);
-    seedLaunchOrdinals();
     moshiCtxRef = ctx;
     if (moshiEnabled()) moshiEnsureContext();
     // LIVE-1: bind the session before any state beat so Herdr attributes the
