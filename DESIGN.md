@@ -714,10 +714,12 @@ argument, Esc, or a cancelled menu writes nothing. With no argument the
 command opens the recovered floating two-pane panel
 (`lib/customize-panel.js`, painted through its own palette)
 over `ctx.ui.custom`: `←/→` or `Tab` moves between the category and value panes,
-`↑/↓` or `j/k` moves the cursor, `Enter` applies the focused row and `Esc`
-closes without a write. An inconclusive sidebar verdict (`unknown`) is shown
-as a note instead of hiding the rows: choosing `On` still attempts the repair
-and reports the apply step's own error, exactly like the menu. The plain
+`↑/↓` or `j/k` moves the cursor, `Enter` toggles the focused switch and `Esc`
+closes without a write. Each switch renders exactly one row that reads its
+stored state and carries the opposite value, so `Enter` is the whole toggle.
+An inconclusive sidebar verdict (`unknown`) renders as `Unknown` with a note
+instead of hiding the row: toggling still attempts the repair and reports the
+apply step's own error, exactly like the menu. The plain
 two-step `ctx.ui.select` menu remains the
 fallback when the TUI helpers or `ctx.ui.custom` are unavailable. The removed
 `Plugin tools` and `Reset` sections and the in-process provider slot

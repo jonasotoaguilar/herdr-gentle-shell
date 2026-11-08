@@ -2645,6 +2645,11 @@ export default function (pi) {
   let nativeSeq = Date.now() * 1000;
   let nativeInFlight = false;
   let nativePending = null;
+  // The report currently on the wire. The drain loop clears `nativePending`
+  // before the round trip and `nativeLastOk` only advances once the host
+  // answers, so this is the only reference the dedupe has to the transition a
+  // beat arriving mid-send is describing.
+  let nativeSending = null;
   let nativeLastOk = undefined;
   let nativeSettledPending = false;
   // LIVE-1 startup latency: the session binding is still INITIATED on
@@ -3202,23 +3207,31 @@ export default function (pi) {
         nativeSeq += 1;
         const seq = nativeSeq;
         let ok = false;
-        for (let attempt = 0; attempt < NATIVE_MAX_ATTEMPTS && !ok; attempt += 1) {
-          ok = await sendRequestAttempt(
-            {
-              id: `${SOURCE}:native:${seq}:${attempt}:${randomUUID()}`,
-              method: "pane.report_agent",
-              params: {
-                pane_id: paneId,
-                source: NATIVE_SOURCE,
-                agent: NATIVE_AGENT,
-                state: next.state,
-                message: next.message,
-                ...binding,
-                seq,
+        nativeSending = next;
+        try {
+          for (let attempt = 0; attempt < NATIVE_MAX_ATTEMPTS && !ok; attempt += 1) {
+            ok = await sendRequestAttempt(
+              {
+                id: `${SOURCE}:native:${seq}:${attempt}:${randomUUID()}`,
+                method: "pane.report_agent",
+                params: {
+                  pane_id: paneId,
+                  source: NATIVE_SOURCE,
+                  agent: NATIVE_AGENT,
+                  state: next.state,
+                  message: next.message,
+                  ...binding,
+                  seq,
+                },
               },
-            },
-            attempt === 0 ? 500 : 1500,
-          );
+              attempt === 0 ? 500 : 1500,
+            );
+          }
+        } finally {
+          // Released on success AND failure: a send that never landed leaves
+          // `nativeLastOk` behind, so the next beat still retries the
+          // transition (attempt loop above, then beats — never a re-queue here).
+          if (nativeSending === next) nativeSending = null;
         }
         if (ok) {
           const wasWorking = nativeLastOk?.state === "working";
@@ -3250,22 +3263,13 @@ export default function (pi) {
     if (!enabled() || !sidebarPublishingEnabled()) return;
     const want = desiredNativeReport();
     if (!want) return;
-    if (
-      nativeLastOk !== undefined &&
-      want.state === nativeLastOk.state &&
-      want.message === nativeLastOk.message &&
-      nativePending === null &&
-      !nativeInFlight
-    ) {
-      return;
-    }
-    if (
-      nativePending !== null &&
-      nativePending.state === want.state &&
-      nativePending.message === want.message
-    ) {
-      return;
-    }
+    // Dedupe against the newest report the host has, is getting, or is
+    // already queued to get: the pending slot, then the in-flight send, then
+    // the last delivered report. The in-flight leg is what keeps one logical
+    // transition to one seq — without it a beat landing inside the round trip
+    // re-queues the report being sent and mints a duplicate.
+    const known = nativePending ?? nativeSending ?? nativeLastOk;
+    if (known && known.state === want.state && known.message === want.message) return;
     nativePending = want;
     void drainNative();
   }
@@ -3427,6 +3431,7 @@ export default function (pi) {
     reviewId = undefined;
     presenceReconciler = createPresenceReconciler();
     nativePending = null;
+    nativeSending = null;
     nativeLastOk = undefined;
     nativeSettledPending = false;
     errorCode = undefined;

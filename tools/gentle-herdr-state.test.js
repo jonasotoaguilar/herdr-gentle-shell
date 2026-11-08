@@ -2567,6 +2567,99 @@ test('N1 RED: real error emits blocked once with the error label', async () => {
   }
 });
 
+// The native queue dedupes by state+message, but the report actually on the
+// wire used to drop out of that comparison for the whole round trip: the drain
+// loop clears its pending slot before sending, and `nativeLastOk` only advances
+// once the host answers. A beat landing inside that window re-queued the very
+// report being sent, which then shipped again under a fresh seq and read as a
+// second blocked transition (the CI flake behind 2 blocked seqs for one error).
+// The wire answers `pane.report_agent` 400 ms late, so one full publish cycle
+// lands deterministically inside the in-flight window instead of racing.
+test('N1: a publish during an in-flight state send never re-emits that transition', async () => {
+  const wire = await startNativeWire({ delayMethod: 'pane.report_agent', delayMs: 400 });
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-n1-inflight', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    n1NativeSession(h, 'sess-n1-inflight', '/tmp/gentle-n1-inflight-session');
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'initial working',
+    );
+    await new Promise((r) => setTimeout(r, 700));
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1i1', isError: true });
+    const blocked = await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'blocked',
+      5000,
+      'blocked on the wire',
+    );
+    assert.match(blocked.params.message ?? '', /^error:/, 'blocked carries the error label');
+    // Same desired report (still `blocked` + the same label) published while
+    // that send is unanswered: the wire schedule puts the beat mid-round-trip.
+    h.fireEvent('gentle-pi:session-change', { sessionId: 'sess-n1-inflight' });
+    await new Promise((r) => setTimeout(r, 2500));
+    const reports = nativeStates(wire.received).map((p) => `${p.seq}|${p.state}|${p.message ?? '-'}`);
+    assert.equal(
+      nativeTransitionCount(wire.received, 'blocked'),
+      1,
+      `one logical blocked transition ships exactly one seq: ${JSON.stringify(reports)}`,
+    );
+    n1NoNotify(wire.received, 'in-flight republish');
+  } finally {
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+// The emit-once dedupe must stay a dedupe, never a suppressor: a real return to
+// working followed by a new failure is a second logical transition and keeps
+// its own report and seq.
+test('N1: a second genuine blocked transition still emits after a return to working', async () => {
+  const wire = await startNativeWire();
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-n1-again', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    n1NativeSession(h, 'sess-n1-again', '/tmp/gentle-n1-again-session');
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'initial working',
+    );
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1a1', isError: true });
+    const first = await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'blocked',
+      5000,
+      'first blocked',
+    );
+    assert.match(first.params.message ?? '', /^error:/, 'first blocked carries the error label');
+    // agent_start is the fresh snapshot: the error latch clears, the pane
+    // returns to working, and the next failure is a new episode.
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working' && r.params.seq > first.params.seq,
+      5000,
+      'working after the error latch clears',
+    );
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1a2', isError: true });
+    const second = await wire.waitFor(
+      (r) =>
+        r.method === 'pane.report_agent' &&
+        r.params.state === 'blocked' &&
+        r.params.seq > first.params.seq,
+      5000,
+      'second blocked after a real return to working',
+    );
+    assert.match(second.params.message ?? '', /^error:/, 'second blocked carries the error label');
+    assert.equal(nativeTransitionCount(wire.received, 'blocked'), 2, 'working->blocked->working->blocked emits twice');
+    n1NoNotify(wire.received, 'second blocked');
+  } finally {
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
 test('N1 RED: review execution stays working-silent, never blocked', async () => {
   const wire = await startNativeWire();
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-n1-review', '1');
