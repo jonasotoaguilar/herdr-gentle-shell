@@ -310,8 +310,9 @@ and TTL discipline as `herdr-pi-tree`, new token names, no new socket or
 webhook. `[[startup]] node bin/gentle-status.js` (no args) is the polling-daemon
 bootstrap (ensures the adaptive poll daemon is running: 10 s baseline,
 `GENTLE_STATUS_POLL_MS`-overridable, with a 2 s fast cycle while recent ask
-activity or send/publish failures are observed); `[[events]] on =
-"pane.agent_detected"`, `pane.agent_status_changed`, `pane.exited`, and
+activity, a rendered non-idle display, or send/publish failures are observed);
+`[[events]] on = "pane.agent_detected"`, `pane.agent_status_changed`,
+`pane.exited`, and
 `pane.closed` each run `node bin/gentle-status.js --refresh`, which ensures the
 adaptive poll daemon is running and requests one coalesced immediate frame
 so a newly opened project name/state renders without waiting for the next

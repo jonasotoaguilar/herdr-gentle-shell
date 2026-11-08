@@ -794,11 +794,16 @@ exactly one mechanism writes each piece of state.
 - Poll cadence: resolved — must be ≪ 60 s TTL to avoid flapping
   (see §10 U2). The daemon runs an adaptive poll (10 s baseline,
   `GENTLE_STATUS_POLL_MS`-overridable, 2 s fast cycle
-  (`GENTLE_STATUS_FAST_POLL_MS`) while recent ask activity or send/publish
-  failures are observed, recovering after N quiet frames
+  (`GENTLE_STATUS_FAST_POLL_MS`) while recent ask activity, a rendered
+  non-idle display, or send/publish failures are observed, recovering after
+  N quiet frames
   (`GENTLE_STATUS_FAST_QUIET_FRAMES`) or a TTL-bounded window
   (`GENTLE_STATUS_FAST_WINDOW_MS`), 250 ms floor, single dynamic
-  `setTimeout` chain.
+  `setTimeout` chain. The active-display trigger exists because the row data
+  the daemon derives by itself — the `+N/-N` changes summary and the `↑N`
+  pull marker, read from local git plus `agent.list` — cannot be driven by a
+  producer report; only `idle` counts as settled, so an idle pane keeps the
+  baseline exactly.
   Drawing is event-synchronized; polling is only the fallback. Every landed
   producer beat requests the daemon's ONE coalesced refresh (the same request
   file `--refresh` touches, §10 U2), so a report that changes state draws an

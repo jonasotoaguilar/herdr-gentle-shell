@@ -368,6 +368,88 @@ describe('adaptive poll (P1)', () => {
       else process.env.GENTLE_STATUS_STATE_DIR = previous;
     }
   });
+
+  // S4: the row data this daemon derives by itself (the `+N/-N` changes
+  // summary and the `↑N` pull marker) is read from local git plus
+  // `agent.list`, so no producer report can drive it. Any display other than
+  // the settled `idle` therefore keeps the fast cycle armed on its own.
+  it('an active display arms the fast cycle', () => {
+    const config = daemon.resolvePollConfig({});
+    const t0 = 5000000;
+    assert.equal(
+      daemon.nextPollDelay(daemon.createPollState(), t0, { active: true, askActivity: false, failure: false }, config),
+      2000,
+      'a rendered non-idle display polls at the fast cycle',
+    );
+    // One classification, taken from the contract's own display list: only
+    // `idle` is settled, and a pane with no usable display counts as settled
+    // (fail closed to today's baseline).
+    const observed = daemon.createPollStateObserved();
+    assert.equal(daemon.observeDisplay(observed, 'idle'), false, 'idle is not an active display');
+    assert.equal(observed.active, false, 'idle never arms the window');
+    for (const display of contract.DISPLAYS) {
+      if (display === 'idle') continue;
+      assert.equal(daemon.observeDisplay(observed, display), true, `${display} is active`);
+    }
+    assert.equal(observed.active, true, 'every non-idle display arms the window');
+    for (const unknown of [undefined, null, '', 42]) {
+      const empty = daemon.createPollStateObserved();
+      assert.equal(daemon.observeDisplay(empty, unknown), false, `${String(unknown)} is not an active display`);
+      assert.equal(empty.active, false, `${String(unknown)} never arms the window`);
+    }
+  });
+
+  it('all-idle frames keep the baseline and still recover after quiet frames', () => {
+    const config = daemon.resolvePollConfig({ GENTLE_STATUS_FAST_QUIET_FRAMES: '3' });
+    const t0 = 6000000;
+    const poll = daemon.createPollState();
+    assert.equal(
+      daemon.nextPollDelay(poll, t0, { active: false, askActivity: false, failure: false }, config),
+      10000,
+      'a cold all-idle frame keeps the baseline exactly',
+    );
+    assert.equal(daemon.nextPollDelay(poll, t0 + 2000, { active: true }, config), 2000, 'an active frame arms');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 4000, { active: false }, config), 2000, 'quiet frame 1');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 6000, { active: false }, config), 2000, 'quiet frame 2');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 8000, { active: false }, config), 10000, 'quiet frame 3 recovers');
+    assert.equal(
+      daemon.nextPollDelay(poll, t0 + 28000, { active: false }, config),
+      10000,
+      'and the loop stays at the baseline afterwards',
+    );
+  });
+
+  it('the active fast cycle composes with the expiry cap: the shorter delay wins', () => {
+    const config = daemon.resolvePollConfig({});
+    const t0 = 7000000;
+    const fast = daemon.nextPollDelay(daemon.createPollState(), t0, { active: true }, config);
+    assert.equal(fast, 2000, 'the active frame polls at the fast cycle');
+    assert.equal(
+      daemon.capDelayToExpiry(fast, t0 + 1500, t0),
+      1500,
+      'a nearer done expiry shortens the active fast delay',
+    );
+    assert.equal(
+      daemon.capDelayToExpiry(fast, t0 + 60000, t0),
+      2000,
+      'a distant expiry leaves the active fast delay exactly',
+    );
+  });
+
+  it('clearing the active display recovers to baseline without a new timer', () => {
+    const config = daemon.resolvePollConfig({ GENTLE_STATUS_FAST_QUIET_FRAMES: '3' });
+    const t0 = 8000000;
+    const poll = daemon.createPollState();
+    assert.equal(daemon.nextPollDelay(poll, t0, { active: true }, config), 2000);
+    assert.deepEqual(
+      Object.keys(poll).sort(),
+      ['fastUntil', 'quietFrames'],
+      'recovery reuses the one poll state: no second timer and no separate decay',
+    );
+    assert.equal(daemon.nextPollDelay(poll, t0 + 2000, { active: false }, config), 2000, 'still fast on the first quiet frame');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 4000, { active: false }, config), 2000, 'still fast on the second');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 6000, { active: false }, config), 10000, 'back to baseline on the third');
+  });
 });
 
 

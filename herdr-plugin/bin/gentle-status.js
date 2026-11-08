@@ -65,10 +65,11 @@ const SOURCE = `plugin:${process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID}`;
 // is comfortably below the 60 s token TTL and the producer's 15 s beat so
 // every beat is observed at least once. Env-overridable, documented here
 // rather than normatively fixed. P1 adaptive poll: the loop idles at the
-// baseline cadence and drops to a fast cycle while recent ask activity or
-// send/publish failures are observed, recovering after N quiet frames or
-// when the TTL-bounded fast window expires. Single setTimeout chain with a
-// dynamic delay — never a busy loop, never setInterval.
+// baseline cadence and drops to a fast cycle while recent ask activity, an
+// active (non-idle) display, or send/publish failures are observed,
+// recovering after N quiet frames or when the TTL-bounded fast window
+// expires. Single setTimeout chain with a dynamic delay — never a busy loop,
+// never setInterval.
 const POLL_MS = Number(process.env.GENTLE_STATUS_POLL_MS ?? 10000) || 10000;
 const POLL_MIN_MS = 250;
 
@@ -100,14 +101,27 @@ function createPollState() {
 }
 
 function createPollStateObserved() {
-  return { askActivity: false, failure: false };
+  return { askActivity: false, failure: false, active: false };
 }
 
-// Decide the next loop delay and advance pollState. Any ask activity or
-// send/publish failure (re)arms the TTL-bounded fast window; N consecutive
-// quiet frames inside the window recover to baseline early.
+// S4: the row data this daemon derives itself — the `+N/-N` changes summary
+// and the `↑N` pull marker, read from local git plus `agent.list` — is
+// refreshed by a frame, not by a producer report, so an idle pane waits a
+// whole baseline for a git change to appear. The reduced display a frame
+// already computed is the only classification used: anything other than the
+// settled `idle` is active, while an absent or unknown display counts as
+// settled and keeps today's baseline (fail closed, like every parser).
+function observeDisplay(observed, display) {
+  const active = typeof display === 'string' && display.length > 0 && display !== 'idle';
+  if (active && observed) observed.active = true;
+  return active;
+}
+
+// Decide the next loop delay and advance pollState. Any ask activity, active
+// display, or send/publish failure (re)arms the TTL-bounded fast window; N
+// consecutive quiet frames inside the window recover to baseline early.
 function nextPollDelay(pollState, now, observed = {}, config = resolvePollConfig()) {
-  if (observed.askActivity || observed.failure) {
+  if (observed.askActivity || observed.failure || observed.active) {
     pollState.fastUntil = now + config.windowMs;
     pollState.quietFrames = 0;
   } else if (pollState.fastUntil > now) {
@@ -611,6 +625,7 @@ async function frame(state, opts = {}) {
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
     state.pollObserved.failure = false;
+    state.pollObserved.active = false;
   }
   const agents = await agentsAsync();
   if (agents === null) {
@@ -652,6 +667,11 @@ async function frame(state, opts = {}) {
     if (reduced.display === 'ask' && reduced.notify && state.pollObserved) {
       state.pollObserved.askActivity = true;
     }
+    // S4: any non-idle display keeps the fast cycle armed too, so the git
+    // changes summary and pull marker this daemon derives by itself stop
+    // lagging up to a whole baseline. Set before the signature short-circuit
+    // below: an unchanged row is still a rendered one.
+    observeDisplay(state.pollObserved, reduced.display);
     const patch = contract.displayTokens(reduced);
     const signature = JSON.stringify(patch);
     if (lastSent.get(paneId) === signature) continue;
@@ -932,10 +952,10 @@ async function run() {
       logError(error);
     }
     if (stopped) break;
-    // Single-loop dynamic delay: fast cycle while recent ask activity or
-    // failures were observed, baseline otherwise, capped at the nearest
-    // pending token expiry so a `done` row reaches `idle` on time. No
-    // setInterval, no busy loop (delays floored at POLL_MIN_MS via
+    // Single-loop dynamic delay: fast cycle while recent ask activity, an
+    // active display or failures were observed, baseline otherwise, capped at
+    // the nearest pending token expiry so a `done` row reaches `idle` on
+    // time. No setInterval, no busy loop (delays floored at POLL_MIN_MS via
     // resolvePollConfig and capDelayToExpiry). The sleep is interruptible: a
     // coalesced refresh request — from a lifecycle hook or from the producer
     // after every landed token report — breaks the wait early for one
@@ -1053,6 +1073,7 @@ if (require.main === module) {
     createPollState,
     createPollStateObserved,
     nextPollDelay,
+    observeDisplay,
     capDelayToExpiry,
     refreshGateMs,
     requestRefresh,
