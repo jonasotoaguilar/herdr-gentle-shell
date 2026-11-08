@@ -1,10 +1,14 @@
 'use strict';
 
-// Release 1.0.0 (odd/tasks/release-1.0.0.md S1-S4) regression probes.
+// Release regression probes shipped with 1.0.0 (odd/tasks/release-1.0.0.md
+// S1-S4); the file keeps its original name to avoid churn.
 //
 // S1 removed the one-shot installer, so no shipped instruction may teach a
 // command form that no longer exists or promise a behaviour only install.sh
-// implemented. S3 pins the released versions, S4 the repository identity.
+// implemented. S3's identity pins are version-agnostic on purpose: the two
+// published versions must stay equal to each other and be strict semver, so no
+// number has to be edited here at every release. S4 pins the repository
+// identity.
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
@@ -14,6 +18,13 @@ const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 const PKG = JSON.parse(read('package.json'));
+const SEMVER = /^\d+\.\d+\.\d+$/;
+
+function manifestVersion() {
+  const match = /^version = "([^"]+)"$/m.exec(read(path.join('herdr-plugin', 'herdr-plugin.toml')));
+  assert.ok(match, 'herdr-plugin.toml must declare a quoted version');
+  return match[1];
+}
 
 describe('release 1.0.0: no retired installer instruction survives (S1)', () => {
   it('the README carries no removed installer command form', () => {
@@ -44,13 +55,21 @@ describe('release 1.0.0: no retired installer instruction survives (S1)', () => 
   });
 });
 
-describe('release 1.0.0 versions and tags (S3)', () => {
-  it('the Pi package reports 1.0.0', () => {
-    assert.equal(PKG.version, '1.0.0');
+describe('released versions and tags (S3)', () => {
+  it('the Pi package reports a strict semver version', () => {
+    assert.match(PKG.version, SEMVER, `package.json version: ${PKG.version}`);
   });
 
-  it('the Herdr plugin reports 1.0.0', () => {
-    assert.match(read(path.join('herdr-plugin', 'herdr-plugin.toml')), /^version = "1\.0\.0"$/m);
+  it('the Herdr plugin reports a strict semver version', () => {
+    assert.match(manifestVersion(), SEMVER, `herdr-plugin.toml version: ${manifestVersion()}`);
+  });
+
+  it('both published identities ship the same version', () => {
+    assert.equal(
+      manifestVersion(),
+      PKG.version,
+      `package.json is ${PKG.version} but herdr-plugin.toml is ${manifestVersion()}`,
+    );
   });
 
   it('the documented release series are pi-vX.Y.Z and herdr-vX.Y.Z', () => {
