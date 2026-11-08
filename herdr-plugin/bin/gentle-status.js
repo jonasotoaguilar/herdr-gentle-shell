@@ -122,6 +122,56 @@ function nextPollDelay(pollState, now, observed = {}, config = resolvePollConfig
   }
   return pollState.fastUntil > now ? config.fastMs : config.baselineMs;
 }
+
+// A `done` display IS a token expiry (DESIGN §4.3): it recedes to `idle` when
+// the hold lapses, so a sleep that runs past it keeps a settled row on `done`
+// for up to one whole poll after the hold ended. Capping the sleep at the
+// nearest pending expiry fixes that without a second timer. The cap may only
+// SHORTEN the delay it was given: a distant expiry returns the delay
+// unchanged, an absent or unparseable one returns it unchanged (fail closed,
+// exactly like the token parsers), and an already-expired or near expiry falls
+// to POLL_MIN_MS instead of 0 so no busy loop is possible.
+function capDelayToExpiry(delayMs, nearestExpiry, now = Date.now()) {
+  if (typeof nearestExpiry !== 'number' || !Number.isFinite(nearestExpiry)) return delayMs;
+  const remaining = nearestExpiry - now;
+  if (!(remaining < delayMs)) return delayMs;
+  if (!(remaining > POLL_MIN_MS)) return Math.min(delayMs, POLL_MIN_MS);
+  return Math.floor(remaining);
+}
+
+// Event-synchronized drawing floor (DESIGN §8): a token report lands in Herdr,
+// not in this loop, so the producer requests the coalesced refresh above. The
+// request may break the sleep, but never sooner than POLL_MIN_MS after the
+// frame that started it, so a burst of reports cannot spin the loop faster
+// than the poll floor. Returns 0 when a wake may fire now, else how long is
+// left before it may — the sleep slices to that instant so an eligible request
+// is consumed on the next pass (a naive boolean check would re-test at the
+// same phase every slice and could starve while the poll delay IS the floor).
+// The request is only consumed once this allows the wake, so nothing is lost.
+function refreshGateMs(lastFrameAt, now = Date.now()) {
+  if (!Number.isFinite(lastFrameAt)) return 0;
+  const elapsed = now - lastFrameAt;
+  if (elapsed >= POLL_MIN_MS) return 0;
+  return Math.min(POLL_MIN_MS, POLL_MIN_MS - elapsed);
+}
+
+// B: the soonest live `done` expiry among the panes a frame reduced. The
+// contract's own parser fails closed (foreign session, malformed, already
+// expired, or beyond the freshness ceiling all yield null), so a bad token
+// never schedules a wake and no value is ever re-derived here.
+function doneExpiryOf(entry, now) {
+  const tokens =
+    entry && typeof entry === 'object' && entry.tokens && typeof entry.tokens === 'object'
+      ? entry.tokens
+      : null;
+  if (tokens === null) return null;
+  const done = contract.parseDone(
+    tokens[contract.DONE_TOKEN],
+    contract.expectedSessionHash(entry),
+    now,
+  );
+  return done === null ? null : done.expiry;
+}
 const MAX_TOKENS_PER_REPORT = 16;
 const SOCKET_TIMEOUT_MS = 4000;
 const CLI_TIMEOUT_MS = 5000;
@@ -553,6 +603,11 @@ async function frame(state, opts = {}) {
   const tracing = traceEnabled(trace);
   const started = tracing ? process.hrtime.bigint() : 0n;
   const now = Date.now();
+  // Cleared every frame, including the failed-snapshot path below: a stale
+  // expiry must never cap a later sleep (it would floor every poll at
+  // POLL_MIN_MS until the snapshot recovers), and no expiry means today's
+  // delay applies.
+  state.nearestExpiry = null;
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
     state.pollObserved.failure = false;
@@ -570,6 +625,7 @@ async function frame(state, opts = {}) {
   const liveOwned = []; // owned pane ids (disabled-mode clear-once)
   const sightings = {}; // paneId -> {entry, reduced} (ledger, daemon only)
   const publishJobs = [];
+  let nearestExpiry = null;
   for (const entry of agents) {
     const paneId = entry?.pane_id;
     if (typeof paneId !== 'string') continue;
@@ -579,6 +635,8 @@ async function frame(state, opts = {}) {
       debug(`pane ${paneId}: pi-tree owns; yielding`);
       continue;
     }
+    const expiry = doneExpiryOf(entry, now);
+    if (expiry !== null && (nearestExpiry === null || expiry < nearestExpiry)) nearestExpiry = expiry;
     sightings[paneId] = { entry, reduced };
     if (!sidebar.enabled) {
       // Native sidebar selected (or malformed flag): never compose a
@@ -599,6 +657,8 @@ async function frame(state, opts = {}) {
     if (lastSent.get(paneId) === signature) continue;
     publishJobs.push({ paneId, patch, signature });
   }
+  // The next sleep may not outlive the soonest hold it just drew.
+  state.nearestExpiry = nearestExpiry;
   // Publishes land every frame; with no notification path nothing gates them.
   // Suppressed entirely while the native sidebar is selected (S7 gate).
   if (sidebar.enabled) {
@@ -766,10 +826,11 @@ function daemonAlive() {
 
 const REFRESH_FILE = () => path.join(stateRoot(), 'gentle-status.refresh');
 
-// Coalesced immediate-refresh request: event hooks (and operators) touch
-// this file; the daemon loop consumes it (delete) and runs one extra
-// frame. N concurrent requests collapse to one frame. The file carries
-// only a timestamp — never tokens, pane data, or sidebar mode — so an
+// Coalesced immediate-refresh request: event hooks, the producer extension
+// (after every landed token report) and operators touch this file; the daemon
+// loop consumes it (delete) and runs one extra frame. N concurrent requests
+// collapse to one frame. The file carries only a timestamp — never tokens,
+// pane data, or sidebar mode — so an
 // event-triggered wake cannot self-feedback: this daemon's own metadata
 // writes emit no agent lifecycle events, --refresh itself publishes
 // nothing, and the sidebar flag is never written here.
@@ -829,6 +890,7 @@ async function run() {
   const state = {
     live: new Set(),
     pollObserved: createPollStateObserved(),
+    nearestExpiry: null,
     interruptionsPrior: {},
     interruptions: interruptions.loadInterruptions(stateRoot()),
     clearedWhileDisabled: new Set(),
@@ -863,6 +925,7 @@ async function run() {
   });
   for (;;) {
     if (stopped) break;
+    const frameStartedAt = Date.now();
     try {
       await frame(state, { persistInterruptions: true });
     } catch (error) {
@@ -870,18 +933,30 @@ async function run() {
     }
     if (stopped) break;
     // Single-loop dynamic delay: fast cycle while recent ask activity or
-    // failures were observed, baseline otherwise. No setInterval, no busy
-    // loop (delays floored at POLL_MIN_MS via resolvePollConfig). The
-    // sleep is interruptible: a coalesced --refresh request breaks the
-    // wait early for one immediate frame. Sequential — the next frame
-    // never overlaps the current one; concurrent requests collapse to one.
-    const delay = nextPollDelay(pollState, Date.now(), state.pollObserved, pollConfig);
+    // failures were observed, baseline otherwise, capped at the nearest
+    // pending token expiry so a `done` row reaches `idle` on time. No
+    // setInterval, no busy loop (delays floored at POLL_MIN_MS via
+    // resolvePollConfig and capDelayToExpiry). The sleep is interruptible: a
+    // coalesced refresh request — from a lifecycle hook or from the producer
+    // after every landed token report — breaks the wait early for one
+    // immediate frame, never sooner than POLL_MIN_MS after the frame that
+    // started it. Sequential — the next frame never overlaps the current one;
+    // concurrent requests collapse to one.
+    const now = Date.now();
+    const delay = nextPollDelay(pollState, now, state.pollObserved, pollConfig);
+    const sleepMs = capDelayToExpiry(delay, state.nearestExpiry, now);
+    // Slice accounting stays whole slices to a deadline, so the sleep can only
+    // be shortened by a coalesced refresh request, never extended.
+    const deadline = now + sleepMs;
     const sliceMs = 250;
-    let remaining = delay;
-    while (remaining > 0 && !stopped) {
-      if (takeRefresh()) break;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(sliceMs, remaining)));
-      remaining -= sliceMs;
+    while (!stopped) {
+      const at = Date.now();
+      const left = deadline - at;
+      if (left <= 0) break;
+      const gateMs = refreshGateMs(frameStartedAt, at);
+      if (gateMs === 0 && takeRefresh()) break;
+      const slice = Math.min(sliceMs, left);
+      await new Promise((resolve) => setTimeout(resolve, gateMs > 0 ? Math.min(slice, gateMs) : slice));
     }
   }
 }
@@ -978,6 +1053,10 @@ if (require.main === module) {
     createPollState,
     createPollStateObserved,
     nextPollDelay,
+    capDelayToExpiry,
+    refreshGateMs,
+    requestRefresh,
+    takeRefresh,
     readSidebarMode,
   };
 }

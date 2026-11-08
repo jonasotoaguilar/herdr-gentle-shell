@@ -315,7 +315,14 @@ activity or send/publish failures are observed); `[[events]] on =
 `pane.closed` each run `node bin/gentle-status.js --refresh`, which ensures the
 adaptive poll daemon is running and requests one coalesced immediate frame
 so a newly opened project name/state renders without waiting for the next
-poll tick. Polling stays the fallback for every lifecycle signal, so a missed
+poll tick. Drawing follows the report, not the clock: the producer requests
+that same coalesced refresh after every landed token beat, so a status change
+it publishes is drawn at once, and the daemon caps each sleep at the nearest
+live `done` expiry, so a settled row reaches `idle` when its short hold (5 s by
+default, `GENTLE_HERDR_DONE_HOLD_MS`-overridable) lapses instead of one poll
+later. Reports in one window collapse into one frame, and refresh-driven frames
+are floored at 250 ms, so a burst can never spin the daemon. Polling stays the
+fallback for every lifecycle signal, so a missed
 or undelivered event never sticks. Read-only
 supervision triage ships beside it: the `doctor` and `whois` plugin actions
 (`node bin/gentle-doctor.js`, `node bin/gentle-whois.js`) plus the explicit-pane

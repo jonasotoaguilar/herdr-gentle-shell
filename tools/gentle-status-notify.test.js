@@ -309,6 +309,65 @@ describe('adaptive poll (P1)', () => {
     const source = fs.readFileSync(DAEMON, 'utf8');
     assert.ok(!/setInterval\s*\(/.test(source), 'daemon must not use setInterval');
   });
+
+  // The `done` display IS a token expiry (§4.3), so a sleep that runs past it
+  // keeps a settled row on `done` for up to one whole poll after the hold
+  // lapsed. The cap can only shorten a delay.
+  it('an expiry-aware wakeup shortens the delay to the nearest expiry, floored', () => {
+    const now = 4000000;
+    assert.equal(daemon.capDelayToExpiry(10000, now + 1500, now), 1500, 'a pending expiry shortens the sleep');
+    assert.equal(daemon.capDelayToExpiry(10000, now - 5000, now), 250, 'an already-past expiry falls to the floor');
+    assert.equal(daemon.capDelayToExpiry(10000, now + 100, now), 250, 'an expiry inside the floor falls to the floor');
+    assert.equal(daemon.capDelayToExpiry(2000, now + 60000, now), 2000, 'a distant expiry never lengthens the delay');
+    assert.equal(daemon.capDelayToExpiry(250, now + 100, now), 250, 'the floor never raises the delay it was given');
+    assert.equal(daemon.capDelayToExpiry(10000, null, now), 10000, 'no pending expiry keeps the delay exactly');
+    assert.equal(daemon.capDelayToExpiry(10000, undefined, now), 10000, 'an absent expiry keeps the delay exactly');
+    assert.equal(daemon.capDelayToExpiry(10000, Number.NaN, now), 10000, 'an unparseable expiry keeps the delay exactly');
+  });
+
+  // A token report lands in Herdr, not in this loop: the producer requests the
+  // daemon's one coalesced refresh (the same file `--refresh` touches) so the
+  // frame follows the report instead of the poll.
+  it('a report request wakes one coalesced frame, floored at POLL_MIN_MS', () => {
+    const previous = process.env.GENTLE_STATUS_STATE_DIR;
+    process.env.GENTLE_STATUS_STATE_DIR = sandbox.stateDir;
+    try {
+      assert.equal(daemon.takeRefresh(), false, 'a quiet sleep carries no request');
+      assert.equal(daemon.requestRefresh(), true, 'a landed report requests a wake');
+      assert.equal(
+        daemon.refreshGateMs(Date.now(), Date.now()),
+        daemon.POLL_MIN_MS,
+        'a wake waits out the floor after the frame that started the sleep',
+      );
+      assert.equal(
+        daemon.refreshGateMs(Date.now() + 1000, Date.now()),
+        daemon.POLL_MIN_MS,
+        'clock skew never widens the gate past the floor',
+      );
+      assert.equal(
+        daemon.refreshGateMs(Date.now() - daemon.POLL_MIN_MS, Date.now()),
+        0,
+        'past the floor the wake is immediate',
+      );
+      assert.equal(daemon.takeRefresh(), true, 'the request breaks the sleep once');
+      assert.equal(daemon.takeRefresh(), false, 'the same request never breaks a second frame');
+
+      daemon.requestRefresh();
+      daemon.requestRefresh();
+      assert.equal(daemon.takeRefresh(), true, 'two reports in one tick collapse into one frame');
+      assert.equal(daemon.takeRefresh(), false, 'and leave nothing queued behind');
+
+      const config = daemon.resolvePollConfig({});
+      assert.equal(
+        daemon.capDelayToExpiry(config.baselineMs, null, Date.now()),
+        config.baselineMs,
+        'with no request and no pending expiry the delay is exactly the baseline',
+      );
+    } finally {
+      if (previous === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+      else process.env.GENTLE_STATUS_STATE_DIR = previous;
+    }
+  });
 });
 
 

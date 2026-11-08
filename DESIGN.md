@@ -328,11 +328,14 @@ gentle_done_v1        = sessionHash ":" expiry
                     ; republished with the SAME expiry (never refreshed) until
                     ; it lapses; null (clear) whenever work reappears or the
                     ; session resets. Its expiry IS the done hold: default
-                    ; 60 s, overridden by GENTLE_HERDR_DONE_HOLD_MS clamped to
-                    ; [1000, 300000], and the consumer accepts no expiry beyond
-                    ; now+300000 at read (the only token whose ceiling is not
-                    ; the 60 s TTL). A session that never worked never mints
-                    ; one.
+                    ; 5 s (short on purpose — the hold only makes a finish
+                    ; visible, it never pins a settled row, so `idle` follows
+                    ; within seconds), overridden by
+                    ; GENTLE_HERDR_DONE_HOLD_MS clamped to [1000, 300000], and
+                    ; the consumer accepts no expiry beyond now+300000 at read
+                    ; (the only token whose ceiling is not the 60 s TTL). The
+                    ; daemon also caps its next sleep at that expiry (§8). A
+                    ; session that never worked never mints one.
 gentle_ask_v1         = sessionHash ":" intentId ":" expiry
                     ; durable ask signal, session-bound + TTL-fresh like
                     ; gentle_orchestrating_v1 — emitted on every beat while
@@ -796,6 +799,20 @@ exactly one mechanism writes each piece of state.
   (`GENTLE_STATUS_FAST_QUIET_FRAMES`) or a TTL-bounded window
   (`GENTLE_STATUS_FAST_WINDOW_MS`), 250 ms floor, single dynamic
   `setTimeout` chain.
+  Drawing is event-synchronized; polling is only the fallback. Every landed
+  producer beat requests the daemon's ONE coalesced refresh (the same request
+  file `--refresh` touches, §10 U2), so a report that changes state draws an
+  immediate frame instead of waiting for the next poll — the event lands on
+  time AND the drawing follows it. N reports in one window collapse into one
+  frame, and refresh-driven frames are floored at 250 ms after the frame that
+  started the sleep, so a report storm can never spin the loop.
+  The sleep is also capped at the nearest live `gentle_done_v1` expiry among
+  the panes just rendered (never below the 250 ms floor), so a held `done`
+  row reaches `idle` when the hold lapses rather than up to one poll later.
+  A pending expiry may only SHORTEN the delay: with no pending expiry the
+  delay is exactly the adaptive value above, and an already-expired or
+  unparseable value falls to the floor (fail closed, like every parser)
+  rather than returning 0.
   The four lifecycle hooks (`pane.agent_detected`, `pane.agent_status_changed`,
   `pane.exited`, `pane.closed`) each run `node bin/gentle-status.js --refresh`
   (daemon ensure plus one coalesced immediate frame), not the cadence itself;
@@ -874,7 +891,12 @@ exactly one mechanism writes each piece of state.
   — each invoke `node bin/gentle-status.js --refresh` (L6: daemon ensure
   plus one coalesced immediate frame, never a second writer loop), while
   `[[startup]]` (no args) remains the polling-daemon bootstrap and polling
-  remains the fallback for every lifecycle signal. `--once` keeps its
+  remains the fallback for every lifecycle signal. The producer extension is
+  the second requester of that same coalesced refresh — it requests one after
+  every landed token beat, so a status change it publishes is drawn at once
+  rather than at the next poll — and the daemon caps each sleep at the nearest
+  live `gentle_done_v1` expiry (§8), so `idle` does not wait for a poll either.
+  Neither requester renders a frame or writes tokens. `--once` keeps its
   existing one-frame public behavior for manual use and is not wired as a
   hook. Runtime proofs of the `--refresh` contract belong to the lifecycle
   unit's tests, not this protocol record.
