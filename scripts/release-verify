@@ -3,24 +3,23 @@
 # is sane after publish. Read-only; makes no changes.
 #
 # Tag series (exactly two, strict semver, no prerelease or build metadata):
-#   pi-vX.Y.Z     verifies the GitHub Release plus the installer asset (same
-#                 as the herdr series) and additionally verifies the published
-#                 npm version resolves: npm view
-#                 @jonasotoaguilar/herdr-gentle-shell@<version> version
+#   pi-vX.Y.Z     verifies the GitHub Release and additionally verifies the
+#                 published npm version resolves: npm view
+#                 herdr-gentle-shell@<version> version
 #                 equals <version>. Fail-closed when the registry has no such
 #                 version.
-#   herdr-vX.Y.Z  verifies the GitHub Release plus the installer asset only;
-#                 never contacts npm. The bare v* series is rejected.
+#   herdr-vX.Y.Z  verifies the GitHub Release only; never contacts npm. The
+#                 bare v* series is rejected.
 #
-# Fails when the release is a draft or a prerelease (the stable
-# releases/latest/download/install.sh entrypoint cannot resolve to it), then
-# downloads the install.sh release asset and fails unless its sha256 equals
-# the tagged ./install.sh. The shared gate for both series is the GitHub
-# Release plus the installer asset; the pi series additionally gates on the
-# npm version above. (The workflow's pi-series npm publish step authenticates
-# with trusted publishing (OIDC) and holds no npm token, in the workflow or in
-# the `release` environment; this script's npm view check itself needs no token
-# either, and its GH_TOKEN is GitHub's, not npm's.)
+# Fails when the release is a draft or a prerelease, since neither is a
+# published release. The release carries the tag and its notes only: no asset
+# is downloaded or checked, because the repository ships no install script.
+# The shared gate for both series is the published GitHub Release; the pi
+# series additionally gates on the npm version above. (The workflow's
+# pi-series npm publish step authenticates with trusted publishing (OIDC) and
+# holds no npm token, in the workflow or in the `release` environment; this
+# script's npm view check itself needs no token either, and its GH_TOKEN is
+# GitHub's, not npm's.)
 #
 # Environment (set by release.yml):
 #   RELEASE_TAG         tag to verify, e.g. pi-v0.1.0 or herdr-v0.1.0
@@ -47,9 +46,7 @@ if ! printf '%s' "$TAG" | grep -Eq '^(pi-v|herdr-v)[0-9]+\.[0-9]+\.[0-9]+$'; the
 fi
 
 command -v gh >/dev/null 2>&1 || fail "gh CLI is required"
-command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is required"
 [ -n "${GH_TOKEN:-}" ] || fail "GH_TOKEN is required in the environment"
-[ -f install.sh ] || fail "install.sh is required"
 
 VERIFY_TMPDIR="$(mktemp -d)" || fail "mktemp failed"
 trap 'rm -rf "$VERIFY_TMPDIR"' EXIT
@@ -92,37 +89,21 @@ TAG_NAME="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d
 [ "$TAG_NAME" = "$TAG" ] || fail "release tag mismatch: expected $TAG, got $TAG_NAME"
 
 IS_DRAFT="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).isDraft))")"
-[ "$IS_DRAFT" = "false" ] || fail "release $TAG is a draft; releases/latest cannot resolve to it"
+[ "$IS_DRAFT" = "false" ] || fail "release $TAG is a draft; it is not published"
 
 IS_PRERELEASE="$(printf '%s' "$VIEW" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).isPrerelease))")"
-[ "$IS_PRERELEASE" = "false" ] || fail "release $TAG is a prerelease; releases/latest cannot resolve to it"
-
-if [ -n "${RELEASE_REPOSITORY:-}" ]; then
-  gh release download "$TAG" --repo "$RELEASE_REPOSITORY" \
-    --dir "$VERIFY_TMPDIR" --pattern "install.sh" \
-    || fail "downloading install.sh asset from $TAG failed"
-else
-  gh release download "$TAG" \
-    --dir "$VERIFY_TMPDIR" --pattern "install.sh" \
-    || fail "downloading install.sh asset from $TAG failed"
-fi
-
-[ -f "$VERIFY_TMPDIR/install.sh" ] || fail "install.sh asset not found in release $TAG"
-
-EXPECTED="$(sha256sum install.sh | cut -d ' ' -f1)"
-ACTUAL="$(sha256sum "$VERIFY_TMPDIR/install.sh" | cut -d ' ' -f1)"
-[ "$EXPECTED" = "$ACTUAL" ] || fail "install.sh asset sha256 mismatch for $TAG"
+[ "$IS_PRERELEASE" = "false" ] || fail "release $TAG is a prerelease; it is not published"
 
 case "$TAG" in
   pi-v*)
     command -v npm >/dev/null 2>&1 || fail "npm is required"
     NPM_VERSION="$(printf '%s' "$TAG" | sed 's/^pi-v//')"
-    PUBLISHED="$(npm view "@jonasotoaguilar/herdr-gentle-shell@$NPM_VERSION" version)" \
-      || fail "npm view @jonasotoaguilar/herdr-gentle-shell@$NPM_VERSION version failed"
+    PUBLISHED="$(npm view "herdr-gentle-shell@$NPM_VERSION" version)" \
+      || fail "npm view herdr-gentle-shell@$NPM_VERSION version failed"
     PUBLISHED_TRIMMED="$(printf '%s' "$PUBLISHED" | tr -d '[:space:]')"
     [ "$PUBLISHED_TRIMMED" = "$NPM_VERSION" ] \
       || fail "npm version mismatch for $TAG: registry has '$PUBLISHED_TRIMMED', expected '$NPM_VERSION'"
-    pass "npm version OK: @jonasotoaguilar/herdr-gentle-shell@$PUBLISHED_TRIMMED"
+    pass "npm version OK: herdr-gentle-shell@$PUBLISHED_TRIMMED"
     ;;
 esac
 

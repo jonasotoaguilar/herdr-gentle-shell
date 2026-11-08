@@ -171,23 +171,6 @@ describe('documentation', () => {
   });
 });
 
-describe('installer', () => {
-  const installer = fs.readFileSync(path.join(ROOT, 'install.sh'), 'utf8');
-
-  test('points sidebar convergence at the shipped CLI, not the interactive command', () => {
-    // The installer is non-interactive: it drives the CLI instead of asking the
-    // user to run the Pi command.
-    assert.equal(installer.includes('/herdr-gentle:customize'), false);
-    assert.ok(installer.includes('bin/gentle-sidebar.js'), 'installer lost the sidebar CLI route');
-  });
-
-  test('installs no removed feature', () => {
-    for (const needle of ['worktree-tools', 'herdr-gentle:odd', 'herdr-gentle:issues', 'herdr-gentle:warp']) {
-      assert.equal(installer.includes(needle), false, `installer still installs ${needle}`);
-    }
-  });
-});
-
 describe('Herdr runtime plugin', () => {
   test('keeps the sidebar daemon and its actions', () => {
     const toml = read(path.join('herdr-plugin', 'herdr-plugin.toml'));

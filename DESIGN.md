@@ -801,15 +801,16 @@ exactly one mechanism writes each piece of state.
   versioning (not sidebar-config versioning) is the compatibility mechanism.
 - Packaging (two-package split): the repository ships two independently
   versioned packages — the Pi package at the repository root (published to
-  npm as `@jonasotoaguilar/herdr-gentle-shell`, installed with
+  npm as `herdr-gentle-shell`, installed with
   `pi install`, updated with `pi update --extensions`) and the Herdr plugin
   in `herdr-plugin/` (installed with `herdr plugin install
-  jonasotoaguilar/herdr-gentle-agents/herdr-plugin`, updated with
+  jonasotoaguilar/herdr-gentle-shell/herdr-plugin`, updated with
   `herdr plugin update herdr-gentle-shell`). Releases run on two tag
   series, `pi-vX.Y.Z` and `herdr-vX.Y.Z`; the Herdr side is not bumped when
-  it carries no change. The old managed-copy install (the installer copying
-  `extensions/gentle-herdr-state.ts` into the Pi agent dir) is retired: the
-  installer installs both packages and migrates an owned legacy copy aside.
+  it carries no change. The repository ships no install script: the
+  documented path is the two plain package installs above. The old
+  managed-copy install (copying `extensions/gentle-herdr-state.ts` into the
+  Pi agent dir) is retired and needs no migration step of its own.
   Ownership split: the Pi package owns the Pi-side helpers (the extension,
   the exclusion helper, the sidebar bridge); the Herdr plugin owns the
   runtime Herdr consumes (manifest, daemon, configure, diagnostics, token

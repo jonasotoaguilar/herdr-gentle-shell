@@ -6,18 +6,18 @@ name: Release
 #
 # Tag series (exactly two, strict semver, no prerelease or build metadata):
 #   pi-vX.Y.Z     the Pi package (package.json, npm name
-#                 @jonasotoaguilar/herdr-gentle-shell). Runs the shared gate,
-#                 publishes the npm package, AND creates the GitHub Release
-#                 with the installer assets.
+#                 herdr-gentle-shell). Runs the shared gate,
+#                 publishes the npm package, AND creates the GitHub Release.
 #   herdr-vX.Y.Z  the Herdr plugin (herdr-plugin/herdr-plugin.toml). Runs the
-#                 same shared gate and creates the GitHub Release with the
-#                 installer assets only. Its release job runs no npm command and
+#                 same shared gate and creates the GitHub Release only. Its
+#                 release job runs no npm command and
 #                 reaches no registry — every npm step is gated to the pi series
 #                 — though the shared preflight still runs `npm pack --dry-run`
 #                 for both series to check the tarball surface, which needs no
 #                 registry access. The bare v* series is rejected.
-# Either series attaches install.sh + install.sh.sha256 so the stable
-# releases/latest/download/install.sh entrypoint keeps resolving.
+# Both series create the GitHub Release with `gh release create
+# --generate-notes` and nothing attached: the repository ships no install
+# script, so a release carries the tag and its notes.
 #
 # npm authentication is Trusted Publishing (OIDC), never a token: the release
 # job holds `id-token: write`, npm exchanges that assertion for a short-lived
@@ -144,12 +144,9 @@ jobs:
             npm publish --access public --provenance
           fi
 
-      # Creates the GitHub Release with automatic base notes and the
-      # install.sh assets in one call, so a failed upload leaves a draft
-      # instead of a live asset-less release. Runs for BOTH series (pi-v and
-      # herdr-v). Example:
-      #   sha256sum install.sh > install.sh.sha256
-      #   gh release create "$RELEASE_TAG" install.sh install.sh.sha256 \
+      # Creates the GitHub Release with automatic base notes and nothing
+      # attached. Runs for BOTH series (pi-v and herdr-v). Example:
+      #   gh release create "$RELEASE_TAG" \
       #     --target "$RELEASE_COMMIT" --title "$RELEASE_TAG" --generate-notes
       # An existing draft is deleted (release only, never --cleanup-tag) and
       # recreated; an existing published release keeps refusing to overwrite.
