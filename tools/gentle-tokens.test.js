@@ -34,6 +34,13 @@ function workToken(hash, count = 0, expiry = EXPIRY) {
   return `${hash}:${count}:${expiry}`;
 }
 
+// Fresh gentle_principal_v1 marker bound to the entry's session hash: the
+// principal's own activity alone (never the delegate aggregate that the
+// native status carries).
+function principalToken(hash, expiry = EXPIRY) {
+  return `${hash}:${expiry}`;
+}
+
 function roleEntry(roleCsv, { count = 0, stateLabels, extraTokens, ...rest } = {}) {
   const entry = baseEntry({ ...rest });
   const hash = sessionHashFor(entry);
@@ -265,16 +272,16 @@ describe('orchestrating reduction', () => {
     return built;
   }
 
-  it('recognized role outranks a fresh marker (role-over-root priority)', () => {
+  it('a recognized role outranks a fresh marker (idle principal shows the role)', () => {
     const { entry } = orchEntry('worker,explorer', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker (2)');
+    assert.equal(reduced.label, 'worker');
     assert.equal(reduced.owned, true);
     assert.equal(reduced.notify, null);
   });
 
-  it('role hint wins at count 0 even with a fresh marker (pending-launch case)', () => {
+  it('count-0 role hint wins over a fresh marker (pending-launch case)', () => {
     const { entry } = orchEntry('worker', { count: 0 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
@@ -298,7 +305,7 @@ describe('orchestrating reduction', () => {
     assert.equal(reduced.notify, null);
   });
 
-  it('terminal done yields to live evidence: roles or a fresh marker veto it', () => {
+  it('terminal done yields to a live role hint (queued delegate is not done)', () => {
     // Count is running-only: a settled principal with a queued delegate
     // (count 0 + fresh marker + role hint) is NOT done.
     const { entry } = orchEntry('worker', { count: 0 });
@@ -322,14 +329,19 @@ describe('orchestrating reduction', () => {
     }
   });
 
-  it('stale or absent marker preserves existing role behavior', () => {
+  it('stale or absent marker preserves role behavior', () => {
+    // The marker never decides between a working principal and a role, and a
+    // stale one is no evidence at all: the roles loop still chooses the word
+    // for a principal that is not working.
     const staleBuilt = orchEntry('worker', { count: 1, stale: true });
     const staleReduced = tokens.reducePane(staleBuilt.entry, NOW);
     assert.equal(staleReduced.display, 'worker');
+    assert.equal(staleReduced.label, 'worker');
 
     const absentBuilt = roleEntry('verify,worker', { count: 2 });
     const absentReduced = tokens.reducePane(absentBuilt.entry, NOW);
     assert.equal(absentReduced.display, 'verify');
+    assert.equal(absentReduced.label, 'verify');
 
     const workingBuilt = roleEntry('', { count: 3 });
     const workingReduced = tokens.reducePane(workingBuilt.entry, NOW);
@@ -338,13 +350,13 @@ describe('orchestrating reduction', () => {
   });
 });
 
-describe('role-over-root-marker precedence', () => {
-  // User priority (task 18): any active recognized role
-  // (explorer/worker/verify/rdd) shows over root `gentle`; the marker
-  // renders only with no recognized role active. Attention states stay
-  // highest and terminal `done` stays above activity (covered above).
-  // Slug contract: the producer maps the actual registry agent
-  // `gentle-ai-explore` (plus the `gentle-ai-explorer` alias) to the
+describe('idle principal + marker keeps the delegate role word', () => {
+  // The root marker is live while the principal is idle with queued or
+  // running delegates, so it is NOT a principal-working signal: a role word
+  // still wins. Only the principal's own status decides (pinned below).
+  // Attention states stay highest and terminal `done` stays above activity
+  // (covered above). Slug contract: the producer maps the actual registry
+  // agent `gentle-ai-explore` (plus the `gentle-ai-explorer` alias) to the
   // `explorer` slug, so every case below exercises the producer's
   // gentle-ai-explore path at the reducer boundary.
   function markedRoleEntry(roleCsv, count = 1) {
@@ -360,7 +372,7 @@ describe('role-over-root-marker precedence', () => {
     { roles: 'rdd', display: 'review', label: 'rdd' },
   ];
   for (const { roles, display, label } of cases) {
-    it(`${roles} beats a fresh marker (${display}/${label})`, () => {
+    it(`${roles} beats a fresh marker while the principal is idle (${display}/${label})`, () => {
       const reduced = tokens.reducePane(markedRoleEntry(roles), NOW);
       assert.equal(reduced.display, display);
       assert.equal(reduced.label, label);
@@ -379,7 +391,7 @@ describe('role-over-root-marker precedence', () => {
   it('oldest role wins over a fresh marker', () => {
     const reduced = tokens.reducePane(markedRoleEntry('worker,explorer', 2), NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker (2)');
+    assert.equal(reduced.label, 'worker');
   });
 
   it('marker still renders with no recognized role', () => {
@@ -912,7 +924,7 @@ describe('durable review token (gentle_review_v1)', () => {
   });
 });
 
-describe('T2b judge role and oldest-running count suffix', () => {
+describe('T2b judge role and role words without a count', () => {
   it('grammar accepts judge; judge maps distinctly (not rdd)', () => {
     assert.deepEqual(tokens.parseRoles('judge'), ['judge']);
     assert.equal(tokens.roleToDisplay('judge'), 'judge');
@@ -923,29 +935,39 @@ describe('T2b judge role and oldest-running count suffix', () => {
     assert.equal(tokens.rowValueFor('judge', 'pi', 'judge'), 'pi · judge');
   });
 
-  it('single judge has no count suffix', () => {
+  it('a single running judge shows the judge word with no count', () => {
     const { entry } = roleEntry('judge', { count: 1 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'judge');
     assert.equal(reduced.label, 'judge');
+    assert.doesNotMatch(reduced.label, /\(/);
+  });
+
+  it('a working principal with a running judge reads gentle', () => {
+    const { entry, hash } = roleEntry('judge', { count: 1 });
+    entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(hash);
+    entry.agent_status = 'working';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
   });
 
   it('visible explorer label is exactly explorer (user-requested, not explore)', () => {
     const { entry } = roleEntry('explorer', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explorer (3)');
+    assert.equal(reduced.label, 'explorer');
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.TITLE_TOKENS.explorer], 'explorer (3)');
-    assert.equal(patch[tokens.ROW_TOKENS.explorer], 'pi · explorer (3)');
+    assert.equal(patch[tokens.TITLE_TOKENS.explorer], 'explorer');
+    assert.equal(patch[tokens.ROW_TOKENS.explorer], 'pi · explorer');
     assert.equal(tokens.rowValueFor('explorer', 'pi', 'explorer'), 'pi · explorer');
   });
 
-  it('mixed judge,worker,rdd uses oldest judge with total count (3)', () => {
+  it('mixed judge,worker,rdd uses the oldest judge word', () => {
     const { entry } = roleEntry('judge,worker,rdd', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'judge');
-    assert.equal(reduced.label, 'judge (3)');
+    assert.equal(reduced.label, 'judge');
   });
 
   it('visible review word is rdd; machine key stays review', () => {
@@ -958,13 +980,13 @@ describe('T2b judge role and oldest-running count suffix', () => {
     assert.equal(patch[tokens.ROW_TOKENS.review], 'pi · rdd');
   });
 
-  it('delegated rdd with true count suffixes the visible rdd word', () => {
+  it('a delegated rdd with running count keeps the rdd word and no suffix', () => {
     const { entry } = roleEntry('rdd', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'review');
-    assert.equal(reduced.label, 'rdd (2)');
+    assert.equal(reduced.label, 'rdd');
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.TITLE_TOKENS.review], 'rdd (2)');
+    assert.equal(patch[tokens.TITLE_TOKENS.review], 'rdd');
   });
 
   it('native done with zero count but a fresh marker settles to gentle (queued cover)', () => {
@@ -981,7 +1003,7 @@ describe('T2b judge role and oldest-running count suffix', () => {
     entry.agent_status = 'done';
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker (2)');
+    assert.equal(reduced.label, 'worker');
   });
 
   it('native done with zero running count settles to done', () => {
@@ -992,35 +1014,36 @@ describe('T2b judge role and oldest-running count suffix', () => {
     assert.equal(reduced.label, 'done');
   });
 
-  it('three same-role running explorers suffix the oldest role (3)', () => {
+  it('three same-role running explorers use the oldest role word, never a count', () => {
     const { entry } = roleEntry('explorer', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explorer (3)');
+    assert.equal(reduced.label, 'explorer');
+    assert.doesNotMatch(reduced.label, /\(/);
   });
 
-  it('oldest explorer plus worker uses oldest role with total count (2)', () => {
+  it('oldest explorer plus worker uses the oldest role word', () => {
     const { entry } = roleEntry('explorer,worker', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'explorer');
-    assert.equal(reduced.label, 'explorer (2)');
+    assert.equal(reduced.label, 'explorer');
   });
 
   it('oldest-first order: first CSV entry wins', () => {
     const { entry } = roleEntry('worker,explorer', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker (2)');
+    assert.equal(reduced.label, 'worker');
   });
 
-  it('single running worker after completion has no suffix', () => {
+  it('a single running worker shows the worker word', () => {
     const { entry } = roleEntry('worker', { count: 1 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
     assert.equal(reduced.label, 'worker');
   });
 
-  it('no suffix on ask/error/idle/done/gentle even with count > 1', () => {
+  it('no count anywhere: ask/error/idle/done/gentle stay plain words', () => {
     const { entry: askEntry } = roleEntry('worker', { count: 3, stateLabels: { 0: 'ask:q1' } });
     assert.equal(tokens.reducePane(askEntry, NOW).label, 'ask');
     const { entry: errEntry } = roleEntry('worker', { count: 3, stateLabels: { 0: 'error:e1' } });
@@ -1038,11 +1061,11 @@ describe('T2b judge role and oldest-running count suffix', () => {
     assert.equal(tokens.reducePane(idleBuilt.entry, NOW).label, 'idle');
   });
 
-  it('delegated rdd role suffixes with true running count; tool-only review does not invent counts', () => {
+  it('delegated rdd keeps the rdd word; tool-only review shows no count', () => {
     const { entry: delegated } = roleEntry('rdd', { count: 2 });
     const delegatedReduced = tokens.reducePane(delegated, NOW);
     assert.equal(delegatedReduced.display, 'review');
-    assert.equal(delegatedReduced.label, 'rdd (2)');
+    assert.equal(delegatedReduced.label, 'rdd');
     const toolOnly = baseEntry();
     const toolHash = sessionHashFor(toolOnly);
     toolOnly.tokens = { gentle_review_v1: `${toolHash}:r1:${EXPIRY}` };
@@ -1051,10 +1074,10 @@ describe('T2b judge role and oldest-running count suffix', () => {
     assert.equal(toolReduced.label, 'rdd');
   });
 
-  it('displayTokens carries the count to the title cell (not just heading)', () => {
+  it('displayTokens carries the role label to the title cell (not just heading)', () => {
     const reduced = {
       display: 'worker',
-      label: 'worker (2)',
+      label: 'worker',
       agent: 'pi',
       workspace: 'myproj',
       added: '',
@@ -1062,15 +1085,15 @@ describe('T2b judge role and oldest-running count suffix', () => {
       pull: '',
     };
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.TITLE_TOKENS.worker], 'worker (2)');
-    assert.equal(patch[tokens.ROW_TOKENS.worker], 'pi · worker (2)');
+    assert.equal(patch[tokens.TITLE_TOKENS.worker], 'worker');
+    assert.equal(patch[tokens.ROW_TOKENS.worker], 'pi · worker');
   });
 
-  it('malformed roles fail closed to working/gentle without suffix', () => {
+  it('malformed role entries never poison the valid ones', () => {
     const { entry } = roleEntry('worker,,bogus!', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker (2)');
+    assert.equal(reduced.label, 'worker');
     const { entry: bad } = roleEntry('bogus!', { count: 2 });
     const badReduced = tokens.reducePane(bad, NOW);
     assert.equal(badReduced.display, 'working');
@@ -1078,7 +1101,7 @@ describe('T2b judge role and oldest-running count suffix', () => {
     assert.doesNotMatch(badReduced.label, /\(/);
   });
 
-  it('stale work token yields idle with no suffix (no stale counts)', () => {
+  it('stale work token yields idle', () => {
     const entry = baseEntry();
     const hash = sessionHashFor(entry);
     entry.tokens = { gentle_work_v1: `${hash}:3:${NOW}`, gentle_roles_v1: 'worker' };
@@ -1118,14 +1141,26 @@ describe('visible generic activity reads gentle, never working', () => {
     assert.equal(reduced.label, 'gentle');
   });
 
-  it('native working with no metadata yields gentle (machine key working)', () => {
+  it('a fresh principal marker with no roles yields gentle (machine key working)', () => {
     const entry = baseEntry({ agent_status: 'working' });
+    const hash = sessionHashFor(entry);
+    entry.tokens = { [tokens.PRINCIPAL_TOKEN]: principalToken(hash) };
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'working');
     assert.equal(reduced.label, 'gentle');
   });
 
-  it('recognized roles still win over the generic word', () => {
+  it('the aggregate native status alone never claims the principal works', () => {
+    // The producer's native status reads `working` whenever any delegate runs,
+    // so it is not principal evidence: with no principal token the pane falls
+    // through to idle.
+    const entry = baseEntry({ agent_status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'idle');
+    assert.equal(reduced.label, 'idle');
+  });
+
+  it('recognized roles still win over the generic word (non-working principal)', () => {
     const cases = [
       ['worker', 'worker', 'worker'],
       ['explorer', 'explorer', 'explorer'],
@@ -1142,7 +1177,7 @@ describe('visible generic activity reads gentle, never working', () => {
   });
 });
 
-describe('unknown delegation surfaces its sanitized name, never a generic word', () => {
+describe('unknown delegation surfaces its sanitized name without own principal state', () => {
   it('parseRoles keeps a sanitized passthrough slug', () => {
     assert.deepEqual(tokens.parseRoles('my-custom-scout'), ['my-custom-scout']);
     assert.deepEqual(tokens.parseRoles('worker,my-custom-scout'), ['worker', 'my-custom-scout']);
@@ -1158,18 +1193,20 @@ describe('unknown delegation surfaces its sanitized name, never a generic word',
     assert.equal(tokens.roleToDisplay('bogus!'), null);
   });
 
-  it('unknown delegation renders its name (machine key working)', () => {
+  it('unknown delegation renders its name with no count (machine key working)', () => {
     const { entry } = roleEntry('my-custom-scout', { count: 1 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'working');
     assert.equal(reduced.label, 'my-custom-scout');
+    assert.doesNotMatch(reduced.label, /\(/);
   });
 
-  it('unknown delegation suffixes with a true count above one', () => {
+  it('three running unknown delegations still render the oldest sanitized name', () => {
     const { entry } = roleEntry('my-custom-scout', { count: 3 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'working');
-    assert.equal(reduced.label, 'my-custom-scout (3)');
+    assert.equal(reduced.label, 'my-custom-scout');
+    assert.doesNotMatch(reduced.label, /\(/);
   });
 
   it('overlong role evidence falls back to gentle, never working', () => {
@@ -1183,7 +1220,7 @@ describe('unknown delegation surfaces its sanitized name, never a generic word',
     const { entry } = roleEntry('worker,my-custom-scout', { count: 2 });
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker (2)');
+    assert.equal(reduced.label, 'worker');
   });
 });
 
@@ -1195,29 +1232,137 @@ describe('principal alone always reads gentle', () => {
       gentle_work_v1: workToken(hash, 0),
       gentle_roles_v1: '',
       gentle_orchestrating_v1: `${hash}:${EXPIRY}`,
+      [tokens.PRINCIPAL_TOKEN]: principalToken(hash),
     };
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.label, 'gentle');
   });
 
   it('count-0 work token with no marker and no roles yields gentle', () => {
-    const { entry } = roleEntry('', { count: 0 });
+    const { entry, hash } = roleEntry('', { count: 0 });
+    entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(hash);
     entry.agent_status = 'working';
     const reduced = tokens.reducePane(entry, NOW);
     assert.equal(reduced.label, 'gentle');
   });
 });
 
-describe('principal interleave precedence (live-reported stuck-gentle)', () => {
-  it('principal working with a live worker reduces to worker, never gentle', () => {
-    const { entry } = roleEntry('worker', { count: 1 });
-    entry.agent_status = 'working';
-    const reduced = tokens.reducePane(entry, NOW);
-    assert.equal(reduced.display, 'worker');
-    assert.equal(reduced.label, 'worker');
+// The principal's own activity is the deciding signal — never the delegate
+// count and never Herdr's aggregate native status: `gentle_work_v1` counts
+// running delegates, and the producer's native status reports `working`
+// whenever any delegate runs, so neither can say whether the principal works.
+// `gentle_principal_v1` carries exactly that fact (published while the
+// principal session's own agent is active, cleared when it settles). A working
+// principal shows `gentle` (pink `orchestrating` while a fresh root marker is
+// live); an idle principal lets the roles loop choose the delegate word,
+// however many delegates run; a fresh marker alone never makes it `gentle`.
+describe('principal-only activity marker decides working vs idle', () => {
+  function principalEntry({ roles, count, marker = false, principal = false, status = 'unknown' }) {
+    const built = roleEntry(roles, { count });
+    if (marker) built.entry.tokens[tokens.ORCH_TOKEN] = `${built.hash}:${EXPIRY}`;
+    if (principal) built.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(built.hash);
+    built.entry.agent_status = status;
+    return built.entry;
+  }
+
+  it('exposes the principal-only token name and its marker format', () => {
+    assert.equal(tokens.PRINCIPAL_TOKEN, 'gentle_principal_v1');
+    const { hash } = roleEntry('worker', { count: 1 });
+    assert.deepEqual(tokens.parsePrincipal(principalToken(hash), hash, NOW), { expiry: EXPIRY });
   });
 
-  it('principal done with a live worker reverts to worker+count, never gentle/done', () => {
+  it('rejects a foreign, stale, zero, overlong, or malformed marker', () => {
+    const { hash } = roleEntry('worker', { count: 1 });
+    const foreign = sessionHashFor(
+      baseEntry({ agent_session: { agent: 'pi', kind: 'path', value: '/other/session' } }),
+    );
+    assert.equal(tokens.parsePrincipal(`${foreign}:${EXPIRY}`, hash, NOW), null);
+    assert.equal(tokens.parsePrincipal(`${hash}:${NOW}`, hash, NOW), null);
+    assert.equal(tokens.parsePrincipal(`${hash}:0`, hash, NOW), null);
+    assert.equal(tokens.parsePrincipal(`${hash}:${NOW + 60001}`, hash, NOW), null);
+    assert.equal(tokens.parsePrincipal(`${hash}:${EXPIRY}:extra`, hash, NOW), null);
+    assert.equal(tokens.parsePrincipal('working', hash, NOW), null);
+    assert.equal(tokens.parsePrincipal(null, hash, NOW), null);
+    assert.equal(tokens.parsePrincipal(principalToken(hash), null, NOW), null);
+  });
+
+  it('a working principal with one running explorer shows gentle', () => {
+    const entry = principalEntry({ roles: 'explorer', count: 1, principal: true, status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.TITLE_TOKENS.working], 'gentle');
+    assert.equal(patch[tokens.TITLE_TOKENS.explorer], null);
+  });
+
+  it('a working principal keeps gentle even with several running delegates', () => {
+    const entry = principalEntry({ roles: 'verify,worker', count: 2, principal: true, status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('a working principal with a fresh marker keeps the orchestrating display', () => {
+    const entry = principalEntry({ roles: 'explorer', count: 1, marker: true, principal: true, status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'orchestrating');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('an idle principal with one running explorer shows explorer although native reads working', () => {
+    // The native status is the delegate aggregate here, not the principal.
+    const entry = principalEntry({ roles: 'explorer', count: 1, status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer');
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.TITLE_TOKENS.explorer], 'explorer');
+    assert.equal(patch[tokens.TITLE_TOKENS.working], null);
+  });
+
+  it('an idle principal with several running delegates shows the oldest role word', () => {
+    const entry = principalEntry({ roles: 'verify,worker', count: 3, principal: false, status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'verify');
+    assert.equal(reduced.label, 'verify');
+  });
+
+  it('a fresh orchestrating marker never turns an idle principal into gentle', () => {
+    const entry = principalEntry({ roles: 'explorer', count: 1, marker: true, status: 'working' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer');
+  });
+
+  it('a stale principal marker never claims the principal works', () => {
+    const built = roleEntry('explorer', { count: 1 });
+    built.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(built.hash, NOW);
+    built.entry.agent_status = 'working';
+    const reduced = tokens.reducePane(built.entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer');
+  });
+
+  it('a role word still shows when the principal publishes no activity token', () => {
+    const entry = principalEntry({ roles: 'explorer', count: 0, status: 'unknown' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer');
+  });
+});
+
+describe('principal interleave precedence (working principal outranks roles)', () => {
+  it('principal working with a live worker reads gentle', () => {
+    const { entry, hash } = roleEntry('worker', { count: 1 });
+    entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(hash);
+    entry.agent_status = 'working';
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('principal done with a live worker keeps the role word, never done', () => {
     const { entry } = roleEntry('worker', { count: 1 });
     entry.agent_status = 'done';
     const reduced = tokens.reducePane(entry, NOW);

@@ -30,10 +30,9 @@ const CHANGES_V2_RE =
 // Authoritative role signal (DESIGN §4.3): bounded CSV of canonical role
 // slugs derived from TaskRecord.agent (never task labels), oldest-first
 // by immutable first-seen, e.g. `worker,explorer` (worker oldest). The
-// consumer renders the oldest recognized role plus the total running count
-// in parentheses only when above one (e.g. `explorer (3)`); a single
-// delegate carries no suffix. Null (clear) when no active recognized
-// roles. `review` is accepted as a legacy alias of `rdd` (rollback
+// consumer renders the oldest recognized role word whenever the principal
+// itself is not working; the label never carries a count suffix. Null
+// (clear) when no active recognized roles. `review` is accepted as a legacy alias of `rdd` (rollback
 // producers); new producers emit `rdd`. `explore` is accepted as a legacy
 // wire alias of `explorer`; the machine key stays `explorer` and the
 // visible rendered word is `explorer`. `judge` is distinct from `rdd` (never collapsed).
@@ -51,11 +50,23 @@ const MAX_ROLES_CHARS = 512;
 // working (agentActive, even with zero subagents), retaining coverage while
 // an authoritative running|queued subagent exists or a subagent launch is
 // pending; null (clear) once the main session settles. The consumer reduces
-// a fresh marker to the `orchestrating` display only when no recognized
-// role is active — below attention (error/ask/review), terminal
-// (done/native-blocked), and recognized roles, ahead of main working.
+// a fresh marker to the `orchestrating` display — below attention
+// (error/ask/review), terminal (done/native-blocked), a working principal,
+// and a delegate role word, and above generic activity. It is not a
+// principal-working signal: it stays live while the principal is idle with
+// queued or running delegates.
 const ORCH_TOKEN = 'gentle_orchestrating_v1';
-const ORCH_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
+// Principal-only activity marker (DESIGN §4.3): `<hash>:<expiry>`, the same
+// session binding and TTL discipline as gentle_orchestrating_v1, emitted
+// while the principal session's own agent is active and cleared once it
+// settles. It is the deciding signal for working-versus-idle: Herdr's native
+// status aggregates delegates (it reads `working` whenever any delegate
+// runs), so using it here would paint an idle principal `gentle`. The native
+// status keeps its own aggregate meaning everywhere else in this module.
+const PRINCIPAL_TOKEN = 'gentle_principal_v1';
+// Presence-marker grammar shared by both markers above: `<hash>:<expiry>`,
+// no count.
+const MARKER_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
 // Subagent disclosure list (`agents sidebar feedback` T3): CSV of
 // `<ordinal>:<agent>` entries, oldest launch first, at most 8 entries and 512
 // bytes. `<agent>` is the FULL agent package name (`gentle-ai-explore`), never
@@ -108,12 +119,14 @@ const TTL_MS = 60000;
 // (explorer/worker/verify/judge) plus the root-session `orchestrating`
 // marker (fresh while the main session actively works, even with zero
 // subagents) plus generic activity (machine key `working`, visible word
-// `gentle`); a recognized role outranks a
-// fresh marker, and the marker outranks generic activity. Attention states
-// (ask/review/error) and the terminal `done`/native-`blocked` states
-// outrank both marker and roles. Only role activity carries a count
-// suffix, and only when the total running count is above one
-// (e.g. `explorer (3)`); ask/error/idle/done/gentle/generic-working never suffix.
+// `gentle`). The principal's own activity marker decides working vs idle,
+// never the delegate count and never the aggregate native status: a working
+// principal renders `gentle` (pink `orchestrating` with a fresh marker) and
+// outranks a delegate role word, while an idle principal shows the oldest
+// role word however many delegates run. Attention states (ask/review/error)
+// and the terminal `done`/native-`blocked` states outrank both. No label
+// carries a running-count suffix: Herdr's disclosure list shows the
+// individual subagents.
 const DISPLAYS = ['working', 'orchestrating', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error', 'done', 'idle'];
 
 const STATE_TOKENS = {
@@ -230,9 +243,8 @@ const HEADING_TOKENS = {
 // no visible row, and the sweeper still clears them.
 // Values are built from the
 // snapshot's validated agent name plus the reduced role/state label — never
-// a subagent name. The role label carries the total running count in
-// parentheses only when above one (e.g. `worker (2)`); ask/error/idle/
-// done/gentle never suffix. No icon is wired in row 2; row 1 is native (`state_icon` carries the
+// a subagent name. No label carries a running-count suffix. No icon is
+// wired in row 2; row 1 is native (`state_icon` carries the
 // Herdr-native glyph, not plugin-controlled), so no plugin icon alignment
 // is claimed.
 const ROW_TOKENS = {
@@ -278,10 +290,8 @@ const ROW_ICONS = {
 // User-facing words per display (DESIGN §5.3). The machine keys `review`,
 // `error`, `orchestrating`, `explorer`, and `working` stay stable; their rendered
 // words are `rdd`/`blocked`/`gentle`/`explorer`/`gentle` — visible generic
-// activity is always per-agent (`gentle`, never `working`). Role labels carry
-// the total running count in parentheses only when above one (e.g. `explorer
-// (3)`); ask/error/idle/done/gentle never suffix, and no label carries a
-// subagent name.
+// activity is always per-agent (`gentle`, never `working`). No label carries
+// a running-count suffix, and no label carries a subagent name.
 const DISPLAY_LABELS = {
   working: 'gentle',
   orchestrating: 'gentle',
@@ -447,13 +457,13 @@ function parseWork(value, sessionHash, now) {
   return { count, expiry };
 }
 
-// gentle_orchestrating_v1 = <hash>:<expiry>. Root-session marker: the same
-// session binding and TTL discipline as gentle_work_v1 but carrying no
-// count. Null on any grammar, binding, or freshness failure — a bad marker
-// never outranks the role signal, it simply falls through to it.
-function parseOrchestrating(value, sessionHash, now) {
+// `<hash>:<expiry>` presence marker: the same session binding and TTL
+// discipline as gentle_work_v1 but carrying no count. Null on any grammar,
+// binding, or freshness failure — a bad marker is no evidence at all, it
+// simply falls through to the next branch.
+function parseMarker(value, sessionHash, now) {
   if (typeof value !== 'string') return null;
-  const match = ORCH_RE.exec(value);
+  const match = MARKER_RE.exec(value);
   if (!match) return null;
   const [, hash, rawExpiry] = match;
   if (hash !== sessionHash) return null;
@@ -461,6 +471,12 @@ function parseOrchestrating(value, sessionHash, now) {
   if (!expiryFresh(expiry, now)) return null;
   return { expiry };
 }
+
+// gentle_orchestrating_v1 / gentle_principal_v1 = <hash>:<expiry>. Both are
+// presence markers with one grammar and one failure rule, so each name keeps
+// its own parser over the shared implementation.
+const parseOrchestrating = parseMarker;
+const parsePrincipal = parseMarker;
 
 // gentle_ask_v1 = <hash>:<intentId>:<expiry>. The durable ask signal:
 // session-bound + TTL-fresh like gentle_work_v1. Null on any grammar,
@@ -684,11 +700,14 @@ function piTreeOwnsPane(tokens, sessionHash, now) {
 }
 
 // Reducer, DESIGN §5.2. First match wins:
-//   error > ask > review > done (terminal) > role activity (oldest
-//   recognized running role plus total running count in parentheses only
-//   when above one) > orchestrating (fresh root marker, incl.
-//   main-session work with zero subagents and no recognized role) >
-//   working(main) > idle.
+//   error > ask > review > done (terminal) > principal working (fresh
+//   `gentle_principal_v1`: `orchestrating` while a fresh root marker is
+//   live, else generic activity) > role activity (oldest recognized role —
+//   the principal is not working) > orchestrating (marker fallback) > main
+//   working (positive running count, no role) > idle. The deciding signal
+//   is the principal's own activity marker, never the delegate count and
+//   never the aggregate native status; role labels carry no running-count
+//   suffix.
 // `notify` is set only for ask (DESIGN §7; review/error stay silent).
 // A native `blocked` with no fresh gentle label clears our family (fail
 // closed): the block belongs to another writer or the producer died, so we
@@ -737,19 +756,15 @@ function reducePane(entry, now = Date.now()) {
     owned: true,
   });
 
-  // Role-activity count suffix (T2b): the oldest running delegate role
-  // plus the total running count in parentheses only when above one
-  // (e.g. `explorer (3)`). Only role displays suffix; ask/error/idle/done/
-  // gentle/generic-working never do, and tool-only review never invents a count — a
-  // `review` suffix requires a delegated rdd role with a true count > 1.
-  // The suffixed label rides the title cell via displayTokens (which
-  // copies result.label), not just compat heading/row values.
-  const outRole = (display, count, labelOverride = null, notify = null) => ({
+  // Role-hint label: the oldest role word, or the sanitized passthrough
+  // slug for an unknown delegation (label override).
+  // The label carries no running-count suffix: Herdr's disclosure list
+  // shows the individual subagents, so a `(n)` total would only repeat it.
+  // The label rides the title cell via displayTokens (which copies
+  // result.label), not just compat heading/row values.
+  const outRole = (display, labelOverride = null, notify = null) => ({
     display,
-    label:
-      Number.isSafeInteger(count) && count > 1
-        ? `${labelOverride ?? DISPLAY_LABELS[display] ?? display} (${count})`
-        : (labelOverride ?? DISPLAY_LABELS[display] ?? display),
+    label: labelOverride ?? DISPLAY_LABELS[display] ?? display,
     agent,
     workspace,
     added,
@@ -759,7 +774,6 @@ function reducePane(entry, now = Date.now()) {
     owned: true,
   });
   const roles = parseRoles(tokens[ROLES_TOKEN]);
-  const hasDelegatedReview = roles.some((role) => role === 'rdd' || role === 'review');
 
   if (blocked !== null) {
     // The sidebar-facing words for error/review/orchestrating are
@@ -775,9 +789,8 @@ function reducePane(entry, now = Date.now()) {
     if (askToken !== null) {
       return out('ask', { sessionHash, intentId: askToken.intentId, expiry: askToken.expiry });
     }
-    // Delegated review (rdd role active) may suffix with the true running
-    // count; tool-only review never invents one.
-    if (hasDelegatedReview && work !== null && work.count > 1) return outRole('review', work.count);
+    // The remaining blocked kind is review: same visible word `rdd` for a
+    // delegated rdd role and for a tool-only review.
     return out('review');
   }
   // Edge-miss repair: the producer kept publishing work/orchestrating beats
@@ -791,31 +804,33 @@ function reducePane(entry, now = Date.now()) {
   // session-bound gentle_review_v1 asserts `review` (visible `rdd`, silent
   // — no notify) on its own TTL, independently of work token presence.
   // Priority holds: error and ask (label or durable token) already returned
-  // above; roles, the orchestrating marker, and main working yield below.
+  // above; roles, the marker, and main working all rank below.
   // NO GRACE on this side either: a cleared/expired token simply stops
-  // asserting review on the next frame. Delegated rdd with a true count
-  // suffixes; tool-only review never invents one.
-  if (reviewToken !== null) {
-    if (hasDelegatedReview && work !== null && work.count > 1) return outRole('review', work.count);
-    return out('review');
-  }
+  // asserting review on the next frame.
+  if (reviewToken !== null) return out('review');
   if (native === 'blocked') return out('idle');
   // Marker computed once, before the terminal gate: a session-bound fresh
   // marker is live activity evidence (it covers running/queued subs and
   // pending launches — the count alone excludes queued). Stale, malformed,
   // or foreign markers parse to null and veto nothing (fail closed).
   const orchestrating =
-    work === null ? null : parseOrchestrating(tokens[ORCH_TOKEN], sessionHash, now);
+    work === null ? null : parseMarker(tokens[ORCH_TOKEN], sessionHash, now);
+  // Principal-only activity: its own fresh marker decides working vs idle.
+  // The native status cannot: the producer's computeNativeState aggregates
+  // delegate activity, so it reads `working` for an idle principal with a
+  // running delegate.
+  const principal =
+    sessionHash === null ? null : parseMarker(tokens[PRINCIPAL_TOKEN], sessionHash, now);
   // Terminal `done` NEVER outranks live evidence: the principal Pi session
   // may settle while background delegates run, and that is NOT terminal.
   // Done requires settled-plus-empty — native done plus a fresh count 0
   // (no running delegates) plus no role evidence (a fresh role-only
   // pending hint means a launch is still pending) plus no fresh marker
   // (which covers queued subs the running-only count excludes). Anything
-  // else falls through to the role/marker branches below; without a fresh
-  // work token the settle is either ancient or was never observed here —
-  // both fall through to idle (native fallback, O5). This claims no
-  // positive settled proof beyond the existing TTL/freshness
+  // else falls through to the principal-state and role branches below;
+  // without a fresh work token the settle is either ancient or was never
+  // observed here — both fall through to idle (native fallback, O5). This
+  // claims no positive settled proof beyond the existing TTL/freshness
   // discipline: it only refuses terminal while live evidence is fresh.
   if (
     native === 'done' &&
@@ -826,42 +841,47 @@ function reducePane(entry, now = Date.now()) {
   ) {
     return out('done');
   }
-  // Role activity rides on a fresh work token (full-state snapshot beat)
-  // and outranks the root marker below: when any recognized running role
-  // is active the sidebar shows the oldest role plus the total running
-  // count in parentheses only when above one (e.g. `explorer (3)`).
-  // Task-mode hint: `gentle_roles_v1` may carry a recognized role even
-  // when the authoritative count is 0 — the pending `subagent_run` tool
-  // call is in flight with no TaskStore record yet, so the count stays 0
-  // while the role hint is live. Accept the oldest recognized role in that
-  // case with no suffix (count 0 never suffixes); unknown/no role falls
-  // through to the marker, then to generic activity (machine key `working`,
-  // visible word `gentle`) below. Attention legs
-  // above (error/ask/review) and terminal `done` already outranked this
-  // branch.
+  // The principal's own activity decides, never the delegate count: a
+  // working principal renders the session's own state and outranks every
+  // delegate role word. A fresh root marker keeps the `orchestrating`
+  // display (pink `gentle`) for that working state; absent, stale, or
+  // foreign, the display is generic activity (`working`, visible `gentle`).
+  // WHY not the count: `gentle_work_v1` counts RUNNING DELEGATES, so a
+  // positive count says nothing about the principal — gating on it would
+  // turn an idle principal with running delegates into `gentle` instead of
+  // its delegate role word. WHY not the native status: it aggregates the
+  // same delegate activity (running delegates, pending launches, jobs), so
+  // an idle principal with a running explorer would read `gentle` too. The
+  // marker is no substitute either: it stays live while the principal is
+  // idle with queued or running delegates.
+  if (principal !== null) {
+    return out(orchestrating !== null ? 'orchestrating' : 'working');
+  }
+  // Principal not working: the oldest role word wins, however many delegates
+  // run. Visible text is the oldest role (oldest-first): known agents render
+  // their short word, unknown delegations their sanitized passthrough slug
+  // (label override on the `working` machine key — never a generic word). The
+  // role hint may also arrive at count 0 — the pending `subagent_run` tool
+  // call is in flight with no TaskStore record yet. An unrecognized shape
+  // falls through to generic activity below.
   if (work !== null) {
-    // Visible text is the oldest role word (gentle_roles_v1, oldest-first):
-    // known agents render their short word, unknown delegations their
-    // sanitized passthrough slug (label override on the `working` machine
-    // key — never a generic word). Unrecognized shapes fall through to the
-    // marker, then to generic activity.
     for (const role of roles) {
       const display = roleToDisplay(role);
       if (display === null) continue;
-      if (display === 'working') return outRole(display, work.count, role);
-      return outRole(display, work.count);
+      if (display === 'working') return outRole(display, role);
+      return outRole(display);
     }
   }
-  // retained below so a settled principal with no live evidence still
-  // reads `done` (compatibility); with live evidence it already returned
-  // above via roles/marker. An absent, stale, or foreign marker falls
-  // through to the working behavior below, unchanged.
+  // Root marker fallback: fresh while the main session works or while a
+  // queued/running sub or a pending launch exists, so it keeps covering
+  // queued subs the running-only count excludes once no role word is left.
   if (orchestrating !== null) return out('orchestrating');
-  // Main working: a fresh work token with a positive count but no
-  // recognized role (orchestrator/main or unrecognized agents) — machine
-  // key `working`, visible word `gentle`, never bare `working`.
+  // Main working: a fresh work token with a positive count but no role word —
+  // machine key `working`, visible word `gentle`, never bare `working`.
   if (work !== null && work.count > 0) return out('working');
-  if (native === 'working' || (work !== null && work.count === 0 && native !== 'done' && native !== 'idle')) {
+  // Fallback: a live count-0 work-token beat whose native status is neither
+  // done nor idle — generic activity (`gentle`).
+  if (work !== null && work.count === 0 && native !== 'done' && native !== 'idle') {
     return out('working');
   }
   return out('idle');
@@ -995,6 +1015,7 @@ module.exports = {
   ROLES_TOKEN,
   SUBS_TOKEN,
   ORCH_TOKEN,
+  PRINCIPAL_TOKEN,
   ASK_TOKEN,
   REVIEW_TOKEN,
   STATE_TOKENS,
@@ -1022,6 +1043,7 @@ module.exports = {
   parseRoles,
   parseSubs,
   parseOrchestrating,
+  parsePrincipal,
   parseAsk,
   parseReview,
   roleToDisplay,

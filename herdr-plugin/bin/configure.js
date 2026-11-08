@@ -66,9 +66,9 @@ const AGENT_ID = 'pi';
 // native `agent` is the grey agent identity with the native separator.
 // Row 2 is the state word plus changes: the eleven presence-encoded
 // `gentle_title_*` state cells (state word only, one current title per
-// frame, each in its state's semantic color as base fg with no rules;
-// role words carry the total running count in parentheses only when above
-// one, e.g. `worker (2)`) followed by the three change-segment tokens (added green `+N`, deleted
+// frame, each in its state's semantic color as base fg with no rules; no
+// state word carries a running-count suffix — Herdr's disclosure list shows
+// the individual subagents) followed by the three change-segment tokens (added green `+N`, deleted
 // red `-N`, pull blue `↑N`, each its own color cell with no rules, never
 // swapped). The review leg renders the user-facing word `rdd` (machine key
 // stays `review`; review execution is silent, never a notification); the error value renders `blocked`; the orchestrating
@@ -128,8 +128,8 @@ function sidebarCell(token, fg, rules) {
 const PI_ROW_1 = ['"state_icon"', '"workspace"', '"agent"'];
 
 // Row 2: eleven state-word cells in state colors with no rules (one current
-// title per frame; role words carry ` (n)` only when the running total is
-// above one), followed by the three change segments as their own
+// title per frame; no state word carries a running-count suffix), followed by
+// the three change segments as their own
 // color cells (added green `+N`, deleted red `-N`, pull blue `↑N`, never
 // swapped; empty segments collapse). Native separators on row 2 are
 // acceptable. No `$gentle_heading_*`, `$gentle_project`, `$gentle_agent`,

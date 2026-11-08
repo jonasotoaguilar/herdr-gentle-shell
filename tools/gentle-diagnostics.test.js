@@ -9,6 +9,7 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -40,6 +41,18 @@ exit 1
 const HASH_A = '8DmJRuXgoClQcF4N7ASyZid8BmMy814HvGqtB0bZpAo';
 const HASH_B = '3vEd-s5_ptFOwss1ASj2wA1k0mSwVNLw26NZT4rZckM';
 
+function paneSessionValue(paneId) {
+  return `/sessions/${paneId.replace(/:/g, '_')}.jsonl`;
+}
+
+// Panes are bound by base64url(sha256(agent_session path)) and every token is
+// checked against it, so a fixture that reports a healthy pane must carry this
+// exact hash. HASH_A/HASH_B stay synthetic on purpose: the fixtures still using
+// them are describing a binding mismatch, never a parsed token.
+function boundHashFor(paneId, sessionValue = paneSessionValue(paneId)) {
+  return createHash('sha256').update(sessionValue, 'utf8').digest('base64url');
+}
+
 function freshWork(hash, count, ttlMs = 55000) {
   return `${hash}:${count}:${Date.now() + ttlMs}`;
 }
@@ -53,7 +66,7 @@ function ownedEntry(paneId, hash, opts = {}) {
     pane_id: paneId,
     workspace_id: opts.workspaceId ?? 'wBG',
     agent: 'pi',
-    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: opts.sessionValue ?? `/sessions/${paneId.replace(/:/g, '_')}.jsonl` },
+    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: opts.sessionValue ?? paneSessionValue(paneId) },
     agent_status: opts.agentStatus ?? 'working',
     group: opts.group ?? 'myproj',
     cwd: '/repo/myproj',
@@ -220,7 +233,7 @@ describe('doctor sidebar-mode handoff', () => {
   it('explicit Gentle mode retains the previous live checks and leaves its flag unchanged', () => {
     fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
     fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid));
-    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    writeAgents([ownedEntry('wBG:p1', boundHashFor('wBG:p1'))]);
     fs.writeFileSync(configFile, '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n');
     const before = stateSnapshot();
     const r = run(DOCTOR, []);
@@ -256,7 +269,7 @@ describe('doctor sidebar-mode handoff', () => {
     fs.writeFileSync(path.join(legacyDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
     fs.writeFileSync(path.join(stateDir, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
     fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid));
-    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    writeAgents([ownedEntry('wBG:p1', boundHashFor('wBG:p1'))]);
     fs.writeFileSync(configFile, '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n');
     const before = stateSnapshot();
     const r = run(DOCTOR, [], { HERDR_PLUGIN_STATE_DIR: path.join(dir, 'injected-shell') });
@@ -291,7 +304,7 @@ describe('gentle-doctor', () => {
 
   it('happy path: live pid + fresh owned pane + managed override yields pass lines, exit 0', () => {
     fs.writeFileSync(path.join(stateDir, 'gentle-status.pid'), String(process.pid), 'utf8');
-    writeAgents([ownedEntry('wBG:p1', HASH_A)]);
+    writeAgents([ownedEntry('wBG:p1', boundHashFor('wBG:p1'))]);
     fs.writeFileSync(
       configFile,
       '# BEGIN herdr-gentle-agents (managed; do not edit)\n[ui.sidebar.agents.rows_by_agent]\n# END herdr-gentle-agents\n',
