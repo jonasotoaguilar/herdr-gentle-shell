@@ -3,13 +3,11 @@
 #
 # Tag series (exactly two, strict semver, no prerelease or build metadata):
 #   pi-vX.Y.Z     the Pi package (repository root, package.json,
-#                 npm name @jonasotoaguilar/herdr-gentle-shell).
-#                 Publishes the npm package AND the GitHub Release with the
-#                 installer assets, so releases/latest/download/install.sh
-#                 keeps resolving after either series.
+#                 npm name herdr-gentle-shell).
+#                 Publishes the npm package AND the GitHub Release.
 #   herdr-vX.Y.Z  the Herdr plugin (herdr-plugin/herdr-plugin.toml).
-#                 Publishes the GitHub Release with the installer assets only;
-#                 never touches npm. The bare v* series is rejected.
+#                 Publishes the GitHub Release only; never touches npm. The
+#                 bare v* series is rejected.
 #
 # Version gate, per series: a pi-v tag must equal package.json version; a
 # herdr-v tag must equal the version in herdr-plugin/herdr-plugin.toml. The
@@ -17,16 +15,17 @@
 #
 # Shared gate (both series): Node tests (node --test tools/*.test.js), JS
 # syntax checks (node --check over bin/, lib/, herdr-plugin/bin/,
-# herdr-plugin/lib/), sh -n install.sh plus shellcheck -x install.sh, TOML
+# herdr-plugin/lib/), TOML
 # parse of herdr-plugin/herdr-plugin.toml including min_herdr_version
 # presence, npm pack --dry-run for the Pi package plus an npm pack
 # --dry-run --json assertion that the tarball contains no path under
 # herdr-plugin/, tools/, scripts/ or odd/ and does contain
-# extensions/gentle-herdr-state.ts. No publishing happens here; the npm
-# publish for the pi series lives in .github/workflows/release.yml and
-# authenticates with trusted publishing (OIDC) — no npm token exists anywhere,
-# in the workflow or in the `release` environment — and never runs on a
-# herdr-v tag.
+# extensions/gentle-herdr-state.ts. The repository ships no install script, so
+# nothing here builds, checksums or uploads a release asset. No publishing
+# happens here; the npm publish for the pi series lives in
+# .github/workflows/release.yml and authenticates with trusted publishing
+# (OIDC) — no npm token exists anywhere, in the workflow or in the `release`
+# environment — and never runs on a herdr-v tag.
 #
 # Environment (set by release.yml; overridable for local checks):
 #   RELEASE_TAG         tag being released, e.g. pi-v0.1.0 (required)
@@ -58,7 +57,6 @@ pass "tag format OK: $TAG"
 command -v node >/dev/null 2>&1 || fail "node is required"
 command -v npm >/dev/null 2>&1 || fail "npm is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
-command -v shellcheck >/dev/null 2>&1 || fail "shellcheck is required"
 
 case "$TAG" in
   pi-v*) SERIES="pi"; TAG_VERSION="$(printf '%s' "$TAG" | sed 's/^pi-v//')" ;;
@@ -93,12 +91,6 @@ pass "running: node --check on bin/, lib/ and herdr-plugin/"
 for f in bin/*.js lib/*.js herdr-plugin/bin/*.js herdr-plugin/lib/*.js; do
   node --check "$f"
 done
-
-pass "running: sh -n install.sh"
-sh -n install.sh
-
-pass "running: shellcheck -x install.sh"
-shellcheck -x install.sh
 
 pass "running: npm pack --dry-run"
 npm pack --dry-run

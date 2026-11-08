@@ -109,11 +109,10 @@ describe('packaged modules', () => {
   test('ship no unreferenced library', () => {
     const libs = fs.readdirSync(path.join(ROOT, 'lib')).filter((name) => name.endsWith('.js')).sort();
     // Everything that can name a module: the shipped surface plus the Herdr
-    // plugin and the installer, which load these libs from the Pi package.
+    // plugin, which loads these libs from the Pi package.
     const referrers = [
       ...shippedPaths(),
       ...walkText(path.join(ROOT, 'herdr-plugin')),
-      path.join(ROOT, 'install.sh'),
     ];
     const orphans = [];
     for (const name of libs) {

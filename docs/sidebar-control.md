@@ -30,7 +30,7 @@ HERDR_CONFIG_PATH=/tmp/c.toml node bin/gentle-sidebar.js status
   Herdr config to verify the managed pi-only rows are present. Only then
   it records the plugin-owned exclusion of the native integration
   (`-extensions/herdr-agent-state.ts` in the Pi `settings.json`
-  `extensions` list, with the ownership marker from the installer) and
+  `extensions` list, with the plugin-owned ownership marker) and
   writes the shared mode file
   (`gentle-sidebar-mode.json`, `{version:1,enabled:true}`). A zero exit
   alone never commits state: without the verified row effect the apply

@@ -23,7 +23,7 @@ const { spawnSync } = require('node:child_process');
 
 // Active plugin lookup identity (S15 rename). The stored state dir below
 // intentionally keeps the pre-rename segment: no migration, no orphaned
-// flags. Used by install.sh and the sidebar provider for lookups.
+// flags. Used by the sidebar provider for lookups.
 const ACTIVE_PLUGIN_ID = 'herdr-gentle-shell';
 const STATE_PLUGIN_ID = 'herdr-gentle-agents';
 const PLUGIN_ID = STATE_PLUGIN_ID;

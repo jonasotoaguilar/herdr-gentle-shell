@@ -1,10 +1,11 @@
 name: CI
 
-# Smallest real CI for this repo: Node tests, JS syntax checks, installer
-# shell checks, and TOML manifest validation. Runs the same gates locally via:
+# Smallest real CI for this repo: Node tests, JS syntax checks, release
+# shell-script checks, and TOML manifest validation. Runs the same gates
+# locally via:
 #   node --test tools/*.test.js (skipped with ::notice:: when no test files exist)
 #   node --check on bin/ and lib/
-#   sh -n install.sh && shellcheck -x install.sh
+#   sh -n scripts/release-* && shellcheck -x scripts/release-*
 #   python3 TOML parse of herdr-plugin/herdr-plugin.toml
 
 on:
@@ -62,27 +63,33 @@ jobs:
             node --check "$f"
           done
 
-      - name: Check installer syntax
+      - name: Check release script syntax
         run: |
           set -euo pipefail
-          if [ ! -f install.sh ]; then
-            echo "::notice::Skipping installer syntax check - install.sh not found"
+          shopt -s nullglob
+          scripts=(scripts/release-*)
+          if [ ${#scripts[@]} -eq 0 ]; then
+            echo "::notice::Skipping release script syntax check - none found"
             exit 0
           fi
-          sh -n install.sh
+          for f in "${scripts[@]}"; do
+            sh -n "$f"
+          done
 
-      - name: Run shellcheck on installer
+      - name: Run shellcheck on release scripts
         run: |
           set -euo pipefail
-          if [ ! -f install.sh ]; then
-            echo "::notice::Skipping shellcheck - install.sh not found"
+          shopt -s nullglob
+          scripts=(scripts/release-*)
+          if [ ${#scripts[@]} -eq 0 ]; then
+            echo "::notice::Skipping shellcheck - no scripts/release-* found"
             exit 0
           fi
           if ! command -v shellcheck >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends shellcheck
           fi
-          shellcheck -x install.sh
+          shellcheck -x "${scripts[@]}"
 
       - name: Validate TOML manifest
         run: |

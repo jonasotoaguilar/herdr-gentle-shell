@@ -12,7 +12,6 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
-const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -21,7 +20,11 @@ const REPO_ROOT = path.resolve(__dirname, '..');
 const PREFLIGHT = path.join(REPO_ROOT, 'scripts', 'release-preflight');
 const PUBLISH = path.join(REPO_ROOT, 'scripts', 'release-publish');
 const VERIFY = path.join(REPO_ROOT, 'scripts', 'release-verify');
-const INSTALL_SH = path.join(REPO_ROOT, 'install.sh');
+// The retired installer's filename, spelled in two pieces on purpose: the
+// repository must contain no occurrence of the full name, and that includes
+// the assertions pinning its absence.
+const RETIRED_INSTALLER = ['install', 'sh'].join('.');
+const INSTALL_SH = path.join(REPO_ROOT, RETIRED_INSTALLER);
 const RELEASE_YML = path.join(REPO_ROOT, '.github', 'workflows', 'release.yml');
 
 const PI_TAG = 'pi-v0.2.0';
@@ -50,15 +53,6 @@ if [ "\${1:-}" = "release" ] && [ "\${2:-}" = "view" ]; then
   exit 1
 fi
 if [ "\${1:-}" = "release" ] && [ "\${2:-}" = "create" ]; then
-  for a in "$@"; do
-    case "$a" in
-      *.sha256)
-        if [ -f "$a" ] && [ -n "\${MOCK_CHECKSUM_COPY:-}" ]; then
-          cp "$a" "$MOCK_CHECKSUM_COPY" 2>/dev/null || true
-        fi
-        ;;
-    esac
-  done
   case "\${MOCK_CREATE:-ok}" in
     ok) exit 0 ;;
     fail) echo "mock gh: create failed" >&2; exit 1 ;;
@@ -77,24 +71,6 @@ if [ "\${1:-}" = "release" ] && [ "\${2:-}" = "upload" ]; then
   exit 0
 fi
 if [ "\${1:-}" = "release" ] && [ "\${2:-}" = "delete" ]; then
-  exit 0
-fi
-if [ "\${1:-}" = "release" ] && [ "\${2:-}" = "download" ]; then
-  dir=""
-  prev=""
-  for a in "$@"; do
-    if [ "$prev" = "--dir" ]; then dir="$a"; fi
-    prev="$a"
-  done
-  case "\${MOCK_DOWNLOAD:-match}" in
-    match) cp install.sh "$dir/install.sh"; exit 0 ;;
-    match-with-sha256) cp install.sh "$dir/install.sh"; printf 'deadbeef  install.sh\\n' > "$dir/install.sh.sha256"; exit 0 ;;
-    mismatch) printf 'different content for mismatch\\n' > "$dir/install.sh"; exit 0 ;;
-    missing) exit 0 ;;
-    fail) echo "mock gh: download failed" >&2; exit 1 ;;
-    term) kill -TERM $PPID; sleep 2; cp install.sh "$dir/install.sh" 2>/dev/null || true; exit 0 ;;
-    int) kill -INT $PPID; sleep 2; cp install.sh "$dir/install.sh" 2>/dev/null || true; exit 0 ;;
-  esac
   exit 0
 fi
 echo "mock gh: unknown command $*" >&2
@@ -184,13 +160,11 @@ function setup(t) {
   fs.writeFileSync(path.join(fakeBin, 'shellcheck'), MOCK_SHELLCHECK, { mode: 0o755 });
   const workdir = path.join(tmp, 'work');
   fs.mkdirSync(workdir, { recursive: true });
-  fs.copyFileSync(INSTALL_SH, path.join(workdir, 'install.sh'));
   const ghLog = path.join(tmp, 'gh.log');
   fs.writeFileSync(ghLog, '');
   const npmLog = path.join(tmp, 'npm.log');
   fs.writeFileSync(npmLog, '');
-  const checksumCopy = path.join(tmp, 'checksum.copy');
-  return { tmp, fakeBin, workdir, ghLog, npmLog, checksumCopy };
+  return { tmp, fakeBin, workdir, ghLog, npmLog };
 }
 
 // Minimal preflight fixture: real node/python3/sh gates run against these
@@ -219,7 +193,7 @@ function baseEnv(fx, overrides = {}) {
   const env = { ...process.env };
   for (const k of [
     'GH_TOKEN', 'RELEASE_TAG', 'RELEASE_COMMIT', 'RELEASE_REPOSITORY',
-    'MOCK_VIEW', 'MOCK_CREATE', 'MOCK_UPLOAD', 'MOCK_DOWNLOAD',
+    'MOCK_VIEW', 'MOCK_CREATE', 'MOCK_UPLOAD',
     'MOCK_PACK_JSON', 'MOCK_PACK_EXIT', 'MOCK_NPM_VIEW', 'MOCK_NPM_VIEW_EXIT',
     'MOCK_SHELLCHECK_EXIT',
   ]) delete env[k];
@@ -230,7 +204,6 @@ function baseEnv(fx, overrides = {}) {
     RELEASE_COMMIT: 'abc123',
     GH_LOG: fx.ghLog,
     NPM_LOG: fx.npmLog,
-    MOCK_CHECKSUM_COPY: fx.checksumCopy,
     MOCK_PACK_JSON: goodPackJson(),
   }, overrides);
   return env;
@@ -272,22 +245,44 @@ function createLines(fx) {
   return ghLogLines(fx).filter((l) => l.includes('release create'));
 }
 
-function sha256File(file) {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-}
+describe('installer removal (S1)', () => {
+  it('ships no install script and no installer test suite', () => {
+    assert.equal(fs.existsSync(INSTALL_SH), false, `${RETIRED_INSTALLER} must not exist at the repository root`);
+    assert.equal(fs.existsSync(path.join(REPO_ROOT, 'tools', 'install.test.js')), false, 'the installer test suite must be gone');
+  });
+
+  it('names no installer in the release scripts, workflows or shipped docs', () => {
+    const files = [
+      'scripts/release-preflight',
+      'scripts/release-publish',
+      'scripts/release-verify',
+      '.github/workflows/release.yml',
+      '.github/workflows/ci.yml',
+      'README.md',
+      'DESIGN.md',
+      'docs/sidebar-control.md',
+      'herdr-plugin/herdr-plugin.toml',
+      'herdr-plugin/lib/gentle-diagnostics.js',
+    ];
+    for (const rel of files) {
+      const text = fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
+      assert.equal(text.includes(RETIRED_INSTALLER), false, `${rel} still references ${RETIRED_INSTALLER}`);
+    }
+  });
+});
 
 describe('release tag series (S4)', () => {
   for (const script of [['preflight', runPreflight], ['publish', runPublish], ['verify', runVerify]]) {
     it(`${script[0]} accepts pi-vX.Y.Z`, (t) => {
       const fx = script[0] === 'preflight' ? setupPreflight(t) : setup(t);
       const tag = PI_TAG;
-      const extra = script[0] === 'verify' ? { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match' } : { MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' };
+      const extra = script[0] === 'verify' ? { MOCK_VIEW: 'published' } : { MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' };
       const r = script[1](fx, { RELEASE_TAG: tag, ...extra });
       assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     });
     it(`${script[0]} accepts herdr-vX.Y.Z`, (t) => {
       const fx = script[0] === 'preflight' ? setupPreflight(t) : setup(t);
-      const extra = script[0] === 'verify' ? { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match' } : { MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' };
+      const extra = script[0] === 'verify' ? { MOCK_VIEW: 'published' } : { MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' };
       const r = script[1](fx, { RELEASE_TAG: HERDR_TAG, ...extra });
       assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     });
@@ -380,46 +375,50 @@ describe('preflight tarball surface (S4)', () => {
   });
 });
 
-describe('release-publish asset wiring (blocker 2, part 1)', () => {
-  it('create argv carries install.sh and install.sh.sha256, never a bare create', (t) => {
+describe('release-publish notes-only releases (S1)', () => {
+  // A release asset list is what the removed installer needed: without it the
+  // GitHub Release carries the tag and its notes only.
+  const isAssetToken = (token) => {
+    const base = path.basename(token);
+    return base === RETIRED_INSTALLER || base.endsWith('.sha256') || base.endsWith('.tgz');
+  };
+
+  it('creates the release with generated notes and no file assets', (t) => {
     const fx = setup(t);
     const r = runPublish(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     const creates = createLines(fx);
-    assert.ok(creates.length >= 1, `expected a release create call, log:\n${ghLogLines(fx).join('\n')}`);
-    for (const line of creates) {
-      assert.ok(line.includes('install.sh'), `create must carry install.sh: ${line}`);
-      const hasSha = line.split(' ').some((tok) => path.basename(tok) === 'install.sh.sha256');
-      assert.ok(hasSha, `create must carry a path with basename install.sh.sha256: ${line}`);
-    }
+    assert.equal(creates.length, 1, `expected one release create call, log:\n${ghLogLines(fx).join('\n')}`);
+    const line = creates[0];
+    assert.ok(line.includes('--generate-notes'), `create must generate the notes: ${line}`);
+    assert.ok(line.includes('--target'), `create must target the release commit: ${line}`);
+    const assets = line.split(' ').filter((tok) => tok.length > 0 && !tok.startsWith('-') && isAssetToken(tok));
+    assert.deepEqual(assets, [], `create must carry no file asset: ${line}`);
+    assert.ok(!line.includes('--draft'), `create must publish directly, never park a draft: ${line}`);
     assert.match(r.stdout, /published GitHub Release herdr-v0\.2\.0/);
   });
 
-  it('pi series also publishes the installer assets', (t) => {
+  it('pi series creates the same notes-only release', (t) => {
     const fx = setup(t);
     const r = runPublish(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     const creates = createLines(fx);
     assert.equal(creates.length, 1, `expected one create, log:\n${ghLogLines(fx).join('\n')}`);
-    assert.ok(creates[0].includes('install.sh'), `create must carry install.sh: ${creates[0]}`);
-    assert.ok(creates[0].split(' ').some((tok) => path.basename(tok) === 'install.sh.sha256'), `create must carry sha256: ${creates[0]}`);
+    assert.ok(creates[0].includes('--generate-notes'), `create must generate the notes: ${creates[0]}`);
+    assert.ok(!creates[0].split(' ').some((tok) => isAssetToken(tok)), `create must carry no file asset: ${creates[0]}`);
     assert.match(r.stdout, /published GitHub Release pi-v0\.2\.0/);
   });
 
-  it('checksum bytes equal sha256sum install.sh and no --clobber is used', (t) => {
+  it('never uploads a file and never passes --clobber', (t) => {
     const fx = setup(t);
     const r = runPublish(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'missing', MOCK_CREATE: 'ok' });
     assert.equal(r.status, 0, r.stderr);
-    const expected = fs.readFileSync(path.join(fx.workdir, 'install.sh'));
-    const expectedLine = `${sha256File(path.join(fx.workdir, 'install.sh'))}  install.sh\n`;
-    assert.ok(fs.existsSync(fx.checksumCopy), 'mock must have captured the sha256 file passed to create');
-    assert.equal(fs.readFileSync(fx.checksumCopy, 'utf8'), expectedLine);
-    assert.ok(expected.length > 0);
     const fullLog = ghLogLines(fx).join('\n');
+    assert.ok(!fullLog.includes('release upload'), `no asset upload may run:\n${fullLog}`);
     assert.ok(!fullLog.includes('--clobber'), `--clobber must never appear:\n${fullLog}`);
   });
 
-  it('create failure exits 1 and uploads nothing', (t) => {
+  it('create failure exits 1 and publishes nothing', (t) => {
     const fx = setup(t);
     const r = runPublish(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'missing', MOCK_CREATE: 'fail' });
     assert.equal(r.status, 1, `expected exit 1, got ${r.status}: stdout=${r.stdout} stderr=${r.stderr}`);
@@ -444,16 +443,16 @@ describe('release-publish signals are fatal (blocker 1)', () => {
     assert.ok(!r.stdout.includes('published GitHub Release'), `success line must never print, got: ${r.stdout}`);
   });
 
-  it('SIGTERM during verify download exits 143 without the success line', (t) => {
+  it('SIGTERM during verify view exits non-zero without the success line', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'term' });
-    assert.equal(r.status, 143, `signal must exit 143, got rc=${r.status}: stdout=${r.stdout} stderr=${r.stderr}`);
+    const r = runVerify(fx, { MOCK_VIEW: 'term' });
+    assert.notEqual(r.status, 0, `signal must be fatal, got rc=${r.status}: stdout=${r.stdout} stderr=${r.stderr}`);
     assert.ok(!r.stdout.includes('verified GitHub Release'), `success line must never print, got: ${r.stdout}`);
   });
 
   it('SIGINT during view must not verify', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'int', MOCK_DOWNLOAD: 'match' });
+    const r = runVerify(fx, { MOCK_VIEW: 'int' });
     assert.notEqual(r.status, 0, `signal during view must be fatal, got rc=${r.status}: stdout=${r.stdout} stderr=${r.stderr}`);
     assert.ok(!r.stdout.includes('verified GitHub Release'), `success line must never print, got: ${r.stdout}`);
     const realFailure = r.stderr.includes('gh release view') || r.status === 130 || r.status === 143;
@@ -481,7 +480,7 @@ describe('release-publish signals are fatal (blocker 1)', () => {
 });
 
 describe('release-publish existing-release repair path (blocker 2, part 2)', () => {
-  it('existing draft is deleted without --cleanup-tag and recreated with assets', (t) => {
+  it('existing draft is deleted without --cleanup-tag and recreated with notes', (t) => {
     const fx = setup(t);
     const r = runPublish(fx, { MOCK_VIEW: 'draft', MOCK_CREATE: 'ok' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
@@ -492,12 +491,13 @@ describe('release-publish existing-release repair path (blocker 2, part 2)', () 
     assert.ok(!lines.join('\n').includes('--cleanup-tag'), 'pushed tag must survive: never --cleanup-tag');
     const creates = createLines(fx);
     assert.equal(creates.length, 1, `expected recreation, log:\n${lines.join('\n')}`);
-    assert.ok(creates[0].includes('install.sh'), `recreate must carry assets: ${creates[0]}`);
-    assert.ok(creates[0].split(' ').some((tok) => path.basename(tok) === 'install.sh.sha256'), `recreate must carry sha256: ${creates[0]}`);
+    assert.ok(creates[0].includes('--generate-notes'), `recreate must generate the notes: ${creates[0]}`);
+    assert.ok(!creates[0].split(' ').some((tok) => path.basename(tok).endsWith('.sha256')),
+      `recreate must carry no asset: ${creates[0]}`);
     assert.match(r.stdout, /published GitHub Release herdr-v0\.2\.0/);
   });
 
-  it('existing published release refuses with the guard and uploads nothing', (t) => {
+  it('existing published release refuses with the guard and creates nothing', (t) => {
     const fx = setup(t);
     const r = runPublish(fx, { MOCK_VIEW: 'published', MOCK_CREATE: 'ok' });
     assert.equal(r.status, 1, `expected exit 1, got ${r.status}: stdout=${r.stdout} stderr=${r.stderr}`);
@@ -512,59 +512,48 @@ describe('release-publish existing-release repair path (blocker 2, part 2)', () 
 describe('release-verify verdicts', () => {
   it('draft release exits 1', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'draft', MOCK_DOWNLOAD: 'match' });
+    const r = runVerify(fx, { MOCK_VIEW: 'draft' });
     assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.match(r.stderr, /is a draft/);
   });
 
   it('prerelease exits 1', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'prerelease', MOCK_DOWNLOAD: 'match' });
+    const r = runVerify(fx, { MOCK_VIEW: 'prerelease' });
     assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.match(r.stderr, /prerelease/);
   });
 
-  it('missing install.sh asset exits 1', (t) => {
-    const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'missing' });
-    assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stderr, /not found|asset/);
+  it('published release exits 0 for both series', (t) => {
+    for (const tag of [HERDR_TAG, PI_TAG]) {
+      const fx = setup(t);
+      const r = runVerify(fx, { RELEASE_TAG: tag, MOCK_VIEW: 'published' });
+      assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+      assert.match(r.stdout, new RegExp(`verified GitHub Release ${tag.replace(/\./g, '\\.')}`));
+    }
   });
 
-  it('sha256 mismatch exits 1', (t) => {
+  it('never downloads a release asset', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'mismatch' });
-    assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stderr, /mismatch/);
-  });
-
-  it('matching asset exits 0', (t) => {
-    const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match' });
+    const r = runVerify(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'published' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stdout, /verified GitHub Release herdr-v0\.2\.0/);
-  });
-
-  it('sibling install.sh.sha256 asset does not change a matching verdict', (t) => {
-    const fx = setup(t);
-    const r = runVerify(fx, { MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match-with-sha256' });
-    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
-    assert.match(r.stdout, /verified GitHub Release herdr-v0\.2\.0/);
+    const fullLog = ghLogLines(fx).join('\n');
+    assert.ok(!fullLog.includes('release download'), `verify must not fetch an asset:\n${fullLog}`);
   });
 
   it('pi series checks the published npm version with exact argv', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match', MOCK_NPM_VIEW: '0.2.0' });
+    const r = runVerify(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'published', MOCK_NPM_VIEW: '0.2.0' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.match(r.stdout, /verified GitHub Release pi-v0\.2\.0/);
     const npmLog = npmLogLines(fx).join('\n');
     assert.ok(npmLog.includes('view'), `npm view must run, log:\n${npmLog}`);
-    assert.ok(npmLog.includes('@jonasotoaguilar/herdr-gentle-shell@0.2.0'), `npm view must target the pinned version, log:\n${npmLog}`);
+    assert.ok(npmLog.includes('herdr-gentle-shell@0.2.0'), `npm view must target the pinned version, log:\n${npmLog}`);
   });
 
   it('pi series fails when the npm version mismatches', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match', MOCK_NPM_VIEW: '0.1.0' });
+    const r = runVerify(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'published', MOCK_NPM_VIEW: '0.1.0' });
     assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.match(r.stderr, /npm/);
     assert.ok(!r.stdout.includes('verified GitHub Release'), 'success line must not print on npm mismatch');
@@ -572,7 +561,7 @@ describe('release-verify verdicts', () => {
 
   it('herdr series never calls npm view', (t) => {
     const fx = setup(t);
-    const r = runVerify(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'published', MOCK_DOWNLOAD: 'match' });
+    const r = runVerify(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'published' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.equal(npmLogLines(fx).length, 0, `npm must not run for herdr tags, log:\n${npmLogLines(fx).join('\n')}`);
   });

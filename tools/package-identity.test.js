@@ -3,7 +3,7 @@
 // The repository root is the Pi package and herdr-plugin/ is the Herdr
 // plugin. These assertions read the two published identities through their
 // public files (package.json, herdr-plugin/herdr-plugin.toml) and pin the
-// invariants the installer and the release gate depend on: a scoped npm
+// invariants the install path and the release gate depend on: an unscoped npm
 // name with the pi-package keyword, a Pi manifest whose extension exists,
 // an npm tarball that never ships the Herdr plugin, and two independent
 // versions.
@@ -28,8 +28,8 @@ function manifestVersion() {
 }
 
 describe('Pi package identity', () => {
-  it('is published under the scoped npm name with the pi-package keyword', () => {
-    assert.equal(PKG.name, '@jonasotoaguilar/herdr-gentle-shell');
+  it('is published under the unscoped npm name with the pi-package keyword', () => {
+    assert.equal(PKG.name, 'herdr-gentle-shell');
     assert.ok(PKG.keywords.includes('pi-package'), `keywords: ${PKG.keywords.join(', ')}`);
   });
 
@@ -70,7 +70,7 @@ describe('Pi package identity', () => {
     const normalized = url.replace(/^git\+/, '').replace(/\.git$/, '');
     assert.equal(
       normalized,
-      'https://github.com/jonasotoaguilar/herdr-gentle-agents',
+      'https://github.com/jonasotoaguilar/herdr-gentle-shell',
       `repository.url must name this repository, got: ${url}`,
     );
   });
