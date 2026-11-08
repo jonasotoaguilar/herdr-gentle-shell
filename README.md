@@ -157,9 +157,7 @@ herdr plugin uninstall herdr-gentle-shell
 
 The `unconfigure` action takes the managed sidebar override out of the Herdr
 config and reloads it; the user-owned `[ui.sidebar.agents]` table is left
-intact. A legacy managed Pi copy
-is ownership-checked: a locally modified `~/.pi/agent/extensions/gentle-herdr-state.ts`
-is preserved with a warning, never deleted. The settings exclusion is likewise
+intact. The settings exclusion is likewise
 ownership-checked: only the entry this plugin added is removed, while a
 pre-existing identical entry and unrelated settings are preserved. A foreign,
 invalid, or misbound ownership record fails closed: removal warns, preserves
