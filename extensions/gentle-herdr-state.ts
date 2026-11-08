@@ -706,14 +706,17 @@ const DONE_HOLD_MS = 60000;
 const DONE_HOLD_MIN_MS = 1000;
 export const DONE_HOLD_MAX_MS = 300000;
 const DONE_HOLD_ENV = "GENTLE_HERDR_DONE_HOLD_MS";
-// Pending background-job count (DESIGN §4.3, S5/D4): the same
-// `<hash>:<count>:<expiry>` shape as gentle_work_v1, but carrying the number of
-// live `bash_background` / `monitor` jobs from Gentle Shell's own snapshot and
-// published ONLY while the session is purely waiting for them — the principal
-// settled, no delegate running, no launch pending — so the sidebar can show the
-// pink `job` state instead of generic activity. Cleared on the next beat once
-// the principal resumes, a delegate starts, or the last job ends.
-const JOBS_TOKEN = "gentle_jobs_v1";
+// Staleness bound for the background-job snapshot. Gentle Shell emits
+// `gentle-ai:jobs-sidebar` on job EDGES only — start, monitor line batch, stop,
+// exit, session shutdown (`refreshJobStatus` in extensions/gentle-agents.ts has
+// no periodic caller) — so a silent `bash_background` job never refreshes it. A
+// snapshot older than this bound therefore counts as ZERO jobs: fail OPEN.
+// Finishing while a job silently runs is a nuisance; latching the session
+// non-terminal on a snapshot that no longer describes the session is the
+// incident this bound exists to prevent (odd/tasks/restore-done-idle.md). Five
+// minutes is the generous end of the [30 s, 5 min] band: a job longer than this
+// fails open early, and a missed exit event delays `done` by at most this long.
+export const JOBS_SNAPSHOT_TTL_MS = 300000;
 const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
 // Herdr's wire ceiling for a single pane-metadata token value, measured in
@@ -738,9 +741,7 @@ const QUESTIONNAIRE_EVENT = "rpiv:ask-user:blocked";
 const PERMISSION_EVENT = "pi-permission-system:permission-request";
 // Gentle Shell's live background jobs (`bash_background` / `monitor`) are
 // published on the Pi event bus, session-scoped and display-only:
-// `{ sessionId, snapshot: { jobs: [{ id, label, startedAt }] } }`. A live job
-// is pending work exactly like a running delegate, so it must keep the
-// session non-terminal.
+// `{ sessionId, snapshot: { jobs: [{ id, label, startedAt }] } }`.
 const JOBS_SIDEBAR_EVENT = "gentle-ai:jobs-sidebar";
 // Neither `gentle-pi:review:blocked` (reserved hook: no producer exists) nor
 // `gentle-ai:review-sidebar` snapshots (entry publishes fire before the
@@ -939,7 +940,7 @@ function sendRequestAttempt(request, timeoutMs) {
       if (timeout) clearTimeout(timeout);
       try {
         socket.destroy();
-      } catch {}
+      } catch { /* best effort: a failure here is non-fatal */ }
       resolve(delivered);
     };
     let socket;
@@ -1043,7 +1044,7 @@ function cliFallback(patch) {
     const timer = setTimeout(() => {
       try {
         child.kill();
-      } catch {}
+      } catch { /* best effort: a failure here is non-fatal */ }
       finish(false);
     }, CLI_FALLBACK_TIMEOUT_MS);
     if (timer.unref) timer.unref();
@@ -1093,25 +1094,16 @@ export function computeNativeState({
   settled,
   activeCount,
   pendingCount,
-  jobCount = 0,
   askActive,
   reviewActive,
   hasError,
 }) {
   if (hasError) return "blocked";
   if (askActive) return "blocked";
-  if (agentActive || activeCount > 0 || pendingCount > 0 || jobCount > 0 || reviewActive) {
+  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive) {
     return "working";
   }
-  if (
-    settled &&
-    !agentActive &&
-    activeCount === 0 &&
-    pendingCount === 0 &&
-    jobCount === 0 &&
-    !askActive &&
-    !reviewActive
-  ) {
+  if (settled && !agentActive && activeCount === 0 && pendingCount === 0 && !askActive && !reviewActive) {
     return "idle";
   }
   return undefined;
@@ -1420,7 +1412,7 @@ function liveRunGit(root, args) {
     }
     let stdout = "";
     const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
+      try { child.kill(); } catch { /* best effort: a failure here is non-fatal */ }
       finish({ stdout, code: 1, error: `timed out after ${LIVE_GIT_TIMEOUT_MS}ms` });
     }, LIVE_GIT_TIMEOUT_MS + 500);
     if (timer.unref) timer.unref();
@@ -1675,7 +1667,7 @@ function moshiSendEnvelope(envelope) {
     sock.on("error", () => {
       try {
         sock.destroy();
-      } catch {}
+      } catch { /* best effort: a failure here is non-fatal */ }
     });
     sock.once("connect", () => {
       sock.write(`${JSON.stringify(envelope)}\n`);
@@ -1790,7 +1782,7 @@ function moshiSessionIsChild(file) {
   } finally {
     try {
       fs.closeSync(fd);
-    } catch {}
+    } catch { /* best effort: a failure here is non-fatal */ }
   }
   moshiChildCache.set(file, child);
   return child;
@@ -2151,7 +2143,7 @@ function writeSettingsDoc(path, doc) {
   } catch (error) {
     try {
       fs.rmSync(temp, { force: true });
-    } catch {}
+    } catch { /* best effort: a failure here is non-fatal */ }
     throw error;
   }
 }
@@ -2535,13 +2527,17 @@ export default function (pi) {
   let moshiCtxRef;
   let lastAskToolName;
 
-  // Live background jobs (Gentle Shell `bash_background` / `monitor`), from
-  // the bus snapshot. Session-scoped: a snapshot owned by another session
-  // never counts here.
+  // Live background jobs (Gentle Shell `bash_background` / `monitor`) from the
+  // bus snapshot: session-scoped, edge-emitted, and therefore a hint with a
+  // freshness bound rather than proof. A live job is PENDING WORK — it holds
+  // the finish mint and keeps the row on the pink generic `gentle` wait — but
+  // it is never a display state of its own: no job count is published and no
+  // `job` token exists to render (odd/tasks/restore-done-idle.md).
   let jobsSnapshot;
 
-  function runningJobCount() {
+  function freshRunningJobCount() {
     if (!jobsSnapshot) return 0;
+    if (Date.now() - jobsSnapshot.at > JOBS_SNAPSHOT_TTL_MS) return 0;
     const owner = jobsSnapshot.sessionId;
     const mine = sessionId;
     if (
@@ -2557,8 +2553,8 @@ export default function (pi) {
   }
 
   // A job starting or ending is a state change: publish immediately so the
-  // sidebar and the native report follow it, and keep the beat alive while
-  // jobs run (the marker has its own TTL).
+  // `gentle` wait and the finish gate follow it. `at` is the arrival time the
+  // freshness bound measures from.
   function onJobsSnapshot(value) {
     if (!isRecord(value) || !isRecord(value.snapshot) || !Array.isArray(value.snapshot.jobs)) return;
     const jobs = value.snapshot.jobs.filter(
@@ -2567,14 +2563,14 @@ export default function (pi) {
     jobsSnapshot = {
       sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined,
       jobs,
+      at: Date.now(),
     };
     schedulePublish();
   }
 
   // Subscribed before the `enabled()` guard would matter: the bus event is
-  // session-scoped display data, so it is safe to observe anywhere. Hosts
-  // whose runtime has no event bus simply never see it (jobs stay at zero,
-  // which is today's behavior).
+  // session-scoped display data, so it is safe to observe anywhere. Hosts whose
+  // runtime has no event bus never see it (jobs stay at zero).
   if (typeof pi?.events?.on === "function") pi.events.on(JOBS_SIDEBAR_EVENT, onJobsSnapshot);
 
   function moshiCapture(ctx) {
@@ -2718,7 +2714,7 @@ export default function (pi) {
     try {
       const cwd = ctx?.cwd;
       if (typeof cwd === "string" && cwd.length > 0) sessionCwd = cwd;
-    } catch {}
+    } catch { /* best effort: a failure here is non-fatal */ }
     try {
       const file = ctx?.sessionManager?.getSessionFile?.();
       if (typeof file === "string" && file.length > 0) {
@@ -2731,7 +2727,7 @@ export default function (pi) {
     try {
       const id = ctx?.sessionManager?.getSessionId?.();
       if (typeof id === "string" && id.length > 0) sessionId = id;
-    } catch {}
+    } catch { /* best effort: a failure here is non-fatal */ }
   }
 
   function askActiveNow() {
@@ -2783,7 +2779,7 @@ export default function (pi) {
         emittedLabel = undefined;
         try {
           pi.events.emit(BLOCKED_EVENT, { active: false });
-        } catch {}
+        } catch { /* best effort: a failure here is non-fatal */ }
       }
       return;
     }
@@ -3024,14 +3020,17 @@ export default function (pi) {
     // emitted by the root Pi session while the main session is actively
     // working (agentActive, even with zero subagents), retaining coverage
     // while an authoritative running|queued subagent exists or a
-    // subagent_run/subagent_continue launch is pending; null (clear) once
-    // the main session settles (or any non-root session) so a settled
-    // session never retains it. Carries no count and never alters the work
-    // total or the roles CSV — the consumer reduces a fresh marker to the
+    // subagent_run/subagent_continue launch is pending, or while a fresh
+    // background-job snapshot shows a live job (the settled wait on a
+    // `bash_background` / `monitor` job renders the same pink generic
+    // `gentle`); null (clear) once the main session settles (or any non-root
+    // session) so a settled session never retains it. Carries no count and
+    // never alters the work total or the roles CSV — the consumer reduces a
+    // fresh marker to the
     // `orchestrating` display only when no recognized role is active (below
     // attention, terminal `done`, and recognized roles; ahead of main
     // `working`).
-    if (rootSession && (agentActive || subs.length > 0 || pendingCalls.size > 0 || runningJobCount() > 0)) {
+    if (rootSession && (agentActive || subs.length > 0 || pendingCalls.size > 0 || freshRunningJobCount() > 0)) {
       tokens.gentle_orchestrating_v1 = `${sessionHash}:${expiry}`;
     } else {
       tokens.gentle_orchestrating_v1 = null;
@@ -3050,13 +3049,14 @@ export default function (pi) {
     // launch, no live background job, and no human-wait, review, or error leg
     // — then republished with the SAME expiry so the hold can never be
     // extended. Any work appearing during the hold clears it on that beat, so
-    // the row moves straight back to the role/job state. A session that never
-    // worked never mints one.
+    // the row moves straight back to the role state. A session that never
+    // worked never mints one. A live background job counts as activity: the
+    // finish waits while the session still waits on it.
     const activity =
       agentActive ||
       subs.length > 0 ||
       pendingCalls.size > 0 ||
-      runningJobCount() > 0 ||
+      freshRunningJobCount() > 0 ||
       askActiveNow() ||
       reviewActive ||
       !!errorCode;
@@ -3079,19 +3079,6 @@ export default function (pi) {
       donePending = false;
     }
     tokens[DONE_TOKEN] = doneExpiry === undefined ? null : `${sessionHash}:${doneExpiry}`;
-    // Pending background jobs (S5/D4): display-only count, published only while
-    // the session waits on them. `nativeSettledPending` is included because a
-    // launch that was in flight when the principal settled has already left
-    // `pendingCalls` — it is still pending work, never a job wait.
-    const jobCount =
-      !agentActive &&
-      settled &&
-      !nativeSettledPending &&
-      subs.length === 0 &&
-      pendingCalls.size === 0
-        ? runningJobCount()
-        : 0;
-    tokens[JOBS_TOKEN] = jobCount > 0 ? `${sessionHash}:${jobCount}:${expiry}` : null;
     if (changes.files > 0) {
       const files = String(changes.files);
       const added = String(changes.added);
@@ -3123,12 +3110,15 @@ export default function (pi) {
     // holds the beat the same way while its span is open. Effective
     // review (executing acknowledged capture/group calls) keeps the beat
     // alive so `review:` and the durable review token publish — NO GRACE:
-    // the leg drops when the last execution ends or resolves.
+    // the leg drops when the last execution ends or resolves. A live
+    // background job keeps the beat alive too: that is what lets the wait end
+    // on its own when the snapshot goes stale instead of the beat stopping
+    // with the row still painted `gentle`.
     return (
       agentActive ||
       activeSubs().length > 0 ||
       pendingCalls.size > 0 ||
-      runningJobCount() > 0 ||
+      freshRunningJobCount() > 0 ||
       askToolCalls.size > 0 ||
       uiPromptActive ||
       reviewActive ||
@@ -3170,7 +3160,6 @@ export default function (pi) {
       settled,
       activeCount: activeSubs().length,
       pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
-      jobCount: runningJobCount(),
       askActive: askActiveNow(),
       reviewActive,
       hasError: !!errorCode,
@@ -3237,7 +3226,9 @@ export default function (pi) {
       params.session_start_source = sessionStartSource;
     }
     const base = `${SOURCE}:session:${seq}`;
-    await sendRequestAttempt(
+    // The result is deliberately discarded: this is the fire-and-forget
+    // session binding, and `void` states that intent for the linter.
+    void (await sendRequestAttempt(
       {
         id: `${base}:0:${randomUUID()}`,
         method: "pane.report_agent_session",
@@ -3252,7 +3243,7 @@ export default function (pi) {
           params,
         },
         1500,
-      ).catch(() => false));
+      ).catch(() => false)));
   }
 
   // Start the session binding without waiting for it (see
@@ -3496,7 +3487,7 @@ export default function (pi) {
             const top = probe.stdout.trim();
             if (top.length > 0) cwdRoot = top;
           }
-        } catch {}
+        } catch { /* best effort: a failure here is non-fatal */ }
       }
       const roots = liveResolveScopeRoots(entries, sessionId, cwdRoot);
       const summary = await liveSummarizeRoots(roots);
@@ -3535,6 +3526,7 @@ export default function (pi) {
     doneExpiry = undefined;
     donePending = false;
     sawActivity = false;
+    jobsSnapshot = undefined;
     errorCode = undefined;
     liveGen += 1;
     liveInFlight = false;
@@ -3551,7 +3543,7 @@ export default function (pi) {
     emittedLabel = undefined;
     try {
       pi.events.emit(BLOCKED_EVENT, { active: false });
-    } catch {}
+    } catch { /* best effort: a failure here is non-fatal */ }
   }
 
   // -- ask legs -------------------------------------------------------------
@@ -3984,7 +3976,7 @@ export default function (pi) {
       emittedLabel = undefined;
       try {
         pi.events.emit(BLOCKED_EVENT, { active: false });
-      } catch {}
+      } catch { /* best effort: a failure here is non-fatal */ }
     }
     resetSessionState();
     return moshiFlushSends(1000);

@@ -52,9 +52,9 @@ const WORKSPACE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const AGENT_NAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const AGENT_STATUS_RE = /^(idle|working|blocked|done|unknown)$/;
 // L6 unfinished displays only: terminal done/idle (and anything unknown)
-// never qualify as an interruption signal. `job` is a wait, not an end.
+// never qualify as an interruption signal.
 const UNFINISHED_DISPLAYS = new Set([
-  'working', 'orchestrating', 'job', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error',
+  'working', 'orchestrating', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error',
 ]);
 const INTERRUPTION_REASON = 'agent_disappeared';
 

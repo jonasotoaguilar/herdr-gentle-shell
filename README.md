@@ -222,7 +222,7 @@ acceptable. Row 1 holds 3 native cells and row 2 holds 14 cells (11 state
 # row 1 native state_icon + workspace + agent, row 2 state word + changes.
 # The parent [ui.sidebar.agents] table is user-owned and never touched here.
 [ui.sidebar.agents.rows_by_agent]
-pi = [["state_icon", "workspace", "agent"], [{ token = "$gentle_title_working", fg = "#f9e2af" }, { token = "$gentle_title_orchestrating", fg = "#f5c2e7" }, { token = "$gentle_title_job", fg = "#f5c2e7" }, { token = "$gentle_title_explorer", fg = "#89b4fa" }, { token = "$gentle_title_worker", fg = "#f9e2af" }, { token = "$gentle_title_verify", fg = "#94e2d5" }, { token = "$gentle_title_judge", fg = "#cba6f7" }, { token = "$gentle_title_ask", fg = "#fab387" }, { token = "$gentle_title_review", fg = "#89b4fa" }, { token = "$gentle_title_error", fg = "#f38ba8" }, { token = "$gentle_title_done", fg = "#a6e3a1" }, { token = "$gentle_title_idle", fg = "#7c7f93" }, { token = "$gentle_changes_added", fg = "#a6e3a1" }, { token = "$gentle_changes_deleted", fg = "#f38ba8" }, { token = "$gentle_changes_pull", fg = "#89b4fa" }]]
+pi = [["state_icon", "workspace", "agent"], [{ token = "$gentle_title_working", fg = "#f9e2af" }, { token = "$gentle_title_orchestrating", fg = "#f5c2e7" }, { token = "$gentle_title_explorer", fg = "#89b4fa" }, { token = "$gentle_title_worker", fg = "#f9e2af" }, { token = "$gentle_title_verify", fg = "#94e2d5" }, { token = "$gentle_title_judge", fg = "#cba6f7" }, { token = "$gentle_title_ask", fg = "#fab387" }, { token = "$gentle_title_review", fg = "#89b4fa" }, { token = "$gentle_title_error", fg = "#f38ba8" }, { token = "$gentle_title_done", fg = "#a6e3a1" }, { token = "$gentle_title_idle", fg = "#7c7f93" }, { token = "$gentle_changes_added", fg = "#a6e3a1" }, { token = "$gentle_changes_deleted", fg = "#f38ba8" }, { token = "$gentle_changes_pull", fg = "#89b4fa" }]]
 # END herdr-gentle-agents
 ```
 
@@ -241,8 +241,8 @@ renders for generic activity (machine key `working`): the main agent when settle
 retaining running-subagent or pending-launch coverage. The principal's own
 activity decides the row, never the delegate count and never Herdr's
 aggregate native status (the work token counts running delegates, and the
-native status reads `working` for any running delegate, pending launch, or
-live job — so neither can say the principal works): the dedicated
+native status reads `working` for any running delegate or pending launch — so
+neither can say the principal works): the dedicated
 `gentle_principal_v1` marker is published while the principal session itself
 works and cleared when it settles. A **working principal** reads `gentle` —
 pink
