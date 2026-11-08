@@ -443,8 +443,9 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   state and both reachable from a plain Pi session outside a Herdr pane. With
   no argument the command opens the restored floating two-pane panel
   (`Herdr Sidebar` and `Moshi notifications`; `←/→` or `Tab` moves between the
-  category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter` applies the
-  focused row and `Esc` closes). The plain two-step menu stays as the fallback
+  category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter` toggles the
+  focused switch and `Esc` closes). Each switch is one row that reads its stored
+  state, so `On` becomes `Off` and back in a single key press. The plain two-step menu stays as the fallback
   when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
   (`--check` to read, `--apply --reload` / `--uninstall --reload` to change) and

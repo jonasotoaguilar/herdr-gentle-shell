@@ -514,7 +514,7 @@ describe('floating customize panel', () => {
       'Herdr Sidebar',
       'Moshi notifications',
       'Preview · Off',
-      '←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close',
+      '←/→ or Tab panes · ↑/↓ or j/k move · Enter toggle · Esc close',
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }

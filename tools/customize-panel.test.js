@@ -66,8 +66,12 @@ describe('customize panel model', () => {
     assert.deepEqual(model.map((category) => category.title), ['Herdr Sidebar', 'Moshi notifications']);
     assert.deepEqual(model.map((category) => category.active), ['off', 'on']);
     assert.deepEqual(model.map((category) => category.note), [undefined, undefined], 'a stored value needs no note');
-    assert.deepEqual(model[0].rows.map((row) => row.id), ['on', 'off']);
-    assert.deepEqual(model[1].rows.map((row) => row.id), ['on', 'off']);
+    // One toggle row per switch: it shows the stored state and carries the
+    // value Enter applies, so a single row is the whole interaction.
+    assert.deepEqual(model[0].rows.map((row) => row.id), ['on'], 'sidebar off toggles back on');
+    assert.deepEqual(model[0].rows.map((row) => row.label), ['Off']);
+    assert.deepEqual(model[1].rows.map((row) => row.id), ['off'], 'moshi on toggles off');
+    assert.deepEqual(model[1].rows.map((row) => row.label), ['On']);
   });
 
   test('an unknown sidebar state carries a note but stays repairable', () => {
@@ -87,10 +91,9 @@ describe('customize panel render', () => {
       'CATEGORIES',
       'Herdr Sidebar',
       'Moshi notifications',
-      'On',
-      'Off',
+      '→ On',
       'Preview · On',
-      '←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close',
+      '←/→ or Tab panes · ↑/↓ or j/k move · Enter toggle · Esc close',
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }
@@ -150,12 +153,13 @@ describe('customize panel render', () => {
     assert.ok(lines.join('\n').includes('Customize · Herdr Gentle Shell'), 'the title survives');
   });
 
-  test('an unknown sidebar state reads its note and keeps both rows', () => {
+  test('an unknown sidebar state reads its note and keeps the row actionable', () => {
     const { component } = open({ model: customizePanelModel({ sidebar: 'unknown', moshi: 'off' }) });
     const seen = seenAt(component, 100);
     assert.ok(seen.includes('state unknown'), 'the note explains the inconclusive state');
     assert.equal(seen.includes('(unavailable in this session)'), false, 'the repair is never blocked');
-    assert.ok(seen.includes('On') && seen.includes('Off'));
+    assert.ok(seen.includes('→ Unknown'), 'an unreadable state is named, never guessed');
+    assert.equal(seen.includes('→ Off'), false);
   });
 
   test('a hostile theme degrades to plain text', () => {
@@ -187,20 +191,20 @@ describe('customize panel navigation', () => {
     component.handleInput('right');
     component.handleInput('down');
     const seen = seenAt(component, 100);
-    assert.match(seen, /▸\s+Off/, 'the focused value moved to Off');
+    assert.match(seen, /▸\s+→ On/, 'the single toggle row keeps focus');
     component.handleInput('tab');
     component.handleInput('k');
     assert.equal(done(), 'pending');
   });
 
-  test('Enter resolves the focused row and closes the overlay', () => {
+  test('Enter toggles the focused switch and closes the overlay', () => {
     const first = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     first.component.handleInput('enter');
-    assert.deepEqual(first.done(), { categoryId: 'sidebar', valueId: 'on' });
+    assert.deepEqual(first.done(), { categoryId: 'sidebar', valueId: 'off' }, 'On toggles off');
 
     const second = open({ model: customizePanelModel({ sidebar: 'off', moshi: 'off' }) });
     second.component.handleInput('enter');
-    assert.deepEqual(second.done(), { categoryId: 'sidebar', valueId: 'off' }, 'Enter starts on the stored value');
+    assert.deepEqual(second.done(), { categoryId: 'sidebar', valueId: 'on' }, 'Off toggles on');
   });
 
   test('Enter in the values pane resolves that pane row', () => {
@@ -209,7 +213,7 @@ describe('customize panel navigation', () => {
     component.handleInput('right');
     component.handleInput('up');
     component.handleInput('enter');
-    assert.deepEqual(done(), { categoryId: 'moshi', valueId: 'on' });
+    assert.deepEqual(done(), { categoryId: 'moshi', valueId: 'on' }, 'a stored Off toggles on');
   });
 
   test('Esc and ctrl+c close with null', () => {
