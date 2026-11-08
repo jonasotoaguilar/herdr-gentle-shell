@@ -1445,4 +1445,16 @@ describe('gentle_subs_v1 disclosure list', () => {
     assert.equal(eight.length > 512, true);
     assert.deepEqual(tokens.parseSubs(eight), []);
   });
+
+  it('rejects a value over 512 UTF-8 bytes whole even when it is under 512 characters', () => {
+    // Six entries of 64 CJK characters: 401 characters, 1169 UTF-8 bytes — a
+    // value the character bound would have accepted and Herdr's byte bound
+    // rejects, so it is dropped whole instead of truncated into a plausible
+    // list the producer never wrote.
+    const agent = '作'.repeat(64);
+    const six = Array.from({ length: 6 }, (_, at) => `${at + 1}:${agent}`).join(',');
+    assert.equal(six.length <= 512, true);
+    assert.equal(Buffer.byteLength(six, 'utf8') > 512, true);
+    assert.deepEqual(tokens.parseSubs(six), []);
+  });
 });

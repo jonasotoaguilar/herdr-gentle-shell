@@ -295,6 +295,7 @@ gentle_changes_v2 = sessionHash ":" count ":" count ":" count ":" expiry
                     ; normative: exact added/deleted totals kept separate so
                     ; the sidebar renders +N/-N without a guessed split
 gentle_names_v1   = label *("," label)   ; label = TaskRecord.label/agent, 1*64 chars
+                    ; total <= 512 UTF-8 bytes (see §4.5)
                     ; compat transport only — never rendered
 role            = "explorer" / "worker" / "verify" / "judge" / "rdd" / passthrough
                     ; known TaskRecord.agent derivations, oldest-first
@@ -303,9 +304,9 @@ role            = "explorer" / "worker" / "verify" / "judge" / "rdd" / passthrou
                     ; passthrough = 1*32 lowercase [a-z0-9_-], leading [a-z0-9]
                     ; (unknown delegation keeps its sanitized original name —
                     ; never a generic collapse; producer truncates to 32)
-gentle_roles_v1   = role *("," role)       ; total <= ~512 chars; null (clear)
+gentle_roles_v1   = role *("," role)       ; total <= 512 UTF-8 bytes; null (clear)
                     ; when no delegation is active (no role words)
-gentle_subs_v1    = subentry *("," subentry) ; / 8 subentry / total <= 512 chars
+gentle_subs_v1    = subentry *("," subentry) ; / 8 subentry / total <= 512 UTF-8 bytes
                     ; subentry = ordinal ":" agent
                     ; ordinal  = [1-9] 0*15DIGIT  (the subagent's 1-based
                     ;            number in this session, ascending, never
@@ -415,12 +416,23 @@ principal marker the pane shows the oldest role word (or `idle`), never
   `workspace.report_metadata`, CLI fallback
   `herdr pane report-metadata <pane> --source gentle:v1 --token name=value`.
 - One report carries at most 16 tokens; `gentle_names_v1` never chunks:
-  excess advisory names are dropped at ~512 chars total (fail-closed).
+  excess advisory names are dropped whole at 512 UTF-8 bytes total
+  (fail-closed).
   `gentle_subs_v1` never chunks either: the producer stops at 8 entries /
-  512 chars, so the consumer rejects an over-cap value whole instead of
+  512 UTF-8 bytes, so the consumer rejects an over-cap value whole instead of
   reassembling or truncating it.
   The `#p=<i>/<m>` suffix form is retired and never emitted; a consumer
   must not expect reassembly.
+- Token values are bounded in UTF-8 BYTES, never in JS characters: Herdr
+  rejects the WHOLE `pane.report_metadata` beat when a single value exceeds
+  512 bytes, so nothing in that report lands and the pane falls back to its
+  60 s TTL. A character count is not a substitute — eight 64-character
+  Japanese labels stay inside every character cap and are ~1.3 KB on the
+  wire. Every published value (work, names, roles, subs, changes, markers,
+  ask, review) is measured with `Buffer.byteLength(value, 'utf8')`, and the
+  publisher clamps any value that ever escapes its builder on a character
+  boundary (never splitting a surrogate pair) so one token can never take
+  its siblings down with it.
 - Writes are idempotent full-state snapshots per pane (all gentle tokens
   re-emitted each beat), never deltas — a lost report is repaired by the next
   beat.
@@ -758,8 +770,8 @@ exactly one mechanism writes each piece of state.
   running total as a suffix (Herdr's disclosure list shows the subagents).
 - TTL: `expiry <= now + 60000` at write; readers use `now` at read.
   Clock skew assumption ≤ 5 s (documented; not compensated).
-- Field bounds: `count` ≤ 16 digits; `label` ≤ 64 chars; names/roles CSV
-  totals ≤ ~512 chars each; `intentId`/`reviewId`/`code` ≤ 64 chars,
+- Field bounds: `count` ≤ 16 digits; `label` ≤ 64 chars; names/roles/subs
+  CSV totals ≤ 512 UTF-8 bytes each; `intentId`/`reviewId`/`code` ≤ 64 chars,
   `[A-Za-z0-9_-]+`.
 - Poll cadence: resolved — must be ≪ 60 s TTL to avoid flapping
   (see §10 U2). The daemon runs an adaptive poll (10 s baseline,

@@ -55,16 +55,16 @@
 //   gentle_changes_v1 = <hash>:<files>:<added+deleted>:<expiry>
 //                       (dual-emitted for rollback consumers only)
 //   gentle_names_v1   = CSV of TaskRecord.label/agent (sanitized, ≤64 chars
-//                       each, oldest-first, total ≤ ~512 chars; excess
-//                       advisory names are dropped, never chunked — the §4.5
-//                       #p= overflow form never triggers by construction)
+//                       each, oldest-first, total ≤ 512 UTF-8 BYTES; excess
+//                       advisory names are dropped whole, never chunked — the
+//                       §4.5 #p= overflow form never triggers by construction)
 //                       Compatibility transport only: the consumer renders
 //                       roles, never names. Null (clear) when the active
 //                       TaskStore list has no labels; null change tokens when the session model has
 //                       zero changed files — refreshed/cleared from the live
 //                       session model, never carried across sessions.
 //   gentle_subs_v1    = CSV of `<ordinal>:<agent>` entries, oldest launch
-//                       first, ≤ 8 entries and ≤ 512 bytes; `<agent>` is the
+//                       first, ≤ 8 entries and ≤ 512 UTF-8 BYTES; `<agent>` is the
 //                       full agent package name (`gentle-ai-explore`) and
 //                       entries are never merged — two runs of one agent are
 //                       two entries. `<ordinal>` is the subagent's 1-based
@@ -762,11 +762,19 @@ const TTL_MS = 60000;
 const BEAT_MS = 15000;
 const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
-const MAX_NAMES_CHARS = 512;
-const MAX_ROLES_CHARS = 512;
+// Herdr's wire ceiling for a single pane-metadata token value, measured in
+// UTF-8 BYTES: one value over it rejects the WHOLE `pane.report_metadata`
+// beat, so nothing in that report lands and the pane falls back to its 60 s
+// TTL. Character counts are not a substitute — eight 64-character Japanese
+// labels are inside every character cap and ~1.3 KB on the wire — so every
+// published value is bounded in bytes (Buffer.byteLength), never in JS
+// characters. The session-bound values (`<hash>:<count>:<expiry>` families,
+// markers, ask/review) are ASCII and ≤ 125 bytes by construction; the CSV
+// values (names, roles, subs) are the only ones that can carry multibyte
+// text, and they are measured against this ceiling as they are built.
+const MAX_TOKEN_BYTES = 512;
 const SUBS_TOKEN = "gentle_subs_v1";
 const MAX_SUBS_ENTRIES = 8;
-const MAX_SUBS_CHARS = 512;
 const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
 const TRANSPORT_FAIL_LATCH = 3;
@@ -887,14 +895,48 @@ function sanitizeId(value, fallbackPrefix) {
   return `${fallbackPrefix}${rand}`;
 }
 
+function utf8Bytes(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+
+// Cap a label at MAX_LABEL_CHARS UTF-16 units — the same unit the consumer's
+// `parseNames` checks, so a label the producer writes is never one the
+// consumer drops — while backing off one unit when the cut would split a
+// surrogate pair and leave a lone half behind.
+function truncateChars(value, maxChars) {
+  if (value.length <= maxChars) return value;
+  let cut = maxChars;
+  const last = value.charCodeAt(cut - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+  return value.slice(0, cut);
+}
+
+// Truncate on a character boundary so the result is always valid UTF-8 and
+// never exceeds `maxBytes`. Only the last-resort wire clamp needs this: the
+// CSV builders below drop whole entries instead of chunking one.
+function truncateBytes(value, maxBytes) {
+  if (utf8Bytes(value) <= maxBytes) return value;
+  let out = "";
+  let used = 0;
+  for (const char of value) {
+    const size = utf8Bytes(char);
+    if (used + size > maxBytes) break;
+    out += char;
+    used += size;
+  }
+  return out;
+}
+
 function sanitizeLabel(value, fallback) {
   const raw = typeof value === "string" && value.length > 0 ? value : fallback;
-  const clean = String(raw)
-    .replace(/[\x00-\x1f\x7f-\x9f]/g, "")
-    .replace(/[,\"\n\r]/g, " ")
-    .trim()
-    .slice(0, MAX_LABEL_CHARS);
-  return clean.length > 0 ? clean : String(fallback).slice(0, MAX_LABEL_CHARS);
+  const clean = truncateChars(
+    String(raw)
+      .replace(/[\x00-\x1f\x7f-\x9f]/g, "")
+      .replace(/[,\"\n\r]/g, " ")
+      .trim(),
+    MAX_LABEL_CHARS,
+  );
+  return clean.length > 0 ? clean : truncateChars(String(fallback), MAX_LABEL_CHARS);
 }
 
 // Full agent package name for the subagent disclosure list (`gentle-ai-explore`,
@@ -905,10 +947,12 @@ function sanitizeLabel(value, fallback) {
 // name.
 function sanitizeSubAgent(agent) {
   if (typeof agent !== "string" || agent.length === 0) return undefined;
-  const clean = agent
-    .replace(/[\x00-\x1f\x7f-\x9f",]/g, "")
-    .trim()
-    .slice(0, MAX_LABEL_CHARS);
+  const clean = truncateChars(
+    agent
+      .replace(/[\x00-\x1f\x7f-\x9f",]/g, "")
+      .trim(),
+    MAX_LABEL_CHARS,
+  );
   return clean.length > 0 ? clean : undefined;
 }
 
@@ -992,7 +1036,15 @@ async function sendTokens(tokens) {
   const names = Object.keys(tokens);
   for (let at = 0; at < names.length; at += MAX_TOKENS_PER_REPORT) {
     const patch = {};
-    for (const name of names.slice(at, at + MAX_TOKENS_PER_REPORT)) patch[name] = tokens[name];
+    for (const name of names.slice(at, at + MAX_TOKENS_PER_REPORT)) {
+      const value = tokens[name];
+      // Last-resort net at the wire boundary: Herdr rejects the whole beat for
+      // one over-cap value, so a value that ever escapes the builders is
+      // clamped on a character boundary instead of taking every sibling token
+      // (work, roles, subs, markers) down with it. The builders above already
+      // keep their values inside the ceiling, so this never fires in practice.
+      patch[name] = typeof value === "string" ? truncateBytes(value, MAX_TOKEN_BYTES) : value;
+    }
     const delivered =
       (await sendRequestAttempt(
         {
@@ -2788,14 +2840,19 @@ export default function (pi) {
     return merged;
   }
 
+  // Advisory names CSV, bounded in UTF-8 BYTES against Herdr's ceiling: an
+  // entry that would push the value past MAX_TOKEN_BYTES is dropped whole
+  // (never chunked, never truncated), so the consumer always sees whole
+  // labels. A single 64-character label is at most 256 bytes, so the first
+  // name always fits.
   function namesCsv(subs) {
     const parts = [];
     let length = 0;
     for (const sub of subs) {
       const name = sanitizeLabel(sub.label, sub.agent);
       if (parts.includes(name)) continue;
-      const add = (parts.length === 0 ? 0 : 1) + name.length;
-      if (length + add > MAX_NAMES_CHARS) break;
+      const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(name);
+      if (length + add > MAX_TOKEN_BYTES) break;
       parts.push(name);
       length += add;
     }
@@ -2858,8 +2915,8 @@ export default function (pi) {
     for (const sub of subs) {
       const role = agentToRole(sub.agent);
       if (!role || parts.includes(role)) continue;
-      const add = (parts.length === 0 ? 0 : 1) + role.length;
-      if (length + add > MAX_ROLES_CHARS) break;
+      const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(role);
+      if (length + add > MAX_TOKEN_BYTES) break;
       parts.push(role);
       length += add;
     }
@@ -2868,11 +2925,11 @@ export default function (pi) {
 
   // Bounded CSV of `<ordinal>:<agent>` entries for the subagent disclosure,
   // oldest launch first (ordinal ascending == launch order) and capped at
-  // MAX_SUBS_ENTRIES / MAX_SUBS_CHARS. Entries are never merged or
-  // deduplicated: the ordinal is the entry identity, so two runs of one agent
-  // are two entries. Fewer than two usable entries yields an empty CSV so the
-  // caller clears the token — a malformed single name can never turn into a
-  // one-child disclosure.
+  // MAX_SUBS_ENTRIES / MAX_TOKEN_BYTES (UTF-8 bytes: an agent name may be
+  // multibyte). Entries are never merged or deduplicated: the ordinal is the
+  // entry identity, so two runs of one agent are two entries. Fewer than two
+  // usable entries yields an empty CSV so the caller clears the token — a
+  // malformed single name can never turn into a one-child disclosure.
   function subsCsv(subs) {
     const entries = [];
     for (const sub of subs) {
@@ -2885,8 +2942,8 @@ export default function (pi) {
     let length = 0;
     for (const { ordinal, agent } of entries) {
       const entry = `${ordinal}:${agent}`;
-      const add = (parts.length === 0 ? 0 : 1) + entry.length;
-      if (parts.length >= MAX_SUBS_ENTRIES || length + add > MAX_SUBS_CHARS) break;
+      const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(entry);
+      if (parts.length >= MAX_SUBS_ENTRIES || length + add > MAX_TOKEN_BYTES) break;
       parts.push(entry);
       length += add;
     }
@@ -3584,7 +3641,7 @@ export default function (pi) {
     if (!isRecord(input)) return undefined;
     const agent = typeof input.agent === "string" ? input.agent : "subagent";
     const label = sanitizeLabel(typeof input.label === "string" ? input.label : agent, agent);
-    return { agent: agent.slice(0, MAX_LABEL_CHARS), label };
+    return { agent: truncateChars(agent, MAX_LABEL_CHARS), label };
   }
 
   pi.on("tool_call", (event) => {
@@ -3697,7 +3754,7 @@ export default function (pi) {
     }
     const incomingAgent =
       typeof details.agent === "string" && details.agent.length > 0
-        ? details.agent.slice(0, MAX_LABEL_CHARS)
+        ? truncateChars(details.agent, MAX_LABEL_CHARS)
         : undefined;
     // A stale read's agent is distrusted with its status, and a missing
     // agent keeps the previous record's agent (never reset to a guess).
@@ -3754,7 +3811,7 @@ export default function (pi) {
     const previous = tasks.get(details.taskId);
     const agent =
       typeof details.agent === "string" && details.agent.length > 0
-        ? details.agent.slice(0, MAX_LABEL_CHARS)
+        ? truncateChars(details.agent, MAX_LABEL_CHARS)
         : (previous?.agent ?? "subagent");
     // Record identity is immutable per taskId: firstSeen never moves (T2b
     // ordering only) whether this observation promotes a background start

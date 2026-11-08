@@ -650,10 +650,14 @@ async function loadWireFactory(sockPath, paneId) {
   }
 }
 
-async function startWireServer() {
+// `options.maxTokenBytes` mirrors Herdr's real rule: one token value over the
+// ceiling rejects the WHOLE `pane.report_metadata` beat. Rejected beats are
+// recorded in `rejections` and never counted as received.
+async function startWireServer(options = {}) {
   const net = require('node:net');
   const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-wire-')), 'herdr.sock');
   const received = [];
+  const rejections = [];
   const conns = new Set();
   const server = net.createServer((conn) => {
     conns.add(conn);
@@ -673,6 +677,22 @@ async function startWireServer() {
           continue;
         }
         if (req && req.method === 'pane.report_metadata' && req.params && typeof req.params.tokens === 'object') {
+          const over =
+            options.maxTokenBytes === undefined
+              ? []
+              : Object.entries(req.params.tokens).filter(
+                  ([, value]) =>
+                    typeof value === 'string' && Buffer.byteLength(value, 'utf8') > options.maxTokenBytes,
+                );
+          if (over.length > 0) {
+            rejections.push({ names: over.map(([name]) => name), tokens: req.params.tokens });
+            try {
+              conn.write(
+                `${JSON.stringify({ id: req.id, error: { message: `token value over ${options.maxTokenBytes} bytes` } })}\n`,
+              );
+            } catch {}
+            continue;
+          }
           received.push(req.params.tokens);
         }
         try {
@@ -702,7 +722,7 @@ async function startWireServer() {
     }
     await new Promise((r) => server.close(r));
   };
-  return { sockPath, received, waitForFrom, close };
+  return { sockPath, received, rejections, waitForFrom, close };
 }
 
 test('deferred chat: witnessed presence absence completes the last delegate', async () => {
@@ -1939,6 +1959,171 @@ test('T3: the disclosure list caps at eight entries', async () => {
     assert.equal(capped.gentle_subs_v1.split(',').length, 8);
   } finally {
     await stopT3Wire(wire);
+  }
+});
+
+// --- Herdr byte ceiling: every published token value ≤ 512 UTF-8 bytes -----
+// Herdr rejects the WHOLE `pane.report_metadata` beat when any single token
+// value exceeds 512 BYTES. The producer bounded its CSV values in JS
+// characters, so eight distinct 64-character Japanese labels (inside every
+// documented character cap, ~1500 bytes on the wire) published
+// `gentle_names_v1` far past the ceiling and Herdr dropped the entire beat —
+// names, roles, work, subs and every marker together — leaving the pane on
+// its 60 s TTL.
+const MAX_HERDR_TOKEN_BYTES = 512;
+
+// 64 characters: two ASCII digits plus 62 CJK characters at 3 UTF-8 bytes
+// each, distinct per delegate and inside every documented character cap.
+function multibyteLabel(at) {
+  return `${String(at).padStart(2, '0')}${'作業'.repeat(31)}`;
+}
+
+function launchLabeled(h, callId, taskId, agent, label) {
+  h.fire('tool_call', { toolName: 'subagent_run', toolCallId: callId, input: { agent, label } });
+  h.fire('tool_result', {
+    toolName: 'subagent_run',
+    toolCallId: callId,
+    details: { gentleAgents: { taskId, agent, status: 'running' } },
+  });
+}
+
+function overCapTokens(tokens) {
+  return Object.entries(tokens)
+    .filter(([, value]) => typeof value === 'string' && Buffer.byteLength(value, 'utf8') > MAX_HERDR_TOKEN_BYTES)
+    .map(([name, value]) => ({ name, bytes: Buffer.byteLength(value, 'utf8') }));
+}
+
+// Same wiring as startT3Wire (throwaway agent home so the developer's real
+// launch roster never seeds the ordinals), with the wire server's Herdr byte
+// ceiling available to the caller.
+async function startByteBoundWire(paneId, sessionId, name, wireOptions = {}) {
+  const wire = await startWireServer(wireOptions);
+  const { factory, prevEnv } = await loadWireFactory(wire.sockPath, paneId);
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), `gentle-bytes-home-${name}-`));
+  const prevHome = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  const h = harness();
+  factory(h.pi);
+  const sessionFile = `/tmp/gentle-bytes-${name}-session`;
+  const { createHash } = require('node:crypto');
+  startT2bSession(h, sessionId, sessionFile);
+  return {
+    wire,
+    h,
+    prevEnv,
+    prevHome,
+    paneHash: createHash('sha256').update(sessionFile, 'utf8').digest('base64url'),
+  };
+}
+
+async function stopByteBoundWire(state) {
+  if (state.prevHome === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+  else process.env.GENTLE_PI_AGENT_HOME = state.prevHome;
+  process.env.HERDR_ENV = state.prevEnv.HERDR_ENV;
+  process.env.HERDR_SOCKET_PATH = state.prevEnv.HERDR_SOCKET_PATH;
+  process.env.HERDR_PANE_ID = state.prevEnv.HERDR_PANE_ID;
+  await state.wire.close();
+}
+
+test('Herdr byte ceiling: a multibyte session publishes only values at or under 512 bytes', async () => {
+  const state = await startByteBoundWire('test-pane-bytes', 'sess-bytes', 'multibyte');
+  const { wire, h, paneHash } = state;
+  try {
+    for (let index = 1; index <= 8; index += 1) {
+      launchLabeled(h, `run-m${index}`, `m${index}`, 'gentle-ai-worker', multibyteLabel(index));
+    }
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:8:`),
+      5000,
+      'eight running multibyte delegates',
+    );
+    assert.deepEqual(overCapTokens(beat), [], 'every published token value must fit 512 UTF-8 bytes');
+    // The byte bound must not cost the documented semantics: eight distinct
+    // disclosure entries, one role word, and advisory names that are whole
+    // labels — never a truncated or chunked fragment.
+    assert.equal(beat.gentle_subs_v1.split(',').length, 8);
+    assert.equal(beat.gentle_roles_v1, 'worker');
+    const labels = Array.from({ length: 8 }, (_, at) => multibyteLabel(at + 1));
+    const names = beat.gentle_names_v1.split(',');
+    assert.ok(names.length >= 1, 'advisory names survive the byte bound');
+    for (const name of names) assert.ok(labels.includes(name), `whole label expected, saw ${name}`);
+  } finally {
+    await stopByteBoundWire(state);
+  }
+});
+
+test('Herdr byte ceiling: the widest documented beat is accepted whole, never partially', async () => {
+  const state = await startByteBoundWire('test-pane-bytes-wide', 'sess-bytes-wide', 'wide', {
+    maxTokenBytes: MAX_HERDR_TOKEN_BYTES,
+  });
+  const { wire, h, paneHash } = state;
+  try {
+    h.fire('agent_start', {});
+    for (let index = 1; index <= 8; index += 1) {
+      launchLabeled(h, `run-w${index}`, `w${index}`, 'gentle-ai-worker', multibyteLabel(index));
+    }
+    h.fire('tool_execution_start', { toolCallId: 'ask-wide', toolName: 'ask_user_choice', args: {} });
+    h.fire('tool_execution_start', {
+      toolCallId: 'review-wide',
+      toolName: 'gentle_review_capture',
+      args: { lineageId: 'lin-1', collectBinding: '{}', reviewerRunAcknowledged: true },
+    });
+    const beat = await wire.waitForFrom(
+      0,
+      (p) =>
+        p.gentle_ask_v1 !== null &&
+        p.gentle_review_v1 !== null &&
+        typeof p.gentle_work_v1 === 'string' &&
+        p.gentle_work_v1.startsWith(`${paneHash}:8:`),
+      5000,
+      'the widest documented beat',
+    );
+    assert.deepEqual(
+      wire.rejections.map((rejection) => rejection.names),
+      [],
+      'Herdr must accept the widest beat whole',
+    );
+    // Nothing is dropped with a sibling token: every documented value rides in
+    // the one accepted report instead of being cleared by a rejected beat.
+    for (const name of [
+      'gentle_work_v1',
+      'gentle_names_v1',
+      'gentle_roles_v1',
+      'gentle_subs_v1',
+      'gentle_ask_v1',
+      'gentle_review_v1',
+      'gentle_orchestrating_v1',
+      'gentle_principal_v1',
+    ]) {
+      assert.ok(name in beat, `${name} must ride in the accepted beat`);
+      assert.notEqual(beat[name], null, `${name} must not be cleared in the widest beat`);
+    }
+    assert.equal(beat.gentle_subs_v1.split(',').length, 8);
+    assert.deepEqual(overCapTokens(beat), [], 'the accepted beat stays inside the ceiling');
+  } finally {
+    await stopByteBoundWire(state);
+  }
+});
+
+test('Herdr byte ceiling: an over-long astral label truncates on a character boundary', async () => {
+  const state = await startByteBoundWire('test-pane-bytes-astral', 'sess-bytes-astral', 'astral');
+  const { wire, h, paneHash } = state;
+  try {
+    // 80 astral characters: 160 UTF-16 units and 320 UTF-8 bytes. The 64-unit
+    // label cap must cut on a character boundary — 32 whole characters — and
+    // never leave a lone surrogate half on the wire.
+    launchLabeled(h, 'run-a1', 'a1', 'gentle-ai-worker', '🛠'.repeat(80));
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'one running delegate with an astral label',
+    );
+    assert.equal(beat.gentle_names_v1, '🛠'.repeat(32));
+    assert.deepEqual(overCapTokens(beat), []);
+  } finally {
+    await stopByteBoundWire(state);
   }
 });
 

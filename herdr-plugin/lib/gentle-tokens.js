@@ -43,7 +43,10 @@ const ROLE_RE = /^(explorer|explore|worker|verify|judge|rdd|review)$/;
 // Anything else is dropped (fail-closed). The producer truncates to 32,
 // so an overlong entry here is foreign/malformed, never a truncation.
 const ROLE_PASSTHROUGH_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-const MAX_ROLES_CHARS = 512;
+// Herdr's ceiling for one pane-metadata token value, in UTF-8 BYTES: the
+// producer bounds every published value against it, so an over-cap value here
+// is foreign or malformed and is rejected whole (see parseRoles/parseSubs).
+const MAX_TOKEN_BYTES = 512;
 // Root-session orchestrating marker (DESIGN §4.3): `<hash>:<expiry>` — the
 // same session binding and TTL discipline as gentle_work_v1 but carrying no
 // count. Emitted by the root Pi session while the main session is actively
@@ -69,13 +72,14 @@ const PRINCIPAL_TOKEN = 'gentle_principal_v1';
 const MARKER_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
 // Subagent disclosure list (`agents sidebar feedback` T3): CSV of
 // `<ordinal>:<agent>` entries, oldest launch first, at most 8 entries and 512
-// bytes. `<agent>` is the FULL agent package name (`gentle-ai-explore`), never
-// a role word, and entries are never merged — the launch ordinal is the entry
-// identity, so two runs of one agent are two entries. `<ordinal>` is the
-// 1-based launch ordinal within the session; a gap is normal (that subagent
-// finished), so ordinals are never renumbered. The producer clears the token
-// below two running subagents. Herdr renders the disclosure from this list
-// (2+ entries only) as `{agent} · {ordinal}`; the plugin only parses it.
+// UTF-8 bytes. `<agent>` is the FULL agent package name
+// (`gentle-ai-explore`), never a role word, and entries are never merged —
+// the launch ordinal is the entry identity, so two runs of one agent are two
+// entries. `<ordinal>` is the 1-based launch ordinal within the session; a gap
+// is normal (that subagent finished), so ordinals are never renumbered. The
+// producer clears the token below two running subagents. Herdr renders the
+// disclosure from this list (2+ entries only) as `{agent} · {ordinal}`; the
+// plugin only parses it.
 const SUBS_TOKEN = 'gentle_subs_v1';
 // Ordinal field: 1-based, never zero, same width bound as `count`.
 const SUBS_ORDINAL_RE = /^[1-9]\d{0,15}$/;
@@ -83,7 +87,6 @@ const SUBS_ORDINAL_RE = /^[1-9]\d{0,15}$/;
 // chars, no CSV separators, no quotes (NAME_BAD_RE), 1-64 chars.
 const MAX_SUBS_AGENT_CHARS = 64;
 const MAX_SUBS_ENTRIES = 8;
-const MAX_SUBS_CHARS = 512;
 // Durable ask signal (DESIGN §4.3): `<hash>:<intentId>:<expiry>` — the same
 // session binding and TTL discipline as gentle_work_v1. Emitted on every
 // producer beat while ask is active (rpiv questionnaire or Gentle Shell
@@ -578,7 +581,7 @@ function parseNames(value) {
 // than guessed.
 function parseRoles(value) {
   if (typeof value !== 'string' || value.length === 0) return [];
-  if (value.length > MAX_ROLES_CHARS) return [];
+  if (Buffer.byteLength(value, 'utf8') > MAX_TOKEN_BYTES) return [];
   const roles = [];
   for (const part of value.split(',')) {
     let role;
@@ -605,7 +608,7 @@ function parseRoles(value) {
 // oldest-first order. A wholly unusable value yields [] (no disclosure).
 function parseSubs(value) {
   if (typeof value !== 'string' || value.length === 0) return [];
-  if (value.length > MAX_SUBS_CHARS) return [];
+  if (Buffer.byteLength(value, 'utf8') > MAX_TOKEN_BYTES) return [];
   const parts = value.split(',');
   if (parts.length > MAX_SUBS_ENTRIES) return [];
   const seen = new Set();
