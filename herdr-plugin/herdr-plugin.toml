@@ -1,6 +1,6 @@
 id = "herdr-gentle-shell"
 name = "Herdr Gentle Shell"
-version = "0.4.0"
+version = "1.0.0"
 min_herdr_version = "0.9.4"
 description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
 platforms = ["linux"]
@@ -70,12 +70,10 @@ command = ["node", "bin/gentle-status.js", "--refresh"]
 # installed herdr-pi-tree convention (action_id/command/description/
 # platforms/title, observed via `herdr plugin action list`); platforms stays
 # linux-only to match this manifest. No [[build]] hook is wired: the plugin
-# ships no build step, so the supported entrypoint is the combined remote
-# installer `install.sh`, which installs + enables this plugin, installs the
-# Pi package with `pi install`, migrates an owned legacy managed copy of
-# extensions/gentle-herdr-state.ts aside, and runs the
-# configure action below (public stable example:
-# `curl -fsSL https://github.com/jonasotoaguilar/herdr-gentle-agents/releases/latest/download/install.sh | sh`).
+# ships no build step, so the supported install is the Herdr command
+# `herdr plugin install jonasotoaguilar/herdr-gentle-shell/herdr-plugin`
+# followed by `pi install npm:herdr-gentle-shell`, then the configure action
+# below (which appends the managed sidebar block and reloads).
 # Local development uses `herdr plugin link --enabled ./herdr-plugin`
 # followed by the configure action below; the Pi side installs with
 # `pi install` (repository root), never as a managed copy.

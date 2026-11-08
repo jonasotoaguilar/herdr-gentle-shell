@@ -1,15 +1,15 @@
 'use strict';
 
-// Project identity rename (customize-command S15/T9).
+// Project identity rename (customize-command S15/T9, release 1.0.0 T2).
 //
-// Bounded rename only: the published npm name becomes
-// `@jonasotoaguilar/herdr-gentle-shell` and the Herdr plugin becomes id
-// `herdr-gentle-shell` / display name `Herdr Gentle Shell`. Everything else
-// is pinned unchanged: the source repository keeps its current URL (no
-// assumed herdr-gentle-shell remote is ever created), the
-// `herdr-gentle:*` command verbs keep their names with no new aliases, and
-// persistent state paths, managed markers and the internal provider slot
-// keep their existing `herdr-gentle-agents` segments for compatibility.
+// Bounded rename only: the published npm name is `herdr-gentle-shell`, the
+// Herdr plugin id is `herdr-gentle-shell` / display name `Herdr Gentle Shell`,
+// and every install command and repository URL names the verified origin
+// `jonasotoaguilar/herdr-gentle-shell` (release 1.0.0 S4), because releases are
+// created there. The `herdr-gentle:*` command verbs keep their names with no
+// new aliases, and persistent state paths, managed markers and the internal
+// provider slot keep their existing `herdr-gentle-agents` segments for
+// compatibility.
 //
 // This suite asserts only current on-disk public metadata and contracts
 // (package.json, package-lock.json, the plugin manifest, README). The
@@ -25,18 +25,20 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
-const NEW_NPM_NAME = '@jonasotoaguilar/herdr-gentle-shell';
+const NEW_NPM_NAME = 'herdr-gentle-shell';
 const NEW_PLUGIN_ID = 'herdr-gentle-shell';
-// The actual existing repository. The rename never creates a remote under
-// the new name and never republishes existing URLs to one.
-const KEPT_REPO = 'github.com/jonasotoaguilar/herdr-gentle-agents';
+// The verified origin (release 1.0.0 S4): releases are created here, so every
+// install command and repository URL must resolve to it.
+const REPO = 'github.com/jonasotoaguilar/herdr-gentle-shell';
+// The retired repository name. Only historical/non-URL prose may keep it.
+const RETIRED_REPO = 'github.com/jonasotoaguilar/herdr-gentle-agents';
 
 function read(rel) {
   return fs.readFileSync(path.join(REPO_ROOT, rel), 'utf8');
 }
 
 describe('project identity rename (S15/T9)', () => {
-  it('package root carries the new npm name in the existing scope', () => {
+  it('package root carries the new npm name without a scope', () => {
     const pkg = JSON.parse(read('package.json'));
     assert.equal(pkg.name, NEW_NPM_NAME);
   });
@@ -71,22 +73,50 @@ describe('project identity rename (S15/T9)', () => {
     assert.match(match[1], /^\d+\.\d+\.\d+$/);
   });
 
-  it('published URLs still name the existing repository, never an assumed one', () => {
+  it('published URLs name the verified origin repository', () => {
     const pkg = JSON.parse(read('package.json'));
     for (const url of [pkg.homepage, pkg.bugs?.url, pkg.repository?.url]) {
       assert.ok(
-        String(url).includes(KEPT_REPO),
-        `published URL must keep the existing repository, got: ${url}`,
+        String(url).includes(REPO),
+        `published URL must name ${REPO}, got: ${url}`,
       );
     }
-    const readme = read('README.md');
-    assert.ok(readme.includes(`https://${KEPT_REPO}/releases/latest/download/install.sh`));
+  });
+
+  it('no published file still points at the retired repository', () => {
     for (const rel of ['package.json', 'package-lock.json', 'herdr-plugin/herdr-plugin.toml', 'README.md']) {
       assert.ok(
-        !read(rel).includes('github.com/jonasotoaguilar/herdr-gentle-shell'),
-        `${rel} must not invent a repository URL under the new name`,
+        !read(rel).includes(RETIRED_REPO),
+        `${rel} must not keep the retired repository URL`,
       );
     }
+  });
+
+  it('the README installs the Herdr plugin first, naming the verified repository', () => {
+    const readme = read('README.md');
+    assert.ok(
+      readme.includes('herdr plugin install jonasotoaguilar/herdr-gentle-shell/herdr-plugin'),
+      'the README must install the Herdr plugin from the verified repository',
+    );
+    assert.ok(
+      readme.indexOf('herdr plugin install jonasotoaguilar/herdr-gentle-shell/herdr-plugin')
+        < readme.indexOf('pi install npm:herdr-gentle-shell'),
+      'the Herdr plugin install must come before the Pi package install',
+    );
+  });
+
+  it('the README shows the Pi package install through both launchers', () => {
+    const readme = read('README.md');
+    const sentence = 'Inside a Gentle Shell session, the same package is installed through the shell\'s launcher:';
+    assert.ok(readme.includes(sentence), 'the README must carry the Gentle Shell launcher sentence');
+    assert.ok(
+      readme.includes('```sh\npi install npm:herdr-gentle-shell\n```'),
+      'the README must show the plain Pi install block',
+    );
+    assert.ok(
+      readme.indexOf(sentence) < readme.indexOf('```sh\ngentle-shell install npm:herdr-gentle-shell\n```'),
+      'the Gentle Shell block must follow its sentence',
+    );
   });
 
   it('the README carries the new visible identity', () => {
@@ -94,24 +124,11 @@ describe('project identity rename (S15/T9)', () => {
     assert.ok(readme.startsWith('# Herdr Gentle Shell\n'), 'README title must carry the new project name');
     assert.ok(readme.includes('![Herdr Gentle Shell banner]'), 'README banner alt must carry the new project name');
     assert.ok(readme.includes(`published to npm as \`${NEW_NPM_NAME}\``));
-    assert.ok(readme.includes(`\`npm:${NEW_NPM_NAME}\``), 'README npm install spec must carry the new name');
-    assert.ok(
-      readme.includes('`git:github.com/jonasotoaguilar/herdr-gentle-agents`'),
-      'README git install spec must keep the existing repository',
-    );
+    assert.ok(readme.includes('npm:herdr-gentle-shell'), 'README npm install spec must carry the new name');
     assert.ok(readme.includes(`--plugin ${NEW_PLUGIN_ID}`), 'README plugin commands must carry the new plugin id');
     assert.ok(readme.includes(`herdr plugin update ${NEW_PLUGIN_ID}`));
     assert.ok(
-      readme.includes('The repository root is the Pi package (`@jonasotoaguilar/herdr-gentle-shell`)'),
-    );
-  });
-
-  it('the README annotates that the source repository keeps its current URL', () => {
-    const readme = read('README.md');
-    assert.ok(
-      readme.includes('github.com/jonasotoaguilar/herdr-gentle-agents')
-        && /source repository[\s\S]*keeps|keeps[\s\S]*current URL|retains its current URL/i.test(readme),
-      'README must say the source repository keeps its current URL',
+      readme.includes('The repository root is the Pi package (`herdr-gentle-shell`)'),
     );
   });
 
