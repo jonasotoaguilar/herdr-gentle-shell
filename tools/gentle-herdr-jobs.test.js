@@ -247,3 +247,239 @@ test('jobs owned by another session never block this one', async () => {
   const states = herdrFrames.slice(before).filter((f) => f.method === 'pane.report_agent').map((f) => f.params.state);
   assert.ok(states.includes('idle'), `another session's job must not block this one (saw ${JSON.stringify(states)})`);
 });
+
+// S2/S3 (D2): the host never reports `done`, so the producer mints the finish
+// itself — one session-bound `gentle_done_v1` token at the settled-and-empty
+// edge, carrying the hold expiry. The sidebar reads `done` while it is fresh
+// and recedes to `idle` after it, and the finish notification hangs off that
+// same edge (never off a raw working->idle transition with work still left).
+const DONE_TOKEN = 'gentle_done_v1';
+
+async function waitFrom(from, predicate, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const hit = herdrFrames.slice(from).find(predicate);
+    if (hit) return hit;
+    if (Date.now() > deadline) return undefined;
+    await settle(25);
+  }
+}
+
+const metadataTokensFrom = (from) =>
+  herdrFrames
+    .slice(from)
+    .filter((f) => f && f.method === 'pane.report_metadata')
+    .map((f) => f.params.tokens ?? {});
+
+const doneValuesFrom = (from) =>
+  metadataTokensFrom(from)
+    .map((tokens) => tokens[DONE_TOKEN])
+    .filter((value) => typeof value === 'string');
+
+const finishesFrom = (from) =>
+  moshiFrames.slice(from).filter((f) => f && f.category === 'task_complete');
+
+test('the settle edge mints the finish token and notifies exactly once', async () => {
+  await listening;
+  const { default: factory } = await loadRuntime();
+  const h = harness();
+  factory(h.pi);
+  const moshiBefore = moshiFrames.length;
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(300);
+
+  const from = herdrFrames.length;
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const minted = await waitFrom(from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
+  assert.ok(minted, 'the settle edge publishes a finish token');
+  const value = minted.params.tokens[DONE_TOKEN];
+  assert.match(value, /^[A-Za-z0-9_-]{43}:\d+$/, 'the finish token is session-bound with an expiry');
+  const expiry = Number(value.split(':')[1]);
+  assert.ok(expiry > Date.now(), 'the finish hold is still in the future');
+  assert.ok(expiry <= Date.now() + 60000 + 1000, 'the hold defaults to 60 s');
+
+  await settle(600);
+  assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification for one finish');
+
+  // A repeated settle neither re-mints (the expiry is never refreshed, so the
+  // hold cannot be extended) nor re-notifies.
+  const settledAgain = herdrFrames.length;
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(600);
+  const held = doneValuesFrom(settledAgain);
+  assert.ok(held.length > 0, 'the live hold keeps publishing');
+  assert.ok(
+    held.every((token) => Number(token.split(':')[1]) === expiry),
+    'the published expiry never moves while the hold is live',
+  );
+  assert.equal(finishesFrom(moshiBefore).length, 1, 'a settled session never re-notifies');
+});
+
+test('the finish hold is overridable and its expiry clears the token', async () => {
+  await listening;
+  const mod = await loadRuntime();
+  assert.equal(typeof mod.doneHoldMs, 'function');
+  assert.equal(mod.doneHoldMs(undefined), 60000, 'default hold is 60 s');
+  assert.equal(mod.doneHoldMs('1500'), 1500, 'the hold is overridable');
+  assert.equal(mod.doneHoldMs('nonsense'), 60000, 'an unparseable override keeps the default');
+  assert.equal(mod.doneHoldMs('0'), 1000, 'clamped up to the floor');
+  assert.equal(mod.doneHoldMs('99999999'), mod.DONE_HOLD_MAX_MS, 'clamped down to the ceiling');
+
+  const { default: factory } = mod;
+  const h = harness();
+  factory(h.pi);
+  const moshiBefore = moshiFrames.length;
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(300);
+
+  const previous = process.env.GENTLE_HERDR_DONE_HOLD_MS;
+  process.env.GENTLE_HERDR_DONE_HOLD_MS = '1500';
+  try {
+    const from = herdrFrames.length;
+    h.fire('agent_settled', {}, ctx({ idle: true }));
+    const minted = await waitFrom(from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
+    assert.ok(minted, 'the settle edge publishes a finish token');
+    const expiry = Number(minted.params.tokens[DONE_TOKEN].split(':')[1]);
+    assert.ok(expiry - Date.now() <= 1500, 'the override shortens the hold');
+
+    await settle(1800);
+    const clearedFrom = herdrFrames.length;
+    h.fire('agent_settled', {}, ctx({ idle: true }));
+    const cleared = await waitFrom(
+      clearedFrom,
+      (f) => (f?.params?.tokens ?? {})[DONE_TOKEN] === null,
+    );
+    assert.ok(cleared, 'an expired hold republishes a clear instead of a stale done');
+    assert.equal(
+      doneValuesFrom(clearedFrom).length,
+      0,
+      'no live finish token is republished after the hold',
+    );
+    assert.equal(finishesFrom(moshiBefore).length, 1, 'an expired hold never re-notifies');
+  } finally {
+    if (previous === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+    else process.env.GENTLE_HERDR_DONE_HOLD_MS = previous;
+  }
+});
+
+test('no finish token is minted while a background job is still pending', async () => {
+  await listening;
+  const { default: factory } = await loadRuntime();
+  const h = harness();
+  factory(h.pi);
+  const moshiBefore = moshiFrames.length;
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-p1')]));
+  const from = herdrFrames.length;
+  await settleWithJobs(h);
+  await settle(400);
+  assert.deepEqual(doneValuesFrom(from), [], 'a pending job blocks the finish signal');
+  assert.ok(
+    metadataTokensFrom(from).length > 0,
+    'the producer keeps beating while the job waits',
+  );
+  assert.equal(finishesFrom(moshiBefore).length, 0, 'no finish notification while work is left');
+});
+
+const JOBS_TOKEN = 'gentle_jobs_v1';
+
+const jobCountsFrom = (from) =>
+  metadataTokensFrom(from)
+    .map((tokens) => tokens[JOBS_TOKEN])
+    .filter((value) => typeof value === 'string');
+
+// S5/D4: the pink `job` state. The producer publishes the pending count only
+// while the session waits on those jobs — principal settled, no delegate
+// running, no launch pending — and clears it on the beat the principal resumes
+// or a delegate starts, so the row can never linger on `job`. The last job
+// ending continues the normal sequence (done, then idle) and notifies then.
+test('a settled principal waiting on a job publishes the pending count', async () => {
+  await listening;
+  const { default: factory } = await loadRuntime();
+  const h = harness();
+  factory(h.pi);
+  const from = herdrFrames.length;
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-a'), job('job-b', 'monitor')]));
+  await settleWithJobs(h);
+
+  const waiting = await waitFrom(from, (f) => typeof (f?.params?.tokens ?? {})[JOBS_TOKEN] === 'string');
+  assert.ok(waiting, 'the job wait publishes its pending count');
+  const [hash, rawCount, rawExpiry] = waiting.params.tokens[JOBS_TOKEN].split(':');
+  assert.match(hash, /^[A-Za-z0-9_-]{43}$/, 'the count is session-bound');
+  assert.equal(Number(rawCount), 2, 'both pending jobs are counted');
+  assert.ok(Number(rawExpiry) > Date.now(), 'the count carries a TTL expiry');
+  assert.deepEqual(doneValuesFrom(from), [], 'a pending job is never a finish');
+});
+
+test('the job count clears the moment the principal resumes or a delegate starts', async () => {
+  await listening;
+  const { default: factory } = await loadRuntime();
+  const h = harness();
+  factory(h.pi);
+  const from = herdrFrames.length;
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-c')]));
+  await settleWithJobs(h);
+  assert.ok(
+    await waitFrom(from, (f) => typeof (f?.params?.tokens ?? {})[JOBS_TOKEN] === 'string'),
+    'waiting on the job shows the count',
+  );
+
+  const resumed = herdrFrames.length;
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  const cleared = await waitFrom(resumed, (f) => (f?.params?.tokens ?? {})[JOBS_TOKEN] === null);
+  assert.ok(cleared, 'the principal resuming clears the job count on that beat');
+
+  const settling = herdrFrames.length;
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const waitingAgain = await waitFrom(settling, (f) => typeof (f?.params?.tokens ?? {})[JOBS_TOKEN] === 'string');
+  assert.ok(waitingAgain, 'settling again with the job still live restores the count');
+
+  const launched = herdrFrames.length;
+  h.fire('tool_call', { toolName: 'subagent_run', toolCallId: 'tc-job-1', input: { agent: 'worker', label: 'job work' } });
+  const launchBeat = await waitFrom(launched, (f) => {
+    const tokens = f?.params?.tokens ?? {};
+    return tokens[JOBS_TOKEN] === null && typeof tokens.gentle_roles_v1 === 'string';
+  });
+  assert.ok(launchBeat, 'a delegate launch clears the job count on that beat');
+});
+
+test('the last job ending continues to done and notifies then', async () => {
+  await listening;
+  const { default: factory } = await loadRuntime();
+  const h = harness();
+  factory(h.pi);
+  const moshiBefore = moshiFrames.length;
+  const from = herdrFrames.length;
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-d')]));
+  await settleWithJobs(h);
+  assert.ok(
+    await waitFrom(from, (f) => typeof (f?.params?.tokens ?? {})[JOBS_TOKEN] === 'string'),
+    'the job wait shows the count',
+  );
+  assert.deepEqual(doneValuesFrom(from), [], 'no finish token while the job waits');
+  assert.equal(finishesFrom(moshiBefore).length, 0, 'no finish notification while the job waits');
+
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', []));
+  const finished = await waitFrom(from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
+  assert.ok(finished, 'the last job ending mints the finish token');
+  assert.equal(finished.params.tokens[JOBS_TOKEN], null, 'the job count clears on the finish beat');
+  await settle(600);
+  assert.equal(finishesFrom(moshiBefore).length, 1, 'the finish notification fires when the job ends');
+});
+
+test('the producer hold ceiling and the consumer freshness ceiling agree', async () => {
+  const mod = await loadRuntime();
+  const contract = require('../herdr-plugin/lib/gentle-tokens.js');
+  assert.equal(
+    contract.FINISH_HOLD_MAX_MS,
+    mod.DONE_HOLD_MAX_MS,
+    'an overridden hold must stay readable as done',
+  );
+  assert.equal(mod.doneHoldMs('999999999'), mod.DONE_HOLD_MAX_MS, 'the producer clamps to the same ceiling');
+  const hash = 'a'.repeat(43);
+  const expiry = Date.now() + mod.DONE_HOLD_MAX_MS;
+  assert.deepEqual(contract.parseDone(`${hash}:${expiry}`, hash, Date.now()), { expiry });
+});

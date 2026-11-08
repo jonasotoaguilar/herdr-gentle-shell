@@ -693,6 +693,27 @@ const paneId = process.env.HERDR_PANE_ID;
 
 const TTL_MS = 60000;
 const BEAT_MS = 15000;
+// Synthesized finish signal (DESIGN §4.3, S2/D2). The host never reports
+// `done`, so the producer mints the finish itself: one session-bound
+// `<hash>:<expiry>` token per finish at the settled-and-empty edge, carrying
+// the hold as its absolute expiry. The sidebar reads it as `done` while it is
+// fresh and recedes to `idle` once it expires — the delay IS that expiry, so
+// no timer and no extra idle hold exists. The hold defaults to 60 s and is
+// overridden through GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min]; the
+// consumer rejects any expiry beyond the same ceiling.
+const DONE_TOKEN = "gentle_done_v1";
+const DONE_HOLD_MS = 60000;
+const DONE_HOLD_MIN_MS = 1000;
+export const DONE_HOLD_MAX_MS = 300000;
+const DONE_HOLD_ENV = "GENTLE_HERDR_DONE_HOLD_MS";
+// Pending background-job count (DESIGN §4.3, S5/D4): the same
+// `<hash>:<count>:<expiry>` shape as gentle_work_v1, but carrying the number of
+// live `bash_background` / `monitor` jobs from Gentle Shell's own snapshot and
+// published ONLY while the session is purely waiting for them — the principal
+// settled, no delegate running, no launch pending — so the sidebar can show the
+// pink `job` state instead of generic activity. Cleared on the next beat once
+// the principal resumes, a delegate starts, or the last job ends.
+const JOBS_TOKEN = "gentle_jobs_v1";
 const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
 // Herdr's wire ceiling for a single pane-metadata token value, measured in
@@ -828,6 +849,17 @@ function sanitizeId(value, fallbackPrefix) {
 
 function utf8Bytes(value) {
   return Buffer.byteLength(value, "utf8");
+}
+
+// Finish-hold override: an absent or unparseable value keeps the 60 s
+// default, and anything outside the ceiling is clamped, so the producer can
+// never publish an expiry the consumer reads as foreign.
+export function doneHoldMs(raw = process.env[DONE_HOLD_ENV]) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0) return DONE_HOLD_MS;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return DONE_HOLD_MS;
+  return Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(parsed)));
 }
 
 // Cap a label at MAX_LABEL_CHARS UTF-16 units — the same unit the consumer's
@@ -1836,8 +1868,9 @@ function lastFinishedLabel(taskMap) {
 }
 
 // ---------------------------------------------------------------------------
-// `/herdr-gentle:customize`: exactly two switches, offered in the former
-// floating two-pane panel (odd/tasks/restore-customize-panel.md T1).
+// `/herdr-gentle:customize`: exactly two switches, offered in the floating panel
+// shaped like Gentle Shell's own card (odd/tasks/restore-customize-panel.md T1;
+// odd/tasks/customize-parity-done-idle.md T1/T3).
 //
 // The command is registered BEFORE the `enabled()` gate in the factory below,
 // so it stays reachable from a plain Pi session outside a Herdr pane; the
@@ -2315,11 +2348,15 @@ async function applyCustomizeSwitch(id, value, ctx) {
 // The single apply path shared by the overlay and the menu fallback. An
 // inconclusive sidebar verdict is never a refusal: choosing On still attempts
 // the repair and reports the apply step's own error, exactly like the baseline
-// menu did.
-async function applyCustomizeChoice(categoryId, valueId, ctx) {
-  if (categoryId !== "sidebar" && categoryId !== "moshi") return;
+// menu did. `switchId` names the switch a row drives when it lives under
+// another category — the notifications row inside `Herdr Sidebar` applies the
+// same `moshi` switch as the `Moshi notifications` category, so the one flag
+// file stays the single source of truth.
+async function applyCustomizeChoice(categoryId, valueId, ctx, switchId) {
+  const target = switchId === "sidebar" || switchId === "moshi" ? switchId : categoryId;
+  if (target !== "sidebar" && target !== "moshi") return;
   if (valueId !== "on" && valueId !== "off") return;
-  await applyCustomizeSwitch(categoryId, valueId, ctx);
+  await applyCustomizeSwitch(target, valueId, ctx);
 }
 
 // The former plain menu, kept as the fallback when the TUI helpers or
@@ -2416,7 +2453,7 @@ async function executeCustomize(rawArgs, ctx) {
     // Esc (null) does nothing at all: no notification, no write, no reload.
     // Anything else runs the single apply path once the overlay is disposed.
     if (!choice || typeof choice !== "object") return;
-    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx);
+    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx, choice.switchId);
     return;
   }
   await runCustomizeFallback(ctx);
@@ -2652,6 +2689,15 @@ export default function (pi) {
   let nativeSending = null;
   let nativeLastOk = undefined;
   let nativeSettledPending = false;
+  // Finish-hold episode (S2): minted once at the settled-and-empty edge so the
+  // row reads `done`, then republished unchanged (never refreshed) until the
+  // hold expires. `donePending` carries the unannounced finish to the beat
+  // that actually delivers the token (S3), and `sawActivity` remembers that
+  // the session did work, so a session that never ran a turn stays idle. All
+  // three clear with the session and the moment any work reappears.
+  let doneExpiry;
+  let donePending = false;
+  let sawActivity = false;
   // LIVE-1 startup latency: the session binding is still INITIATED on
   // session_start (so Herdr can attribute the pane from the first frame), but
   // the host no longer waits for it. The host awaits every session_start
@@ -2999,6 +3045,53 @@ export default function (pi) {
     // how many delegates keep running.
     if (agentActive) tokens[PRINCIPAL_TOKEN] = `${sessionHash}:${expiry}`;
     else tokens[PRINCIPAL_TOKEN] = null;
+    // Synthesized finish signal (S2/D2): minted once at the settled-and-empty
+    // edge — principal settled with no running/queued delegate, no pending
+    // launch, no live background job, and no human-wait, review, or error leg
+    // — then republished with the SAME expiry so the hold can never be
+    // extended. Any work appearing during the hold clears it on that beat, so
+    // the row moves straight back to the role/job state. A session that never
+    // worked never mints one.
+    const activity =
+      agentActive ||
+      subs.length > 0 ||
+      pendingCalls.size > 0 ||
+      runningJobCount() > 0 ||
+      askActiveNow() ||
+      reviewActive ||
+      !!errorCode;
+    if (activity) {
+      sawActivity = true;
+      doneExpiry = undefined;
+      donePending = false;
+    } else if (settled) {
+      if (doneExpiry === undefined && sawActivity) {
+        doneExpiry = Date.now() + doneHoldMs();
+        donePending = true;
+        sawActivity = false;
+      }
+      if (doneExpiry !== undefined && Date.now() >= doneExpiry) {
+        doneExpiry = undefined;
+        donePending = false;
+      }
+    } else {
+      doneExpiry = undefined;
+      donePending = false;
+    }
+    tokens[DONE_TOKEN] = doneExpiry === undefined ? null : `${sessionHash}:${doneExpiry}`;
+    // Pending background jobs (S5/D4): display-only count, published only while
+    // the session waits on them. `nativeSettledPending` is included because a
+    // launch that was in flight when the principal settled has already left
+    // `pendingCalls` — it is still pending work, never a job wait.
+    const jobCount =
+      !agentActive &&
+      settled &&
+      !nativeSettledPending &&
+      subs.length === 0 &&
+      pendingCalls.size === 0
+        ? runningJobCount()
+        : 0;
+    tokens[JOBS_TOKEN] = jobCount > 0 ? `${sessionHash}:${jobCount}:${expiry}` : null;
     if (changes.files > 0) {
       const files = String(changes.files);
       const added = String(changes.added);
@@ -3039,7 +3132,8 @@ export default function (pi) {
       askToolCalls.size > 0 ||
       uiPromptActive ||
       reviewActive ||
-      emittedLabel !== undefined
+      emittedLabel !== undefined ||
+      doneExpiry !== undefined
     );
   }
 
@@ -3189,6 +3283,24 @@ export default function (pi) {
     }
   }
 
+  // Moshi replacement (DESIGN §7, S3): the finish notification hangs off the
+  // synthesized `done` edge — the beat that delivered the finish token, minted
+  // only when the principal settled with zero delegates, pending launches, and
+  // live jobs — never off a raw native working->idle transition, which fires
+  // with work still left and used to skip `done` entirely.
+  function emitFinish() {
+    const project = moshiContext?.project ?? "Gentle";
+    const lastLabel = lastFinishedLabel(tasks);
+    moshiEmit("AgentEnd", {
+      category: "task_complete",
+      title: `Gentle finished: ${project}`,
+      message:
+        lastLabel !== undefined
+          ? `${project} finished \u2014 ${lastLabel}. Return to Pi for what\u2019s next.`
+          : `${project} finished and is waiting for your next instruction.`,
+    });
+  }
+
   async function drainNative() {
     if (!enabled()) return;
     if (nativeInFlight) return;
@@ -3233,25 +3345,7 @@ export default function (pi) {
           // transition (attempt loop above, then beats — never a re-queue here).
           if (nativeSending === next) nativeSending = null;
         }
-        if (ok) {
-          const wasWorking = nativeLastOk?.state === "working";
-          nativeLastOk = next;
-          // Moshi replacement (DESIGN §7): the real finish is the native
-          // transition into `idle` — settled plus zero running/queued plus
-          // zero pending plus no human wait — never a settle with work left.
-          if (wasWorking && next.state === "idle") {
-            const project = moshiContext?.project ?? "Gentle";
-            const lastLabel = lastFinishedLabel(tasks);
-            moshiEmit("AgentEnd", {
-              category: "task_complete",
-              title: `Gentle finished: ${project}`,
-              message:
-                lastLabel !== undefined
-                  ? `${project} finished \u2014 ${lastLabel}. Return to Pi for what\u2019s next.`
-                  : `${project} finished and is waiting for your next instruction.`,
-            });
-          }
-        }
+        if (ok) nativeLastOk = next;
       }
     } finally {
       nativeInFlight = false;
@@ -3301,6 +3395,10 @@ export default function (pi) {
     try {
       const ok = await sendTokens(tokens);
       if (ok) {
+        if (donePending) {
+          donePending = false;
+          emitFinish();
+        }
         if (transportFails >= TRANSPORT_FAIL_LATCH && errorCode === "transport") {
           errorCode = undefined;
           updateBlocker();
@@ -3434,6 +3532,9 @@ export default function (pi) {
     nativeSending = null;
     nativeLastOk = undefined;
     nativeSettledPending = false;
+    doneExpiry = undefined;
+    donePending = false;
+    sawActivity = false;
     errorCode = undefined;
     liveGen += 1;
     liveInFlight = false;

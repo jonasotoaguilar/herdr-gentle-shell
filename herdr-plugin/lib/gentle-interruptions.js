@@ -30,10 +30,12 @@ const INTERRUPTION_REASON = 'agent_disappeared';
 // Reducer displays that count as unfinished owned activity. Terminal
 // `done`/`idle` are excluded: a settled done with fresh count 0 is proof
 // of completion, never disappearance, and idle covers stale/foreign/empty
-// evidence that must fail closed.
+// evidence that must fail closed. `job` is a wait, not an end: a producer
+// that dies while the principal waits on background jobs never finished.
 const UNFINISHED_DISPLAYS = new Set([
   'working',
   'orchestrating',
+  'job',
   'explorer',
   'worker',
   'verify',
