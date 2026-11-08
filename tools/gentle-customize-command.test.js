@@ -17,6 +17,13 @@
 // - the sidebar switch drives the Herdr plugin's own
 //   `bin/configure.js --check|--apply --reload|--uninstall --reload`.
 //
+// The restored floating panel (odd/tasks/restore-customize-panel.md T1) adds
+// one more path, pinned below through `ctx.ui.custom` only: no argument opens
+// the former two-pane overlay with the exact options, its factory renders and
+// navigates both switches, Esc writes nothing, and Enter runs the same single
+// apply path the menu uses. The menu itself stays the fallback when the TUI
+// helpers or `ctx.ui.custom` are unavailable.
+//
 // The extension is TypeScript with one package import that is unresolvable
 // under plain node, so the tests load a renamed copy with exactly that import
 // line stubbed (same approach as tools/gentle-herdr-state.test.js). Every
@@ -44,6 +51,9 @@ assert.ok(
 );
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-customize-'));
+// The copied extension lives outside the repo, so the panel helper is loaded
+// from the real lib/ through the documented override.
+process.env.GENTLE_CUSTOMIZE_LIB_DIR = path.join(REPO_ROOT, 'lib');
 const COPY = path.join(ROOT, 'gentle-herdr-state.mjs');
 fs.writeFileSync(COPY, stubbed);
 const copyUrl = pathToFileURL(COPY).href;
@@ -82,10 +92,11 @@ function fixture(name) {
   return dir;
 }
 
-function harness() {
+function harness({ customImpl } = {}) {
   const commands = new Map();
   const notices = [];
   const selections = [];
+  const customs = [];
   const reloads = [];
   const handlerKinds = [];
   const pi = {
@@ -93,20 +104,25 @@ function harness() {
     events: { on: () => {}, emit: () => {} },
     registerCommand: (name, definition) => commands.set(name, definition),
   };
-  const ctx = {
-    ui: {
-      notify: (message, level) => notices.push([message, level ?? 'info']),
-      select: async () => selections.shift(),
-    },
-    reload: async () => reloads.push(true),
+  const ui = {
+    notify: (message, level) => notices.push([message, level ?? 'info']),
+    select: async () => selections.shift(),
   };
-  return { pi, ctx, commands, notices, selections, reloads, handlerKinds };
+  if (typeof customImpl === 'function') {
+    ui.custom = async (factory, options) => {
+      customs.push([factory, options]);
+      return customImpl(factory, options);
+    };
+  }
+  const ctx = { ui, reload: async () => reloads.push(true) };
+  return { pi, ctx, commands, notices, selections, customs, reloads, handlerKinds };
 }
 
 let moduleCache = null;
 async function loadExtension(h) {
   if (moduleCache === null) moduleCache = await factoryPromise;
   moduleCache.default(h.pi);
+  return moduleCache;
 }
 
 async function run(h, args) {
@@ -118,6 +134,28 @@ async function run(h, args) {
 
 function noticeTexts(h) {
   return h.notices.map(([message]) => message);
+}
+
+// The pi-tui shape the panel consumes; inputs arrive as plain strings.
+const stubTui = {
+  visibleWidth: (s) => [...String(s)].length,
+  truncateToWidth: (s, w) => {
+    const chars = [...String(s)];
+    return chars.length > w ? chars.slice(0, w).join('') : String(s);
+  },
+  matchesKey: (key, name) => key === name,
+  isKeyRelease: (key) => key === 'release',
+};
+
+// Drive the component the way the host does: factory(hostTui, theme,
+// keybindings, done), keystrokes through handleInput and the result through
+// done(). A component that never finishes fails fast instead of hanging.
+function openPanel(factory, hostTui = {}) {
+  let settled = 'pending';
+  const component = factory(hostTui, {}, {}, (result) => { settled = result; });
+  assert.equal(typeof component.render, 'function');
+  assert.equal(typeof component.handleInput, 'function');
+  return { component, done: () => settled };
 }
 
 before(() => {
@@ -158,6 +196,7 @@ function setupEnvironment(name, { moshiHooks = true } = {}) {
   process.env.GENTLE_STATUS_STATE_DIR = stateDir;
   process.env.GENTLE_PI_AGENT_HOME = agentDir;
   process.env.GENTLE_HERDR_PLUGIN_ROOT = path.join(REPO_ROOT, 'herdr-plugin');
+  process.env.GENTLE_CUSTOMIZE_LIB_DIR = path.join(REPO_ROOT, 'lib');
   const configPath = path.join(dir, 'config.toml');
   process.env.HERDR_CONFIG_PATH = configPath;
   const callLog = path.join(dir, 'herdr-calls.log');
@@ -437,3 +476,252 @@ test('customize menu offers exactly the two switches and On/Off', async () => {
   assert.equal(offered[0][0], 'Customize · Herdr Gentle Shell');
   assert.equal(offered[1][0], 'Moshi notifications (currently off)');
 });
+
+/* ------------------------------------------------ restored floating panel */
+
+describe('floating customize panel', () => {
+  function makeHostTui() {
+    const paints = [];
+    return { paints, tui: { requestRender: () => { paints.push(true); } } };
+  }
+
+  test('no argument opens the restored two-pane overlay with the exact options', async () => {
+    const env = setupEnvironment('overlay-open');
+    fs.writeFileSync(env.configPath, '');
+    const configBefore = fs.readFileSync(env.configPath, 'utf8');
+    const h = harness({ customImpl: async () => undefined });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.equal(h.customs.length, 1, 'expected exactly one custom() call');
+    assert.deepEqual(h.customs[0][1], {
+      overlay: true,
+      overlayOptions: { anchor: 'center', width: '70%', minWidth: 60, maxHeight: '85%' },
+    });
+    // Opening the panel writes and announces nothing: the factory is only
+    // captured, and the overlay is disposed by the host without a result.
+    assert.deepEqual(noticeTexts(h), []);
+    assert.deepEqual(h.reloads, []);
+    assert.equal(fs.existsSync(env.flagPath), false);
+    assert.equal(fs.readFileSync(env.configPath, 'utf8'), configBefore);
+
+    const host = makeHostTui();
+    const { component } = openPanel(h.customs[0][0], host.tui);
+    const seen = component.render(100).join('\n');
+    for (const copy of [
+      'Customize · Herdr Gentle Shell',
+      'CATEGORIES',
+      'Herdr Sidebar',
+      'Moshi notifications',
+      'Preview · Off',
+      '←/→ or Tab panes · ↑/↓ or j/k move · Enter apply · Esc close',
+    ]) {
+      assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
+    }
+    for (const gone of ['Plugin tools', 'Worktree tools', 'Reset every option']) {
+      assert.equal(seen.includes(gone), false, `removed section still rendered: ${gone}`);
+    }
+  });
+
+  test('movement repaints and writes nothing', async () => {
+    const env = setupEnvironment('overlay-navigation');
+    fs.writeFileSync(env.configPath, '');
+    const configBefore = fs.readFileSync(env.configPath, 'utf8');
+    const host = makeHostTui();
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, host.tui);
+        assert.ok(component.render(100).join('\n').includes('▸ Herdr Sidebar'));
+        component.handleInput('down');
+        assert.equal(host.paints.length, 1, 'a selection change requests a repaint');
+        assert.ok(component.render(100).join('\n').includes('▸ Moshi notifications'));
+        assert.equal(done(), 'pending', 'movement never finishes the overlay');
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), []);
+    assert.deepEqual(h.reloads, []);
+    assert.equal(fs.readFileSync(env.configPath, 'utf8'), configBefore);
+  });
+
+  test('Esc closes the overlay with zero writes', async () => {
+    const env = setupEnvironment('overlay-esc');
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('escape');
+        assert.equal(done(), null, 'Esc finishes the overlay with null');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), []);
+    assert.deepEqual(h.reloads, []);
+    assert.equal(fs.existsSync(env.flagPath), false);
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
+  });
+
+  test('Enter applies the chosen sidebar row through the same apply path', async () => {
+    const env = setupEnvironment('overlay-sidebar-on');
+    fs.writeFileSync(env.configPath, '[ui.sidebar.agents]\nignored = true\n');
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('right');
+        component.handleInput('up');
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), [
+      'Sidebar agent rows enabled; the managed block is in place and Herdr reloaded its config.',
+    ]);
+    const applied = fs.readFileSync(env.configPath, 'utf8');
+    assert.ok(applied.includes(MANAGED_BEGIN) && applied.includes(MANAGED_END));
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('Enter applies the chosen Moshi row with the usual gate and reload', async () => {
+    const env = setupEnvironment('overlay-moshi-on');
+    installMoshiHook(env.pathDir, { paired: true });
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('up');
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), [
+      `Moshi notifications enabled. added ${MOSHI_ENTRY}. Reloading now to apply the change.`,
+    ]);
+    assert.equal(readSettings(env.flagPath).enabled, true);
+    assert.deepEqual(readSettings(env.settingsPath).extensions, ['keep-me', MOSHI_ENTRY]);
+    assert.equal(h.reloads.length, 1);
+  });
+
+  test('an unavailable TUI helper keeps the menu fallback', async () => {
+    const env = setupEnvironment('overlay-no-tui');
+    fs.writeFileSync(env.flagPath, `${JSON.stringify({ enabled: true })}\n`);
+    writeSettings(env.settingsPath, { extensions: ['keep-me', MOSHI_ENTRY] });
+    const h = harness({
+      customImpl: async () => { throw new Error('the overlay must not open without helpers'); },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => { throw new Error('pi-tui unavailable'); });
+    h.selections.push('Moshi notifications', 'Off');
+    await run(h, '');
+    assert.equal(h.customs.length, 0);
+    assert.deepEqual(noticeTexts(h), [
+      `Moshi notifications disabled. removed ${MOSHI_ENTRY}. Reloading now to apply the change.`,
+    ]);
+    assert.equal(h.reloads.length, 1);
+  });
+
+  test('a missing panel module keeps the menu fallback (single-file deployment)', async () => {
+    const env = setupEnvironment('overlay-no-module');
+    process.env.GENTLE_CUSTOMIZE_LIB_DIR = path.join(env.dir, 'missing-lib');
+    fs.writeFileSync(env.flagPath, `${JSON.stringify({ enabled: true })}\n`);
+    writeSettings(env.settingsPath, { extensions: ['keep-me', MOSHI_ENTRY] });
+    const h = harness({ customImpl: async () => { throw new Error('the overlay needs the panel module'); } });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    h.selections.push('Moshi notifications', 'Off');
+    await run(h, '');
+    assert.equal(h.customs.length, 0);
+    assert.deepEqual(noticeTexts(h), [
+      `Moshi notifications disabled. removed ${MOSHI_ENTRY}. Reloading now to apply the change.`,
+    ]);
+    assert.equal(h.reloads.length, 1);
+  });
+
+  test('a host that rejects the overlay degrades to the menu', async () => {
+    const env = setupEnvironment('overlay-rejected');
+    fs.writeFileSync(env.flagPath, `${JSON.stringify({ enabled: true })}\n`);
+    writeSettings(env.settingsPath, { extensions: ['keep-me', MOSHI_ENTRY] });
+    const h = harness({
+      customImpl: async () => { throw new Error('overlay unsupported'); },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    h.selections.push('Moshi notifications', 'Off');
+    await run(h, '');
+    assert.equal(h.customs.length, 1);
+    assert.deepEqual(noticeTexts(h), [
+      `Moshi notifications disabled. removed ${MOSHI_ENTRY}. Reloading now to apply the change.`,
+    ]);
+    assert.equal(h.reloads.length, 1);
+  });
+});
+
+/* ------------------------------------------- inconclusive sidebar --check */
+
+describe('inconclusive sidebar state', () => {
+  // A foreign rows_by_agent override makes configure.js --check exit 2, which
+  // readSidebarRows reports as `unknown`. The baseline menu never blocked the
+  // repair on that verdict: choosing On still ran --apply and reported its own
+  // refusal. These tests pin that observable behavior for both entry points.
+  const UNMANAGED_CONFIG = '[ui.sidebar.agents.rows_by_agent]\nuser = "x"\n';
+  const INCONCLUSIVE_APPLY_TEXT =
+    'Could not enable the sidebar agent rows: configure exited 2: ' +
+    'configure: refusing --apply: an unmanaged [ui.sidebar.agents.rows_by_agent] override already exists. ' +
+    'This tool only manages its marked block and will not adopt or overwrite foreign config. ' +
+    'Remove or rename the existing override, then re-run --apply. Nothing was changed.';
+
+  test('baseline: the menu still attempts On and reports the apply refusal', async () => {
+    const env = setupEnvironment('sidebar-inconclusive-menu');
+    fs.writeFileSync(env.configPath, UNMANAGED_CONFIG);
+    const h = harness();
+    h.selections.push('Sidebar agent rows', 'On');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), [INCONCLUSIVE_APPLY_TEXT]);
+    assert.deepEqual(h.notices.map(([, level]) => level), ['error']);
+    assert.equal(fs.readFileSync(env.configPath, 'utf8'), UNMANAGED_CONFIG, 'the refusal writes nothing');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('the overlay conveys unknown and still attempts On', async () => {
+    const env = setupEnvironment('sidebar-inconclusive-overlay');
+    fs.writeFileSync(env.configPath, UNMANAGED_CONFIG);
+    let renderSeen = '';
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        renderSeen = component.render(100).join('\n');
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.ok(renderSeen.includes('state unknown'), 'the panel explains the inconclusive state');
+    assert.equal(renderSeen.includes('(unavailable in this session)'), false, 'the repair is never blocked');
+    assert.deepEqual(noticeTexts(h), [INCONCLUSIVE_APPLY_TEXT]);
+    assert.deepEqual(h.notices.map(([, level]) => level), ['error']);
+    assert.equal(fs.readFileSync(env.configPath, 'utf8'), UNMANAGED_CONFIG, 'the refusal writes nothing');
+    assert.deepEqual(h.reloads, []);
+  });
+});
+
+function makeHostTui() {
+  const paints = [];
+  return { paints, tui: { requestRender: () => { paints.push(true); } } };
+}

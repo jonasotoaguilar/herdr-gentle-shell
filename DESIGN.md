@@ -710,8 +710,17 @@ nothing:
   waits for the next Pi extension load.
 
 `/herdr-gentle:customize status` prints one read-only line; an unknown
-argument, Esc, or a cancelled menu writes nothing. The removed `Plugin tools`
-and `Reset` sections, the two-pane TUI and the in-process provider slot
+argument, Esc, or a cancelled menu writes nothing. With no argument the
+command opens the recovered floating two-pane panel
+(`lib/customize-panel.js`, painted through its own palette)
+over `ctx.ui.custom`: `←/→` or `Tab` moves between the category and value panes,
+`↑/↓` or `j/k` moves the cursor, `Enter` applies the focused row and `Esc`
+closes without a write. An inconclusive sidebar verdict (`unknown`) is shown
+as a note instead of hiding the rows: choosing `On` still attempts the repair
+and reports the apply step's own error, exactly like the menu. The plain
+two-step `ctx.ui.select` menu remains the
+fallback when the TUI helpers or `ctx.ui.custom` are unavailable. The removed
+`Plugin tools` and `Reset` sections and the in-process provider slot
 `globalThis[Symbol.for("herdr-gentle.customize.v1")]` are not restored: they
 switched worktree/ODD/issues surfaces this package no longer contains, so
 exactly one mechanism writes each piece of state.
