@@ -78,15 +78,6 @@ const PRINCIPAL_TOKEN = 'gentle_principal_v1';
 // expiry either side accepts (the producer clamps its override to it).
 const DONE_TOKEN = 'gentle_done_v1';
 const FINISH_HOLD_MAX_MS = 300000;
-// Pending background-job count (DESIGN §4.3, S5/D4): `<hash>:<count>:<expiry>` —
-// the same grammar, session binding, and TTL-freshness rule as
-// gentle_work_v1, carrying the number of live `bash_background` / `monitor`
-// jobs instead of delegates. The producer publishes it only while the session
-// is purely waiting on those jobs (principal settled, no delegate running or
-// launching), so a fresh count is the whole evidence for the pink `job` state;
-// it outranks the terminal `done` and disappears the beat the principal
-// resumes or a delegate starts.
-const JOBS_TOKEN = 'gentle_jobs_v1';
 // Presence-marker grammar shared by both markers above: `<hash>:<expiry>`,
 // no count.
 const MARKER_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
@@ -124,23 +115,21 @@ const TTL_MS = 60000;
 // Reduced displays, DESIGN §5.2. Activity states are the TaskStore roles
 // (explorer/worker/verify/judge) plus the root-session `orchestrating`
 // marker (fresh while the main session actively works, even with zero
-// subagents) plus the pink `job` wait (principal settled, no delegate, at
-// least one background job still pending) plus generic activity (machine key
-// `working`, visible word `gentle`). The principal's own activity marker
-// decides working vs idle, never the delegate count and never the aggregate
-// native status: a working principal renders `gentle` (pink `orchestrating`
-// with a fresh marker) and outranks a delegate role word, while an idle
-// principal shows the oldest role word however many delegates run. Attention
-// states (ask/review/error) outrank both; the pending-job wait sits above the
-// terminal `done` and below every live activity signal. Role labels carry the
-// running delegate total when it exceeds one; the job label carries the pending
-// job total the same way.
-const DISPLAYS = ['working', 'orchestrating', 'job', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error', 'done', 'idle'];
+// subagents) plus generic activity (machine key `working`, visible word
+// `gentle`). The principal's own activity marker decides working vs idle,
+// never the delegate count and never the aggregate native status: a working
+// principal renders `gentle` (pink `orchestrating` with a fresh marker) and
+// outranks a delegate role word, while an idle principal shows the oldest
+// role word however many delegates run. Attention states (ask/review/error)
+// outrank both and sit above the terminal `done`. Role labels carry the
+// running delegate total when it exceeds one. No background-job display
+// exists: a live job is pending work the producer keeps out of `done`, never
+// a row state of its own.
+const DISPLAYS = ['working', 'orchestrating', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error', 'done', 'idle'];
 
 const STATE_TOKENS = {
   working: 'gentle_state_working',
   orchestrating: 'gentle_state_orchestrating',
-  job: 'gentle_state_job',
   explorer: 'gentle_state_explorer',
   worker: 'gentle_state_worker',
   verify: 'gentle_state_verify',
@@ -155,7 +144,6 @@ const STATE_TOKENS = {
 const TITLE_TOKENS = {
   working: 'gentle_title_working',
   orchestrating: 'gentle_title_orchestrating',
-  job: 'gentle_title_job',
   explorer: 'gentle_title_explorer',
   worker: 'gentle_title_worker',
   verify: 'gentle_title_verify',
@@ -177,7 +165,6 @@ const TITLE_TOKENS = {
 const AGENT_TOKENS = {
   working: 'gentle_agent_working',
   orchestrating: 'gentle_agent_orchestrating',
-  job: 'gentle_agent_job',
   explorer: 'gentle_agent_explorer',
   worker: 'gentle_agent_worker',
   verify: 'gentle_agent_verify',
@@ -212,7 +199,6 @@ const AGENT_TOKEN = 'gentle_agent';
 const ICON_TOKENS = {
   working: 'gentle_icon_working',
   orchestrating: 'gentle_icon_orchestrating',
-  job: 'gentle_icon_job',
   explorer: 'gentle_icon_explorer',
   worker: 'gentle_icon_worker',
   verify: 'gentle_icon_verify',
@@ -234,7 +220,6 @@ const ICON_TOKENS = {
 const HEADING_TOKENS = {
   working: 'gentle_heading_working',
   orchestrating: 'gentle_heading_orchestrating',
-  job: 'gentle_heading_job',
   explorer: 'gentle_heading_explorer',
   worker: 'gentle_heading_worker',
   verify: 'gentle_heading_verify',
@@ -263,7 +248,6 @@ const HEADING_TOKENS = {
 const ROW_TOKENS = {
   working: 'gentle_row_working',
   orchestrating: 'gentle_row_orchestrating',
-  job: 'gentle_row_job',
   explorer: 'gentle_row_explorer',
   worker: 'gentle_row_worker',
   verify: 'gentle_row_verify',
@@ -290,7 +274,6 @@ const ROW_TOKENS = {
 const ROW_ICONS = {
   working: '●',
   orchestrating: '●',
-  job: '●',
   explorer: '●',
   worker: '●',
   verify: '●',
@@ -310,7 +293,6 @@ const ROW_ICONS = {
 const DISPLAY_LABELS = {
   working: 'gentle',
   orchestrating: 'gentle',
-  job: 'job',
   explorer: 'explorer',
   worker: 'worker',
   verify: 'verify',
@@ -493,10 +475,6 @@ function parseMarker(value, sessionHash, now) {
 // its own parser over the shared implementation.
 const parseOrchestrating = parseMarker;
 const parsePrincipal = parseMarker;
-// gentle_jobs_v1 = <hash>:<count>:<expiry>. The pending background-job count
-// uses gentle_work_v1's grammar, session binding, and freshness rule verbatim,
-// so it shares that parser; the count means jobs, never delegates.
-const parseJobs = parseWork;
 
 // gentle_done_v1 = <hash>:<expiry>. The synthesized finish signal: the same
 // grammar, session binding, and fail-closed rule as the presence markers, with
@@ -705,18 +683,14 @@ function piTreeOwnsPane(tokens, sessionHash, now) {
 }
 
 // Reducer, DESIGN §5.2. First match wins:
-//   error > ask > review > job (pink pending-job wait) > done (terminal) >
+//   error > ask > review > done (terminal) >
 //   principal working (fresh `gentle_principal_v1`: `orchestrating` while a
 //   fresh root marker is live, else generic activity) > role activity (oldest
 //   recognized role — the principal is not working) > orchestrating (marker
 //   fallback) > main working (positive running count, no role) > idle. The
 //   deciding signal is the principal's own activity marker, never the delegate
 //   count and never the aggregate native status; role labels carry the running
-//   count as a suffix when above one, and the pending-job label carries the job
-//   count when above one.
-//   Two terminal-ish branches sit apart on purpose: `job` is evaluated BEFORE
-//   `done` (a pending job is unfinished work) but only describes the
-//   settled-and-empty wait, so it never hides a working principal or a role.
+//   count as a suffix when above one.
 // `notify` is set only for ask (DESIGN §7; review/error stay silent).
 // A native `blocked` with no fresh gentle label clears our family (fail
 // closed): the block belongs to another writer or the producer died, so we
@@ -756,11 +730,6 @@ function reducePane(entry, now = Date.now()) {
   // settled-and-empty edge, so a fresh token is the ONLY reachable `done`
   // evidence in practice — the host never reports `agent_status === 'done'`.
   const done = sessionHash === null ? null : parseDone(tokens[DONE_TOKEN], sessionHash, now);
-  // Pending background jobs (S5/D4): the producer publishes this count only
-  // while the session waits on those jobs alone, so the branch below also
-  // re-checks the settled-and-empty preconditions — a stale or foreign count
-  // can never outrank a working principal or a running delegate.
-  const jobs = sessionHash === null ? null : parseJobs(tokens[JOBS_TOKEN], sessionHash, now);
 
   const out = (display, notify = null) => ({
     display,
@@ -785,19 +754,6 @@ function reducePane(entry, now = Date.now()) {
     deleted,
     pull: '',
     notify,
-    owned: true,
-  });
-  // Display-only label for the pending-job count: `job`, with the count in
-  // parentheses only when more than one job waits (one job is never `(1)`).
-  const outJobs = (count) => ({
-    display: 'job',
-    label: `${DISPLAY_LABELS.job}${count > 1 ? ` (${count})` : ''}`,
-    agent,
-    workspace,
-    added,
-    deleted,
-    pull: '',
-    notify: null,
     owned: true,
   });
   const roles = parseRoles(tokens[ROLES_TOKEN]);
@@ -848,22 +804,6 @@ function reducePane(entry, now = Date.now()) {
   // running delegate.
   const principal =
     sessionHash === null ? null : parseMarker(tokens[PRINCIPAL_TOKEN], sessionHash, now);
-  // Pending background jobs (S5/D4): the principal settled with no delegate
-  // running and no launch pending while at least one job still waits. Above the
-  // terminal `done` on purpose — a finish with a job still pending is not
-  // finished — and ABSENT the moment the principal resumes or a delegate
-  // starts, because the producer clears the count on that beat and the
-  // precondition checks here refuse a stale one.
-  if (
-    jobs !== null &&
-    jobs.count > 0 &&
-    work !== null &&
-    work.count === 0 &&
-    roles.length === 0 &&
-    principal === null
-  ) {
-    return outJobs(jobs.count);
-  }
   // Terminal `done` NEVER outranks live evidence: the principal Pi session
   // may settle while background delegates run, and that is NOT terminal.
   // Done requires settled-plus-empty — a fresh native done OR the producer's
@@ -897,7 +837,7 @@ function reducePane(entry, now = Date.now()) {
   // positive count says nothing about the principal — gating on it would
   // turn an idle principal with running delegates into `gentle` instead of
   // its delegate role word. WHY not the native status: it aggregates the
-  // same delegate activity (running delegates, pending launches, jobs), so
+  // same delegate activity (running delegates, pending launches), so
   // an idle principal with a running explorer would read `gentle` too. The
   // marker is no substitute either: it stays live while the principal is
   // idle with queued or running delegates.
@@ -1066,7 +1006,6 @@ module.exports = {
   REVIEW_TOKEN,
   DONE_TOKEN,
   FINISH_HOLD_MAX_MS,
-  JOBS_TOKEN,
   STATE_TOKENS,
   TITLE_TOKENS,
   AGENT_TOKENS,
@@ -1095,7 +1034,6 @@ module.exports = {
   parseAsk,
   parseReview,
   parseDone,
-  parseJobs,
   roleToDisplay,
   parseBlockedLabel,
   parseAgentName,

@@ -64,23 +64,22 @@ const AGENT_ID = 'pi';
 // no fg/rules wired here. This is intentional: native `state_icon` +
 // `workspace` gives the native no-duplication/name coloring behavior, and
 // native `agent` is the grey agent identity with the native separator.
-// Row 2 is the state word plus changes: the twelve presence-encoded
+// Row 2 is the state word plus changes: the eleven presence-encoded
 // `gentle_title_*` state cells (state word only, one current title per
 // frame, each in its state's semantic color as base fg with no rules; role
-// labels include the total when two or more delegates run, and the job label
-// includes the pending-job total when two or more jobs wait) followed by the
+// labels include the total when two or more delegates run) followed by the
 // three change-segment tokens (added green `+N`, deleted
 // red `-N`, pull blue `↑N`, each its own color cell with no rules, never
 // swapped). The review leg renders the user-facing word `rdd` (machine key
 // stays `review`; review execution is silent, never a notification); the error value renders `blocked`; the orchestrating
 // leg renders the user-facing word `gentle` (machine key stays
-// `orchestrating`, pink), and the pending-job wait renders `job` in the same
-// pink. The compact `gentle_changes_summary` token and
+// `orchestrating`, pink), which is also the word for a settled session still
+// waiting on background jobs. The compact `gentle_changes_summary` token and
 // the custom `$gentle_heading_*` / `$gentle_project` / `$gentle_agent`
 // cells stay published and owned for compatibility but are wired into no
 // visible row. Only one title token carries a value per frame (presence
 // encoding), so absent tokens render empty. Row 1 holds 3 native cells
-// and row 2 holds 15 cells (12 state + 3 changes), each within
+// and row 2 holds 14 cells (11 state + 3 changes), each within
 // Herdr's 16-token per-row ceiling. The agent name in each value is the snapshot-provided
 // validated identity (pi, op, codex, ...) — never a subagent name, never a
 // count — with no vendor colors invented here. The heading
@@ -92,7 +91,7 @@ const AGENT_ID = 'pi';
 // #89b4fa, added/done green #a6e3a1, removed/blocked red #f38ba8, working
 // amber #f9e2af; ask #fab387 is the warning hue; explorer icon uses Herdr
 // blue #89b4fa, verify teal #94e2d5, the root-session `orchestrating`
-// marker and the pending-job `job` wait pink fuchsia #f5c2e7
+// marker pink fuchsia #f5c2e7
 // (SIDEBAR_FUCHSIA for its heading icon and title), the RDD/review running state
 // uses blue #89b4fa (same as explorer/pull), and the judge delegate role
 // uses purple #cba6f7 (SIDEBAR_PURPLE, distinct from explorer blue, verify
@@ -129,9 +128,8 @@ function sidebarCell(token, fg, rules) {
 // visibly wired; those tokens stay published/owned for compatibility.
 const PI_ROW_1 = ['"state_icon"', '"workspace"', '"agent"'];
 
-// Row 2: twelve state-word cells in state colors with no rules (one current
-// title per frame; role words carry a running-count suffix above one, and the
-// `job` word carries the pending-job count above one), followed by
+// Row 2: eleven state-word cells in state colors with no rules (one current
+// title per frame; role words carry a running-count suffix above one), followed by
 // the three change segments as their own
 // color cells (added green `+N`, deleted red `-N`, pull blue `↑N`, never
 // swapped; empty segments collapse). Native separators on row 2 are
@@ -143,7 +141,6 @@ const PI_ROW_1 = ['"state_icon"', '"workspace"', '"agent"'];
 const PI_ROW_2 = [
   sidebarCell('$gentle_title_working', SIDEBAR_AMBER),
   sidebarCell('$gentle_title_orchestrating', SIDEBAR_FUCHSIA),
-  sidebarCell('$gentle_title_job', SIDEBAR_FUCHSIA),
   sidebarCell('$gentle_title_explorer', SIDEBAR_BLUE),
   sidebarCell('$gentle_title_worker', SIDEBAR_AMBER),
   sidebarCell('$gentle_title_verify', SIDEBAR_TEAL),

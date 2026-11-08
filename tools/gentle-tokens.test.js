@@ -404,7 +404,7 @@ describe('idle principal + marker keeps the delegate role word', () => {
 describe('orchestrating display family', () => {
   it('display key stays orchestrating; label, icon, heading, row use gentle', () => {
     assert.ok(tokens.DISPLAYS.includes('orchestrating'));
-    assert.equal(tokens.DISPLAYS.length, 12);
+    assert.equal(tokens.DISPLAYS.length, 11);
     assert.equal(tokens.DISPLAY_LABELS.orchestrating, 'gentle');
     assert.equal(tokens.iconValueFor('orchestrating'), '●');
     assert.equal(tokens.headingValueFor('orchestrating', 'myproj'), '● myproj');
@@ -440,8 +440,8 @@ describe('orchestrating display family', () => {
     }
   });
 
-  it('owned and sweep lists include judge (66 + 6 = 72; job adds 6 more)', () => {
-    assert.equal(tokens.OWNED_TOKENS.length, 78);
+  it('owned and sweep lists include judge (66 + 6 = 72)', () => {
+    assert.equal(tokens.OWNED_TOKENS.length, 72);
     const names = [
       'gentle_state_orchestrating',
       'gentle_title_orchestrating',
@@ -614,7 +614,6 @@ describe('sidebar row layout (bin/configure.js)', () => {
     const order = [
       '$gentle_title_working',
       '$gentle_title_orchestrating',
-      '$gentle_title_job',
       '$gentle_title_explorer',
       '$gentle_title_worker',
       '$gentle_title_verify',
@@ -634,7 +633,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
       assert.ok(idx > prev, token + ' in order on row 2');
       prev = idx;
     }
-    assert.equal(cells(row2), 15);
+    assert.equal(cells(row2), 14);
     assert.ok(!row2.includes('rules'));
     assert.ok(!row2.includes('$gentle_heading_'));
     assert.ok(!row2.includes('$gentle_project'));
@@ -647,7 +646,6 @@ describe('sidebar row layout (bin/configure.js)', () => {
     const expected = [
       ['$gentle_title_working', 'SIDEBAR_AMBER'],
       ['$gentle_title_orchestrating', 'SIDEBAR_FUCHSIA'],
-      ['$gentle_title_job', 'SIDEBAR_FUCHSIA'],
       ['$gentle_title_explorer', 'SIDEBAR_BLUE'],
       ['$gentle_title_worker', 'SIDEBAR_AMBER'],
       ['$gentle_title_verify', 'SIDEBAR_TEAL'],
@@ -1127,9 +1125,9 @@ describe('T2b role words and running delegate count', () => {
     assert.equal(reduced.label, 'idle');
   });
 
-  it('owned/sweep families include judge (72 total, 78 with job) and row 2 holds 15 cells', () => {
-    assert.equal(tokens.DISPLAYS.length, 12);
-    assert.equal(tokens.OWNED_TOKENS.length, 78);
+  it('owned/sweep families include judge (72 total) and row 2 holds 14 cells', () => {
+    assert.equal(tokens.DISPLAYS.length, 11);
+    assert.equal(tokens.OWNED_TOKENS.length, 72);
     assert.ok(tokens.OWNED_TOKENS.includes('gentle_state_judge'));
     assert.ok(tokens.OWNED_TOKENS.includes('gentle_title_judge'));
     assert.ok(tokens.SWEEP_TOKENS.includes('gentle_title_judge'));
@@ -1517,153 +1515,48 @@ describe('synthesized finish signal (gentle_done_v1): done then idle', () => {
   });
 });
 
-// S5/D4: while the principal is settled with no delegate running and at least
-// one Gentle Shell background job (`bash_background` / `monitor`) still waits,
-// the row shows the pink `job` state instead of generic `gentle`. It outranks
-// the terminal `done` and disappears the moment the principal resumes or a
-// delegate starts — the producer only publishes the count during that wait, and
-// the precondition checks below refuse a stale one.
-describe('pending background job wait (gentle_jobs_v1): pink job state', () => {
-  function jobEntry({ jobs = 1, count = 0, roles = '', principal = false, marker = false, status = 'working', expiry = EXPIRY } = {}) {
-    const built = roleEntry(roles, { count });
-    built.entry.tokens[tokens.JOBS_TOKEN] = `${built.hash}:${jobs}:${expiry}`;
-    if (principal) built.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(built.hash);
-    if (marker) built.entry.tokens[tokens.ORCH_TOKEN] = `${built.hash}:${EXPIRY}`;
-    built.entry.agent_status = status;
-    return built;
-  }
-
-  it('a settled principal waiting on one job shows job with no count', () => {
-    assert.equal(tokens.JOBS_TOKEN, 'gentle_jobs_v1');
-    const { entry } = jobEntry();
+// The settled background-job wait has no row state of its own
+// (odd/tasks/restore-done-idle.md): the producer keeps the root marker live
+// while a job runs, so the row reads the pink generic `gentle` until the job
+// set clears and `done` mints.
+describe('a settled job wait renders the pink generic gentle', () => {
+  it('a fresh root marker with a settled principal renders orchestrating, visible gentle', () => {
+    const { entry, hash } = roleEntry('', { count: 0, agent_status: 'idle' });
+    entry.tokens[tokens.ORCH_TOKEN] = `${hash}:${EXPIRY}`;
     const reduced = tokens.reducePane(entry, NOW);
-    assert.equal(reduced.display, 'job');
-    assert.equal(reduced.label, 'job');
+    assert.equal(reduced.display, 'orchestrating');
+    assert.equal(reduced.label, 'gentle');
     assert.equal(reduced.notify, null);
-    assert.equal(reduced.owned, true);
     const patch = tokens.displayTokens(reduced);
-    assert.equal(patch[tokens.STATE_TOKENS.job], 'job');
-    assert.equal(patch[tokens.TITLE_TOKENS.job], 'job');
-    for (const display of tokens.DISPLAYS) {
-      if (display === 'job') continue;
-      assert.equal(patch[tokens.TITLE_TOKENS[display]], null);
-    }
+    assert.equal(patch[tokens.TITLE_TOKENS.orchestrating], 'gentle');
+    assert.equal(patch[tokens.STATE_TOKENS.orchestrating], 'orchestrating');
   });
 
-  it('two or more pending jobs carry the count in parentheses', () => {
-    for (const jobs of [2, 3]) {
-      const { entry } = jobEntry({ jobs });
-      const reduced = tokens.reducePane(entry, NOW);
-      assert.equal(reduced.display, 'job');
-      assert.equal(reduced.label, `job (${jobs})`);
-      assert.equal(tokens.displayTokens(reduced)[tokens.TITLE_TOKENS.job], `job (${jobs})`);
-    }
-    const { entry: single } = jobEntry({ jobs: 1 });
-    assert.doesNotMatch(tokens.reducePane(single, NOW).label, /\(/);
-  });
-
-  it('the job word keeps the pink sibling shape: ● icon, heading, row', () => {
-    assert.equal(tokens.DISPLAY_LABELS.job, 'job');
-    assert.equal(tokens.iconValueFor('job'), '●');
-    assert.equal(tokens.headingValueFor('job', 'myproj'), '● myproj');
-    assert.equal(tokens.rowValueFor('job', 'pi', 'job (2)'), 'pi · job (2)');
-    for (const name of [
-      'gentle_state_job',
-      'gentle_title_job',
-      'gentle_agent_job',
-      'gentle_icon_job',
-      'gentle_heading_job',
-      'gentle_row_job',
-    ]) {
-      assert.ok(tokens.OWNED_TOKENS.includes(name), name);
-      assert.ok(tokens.SWEEP_TOKENS.includes(name), name);
-    }
-  });
-
-  it('job outranks done (a finish with a job pending is not finished)', () => {
-    const built = jobEntry({ jobs: 2 });
-    built.entry.tokens[tokens.DONE_TOKEN] = `${built.hash}:${EXPIRY}`;
-    const reduced = tokens.reducePane(built.entry, NOW);
-    assert.equal(reduced.display, 'job');
-    assert.equal(reduced.label, 'job (2)');
-  });
-
-  it('job disappears the moment the principal resumes or a delegate starts', () => {
-    const principal = jobEntry({ principal: true });
-    assert.equal(tokens.reducePane(principal.entry, NOW).display, 'working');
-
-    const role = jobEntry({ roles: 'worker', count: 1 });
-    assert.equal(tokens.reducePane(role.entry, NOW).display, 'worker');
-
-    const queued = jobEntry({ roles: 'explorer', count: 0 });
-    assert.equal(tokens.reducePane(queued.entry, NOW).display, 'explorer');
-
-    const counted = jobEntry({ count: 1 });
-    assert.equal(tokens.reducePane(counted.entry, NOW).display, 'working');
-  });
-
-  it('the live orchestrating marker does not block job, and attention still wins', () => {
-    const marker = jobEntry({ marker: true });
-    assert.equal(tokens.reducePane(marker.entry, NOW).display, 'job');
-
-    const ask = jobEntry();
-    ask.entry.state_labels = { 0: 'ask:q4' };
-    const askReduced = tokens.reducePane(ask.entry, NOW);
-    assert.equal(askReduced.display, 'ask');
-    assert.deepEqual(askReduced.notify, { sessionHash: ask.hash, intentId: 'q4', expiry: EXPIRY });
-
-    const error = jobEntry();
-    error.entry.state_labels = { 0: 'error:e4' };
-    assert.equal(tokens.reducePane(error.entry, NOW).display, 'error');
-
-    const review = jobEntry();
-    review.entry.tokens[tokens.REVIEW_TOKEN] = `${review.hash}:r4:${EXPIRY}`;
-    assert.equal(tokens.reducePane(review.entry, NOW).display, 'review');
-  });
-
-  it('stale, foreign, malformed, or zero job counts fail closed', () => {
-    const { hash } = jobEntry();
-    const foreign = sessionHashFor(
-      baseEntry({ agent_session: { agent: 'pi', kind: 'path', value: '/other/jobs' } }),
+  it('no job display or job token family exists', () => {
+    assert.ok(!tokens.DISPLAYS.includes('job'), 'the reducer vocabulary carries no job state');
+    assert.ok(!Object.keys(tokens.STATE_TOKENS).includes('job'));
+    assert.ok(!Object.keys(tokens.TITLE_TOKENS).includes('job'));
+    assert.ok(!Object.keys(tokens.AGENT_TOKENS).includes('job'));
+    assert.ok(!Object.keys(tokens.ICON_TOKENS).includes('job'));
+    assert.ok(!Object.keys(tokens.HEADING_TOKENS).includes('job'));
+    assert.ok(!Object.keys(tokens.ROW_TOKENS).includes('job'));
+    assert.deepEqual(
+      tokens.OWNED_TOKENS.filter((name) => /job/i.test(name)),
+      [],
+      'no owned token name mentions a job',
     );
-    for (const bad of [
-      `${hash}:${NOW}`,
-      `${foreign}:2:${EXPIRY}`,
-      `${hash}:2`,
-      `${hash}:x:${EXPIRY}`,
-      `${hash}:2:${EXPIRY}:extra`,
-      null,
-      '',
-    ]) {
-      assert.equal(tokens.parseJobs(bad, hash, NOW), null, String(bad));
-    }
-    assert.deepEqual(tokens.parseJobs(`${hash}:3:${EXPIRY}`, hash, NOW), { count: 3, expiry: EXPIRY });
-
-    assert.notEqual(tokens.reducePane(jobEntry({ jobs: 0 }).entry, NOW).display, 'job');
-    assert.notEqual(tokens.reducePane(jobEntry({ expiry: NOW }).entry, NOW).display, 'job');
-    const foreignBuilt = jobEntry();
-    foreignBuilt.entry.tokens[tokens.JOBS_TOKEN] = `${foreign}:2:${EXPIRY}`;
-    assert.notEqual(tokens.reducePane(foreignBuilt.entry, NOW).display, 'job');
-  });
-
-  it('the job branch needs a live work beat (no beat, no signal)', () => {
-    const entry = baseEntry({ agent_status: 'working' });
-    const hash = sessionHashFor(entry);
-    entry.tokens = { [tokens.JOBS_TOKEN]: `${hash}:2:${EXPIRY}` };
-    assert.equal(tokens.reducePane(entry, NOW).display, 'idle');
   });
 });
 
 // The interruption ledgers treat every non-terminal reducer display as
 // unfinished owned work, so a pane whose producer dies mid-wait is still
-// reported. `job` joined the vocabulary with S5/D4; a display added to
-// `DISPLAYS` without joining both sets would silently drop that wait.
+// reported. A display added to `DISPLAYS` without joining both sets would
+// silently drop that wait.
 describe('unfinished displays match the non-terminal reducer vocabulary', () => {
-  it('includes the pink job wait in the interruptions and diagnostics ledgers', () => {
+  it('the interruption and diagnostics ledgers carry every non-terminal display', () => {
     const interruptions = require('../herdr-plugin/lib/gentle-interruptions.js');
     const diagnostics = require('../herdr-plugin/lib/gentle-diagnostics.js');
     const expected = tokens.DISPLAYS.filter((display) => display !== 'done' && display !== 'idle').sort();
-    assert.ok(expected.includes('job'), 'the reducer vocabulary carries the pink job wait');
     assert.deepEqual([...interruptions.UNFINISHED_DISPLAYS].sort(), expected);
     assert.deepEqual([...diagnostics.UNFINISHED_DISPLAYS].sort(), expected);
   });
