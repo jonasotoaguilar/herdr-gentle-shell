@@ -440,7 +440,12 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   `disable` removes only our owned rows and exclusion, never a user table.
   See [docs/sidebar-control.md](docs/sidebar-control.md).
 - In-Pi switches (`/herdr-gentle:customize`): exactly two toggles, both local
-  state and both reachable from a plain Pi session outside a Herdr pane.
+  state and both reachable from a plain Pi session outside a Herdr pane. With
+  no argument the command opens the restored floating two-pane panel
+  (`Herdr Sidebar` and `Moshi notifications`; `←/→` or `Tab` moves between the
+  category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter` applies the
+  focused row and `Esc` closes). The plain two-step menu stays as the fallback
+  when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
   (`--check` to read, `--apply --reload` / `--uninstall --reload` to change) and
   never edits the Herdr config itself; `Moshi notifications` writes the flag
@@ -449,7 +454,10 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   refusal writes nothing) and reloading Pi only when that settings entry
   actually changed. `/herdr-gentle:customize status` prints one read-only line
   (`customize status: sidebar=<on|off|unknown> moshi=<on|off>`); an unknown
-  argument, Esc, or a cancelled menu writes nothing. The run-by-hand
+  argument, Esc, or a cancelled menu writes nothing. A sidebar verdict of
+  `unknown` is never a refusal: the panel says the state is unknown and
+  choosing `On` still runs the apply step, reporting that step's own error
+  when it refuses (the same behavior the menu always had). The run-by-hand
   equivalents are the CLI and the flag file shown below.
 - Optional Moshi replacement (off by default): one flag file,
   `<state dir>/gentle-moshi.json` containing `{"enabled":true}` (the state dir

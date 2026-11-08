@@ -218,6 +218,10 @@ import * as fs from "node:fs";
 import { homedir } from "node:os";
 import { delimiter as pathDelimiter, dirname, join, resolve as resolvePath, relative as pathRelative, basename as pathBasename, isAbsolute as pathIsAbsolute } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+
+const nodeRequire = createRequire(import.meta.url);
 // Inlined presence reconciliation (T1). Single-file deployment boundary:
 // the installed copy/symlink of this file ships WITHOUT the sibling
 // helper module, so the bounded passive reader lives here and this file
@@ -1832,7 +1836,8 @@ function lastFinishedLabel(taskMap) {
 }
 
 // ---------------------------------------------------------------------------
-// `/herdr-gentle:customize`: exactly two switches, nothing else.
+// `/herdr-gentle:customize`: exactly two switches, offered in the former
+// floating two-pane panel (odd/tasks/restore-customize-panel.md T1).
 //
 // The command is registered BEFORE the `enabled()` gate in the factory below,
 // so it stays reachable from a plain Pi session outside a Herdr pane; the
@@ -1853,10 +1858,13 @@ function lastFinishedLabel(taskMap) {
 //   reload is requested only when the settings entry actually changed, because
 //   that entry is the only part that waits for the next Pi extension load.
 //
-// The removed `Plugin tools` and `Reset` sections, the two-pane TUI and the
-// cross-extension provider slot the old panel read are deliberately NOT
-// restored: they switched worktree/ODD/issues surfaces this package no longer
-// contains, and a flat `ctx.ui.select` menu is the whole interaction.
+// No argument opens the recovered panel from lib/customize-panel.js through
+// `ctx.ui.custom` with the overlay options the former implementation pinned;
+// Enter runs the same apply path the plain `ctx.ui.select` menu uses, and that
+// menu remains the fallback when the TUI helpers or `ctx.ui.custom` are
+// unavailable. The removed `Plugin tools` and `Reset` sections and the
+// cross-extension provider slot are deliberately NOT restored: they switched
+// worktree/ODD/issues surfaces this package no longer contains.
 // ---------------------------------------------------------------------------
 
 const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
@@ -1864,6 +1872,46 @@ const CUSTOMIZE_SIDEBAR_LABEL = "Sidebar agent rows";
 const CUSTOMIZE_MOSHI_LABEL = "Moshi notifications";
 const CUSTOMIZE_ON = "On";
 const CUSTOMIZE_OFF = "Off";
+
+// The former panel's geometry and overlay options, unchanged. The helpers
+// module (@earendil-works/pi-tui) is resolved lazily through the injectable
+// seam below so registering the extension never depends on it and tests can
+// stub measurement and key matching.
+const CUSTOMIZE_OVERLAY_OPTIONS = {
+  overlay: true,
+  overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" },
+};
+let customizeTuiLoader = () => import("@earendil-works/pi-tui");
+
+export function setCustomizeTuiLoader(loader) {
+  customizeTuiLoader = loader;
+}
+
+// The panel module lives in lib/, resolved relative to this file in the
+// installed package. Tests load a copy from a temp directory and point the
+// documented override at the real lib dir. A single-file deployment (the
+// installed copy or symlink without sibling helpers) has no panel module, so
+// the callback returns null and the command keeps the plain menu below.
+function customizePanelModule() {
+  try {
+    const override = process.env.GENTLE_CUSTOMIZE_LIB_DIR;
+    const dir = typeof override === "string" && override.length > 0
+      ? override
+      : join(dirname(fileURLToPath(import.meta.url)), "..", "lib");
+    return nodeRequire(join(dir, "customize-panel.js"));
+  } catch {
+    return null;
+  }
+}
+
+function customizePanelModel() {
+  const panel = customizePanelModule();
+  if (!panel) return null;
+  return panel.customizePanelModel({
+    sidebar: sidebarRowsState().state,
+    moshi: moshiFlagEnabled(moshiFlagPath()) ? "on" : "off",
+  });
+}
 
 // bin/configure.js lives in the Herdr plugin (installed as its own package), so
 // the Pi side resolves that root exactly like lib/gentle-sidebar.js does:
@@ -2264,25 +2312,20 @@ async function applyCustomizeSwitch(id, value, ctx) {
   if (result.needsReload && typeof ctx?.reload === "function") await ctx.reload();
 }
 
-async function executeCustomize(rawArgs, ctx) {
-  const notify = ctx?.ui?.notify;
-  const raw = String(rawArgs ?? "").trim();
-  const head = (raw.split(/\s+/).filter((part) => part.length > 0)[0] || "").toLowerCase();
-  if (head === "status") {
-    // One read-only line: nothing is written and nothing is reloaded.
-    const sidebar = sidebarRowsState();
-    const moshi = moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
-    if (typeof notify === "function") {
-      notify(`customize status: sidebar=${sidebar.state} moshi=${moshi}`, "info");
-    }
-    return;
-  }
-  if (head !== "") {
-    if (typeof notify === "function") {
-      notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
-    }
-    return;
-  }
+// The single apply path shared by the overlay and the menu fallback. An
+// inconclusive sidebar verdict is never a refusal: choosing On still attempts
+// the repair and reports the apply step's own error, exactly like the baseline
+// menu did.
+async function applyCustomizeChoice(categoryId, valueId, ctx) {
+  if (categoryId !== "sidebar" && categoryId !== "moshi") return;
+  if (valueId !== "on" && valueId !== "off") return;
+  await applyCustomizeSwitch(categoryId, valueId, ctx);
+}
+
+// The former plain menu, kept as the fallback when the TUI helpers or
+// `ctx.ui.custom` are unavailable. It reads the same model and applies
+// through the same path as the overlay.
+async function runCustomizeFallback(ctx) {
   const select = ctx?.ui?.select;
   if (typeof select !== "function") return;
   let picked = null;
@@ -2305,7 +2348,78 @@ async function executeCustomize(rawArgs, ctx) {
     choice = undefined;
   }
   if (choice !== CUSTOMIZE_ON && choice !== CUSTOMIZE_OFF) return;
-  await applyCustomizeSwitch(id, choice === CUSTOMIZE_ON ? "on" : "off", ctx);
+  await applyCustomizeChoice(id, choice === CUSTOMIZE_ON ? "on" : "off", ctx);
+}
+
+async function executeCustomize(rawArgs, ctx) {
+  const notify = ctx?.ui?.notify;
+  const raw = String(rawArgs ?? "").trim();
+  const head = (raw.split(/\s+/).filter((part) => part.length > 0)[0] || "").toLowerCase();
+  if (head === "status") {
+    // One read-only line: nothing is written and nothing is reloaded.
+    const sidebar = sidebarRowsState();
+    const moshi = moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
+    if (typeof notify === "function") {
+      notify(`customize status: sidebar=${sidebar.state} moshi=${moshi}`, "info");
+    }
+    return;
+  }
+  if (head !== "") {
+    if (typeof notify === "function") {
+      notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
+    }
+    return;
+  }
+  // The helpers module is loaded lazily, never at registration: a host
+  // without @earendil-works/pi-tui keeps every other surface working and
+  // degrades this command to the menu below.
+  let helpers = null;
+  try {
+    helpers = await customizeTuiLoader();
+  } catch {
+    helpers = null;
+  }
+  if (helpers && ctx?.ui && typeof ctx.ui.custom === "function") {
+    const panel = customizePanelModule();
+    const model = customizePanelModel();
+    let choice = null;
+    if (panel && model) {
+      try {
+        choice = await ctx.ui.custom(
+          // Theme and terminal rows travel through the real factory arguments:
+          // the card paints with the host theme and clips to the live height.
+          (hostTui, theme, _keybindings, done) => panel.createCustomizePanel({
+            helpers,
+            hostTui,
+            theme,
+            rowsAvailable: () => {
+              try {
+                return hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+              } catch {
+                return undefined;
+              }
+            },
+            model,
+            done,
+          }),
+          CUSTOMIZE_OVERLAY_OPTIONS,
+        );
+      } catch {
+        // A host that rejects the overlay degrades to the menu below.
+        await runCustomizeFallback(ctx);
+        return;
+      }
+    } else {
+      await runCustomizeFallback(ctx);
+      return;
+    }
+    // Esc (null) does nothing at all: no notification, no write, no reload.
+    // Anything else runs the single apply path once the overlay is disposed.
+    if (!choice || typeof choice !== "object") return;
+    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx);
+    return;
+  }
+  await runCustomizeFallback(ctx);
 }
 
 export default function (pi) {
