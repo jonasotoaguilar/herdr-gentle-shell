@@ -574,13 +574,11 @@ function eventKindOf(message) {
   if (!message || typeof message !== 'object') return null;
   if (message.id !== undefined && message.id !== null) return null;
   const data = message.data;
-  const kind =
-    typeof message.event === 'string'
-      ? message.event
-      : data && typeof data.type === 'string'
-        ? data.type
-        : null;
-  return kind !== null && EVENT_WAKE_KINDS.has(kind) ? kind : null;
+  let kind = null;
+  if (typeof message.event === 'string') kind = message.event;
+  else if (data && typeof data.type === 'string') kind = data.type;
+  if (kind === null || !EVENT_WAKE_KINDS.has(kind)) return null;
+  return kind;
 }
 
 // One connection at a time, reconnected on failure. Every failure is reported
