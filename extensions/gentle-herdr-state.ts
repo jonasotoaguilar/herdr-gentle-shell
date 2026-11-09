@@ -90,6 +90,17 @@
 //                       (single effective label, priority error > ask >
 //                       review, edge-triggered so the native counter in
 //                       herdr-agent-state.ts stays balanced)
+//   gentle_error_v1       = <hash>:<code>:<expiry>
+//                       (durable run-error signal, session-bound + TTL-fresh
+//                       like gentle_ask_v1: emitted on every beat while the
+//                       run-error leg stands, null / clear the beat it
+//                       releases. It is the sidebar's ONLY error carrier —
+//                       the native pane report never claims `blocked`, so an
+//                       error raises no host NeedsAttention toast or sound
+//                       and sends no phone envelope. The consumer reduces a
+//                       fresh token to `error` (row word `blocked`) with the
+//                       same error > ask > review priority the label leg
+//                       uses, independently of work token presence.)
 //
 // Event seams (all in-process; this extension imports nothing from
 // gentle-shell — DESIGN §10 U6 source pin is unresolved, so the producer is
@@ -178,9 +189,17 @@
 //                       as user-facing `rdd` (machine key stays `review`).
 //                       Fail-safe: no provider verdicts are
 //                       invented; the id is a sanitized correlation id only.
-//   error             : subagent task failed status / subagent tool error /
-//                       repeated own-transport failure. Latched until the next
-//                       agent_start (fresh snapshot), TTL-bounded display.
+//   error             : the agent run itself stopped on an error (an assistant
+//                       message whose `stopReason` is `error` — the same
+//                       signal Pi derives `turn_end.outcome === "error"`
+//                       from). Never a tool-level failure, never a failed
+//                       delegate record, never our own transport: those are
+//                       detected and logged, and change no state. Sidebar-only:
+//                       the pane keeps reporting native `working` while the
+//                       label stands, so an error never fires the host's
+//                       NeedsAttention toast or sound. Released by the next
+//                       non-error beat (agent_start, any tool activity, or a
+//                       non-error assistant message), never latched.
 //   changes           : SESSION_CHANGE_ENTRY facts mirroring the Gentle Shell
 //                       SessionChanges model semantics from the session
 //                       transcript (write|edit tool outcomes only, never git
@@ -719,6 +738,21 @@ const DONE_HOLD_ENV = "GENTLE_HERDR_DONE_HOLD_MS";
 // minutes is the generous end of the [30 s, 5 min] band: a job longer than this
 // fails open early, and a missed exit event delays `done` by at most this long.
 export const JOBS_SNAPSHOT_TTL_MS = 300000;
+const JOBS_TTL_ENV = "GENTLE_HERDR_JOBS_TTL_MS";
+const JOBS_TTL_MIN_MS = 100;
+const JOBS_TTL_MAX_MS = 3600000;
+
+// Same discipline as doneHoldMs: an absent or unparseable value keeps the
+// default and anything outside the band is clamped, so a debugging session (or
+// a test that cannot wait five minutes) can shorten the bound without ever
+// making every snapshot instantly stale.
+export function jobsSnapshotTtlMs(raw = process.env[JOBS_TTL_ENV]) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0) return JOBS_SNAPSHOT_TTL_MS;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return JOBS_SNAPSHOT_TTL_MS;
+  return Math.min(JOBS_TTL_MAX_MS, Math.max(JOBS_TTL_MIN_MS, Math.round(parsed)));
+}
 const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
 // Herdr's wire ceiling for a single pane-metadata token value, measured in
@@ -734,7 +768,6 @@ const MAX_LABEL_CHARS = 64;
 const MAX_TOKEN_BYTES = 512;
 const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
-const TRANSPORT_FAIL_LATCH = 3;
 const CLI_FALLBACK_TIMEOUT_MS = 2500;
 
 const ASK_EVENT = "gentle-pi:ask-user-choice:blocked";
@@ -793,6 +826,13 @@ const ASK_TOKEN = "gentle_ask_v1";
 // review is active (acknowledged capture/group execution only). Null /
 // clear the beat the last execution resolves — NO GRACE, no timers.
 const REVIEW_TOKEN = "gentle_review_v1";
+// Durable run-error token name (DESIGN §4.3): session-bound + TTL-fresh
+// `<hash>:<code>:<expiry>`, emitted on every beat while the run-error leg
+// stands and cleared to null the beat it releases. This is the sidebar's only
+// error carrier: the native report stays `working` while the leg stands, so an
+// error never raises the host's NeedsAttention toast, its sound, or a phone
+// envelope (DESIGN §7).
+const ERROR_TOKEN = "gentle_error_v1";
 // Principal-only activity marker (DESIGN §4.3): session-bound + TTL-fresh
 // `<hash>:<expiry>`, emitted while this session's own agent is active and
 // cleared when it settles. It carries the principal input of
@@ -1079,14 +1119,17 @@ function cliFallback(patch) {
 export const NATIVE_STATES = ["working", "blocked", "idle"];
 const NATIVE_MAX_ATTEMPTS = 2;
 
-// Principal-gated native state (pure, testable): blocked on a real
-// principal-stopped error OR an actual human-wait intervention leg
+// Principal-gated native state (pure, testable): blocked on the `hasError`
+// input OR an actual human-wait intervention leg
 // (ask/choice/question/questionnaire/permission — never
 // review/RDD execution, which stays working and silent); working while the
 // principal is active OR running/queued delegates exist OR pending launches
 // exist OR review execution holds; idle ONLY on authoritative principal
 // settled plus zero running+queued plus zero pending plus no human-wait
-// prompt and no review execution. Never infer terminal from child
+// prompt and no review execution. The producer never sets `hasError`: native
+// `blocked` is what fires the host's NeedsAttention toast and sound, so an
+// `error:` label stays sidebar-only and the pane reports `working` while it
+// stands. Never infer terminal from child
 // completion, timeout, or count0 alone (settled required). Never
 // done/finished (only working|blocked|idle) and never a notification
 // method — the host owns finished text plus toast/sound, and desktop ask
@@ -1814,16 +1857,20 @@ function moshiSessionIsChild(file) {
   return child;
 }
 
-let moshiFlagCache = { mtimeMs: -1, enabled: false };
+let moshiFlagCache = { key: "", enabled: false };
 
 function moshiEnabled() {
   const path = moshiFlagPath();
   try {
     const stat = fs.statSync(path);
-    if (stat.mtimeMs === moshiFlagCache.mtimeMs) return moshiFlagCache.enabled;
-    moshiFlagCache = { mtimeMs: stat.mtimeMs, enabled: moshiFlagEnabled(path) };
+    // Identity, not just mtime: a rewrite that lands inside the same timestamp
+    // tick (or on a coarse or network filesystem) must still flip the gate. A
+    // stale "enabled" is exactly the notification the user asked not to get.
+    const key = `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+    if (key === moshiFlagCache.key) return moshiFlagCache.enabled;
+    moshiFlagCache = { key, enabled: moshiFlagEnabled(path) };
   } catch {
-    moshiFlagCache = { mtimeMs: -1, enabled: false };
+    moshiFlagCache = { key: "", enabled: false };
   }
   return moshiFlagCache.enabled;
 }
@@ -1932,6 +1979,11 @@ const CUSTOMIZE_OVERLAY_OPTIONS = {
   overlay: true,
   overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" },
 };
+// The overlay caps its own box at `maxHeight` of the terminal, so the panel's
+// row budget is that box and never the whole terminal: a card taller than the
+// box is clipped by the host, and the pointer would then hit-test rows the user
+// cannot see (the reported "the switch never changes" bug).
+const CUSTOMIZE_OVERLAY_MAX_HEIGHT = 0.85;
 let customizeTuiLoader = () => import("@earendil-works/pi-tui");
 
 export function setCustomizeTuiLoader(loader) {
@@ -2449,7 +2501,10 @@ async function executeCustomize(rawArgs, ctx) {
             theme,
             rowsAvailable: () => {
               try {
-                return hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+                const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+                return Number.isFinite(rows)
+                  ? Math.floor(rows * CUSTOMIZE_OVERLAY_MAX_HEIGHT)
+                  : undefined;
               } catch {
                 return undefined;
               }
@@ -2560,10 +2615,37 @@ export default function (pi) {
   // it is never a display state of its own: no job count is published and no
   // `job` token exists to render (odd/tasks/restore-done-idle.md).
   let jobsSnapshot;
+  // One timer per live snapshot, armed for the instant that snapshot goes
+  // stale. The bus is edge-emitted, so a job whose exit snapshot never arrives
+  // would otherwise leave `freshRunningJobCount()` frozen at its last value
+  // with nothing left to publish the settle that follows: no beat, no `done`,
+  // and the row stays on the pink generic `gentle` for good. One beat at the
+  // expiry is enough — from that instant the hint is zero jobs, so the beat
+  // either mints `done` or reports the real activity that still holds it.
+  // Never a poll: a new snapshot replaces the timer, the session reset and
+  // shutdown drop it, and an empty snapshot drops it immediately.
+  let jobsExpiryTimer;
+
+  function clearJobsExpiry() {
+    if (jobsExpiryTimer === undefined) return;
+    clearTimeout(jobsExpiryTimer);
+    jobsExpiryTimer = undefined;
+  }
+
+  function armJobsExpiry(at) {
+    clearJobsExpiry();
+    const delay = Math.max(0, at + jobsSnapshotTtlMs() - Date.now());
+    jobsExpiryTimer = setTimeout(() => {
+      jobsExpiryTimer = undefined;
+      if (!rootSession) return;
+      schedulePublish();
+    }, delay);
+    if (jobsExpiryTimer.unref) jobsExpiryTimer.unref();
+  }
 
   function freshRunningJobCount() {
     if (!jobsSnapshot) return 0;
-    if (Date.now() - jobsSnapshot.at > JOBS_SNAPSHOT_TTL_MS) return 0;
+    if (Date.now() - jobsSnapshot.at > jobsSnapshotTtlMs()) return 0;
     const owner = jobsSnapshot.sessionId;
     const mine = sessionId;
     if (
@@ -2586,11 +2668,23 @@ export default function (pi) {
     const jobs = value.snapshot.jobs.filter(
       (entry) => isRecord(entry) && typeof entry.id === "string" && entry.id.length > 0,
     );
+    // Gentle Shell publishes a FINISHED TAIL: a job that already ended stays in
+    // the array carrying `status: "exited" | "stopped" | "failed"` (its
+    // `RunningJobDisplay`, optional so older publishers that list running jobs
+    // only keep validating). Only an entry with NO status is still running.
+    // Counting a tail entry made `activity` true forever: the row stayed on the
+    // pink generic `gentle` and the `done` mint — hence the finish token, the
+    // host `idle` edge and the Finished toast — never happened, on a panel that
+    // read `none running`. Any status, known or not, therefore stops counting.
+    // `jobs` is only read by freshRunningJobCount, so the filter lives here.
+    const live = jobs.filter((entry) => entry.status === undefined);
     jobsSnapshot = {
       sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined,
-      jobs,
+      jobs: live,
       at: Date.now(),
     };
+    if (live.length > 0) armJobsExpiry(jobsSnapshot.at);
+    else clearJobsExpiry();
     schedulePublish();
   }
 
@@ -2619,6 +2713,10 @@ export default function (pi) {
 
   function moshiEmit(eventName, extra = {}) {
     if (!rootSession) return;
+    // THE gate for every envelope path: the opt-in flag is required here, on
+    // every path, with no per-event exception. A context captured while the
+    // channel was on is Chat View prefill only — it never authorizes a send.
+    if (!moshiEnabled()) return;
     if (!moshiContext && !moshiEnsureContext()) return;
     const context = moshiContext;
     if (!context) return;
@@ -2639,6 +2737,15 @@ export default function (pi) {
       envelope.contextRemaining = Math.round(context.contextRemaining);
     }
     moshiSendEnvelope(envelope);
+  }
+
+  // The notifications name the project, so they must resolve it the way a send
+  // resolves its context — capturing on demand, which also keeps a channel
+  // enabled mid-session from announcing itself as a bare "Gentle".
+  function moshiNotifyProject() {
+    if (!moshiEnabled()) return "Gentle";
+    moshiEnsureContext();
+    return moshiContext?.project ?? "Gentle";
   }
 
   // Captures on demand and sends the silent carrier once per session, so
@@ -2671,8 +2778,14 @@ export default function (pi) {
   function syncReviewActive() {
     reviewActive = reviewCalls.size > 0;
   }
-  // Error latch: cleared on the next agent_start (fresh snapshot).
+  // Run-error leg: set ONLY when the agent run itself stops on an error, and
+  // released by the next non-error beat (see setRunError/clearRunError). Tool
+  // failures never touch it, so a failed tool can no longer repaint the row.
   let errorCode;
+  const RUN_ERROR = "run-failed";
+  // Tool-level failures are still detected (the reported defect asked for
+  // detection) but are telemetry: a counter plus a debug line, never state.
+  let toolErrors = 0;
   let emittedLabel;
 
   let changes = { files: 0, added: 0, deleted: 0 };
@@ -2774,6 +2887,26 @@ export default function (pi) {
     return undefined;
   }
 
+  // Detection surface for tool-level failures: recorded, never published. The
+  // state they reach (label, native state, finish hold) is untouched by design
+  // — only a run that stops on an error may show `error:`.
+  function recordToolFailure(site) {
+    toolErrors += 1;
+    debug("tool-error", `${site} count=${toolErrors}`);
+  }
+
+  function setRunError() {
+    if (errorCode) return;
+    errorCode = RUN_ERROR;
+    updateBlocker();
+  }
+
+  function clearRunError() {
+    if (!errorCode) return;
+    errorCode = undefined;
+    updateBlocker();
+  }
+
   function ensureAskIntent() {
     if (askActiveNow() && !askIntentId) {
       askCounter += 1;
@@ -2781,14 +2914,16 @@ export default function (pi) {
       // Moshi replacement (DESIGN §7): a real ask episode is the only
       // intervention that reaches the phone — one approval_required per
       // intentId, exactly like the Herdr toast, and never a speculative ask.
-      if (moshiContext || moshiEnabled()) {
+      // `moshiContext` alone never authorizes it: the flag gates every send.
+      if (moshiEnabled()) {
+        const project = moshiNotifyProject();
         moshiEmit("PermissionRequest", {
           category: "approval_required",
           phase: "waitingForApproval",
           actionId: askIntentId,
-          title: `Gentle ask: ${moshiContext?.project ?? "Gentle"}`,
+          title: `Gentle ask: ${project}`,
           subtitle: "Answer in terminal",
-          message: `${moshiContext?.project ?? "Gentle"} has a question and is waiting for your answer. Return to Pi to respond.`,
+          message: `${project} has a question and is waiting for your answer. Return to Pi to respond.`,
           ...(lastAskToolName ? { toolName: lastAskToolName } : {}),
         });
       }
@@ -3041,6 +3176,16 @@ export default function (pi) {
     if (!reviewActive) reviewId = undefined;
     if (reviewActive && reviewId) tokens[REVIEW_TOKEN] = `${sessionHash}:${reviewId}:${expiry}`;
     else tokens[REVIEW_TOKEN] = null;
+    // Durable run-error signal: session-bound + TTL-fresh
+    // `<hash>:<code>:<expiry>`, republished on every beat while the run-error
+    // leg stands (durable, never edge-only, so a missed beat cannot strand the
+    // row) and cleared to null on the beat the leg releases. It is the only
+    // carrier of the error to the sidebar: the native report stays `working`
+    // while it stands, which is what keeps the host from firing a
+    // NeedsAttention toast or sound for it (DESIGN §7). Tool-level failures
+    // never reach this leg (recordToolFailure is telemetry only).
+    if (errorCode) tokens[ERROR_TOKEN] = `${sessionHash}:${errorCode}:${expiry}`;
+    else tokens[ERROR_TOKEN] = null;
     // Root-only orchestrating marker (DESIGN §4.3): session-bound freshness
     // (<hash>:<expiry>, same binding/TTL style as gentle_work_v1, no count)
     // emitted by the root Pi session while the main session is actively
@@ -3148,6 +3293,10 @@ export default function (pi) {
       askToolCalls.size > 0 ||
       uiPromptActive ||
       reviewActive ||
+      // The standing run error keeps a beat alive so its durable token stays
+      // republished (and TTL-fresh) until the leg releases, even after the
+      // session settles.
+      errorCode !== undefined ||
       emittedLabel !== undefined ||
       doneExpiry !== undefined
     );
@@ -3181,15 +3330,22 @@ export default function (pi) {
   // stays consumer-side per DESIGN §7).
   function desiredNativeReport() {
     if (!rootSession) return undefined;
-    const state = computeNativeState({
-      agentActive,
-      settled,
-      activeCount: activeSubs().length,
-      pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
-      askActive: askActiveNow(),
-      reviewActive,
-      hasError: !!errorCode,
-    });
+    // `error:` is sidebar-only: native `blocked` is exactly what fires the
+    // host's NeedsAttention toast and sound (DESIGN §7), so an error label
+    // never claims it. While the label stands the pane reports `working` —
+    // the only native state that raises no attention — and returns to the
+    // lifecycle state on the next non-error beat. `hasError` stays out of
+    // computeNativeState for this reason.
+    const state = errorCode
+      ? "working"
+      : computeNativeState({
+          agentActive,
+          settled,
+          activeCount: activeSubs().length,
+          pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
+          askActive: askActiveNow(),
+          reviewActive,
+        });
     if (!state) return undefined;
     if (state === "blocked") {
       ensureAskIntent();
@@ -3306,7 +3462,7 @@ export default function (pi) {
   // live jobs — never off a raw native working->idle transition, which fires
   // with work still left and used to skip `done` entirely.
   function emitFinish() {
-    const project = moshiContext?.project ?? "Gentle";
+    const project = moshiNotifyProject();
     const lastLabel = lastFinishedLabel(tasks);
     moshiEmit("AgentEnd", {
       category: "task_complete",
@@ -3408,6 +3564,15 @@ export default function (pi) {
       maybeStopBeat();
       return;
     }
+    // The finish notification is a Moshi envelope, not a Herdr token: it hangs
+    // off the minted done edge above, and announcing it here — before, and
+    // regardless of, the token publish — keeps a transport failure from
+    // swallowing it. Cleared with the announcement, so a retried beat can
+    // never duplicate it.
+    if (donePending) {
+      donePending = false;
+      emitFinish();
+    }
     publishInFlight = true;
     try {
       const ok = await sendTokens(tokens);
@@ -3415,21 +3580,15 @@ export default function (pi) {
         // One coalesced wake per landed beat, after the tokens are in Herdr
         // (a request written first could render a frame over stale tokens).
         requestStatusRefresh();
-        if (donePending) {
-          donePending = false;
-          emitFinish();
-        }
-        if (transportFails >= TRANSPORT_FAIL_LATCH && errorCode === "transport") {
-          errorCode = undefined;
-          updateBlocker();
-        }
+        if (transportFails > 0) debug("transport-ok", `after ${transportFails} failed beat(s)`);
         transportFails = 0;
       } else {
+        // Our own report transport failing is not the agent failing: it is a
+        // telemetry line, never an `error:` label and never native `blocked`
+        // (that latched a stuck red row on a socket hiccup and fired the
+        // host's toast for it). The next landed beat resets the counter.
         transportFails += 1;
-        if (transportFails >= TRANSPORT_FAIL_LATCH && !errorCode) {
-          errorCode = "transport";
-          updateBlocker();
-        }
+        debug("transport-failed", `${transportFails} beat(s) in a row`);
       }
     } finally {
       publishInFlight = false;
@@ -3466,12 +3625,10 @@ export default function (pi) {
       return;
     }
     if (!Array.isArray(applied) || applied.length === 0) return;
-    // An explicitly failed delegate latches the error leg exactly like a
-    // failed tool_result/message_end; absence-driven completion carries no
-    // known terminal state and never latches.
-    if (!errorCode && applied.some((entry) => entry && entry.status === "failed")) {
-      errorCode = "task-failed";
-      updateBlocker();
+    // A delegate that ended failed is a tool-level outcome, not the run
+    // stopping: detected and counted, and no state changes.
+    if (applied.some((entry) => entry && entry.status === "failed")) {
+      recordToolFailure("presence:failed");
     }
   }
 
@@ -3556,7 +3713,9 @@ export default function (pi) {
     donePending = false;
     sawActivity = false;
     jobsSnapshot = undefined;
+    clearJobsExpiry();
     errorCode = undefined;
+    toolErrors = 0;
     liveGen += 1;
     liveInFlight = false;
     liveQueued = false;
@@ -3730,6 +3889,9 @@ export default function (pi) {
 
   pi.on("tool_call", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    // A tool starting proves a run is alive: an error left over from a run that
+    // already died is released here rather than sticking until the next turn.
+    clearRunError();
     // Structured ask proposals never open ask (execution does); subagent
     // launch correlation below is unchanged.
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
@@ -3758,6 +3920,7 @@ export default function (pi) {
 
   pi.on("tool_result", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    clearRunError();
     if (typeof event.toolCallId === "string" && askToolCalls.delete(event.toolCallId)) {
       updateBlocker();
     }
@@ -3788,10 +3951,9 @@ export default function (pi) {
     }
     const details = isRecord(event.details) ? event.details.gentleAgents : undefined;
     if (!isRecord(details) || typeof details.taskId !== "string") {
-      if (event.toolName === "subagent_run" && event.isError === true && !errorCode) {
-        errorCode = "task-failed";
-        updateBlocker();
-      }
+      // A tool that failed is detected and counted, and that is all: no label,
+      // no native state, no finish hold, no notification.
+      if (event.isError === true) recordToolFailure(`tool:${event.toolName}`);
       return;
     }
     const previous = tasks.get(details.taskId);
@@ -3858,10 +4020,7 @@ export default function (pi) {
       const oldest = tasks.keys().next().value;
       tasks.delete(oldest);
     }
-    if (status === "failed" && !errorCode) {
-      errorCode = "task-failed";
-      updateBlocker();
-    }
+    if (status === "failed") recordToolFailure(`task:${details.taskId}`);
     schedulePublish();
   });
 
@@ -3880,7 +4039,18 @@ export default function (pi) {
   pi.on("message_end", (event) => {
     if (!rootSession || !isRecord(event)) return;
     const message = event.message;
-    if (!isRecord(message) || message.role !== "custom") return;
+    if (!isRecord(message)) return;
+    if (message.role === "assistant") {
+      // The one real error state. Pi derives `turn_end.outcome === "error"`
+      // from exactly this stopReason, so a run that stopped on an error is
+      // visible here without a second handler; any other assistant message
+      // proves the run is alive again (a retry that succeeded) and releases
+      // the label.
+      if (message.stopReason === "error") setRunError();
+      else clearRunError();
+      return;
+    }
+    if (message.role !== "custom") return;
     if (message.customType !== AGENTS_RESULT_TYPE) return;
     const details = isRecord(message.details) ? message.details.gentleAgents : undefined;
     if (!isRecord(details) || typeof details.taskId !== "string") return;
@@ -3908,10 +4078,7 @@ export default function (pi) {
       const oldest = tasks.keys().next().value;
       tasks.delete(oldest);
     }
-    if (details.status === "failed" && !errorCode) {
-      errorCode = "task-failed";
-      updateBlocker();
-    }
+    if (details.status === "failed") recordToolFailure(`background:${details.taskId}`);
     schedulePublish();
   });
 
@@ -3956,10 +4123,7 @@ export default function (pi) {
     agentActive = true;
     settled = false;
     nativeSettledPending = false;
-    if (errorCode) {
-      errorCode = undefined;
-      updateBlocker();
-    }
+    clearRunError();
     refreshChanges();
     schedulePublish();
   });
@@ -3976,7 +4140,7 @@ export default function (pi) {
     // S62 turn-end: the working tree may have changed without transcript
     // evidence (external/untracked edits), so re-scan before publishing.
     refreshChanges();
-    if (activeSubs().length === 0 && !askActiveNow() && !reviewActive) {
+    if (activeSubs().length === 0 && !askActiveNow() && !reviewActive && !errorCode) {
       clearEmittedLabel();
       void publishNow();
     } else {

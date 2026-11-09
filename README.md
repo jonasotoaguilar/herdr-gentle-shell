@@ -201,7 +201,12 @@ and token names stay `review` — review execution is silent, never a
 notification; only an actual waiting prompt renders `ask` (desktop attention
 is Herdr's native `blocked` toast); the judge delegate role renders `judge` in
 purple `#cba6f7` (distinct from explorer blue, verify teal, and
-orchestrating pink); the error value renders `blocked`; the orchestrating
+orchestrating pink); the error value renders `blocked` as the row word for
+the `error` machine key (never the pane's native state — an error is
+sidebar-only, DESIGN §7; it rides the durable session-bound
+`gentle_error_v1` token, republished on every beat while the run-error leg
+stands and cleared the beat it releases, so a beat the sidebar missed is
+repaired by the next one); the orchestrating
 leg renders the user-facing word `gentle` (machine key stays
 `orchestrating`, pink `#f5c2e7`). Remaining state colors:
 working/worker amber `#f9e2af`, explorer blue `#89b4fa`, verify teal
@@ -303,7 +308,7 @@ the principal session actively works — even with zero subagents — and keeps
 `gentle` while its delegates run (a role word such as `worker`, `explorer`,
 `verify`, `judge` shows once the principal itself is idle), row 1 shows
 the single heading cell (`● <project>` plus ` +N`/` -N`/` ↑N` inline, zero `·`) after edits / when behind upstream; then `ask` on an open
-question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD viewer, changes view, design canvas — never counts, because opening a panel is navigation, not a question), or permission waiting; `gentle_review` starts never speculate ask) and `blocked` on error. `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
+question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD viewer, changes view, design canvas — never counts, because opening a panel is navigation, not a question), or permission waiting; `gentle_review` starts never speculate ask, and no failed tool ever does either: a tool error changes nothing, see the error rule below). `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
 `HERDR_CONFIG_PATH` on a temp file for apply/uninstall checks.
 
 ## Core Workflow
@@ -358,7 +363,11 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   `rdd` during native review execution (machine key stays `review`; execution
   is silent — desktop attention fires only for a waiting `ask` intent, as
   Herdr's native toast), and
-  user-facing `blocked` for errors.
+  user-facing `blocked` as the row word for the `error` machine key (an
+  error never claims the native `blocked` state — that is the host's
+  NeedsAttention toast and sound, so the sidebar carries the error on the
+  durable `gentle_error_v1` token while the pane stays quiet on `working`,
+  and no phone envelope is sent).
 - Single-cell row-1 heading (`<icon> <project>` plus ` +N`/` -N`/` ↑N`
   inline, exactly one nonempty cell so zero `·` separators; white base with
   `contains` rules keeping ` +` green (added), ` -` red (deleted,
@@ -395,7 +404,7 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   nothing and logs one line per reason. The gs pane's own live state stays
   unobservable until the isolated install forwards `HERDR_ENV` to its agent (a
   gentle-ai concern, out of scope here).
-- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning — it reads `working` while any delegate runs — while the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` marker, so an idle principal with a running delegate shows the delegate role word instead of `gentle`. Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement below is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `node bin/gentle-sidebar.js disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and hands the sidebar back to the native publisher (running Pi sessions need `/reload`); never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
+- Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). `blocked` is never derived from an error: native `blocked` is what fires the host's NeedsAttention toast and sound, so a failed run shows our own `error` state — the durable, session-bound `gentle_error_v1` token (republished every beat while the leg stands, cleared when it releases) that the sidebar reduces to the `error` row word — while the pane stays on `working`, and a failed tool call (or a delegate that ended `failed`, or a failed beat transport) changes nothing at all: it is detected and logged, never published, and never reaches the error token. The native status keeps its aggregate meaning — it reads `working` while any delegate runs — while the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` marker, so an idle principal with a running delegate shows the delegate role word instead of `gentle`. Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement below is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `node bin/gentle-sidebar.js disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and hands the sidebar back to the native publisher (running Pi sessions need `/reload`); never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
 - Sidebar switch (`enable` / `disable` / `status` / `toggle`):
   `node bin/gentle-sidebar.js <verb>` picks between this plugin's sidebar rows
   and the native Herdr sidebar. `status` is read-only; `enable` converges the
@@ -407,12 +416,17 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   no argument the command opens the floating panel in Gentle Shell's own
   layout: one left `CATEGORIES` list (`Herdr Sidebar`, `Moshi notifications`)
   and one right pane headed `<Category> · n/m` with its setting rows, each row
-  painting the stored value with `●` and the other with `○`; the footer reads
-  `Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`, and `←/→` or
+  painting the stored value with `●` and the other with `○`; one line above the
+  footer describes the focused setting (`<setting> — <what it changes>`), and
+  the footer reads
+  `←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`, while `←/→` or
   `Tab` moves between the category and value panes, `↑/↓` or `j/k` moves the
-  cursor while `Esc` closes. A click on a category selects it and a click on a
-  row applies it, exactly like `Enter` on the focused row; clicks outside the
-  panes are ignored. The notifications switch appears twice — as its own
+  cursor, `Enter` applies the focused row and `Esc` closes without a write. The
+  legend names only keys: it never advertises `Click`, because every token in
+  it is a key the panel answers to, and a narrow card compacts it instead of
+  wrapping. Pointer input still works without being advertised — a click on a
+  category selects it, a click on a row applies it, and a click outside the
+  panes is ignored. The notifications switch appears twice — as its own
   `Moshi notifications` category and as a `Notifications` row inside
   `Herdr Sidebar` — and both rows read the one flag below, so the state they
   show can never disagree. The plain two-step menu stays as the fallback
@@ -451,7 +465,10 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   session row, terminal context, phone-side approvals) keeps working, but
   notifications follow this plugin's policy — one when Pi really needs your
   input (`ask`) and one when Pi really finishes. Nothing per prompt, nothing per
-  turn. If `extensions/moshi-hooks.ts` is installed, add
+  turn, and nothing at all while the flag is off: every envelope path requires
+  the flag at send time, so a context captured for Chat View while the channel
+  was on can never authorize a notification after it is turned off. If
+  `extensions/moshi-hooks.ts` is installed, add
   `-extensions/moshi-hooks.ts` to the `extensions` list in your Pi
   `settings.json` so the Moshi-managed hook cannot notify in parallel; that edit
   leaves every other settings key and entry untouched. Removal of the flag (or
@@ -468,7 +485,9 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   heartbeat tick). Ambiguous, stale, or oversize snapshots never clear
   tasks. Known limits: delegates that launch and finish between presence
   publications never appear and still depend on chat delivery, and
-  absence-driven completion records `completed` without latching an error.
+  absence-driven completion records `completed` without touching the error
+  leg; a delegate that ended `failed` is detected and logged, never published
+  as state.
 - TTL-bounded tokens: stale panes fall back to native `idle`.
 - Herdr session opener (`herdr_session_open`): opens a Herdr panel running a
   Pi session at a path. A linked Git worktree opens as a **worktree panel**

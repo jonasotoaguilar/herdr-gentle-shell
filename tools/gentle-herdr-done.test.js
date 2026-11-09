@@ -38,6 +38,10 @@ assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed')
 const JOBS_EVENT = 'gentle-ai:jobs-sidebar';
 const DONE_TOKEN = 'gentle_done_v1';
 const ORCHESTRATING_TOKEN = 'gentle_orchestrating_v1';
+const ERROR_TOKEN = 'gentle_error_v1';
+// The sidebar daemon derives the pane's binding hash from exactly the same
+// agent_session path, so this is the hash both sides must agree on.
+const contract = require('../herdr-plugin/lib/gentle-tokens.js');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-herdr-done-'));
 const herdrSock = path.join(root, 'herdr.sock');
@@ -46,6 +50,9 @@ const stateDir = path.join(root, 'state');
 const sessionFile = path.join(root, 'sess.jsonl');
 fs.mkdirSync(stateDir, { recursive: true });
 fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+const SESSION_HASH = contract.expectedSessionHash({
+  agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+});
 fs.writeFileSync(path.join(stateDir, 'gentle-moshi.json'), '{"enabled":true}\n');
 const fakeHerdr = path.join(root, 'herdr-fake.sh');
 fs.writeFileSync(fakeHerdr, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -156,16 +163,27 @@ const finishesFrom = (from) =>
 function harness() {
   const handlers = new Map();
   const busHandlers = new Map();
+  // In-process `herdr:blocked` labels are the producer's own channel into the
+  // consumer (never a Herdr notification): recording them is how a test proves
+  // which label, if any, the sidebar was told to render.
+  const emitted = [];
   const on = (registry) => (kind, fn) => {
     if (!registry.has(kind)) registry.set(kind, []);
     registry.get(kind).push(fn);
   };
   const pi = {
     on: on(handlers),
-    events: { on: on(busHandlers), emit: () => {} },
+    events: {
+      on: on(busHandlers),
+      emit: (kind, payload) => {
+        emitted.push({ kind, payload });
+      },
+    },
   };
   return {
     pi,
+    emitted,
+    labels: () => emitted.filter((entry) => entry.kind === 'herdr:blocked'),
     fire: (kind, event, ctx) => {
       for (const fn of handlers.get(kind) ?? []) fn(event, ctx);
     },
@@ -223,6 +241,415 @@ async function startAndSettle(h, paneId) {
   h.fire('agent_settled', {}, ctx({ idle: true }));
   return from;
 }
+
+test('an empty settle lands the native Working -> Idle edge the host finishes on', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+
+  const from = cursor(paneId);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(400);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const idle = await waitFrom(
+    paneId,
+    from,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(
+    idle,
+    'a truly empty settle reports native idle, which is what fires the host Finished toast',
+  );
+  assert.equal(idle.params.message, undefined, 'idle carries no message');
+  await settle(400);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, from),
+    ['working', 'idle'],
+    'the host sees exactly one Working -> Idle transition, never a duplicate',
+  );
+});
+
+// --- the reported defect: a failed tool call repainted the whole row --------
+//
+// "tiro error y me notificio pero paso a estado idle, ademas que se quedo
+// pegado en error": a tool that failed inside a healthy turn latched
+// `error:task-failed`, which cleared the role/`gentle` display, claimed native
+// `blocked` (the host's NeedsAttention toast + sound) and held the finish
+// back. A failed tool call now changes nothing at all.
+
+async function workingTurn() {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(350);
+  return { h, paneId };
+}
+
+// Every observable effect of one failed tool call at once: no label, no
+// native state, no repaint of the role/`gentle` display, no phone envelope, no
+// held finish.
+const displayOf = (tokens) => ({
+  work:
+    typeof tokens.gentle_work_v1 === 'string'
+      ? tokens.gentle_work_v1.split(':').slice(0, 2).join(':')
+      : null,
+  roles: tokens.gentle_roles_v1 ?? null,
+  principal: tokens.gentle_principal_v1 === null ? null : 'live',
+  errorKeys: Object.keys(tokens).filter((key) => /error/i.test(key)),
+});
+
+async function assertToolFailureChangesNothing(h, paneId, fireFailure) {
+  const before = metadataTokensFrom(paneId, 0).at(-1);
+  assert.ok(before, 'the working turn published its state before the failure');
+  const framesFrom = cursor(paneId);
+  const labelsFrom = h.labels().length;
+  const phoneFrom = moshiFrames.length;
+  fireFailure();
+  await settle(450);
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    [],
+    'a failed tool call publishes no blocked label',
+  );
+  for (const tokens of metadataTokensFrom(paneId, framesFrom)) {
+    assert.deepEqual(
+      displayOf(tokens),
+      displayOf(before),
+      'a failed tool call never repaints the role/working display',
+    );
+  }
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom),
+    [],
+    'a failed tool call publishes no native state',
+  );
+  assert.deepEqual(
+    moshiFrames.slice(phoneFrom),
+    [],
+    'a failed tool call sends no phone envelope',
+  );
+  // The turn keeps its own edges: the settle still reaches native idle and the
+  // finish still ships, which the error leg used to hold back.
+  const settledFrom = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const idle = await waitFrom(
+    paneId,
+    settledFrom,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(idle, 'a settle after a failed tool call still reaches native idle');
+  assert.ok(
+    doneValuesFrom(paneId, settledFrom).length > 0,
+    'a failed tool call never blocks the done edge',
+  );
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom).filter((state) => state === 'blocked'),
+    [],
+    'a tool error never claims native blocked, which is the host NeedsAttention toast',
+  );
+  // The durable error token is the run-error signal: a tool-level failure
+  // never publishes it, so the settle beat above carries an explicit clear.
+  const settledTokens = metadataTokensFrom(paneId, settledFrom);
+  assert.ok(settledTokens.length > 0, 'the settle beat still publishes a full snapshot');
+  for (const published of settledTokens) {
+    assert.equal(
+      published[ERROR_TOKEN],
+      null,
+      'a failed tool call never publishes the run-error token',
+    );
+  }
+}
+
+test('S-E1: a failed subagent launch changes nothing in the published state', async () => {
+  const { h, paneId } = await workingTurn();
+  await assertToolFailureChangesNothing(h, paneId, () =>
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'tool-err-1', isError: true }),
+  );
+});
+
+test('S-E1: a failed TaskStore status changes nothing in the published state', async () => {
+  const { h, paneId } = await workingTurn();
+  await assertToolFailureChangesNothing(h, paneId, () =>
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'task-err-1',
+      details: { gentleAgents: { taskId: 't-err-1', agent: 'gentle-ai-worker', status: 'failed' } },
+    }),
+  );
+});
+
+test('S-E1: a failed background delegate result changes nothing in the published state', async () => {
+  const { h, paneId } = await workingTurn();
+  await assertToolFailureChangesNothing(h, paneId, () =>
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'bg-err-1', agent: 'gentle-ai-worker', status: 'failed' } },
+      },
+    }),
+  );
+});
+
+// S-E2/S-E3: the one real error state — the run itself stopped on an error
+// (Pi's own `turn_end.outcome === "error"` derives from exactly this
+// stopReason). It is sidebar-only: our own `error:` label, native state stays
+// `working` so no NeedsAttention toast/sound fires, and no phone envelope.
+test('S-E2/S-E3: a run that stops on an error shows our label only, never native blocked', async () => {
+  const { h, paneId } = await workingTurn();
+  const framesFrom = cursor(paneId);
+  const labelsFrom = h.labels().length;
+  const phoneFrom = moshiFrames.length;
+
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+  await settle(500);
+
+  const raised = h.labels().slice(labelsFrom);
+  assert.equal(raised.length, 1, 'a run that stops on an error raises exactly one label');
+  assert.deepEqual(
+    raised[0].payload,
+    { active: true, label: 'error:run-failed' },
+    'the error is our own sidebar label, not a native state',
+  );
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom).filter((state) => state === 'blocked'),
+    [],
+    'native blocked fires the host NeedsAttention toast + sound: an error never claims it',
+  );
+  assert.deepEqual(
+    moshiFrames.slice(phoneFrom),
+    [],
+    'error never reaches the phone channel',
+  );
+
+  // The label survives the settle of the run that died: it is the state, not a
+  // transient. The pane stays on the attention-free native `working` — and a
+  // settle that would otherwise report `idle` (the host's Finished toast) sends
+  // nothing at all.
+  const settledFrom = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(500);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, settledFrom),
+    [],
+    'while the error label stands the pane never reports idle or blocked',
+  );
+  assert.equal(
+    nativeStatesFrom(paneId, 0).at(-1),
+    'working',
+    'the pane sits on native working, the only silent native state, while the error label stands',
+  );
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    raised,
+    'no label churn on the settle of an already-failed run',
+  );
+});
+
+// S-E4: the error must never latch. The first non-error beat clears it.
+test('S-E4: the error label clears on the next non-error beat', async () => {
+  const { h, paneId } = await workingTurn();
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+  await settle(450);
+  assert.equal(
+    h.labels().filter((entry) => entry.payload?.label === 'error:run-failed').length,
+    1,
+    'the run error is up before the recovery beat',
+  );
+  const settledFrom = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(450);
+
+  const labelsFrom = h.labels().length;
+  h.fire('tool_result', { toolName: 'bash', toolCallId: 'alive-1' });
+  await settle(450);
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    [{ kind: 'herdr:blocked', payload: { active: false } }],
+    'the next non-error beat releases the error label instead of sticking',
+  );
+  const idle = await waitFrom(
+    paneId,
+    settledFrom,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(idle, 'once the error is gone the pane returns to the lifecycle state');
+});
+
+test('S-E4: a retried run clears the error without waiting for a new turn', async () => {
+  const { h } = await workingTurn();
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+  await settle(450);
+  const labelsFrom = h.labels().length;
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'stop' } });
+  await settle(450);
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    [{ kind: 'herdr:blocked', payload: { active: false } }],
+    'a successful retry releases the error label',
+  );
+});
+
+// S-E5: the run error is OUR OWN durable sidebar signal, not the native
+// `blocked` state. `blocked` is exactly what fires the host NeedsAttention
+// toast and sound, so the error rides a session-bound, TTL-fresh token that
+// the consumer reduces to the `error` display word, while the pane keeps
+// reporting the attention-free native `working`.
+
+function parsedError(value, now = Date.now()) {
+  return contract.parseError(value, SESSION_HASH, now);
+}
+
+async function fireRunError(h) {
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+}
+
+const publishedErrorToken = (frame) => {
+  const published = frame?.params?.tokens ?? {};
+  return typeof published[ERROR_TOKEN] === 'string' ? published[ERROR_TOKEN] : undefined;
+};
+
+test('S-E5: a run error publishes its own durable token, never native blocked', async () => {
+  const { h, paneId } = await workingTurn();
+  const framesFrom = cursor(paneId);
+  const phoneFrom = moshiFrames.length;
+
+  await fireRunError(h);
+  const beat = await waitFrom(
+    paneId,
+    framesFrom,
+    (f) => publishedErrorToken(f) !== undefined,
+  );
+  assert.ok(beat, 'the run error reaches the sidebar as our own durable token');
+  const value = publishedErrorToken(beat);
+  assert.match(
+    value,
+    /^[A-Za-z0-9_-]{43}:run-failed:[1-9]\d{0,15}$/,
+    'the error token mirrors the durable ask/review grammar',
+  );
+  assert.deepEqual(
+    parsedError(value),
+    { code: 'run-failed', expiry: Number(value.split(':')[2]) },
+    'the token is session-bound and TTL-fresh for this pane',
+  );
+
+  await settle(300);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom).filter((state) => state === 'blocked'),
+    [],
+    'an error never claims native blocked: no NeedsAttention toast, no sound',
+  );
+  assert.equal(
+    nativeStatesFrom(paneId, 0).at(-1),
+    'working',
+    'the pane stays on the only attention-free native state',
+  );
+  assert.deepEqual(
+    moshiFrames.slice(phoneFrom),
+    [],
+    'an error never sends a phone envelope',
+  );
+});
+
+test('S-E5: the error token is republished on every beat while the leg stands', async () => {
+  const { h, paneId } = await workingTurn();
+  await fireRunError(h);
+  const first = await waitFrom(paneId, 0, (f) => publishedErrorToken(f) !== undefined);
+  assert.ok(first, 'the error beat publishes the token');
+
+  // The settle of the run that died is a second beat while the leg still
+  // stands: a durable signal is republished there, never fired once on the
+  // error edge, so a missed beat cannot strand the row.
+  const from = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const second = await waitFrom(paneId, from, (f) => publishedErrorToken(f) !== undefined);
+  assert.ok(second, 'a later beat republishes the error token instead of firing it once');
+
+  const firstExpiry = parsedError(publishedErrorToken(first)).expiry;
+  const secondExpiry = parsedError(publishedErrorToken(second)).expiry;
+  assert.ok(secondExpiry >= firstExpiry, 'each beat mints a fresh expiry for the live leg');
+  assert.equal(
+    contract.reducePane({
+      agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+      agent_status: 'working',
+      group: 'myproj',
+      state_labels: {},
+      tokens: second.params.tokens,
+    }).display,
+    'error',
+    'the republished token still reads as the error state',
+  );
+});
+
+test('S-E5: the release beat clears the error token to null', async () => {
+  const { h, paneId } = await workingTurn();
+  await fireRunError(h);
+  await waitFrom(paneId, 0, (f) => publishedErrorToken(f) !== undefined);
+
+  const from = cursor(paneId);
+  h.fire('tool_result', { toolName: 'bash', toolCallId: 'alive-1' });
+  const cleared = await waitFrom(paneId, from, (f) => {
+    const published = f?.params?.tokens;
+    return !!published && ERROR_TOKEN in published && published[ERROR_TOKEN] === null;
+  });
+  assert.ok(cleared, 'the beat that releases the leg publishes the clear');
+
+  await settle(250);
+  const after = metadataTokensFrom(paneId, from);
+  assert.equal(after.at(-1)[ERROR_TOKEN], null, 'the token stays cleared while the leg is down');
+});
+
+// The assertion that was missing and let this regress: the run error actually
+// reaches the sidebar row, through the real producer output.
+test('S-E5 end-to-end: the run error renders as `error` in the sidebar reducer', async () => {
+  const { h, paneId } = await workingTurn();
+  await fireRunError(h);
+  const beat = await waitFrom(paneId, 0, (f) => publishedErrorToken(f) !== undefined);
+  assert.ok(beat, 'the producer published the error token');
+
+  const reduced = contract.reducePane({
+    agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+    agent_status: 'working',
+    group: 'myproj',
+    state_labels: {},
+    tokens: beat.params.tokens,
+  });
+  assert.equal(reduced.display, 'error', 'the row shows the run error, not generic `gentle`');
+  assert.equal(reduced.label, 'blocked', 'the error row word is the existing one');
+  assert.equal(reduced.notify, null, 'and the error never notifies');
+});
+
+// PRESERVE: an actual human-wait intervention is still the leg that claims
+// native `blocked` with its own label (the state this change kept intact).
+test('PRESERVE: an ask still reports native blocked with its label', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+
+  const from = cursor(paneId);
+  h.fireBus('gentle-pi:ask-user-choice:blocked', { active: true });
+  const blocked = await waitFrom(
+    paneId,
+    from,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'blocked',
+  );
+  assert.ok(blocked, 'a real human-wait still reports native blocked');
+  assert.match(blocked.params.message ?? '', /^ask:/, 'blocked carries the ask label');
+  assert.ok(
+    h.labels().some((entry) => entry.payload?.label === blocked.params.message),
+    'the label on the wire is the label the sidebar was told to render',
+  );
+});
 
 test('computeNativeState takes no job input', async () => {
   const { module } = await loadRuntime();
@@ -351,6 +778,248 @@ test('a snapshot owned by another session is ignored', async () => {
   const from = await startAndSettle(h, paneId);
   const minted = await waitFrom(paneId, from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
   assert.ok(minted, 'a foreign job set never holds this session');
+});
+
+// A finished job keeps appearing in the snapshot as a result tail; only an
+// entry with no `status` is still running (upstream RunningJobDisplay).
+const finishedJob = (id, status = 'exited', label = 'ci') => ({
+  ...job(id, label),
+  status,
+  endedAt: Date.now(),
+  exitCode: 0,
+});
+
+test('a finished-tail job is never pending work, whatever its terminal status', async () => {
+  await listening;
+  for (const status of ['exited', 'stopped', 'failed']) {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [finishedJob('job-1', status)]));
+
+    const from = await startAndSettle(h, paneId);
+    const minted = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(minted, `${status}: a finished-tail entry never holds the finish`);
+    assert.equal(
+      minted.params.tokens[ORCHESTRATING_TOKEN],
+      null,
+      `${status}: the row leaves the pink generic gentle wait on the same beat`,
+    );
+    await settle(400);
+    assert.equal(finishesFrom(moshiBefore).length, 1, `${status}: exactly one finish notification`);
+  }
+});
+
+test('a live job next to a finished tail holds the row, then releases it', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  const moshiBefore = moshiFrames.length;
+  // The live job carries no `status` at all (an older publisher shape): it
+  // still counts as pending work.
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-live'), finishedJob('job-done')]));
+
+  const from = await startAndSettle(h, paneId);
+  const held = await waitFrom(
+    paneId,
+    from,
+    (f) => typeof (f?.params?.tokens ?? {})[ORCHESTRATING_TOKEN] === 'string',
+  );
+  assert.ok(held, 'a live job keeps the row on the pink generic gentle');
+  assert.equal(held.params.tokens[DONE_TOKEN], null, 'and holds the finish');
+  await settle(400);
+  assert.equal(finishesFrom(moshiBefore).length, 0, 'no finish while one job still runs');
+
+  const freedFrom = cursor(paneId);
+  h.fireBus(
+    JOBS_EVENT,
+    jobsSnapshot('sess-1', [finishedJob('job-live'), finishedJob('job-done')]),
+  );
+  const minted = await waitFrom(
+    paneId,
+    freedFrom,
+    (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+  );
+  assert.ok(minted, 'a snapshot of finished tails alone releases the finish');
+  assert.equal(minted.params.tokens[ORCHESTRATING_TOKEN], null, 'and clears the gentle wait');
+  await settle(400);
+  assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification');
+});
+
+test('a job whose exit snapshot never arrives still releases the finish at the TTL', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '1500';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const from = await startAndSettle(h, paneId);
+    await settle(350);
+    assert.deepEqual(
+      doneValuesFrom(paneId, from),
+      [],
+      'a fresh job holds the finish: the beat it painted reports no done token',
+    );
+
+    // No further bus event ever arrives. Only the freshness bound can release
+    // the settle it is holding, and nothing else programs that beat.
+    const releasedFrom = cursor(paneId);
+    const minted = await waitFrom(
+      paneId,
+      releasedFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(
+      minted,
+      'the snapshot going stale publishes a beat of its own, and that beat mints the finish',
+    );
+    assert.equal(
+      minted.params.tokens[ORCHESTRATING_TOKEN],
+      null,
+      'the same beat drops the gentle wait, so the row reads done',
+    );
+    await settle(400);
+    assert.equal(
+      finishesFrom(moshiBefore).length,
+      1,
+      'the expiry beat is enough for the channel-on finish notification: exactly one',
+    );
+    assert.ok(
+      nativeStatesFrom(paneId, from).includes('idle'),
+      'the native Working -> Idle edge still lands on its own',
+    );
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+test('the exiting snapshot mints done on the spot, never waiting for the TTL', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '3000';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const heldFrom = await startAndSettle(h, paneId);
+    await settle(350);
+    assert.deepEqual(doneValuesFrom(paneId, heldFrom), [], 'the live job holds the finish');
+
+    const from = cursor(paneId);
+    const startedAt = Date.now();
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', []));
+    const minted = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+      2500,
+    );
+    assert.ok(minted, 'the exit snapshot releases the finish on the next beat');
+    assert.ok(
+      Date.now() - startedAt < 3000,
+      'it lands on the band the snapshot already describes, not on the staleness bound',
+    );
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+test('a new live snapshot after the expiry mints a second finish, once', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '1200';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const from = await startAndSettle(h, paneId);
+    const first = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(first, 'the first expiry releases the finish');
+    const firstExpiry = first.params.tokens[DONE_TOKEN].split(':')[1];
+    await settle(300);
+    assert.deepEqual(
+      doneValuesFrom(paneId, from).map((token) => token.split(':')[1]),
+      [firstExpiry],
+      'the hold republishes one expiry, never a second mint',
+    );
+
+    // A new live snapshot is activity again: the row returns to `gentle` and
+    // the finish it will hold is a genuinely new edge.
+    const backFrom = cursor(paneId);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-2')]));
+    const back = await waitFrom(
+      paneId,
+      backFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[ORCHESTRATING_TOKEN] === 'string',
+    );
+    assert.ok(back, 'a new live job returns the row to the gentle wait');
+    assert.equal(back.params.tokens[DONE_TOKEN], null, 'and clears the finished row');
+
+    const secondFrom = cursor(paneId);
+    const second = await waitFrom(
+      paneId,
+      secondFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(second, 'the new snapshot is its own expiry: the finish returns at its bound');
+    assert.notEqual(
+      second.params.tokens[DONE_TOKEN].split(':')[1],
+      firstExpiry,
+      'a new finish is a new hold, not the old one replayed',
+    );
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+test('shutdown drops the pending expiry instead of leaving an orphan beat', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '800';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+    h.fire('session_start', { reason: 'startup' }, ctx());
+    await settle(250);
+
+    const afterShutdown = cursor(paneId);
+    h.fire('session_shutdown', {}, ctx());
+    await settle(200);
+    const quietFrom = cursor(paneId);
+    await settle(1200);
+    assert.equal(
+      cursor(paneId),
+      quietFrom,
+      'the expiry timer is dropped with the session: no orphan beat after shutdown',
+    );
+    assert.ok(quietFrom >= afterShutdown, 'the shutdown itself published nothing extra');
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
 });
 
 test('the settle edge mints the finish token and notifies exactly once', async () => {
