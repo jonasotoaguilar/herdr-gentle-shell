@@ -2418,10 +2418,9 @@ async function applyCustomizeSwitch(id, value, ctx) {
 // The single apply path shared by the overlay and the menu fallback. An
 // inconclusive sidebar verdict is never a refusal: choosing On still attempts
 // the repair and reports the apply step's own error, exactly like the baseline
-// menu did. `switchId` names the switch a row drives when it lives under
-// another category — the notifications row inside `Herdr Sidebar` applies the
-// same `moshi` switch as the `Moshi notifications` category, so the one flag
-// file stays the single source of truth.
+// menu did. `switchId` names the switch a row drives, never the category it is
+// painted under: each category now owns exactly one switch, so the sidebar rows
+// can only ever resolve `sidebar` and the notification row only `moshi`.
 async function applyCustomizeChoice(categoryId, valueId, ctx, switchId) {
   const target = switchId === "sidebar" || switchId === "moshi" ? switchId : categoryId;
   if (target !== "sidebar" && target !== "moshi") return;

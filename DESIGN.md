@@ -881,11 +881,13 @@ applies the focused row and `Esc` closes without a write; a click on a category
 selects it, a click on a row applies it, and a click outside the panes is
 ignored (a press only captures the gesture, so a drag never applies a row).
 Each switch is one row that paints the stored state and carries the opposite
-value. The notifications switch appears under both `Herdr Sidebar` (as
-`Notifications`, where the plugin's own switches are looked for) and its own
-`Moshi notifications` category: a row names the switch it drives, so both
-apply the one `gentle-moshi.json` flag through `applyMoshiNotifications` and
-whosever change it was is what both rows read on the next render.
+value. Each category owns exactly one switch: `Herdr Sidebar` shows the single
+`Sidebar agent rows` row and its description names the managed agent rows only,
+while the only Moshi switch is the `Notifications` row under
+`Moshi notifications`, which applies the `gentle-moshi.json` flag through
+`applyMoshiNotifications`. The two channels are never mixed: the sidebar-rows
+switch neither reads nor writes that flag, so disabling the agent rows leaves
+the notification channel exactly as it was.
 An inconclusive sidebar verdict (`unknown`) renders as `● Unknown` with a note
 instead of hiding the row: toggling still attempts the repair and reports the
 apply step's own error, exactly like the menu. The plain

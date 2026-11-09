@@ -511,16 +511,16 @@ describe('floating customize panel', () => {
     for (const copy of [
       'Customize · Herdr Gentle Shell',
       'CATEGORIES',
-      'Herdr Sidebar · 1/2',
+      'Herdr Sidebar · 1/1',
       'Moshi notifications',
       'Sidebar agent rows',
-      'Notifications',
       '● Off',
       '○ On',
       '←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close',
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }
+    assert.equal(seen.includes('Notifications'), false, 'the Herdr Sidebar category lists no notification row');
     assert.equal(seen.includes('Click'), false, 'the legend names keys only');
     for (const gone of ['Plugin tools', 'Worktree tools', 'Preview', 'Reset every option']) {
       assert.equal(seen.includes(gone), false, `removed section still rendered: ${gone}`);
@@ -638,6 +638,35 @@ describe('floating customize panel', () => {
     const applied = fs.readFileSync(env.configPath, 'utf8');
     assert.ok(applied.includes(MANAGED_BEGIN) && applied.includes(MANAGED_END));
     assert.deepEqual(h.reloads, []);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the sidebar switch writes no Moshi flag');
+  });
+
+  test('the sidebar switch never reads or writes the Moshi flag', async () => {
+    const env = setupEnvironment('overlay-sidebar-no-moshi');
+    fs.writeFileSync(env.configPath, '[ui.sidebar.agents]\nignored = true\n');
+    // The user's reported bug: turning the agent rows off also turned the
+    // Moshi channel off. An existing flag must survive byte-identical.
+    const flagBefore = `${JSON.stringify({ enabled: true, updatedAt: '2024-01-01T00:00:00.000Z' })}\n`;
+    fs.writeFileSync(env.flagPath, flagBefore);
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('right');
+        const seen = component.render(100).join('\n');
+        assert.ok(seen.includes('▸ Sidebar agent rows'));
+        assert.equal(seen.includes('Notifications'), false, 'the category carries no Moshi switch');
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), [
+      'Sidebar agent rows enabled; the managed block is in place and Herdr reloaded its config.',
+    ]);
+    assert.equal(fs.readFileSync(env.flagPath, 'utf8'), flagBefore, 'the Moshi flag stays byte-identical');
+    assert.deepEqual(h.reloads, []);
   });
 
   test('Enter applies the chosen Moshi row with the usual gate and reload', async () => {
@@ -665,61 +694,7 @@ describe('floating customize panel', () => {
     assert.equal(h.reloads.length, 1);
   });
 
-  test('the notifications row inside Herdr Sidebar enables the same flag', async () => {
-    const env = setupEnvironment('overlay-sidebar-notifications-on');
-    installMoshiHook(env.pathDir, { paired: true });
-    fs.writeFileSync(env.configPath, '');
-    const configBefore = fs.readFileSync(env.configPath, 'utf8');
-    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
-    const h = harness({
-      customImpl: async (factory) => {
-        const { component, done } = openPanel(factory, makeHostTui().tui);
-        component.handleInput('right');
-        component.handleInput('down');
-        assert.ok(component.render(100).join('\n').includes('▸ Notifications'));
-        component.handleInput('enter');
-        return done();
-      },
-    });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    await run(h, '');
-    // The one flag and the owned exclusion, exactly like the `Moshi
-    // notifications` category: no second flag file, no Herdr config write.
-    assert.deepEqual(noticeTexts(h), [
-      `Moshi notifications enabled. added ${MOSHI_ENTRY}. Reloading now to apply the change.`,
-    ]);
-    assert.equal(readSettings(env.flagPath).enabled, true);
-    assert.deepEqual(readSettings(env.settingsPath).extensions, ['keep-me', MOSHI_ENTRY]);
-    assert.equal(h.reloads.length, 1);
-    assert.equal(fs.readFileSync(env.configPath, 'utf8'), configBefore);
-  });
-
-  test('the sidebar notifications row keeps the enable refusal', async () => {
-    const env = setupEnvironment('overlay-sidebar-notifications-refused');
-    // No `moshi-hook` on PATH at all: the gate must refuse before any write.
-    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
-    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
-    const h = harness({
-      customImpl: async (factory) => {
-        const { component, done } = openPanel(factory, makeHostTui().tui);
-        component.handleInput('right');
-        component.handleInput('down');
-        component.handleInput('enter');
-        return done();
-      },
-    });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    await run(h, '');
-    assert.deepEqual(noticeTexts(h), [MISSING_CLI_TEXT]);
-    assert.deepEqual(h.notices.map(([, level]) => level), ['error']);
-    assert.equal(fs.existsSync(env.flagPath), false);
-    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
-    assert.deepEqual(h.reloads, []);
-  });
-
-  test('both notification rows read the one flag on the next render', async () => {
+  test('the Moshi category reads the flag it just wrote', async () => {
     const env = setupEnvironment('overlay-notifications-consistency');
     installMoshiHook(env.pathDir, { paired: true });
     fs.writeFileSync(env.configPath, '');
@@ -728,8 +703,8 @@ describe('floating customize panel', () => {
     const enable = harness({
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
-        component.handleInput('right');
         component.handleInput('down');
+        component.handleInput('right');
         component.handleInput('enter');
         return done();
       },
@@ -739,8 +714,8 @@ describe('floating customize panel', () => {
     await run(enable, '');
     assert.equal(readSettings(env.flagPath).enabled, true);
 
-    // Reopening reads the same flag: both rows under `Herdr Sidebar` and the
-    // `Moshi notifications` category show the new state.
+    // Reopening reads the same flag: the `Moshi notifications` category shows
+    // the new state, and `Herdr Sidebar` still shows its own switch alone.
     const seen = {};
     const reopen = harness({
       customImpl: async (factory) => {
@@ -755,15 +730,14 @@ describe('floating customize panel', () => {
     const mod2 = await loadExtension(reopen);
     mod2.setCustomizeTuiLoader(async () => stubTui);
     await run(reopen, '');
-    assert.ok(seen.sidebar.includes('Herdr Sidebar · 1/2'));
+    assert.ok(seen.sidebar.includes('Herdr Sidebar · 1/1'));
     const sidebarLine = seen.sidebar.split('\n').find((line) => line.includes('Sidebar agent rows'));
-    const notificationLine = seen.sidebar.split('\n').find((line) => line.includes('Notifications'));
     assert.ok(sidebarLine.includes('● Off'), 'the sidebar rows keep their own stored state');
-    assert.ok(notificationLine.includes('● On'), 'the notifications row reads the flag it just wrote');
+    assert.equal(seen.sidebar.includes('Notifications'), false, 'no notification row under Herdr Sidebar');
     assert.ok(seen.moshi.includes('Moshi notifications · 1/1'));
-    assert.ok(seen.moshi.includes('● On'), 'the Moshi notifications category reads the same flag');
+    assert.ok(seen.moshi.includes('● On'), 'the Moshi notifications category reads the flag it just wrote');
 
-    // And Off through the Moshi category is what both rows show next time.
+    // And Off through the Moshi category is what it shows next time.
     const disable = harness({
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
@@ -783,6 +757,7 @@ describe('floating customize panel', () => {
     const reopenOff = harness({
       customImpl: async (factory) => {
         const { component } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
         after = component.render(100).join('\n');
         component.handleInput('escape');
         return null;
@@ -791,7 +766,7 @@ describe('floating customize panel', () => {
     const mod4 = await loadExtension(reopenOff);
     mod4.setCustomizeTuiLoader(async () => stubTui);
     await run(reopenOff, '');
-    assert.equal((after.match(/● Off/g) || []).length, 2, 'both rows fell back to Off');
+    assert.ok(after.includes('● Off'), 'the Moshi category fell back to Off');
   });
 
   test('an unavailable TUI helper keeps the menu fallback', async () => {

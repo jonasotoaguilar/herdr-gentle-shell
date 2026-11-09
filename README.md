@@ -426,10 +426,12 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   it is a key the panel answers to, and a narrow card compacts it instead of
   wrapping. Pointer input still works without being advertised — a click on a
   category selects it, a click on a row applies it, and a click outside the
-  panes is ignored. The notifications switch appears twice — as its own
-  `Moshi notifications` category and as a `Notifications` row inside
-  `Herdr Sidebar` — and both rows read the one flag below, so the state they
-  show can never disagree. The plain two-step menu stays as the fallback
+  panes is ignored. Each category owns exactly one switch: `Herdr Sidebar`
+  shows the single `Sidebar agent rows` row, and the only Moshi switch is the
+  `Notifications` row under `Moshi notifications`. The two are never mixed —
+  `Sidebar agent rows` neither reads nor writes `gentle-moshi.json`, so turning
+  the agent rows off never turns the notification channel off. The plain
+  two-step menu stays as the fallback
   when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
   (`--check` to read, `--apply --reload` / `--uninstall --reload` to change) and
@@ -454,8 +456,8 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   mkdir -p "$dir" && echo '{"enabled":true}' > "$dir/gentle-moshi.json"
   ```
 
-  `/herdr-gentle:customize` → `Moshi notifications` (or the `Notifications` row
-  inside `Herdr Sidebar`) writes this flag for you, and enabling there first
+  `/herdr-gentle:customize` → `Moshi notifications` writes this flag for you,
+  and enabling there first
   requires the `moshi-hook` CLI on `PATH` with `moshi-hook status --json`
   reporting `paired: true` (an unpaired host is refused and nothing is
   written).
