@@ -98,6 +98,7 @@ describe('state sidecar', () => {
       'gentle_work_v1',
       'gentle_roles_v1',
       'gentle_orchestrating_v1',
+      'gentle_pending_v1',
       'gentle_changes_v2',
       'gentle_ask_v1',
       'gentle_review_v1',

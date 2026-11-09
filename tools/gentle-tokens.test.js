@@ -1664,3 +1664,128 @@ describe('unfinished displays match the non-terminal reducer vocabulary', () => 
     assert.deepEqual([...diagnostics.UNFINISHED_DISPLAYS].sort(), expected);
   });
 });
+
+// A synchronous (task-mode) `subagent_run`/`subagent_continue` call blocks the
+// principal's own turn: the session is executing a tool call and waiting for
+// the child, not doing its own model work. `agentActive` stays true for the
+// whole call, so the principal marker alone paints generic `gentle` even
+// though the running role is known. The producer therefore publishes one
+// dedicated marker for the in-flight blocking call (`gentle_pending_v1`), and
+// this leg renders its role word at role precedence — above the principal
+// activity marker, below attention and the terminal `done`. Background
+// launches return immediately and never leave a marker behind, so a running
+// background delegate still changes nothing about the principal's display.
+// (odd/tasks/pending-role-display.md S1-S4.)
+describe('blocking pending delegate call decides the row', () => {
+  // Fresh gentle_pending_v1: `<hash>:<role>:<expiry>`, one role word.
+  function pendingToken(hash, role, expiry = EXPIRY) {
+    return `${hash}:${role}:${expiry}`;
+  }
+
+  // The reported shape: herdr native `working`, a fresh principal marker
+  // (the principal is inside a blocking tool call, so its own agent is
+  // active), count 0 (task-mode launches have no TaskStore record yet) and
+  // the pending role marker.
+  function pendingEntry({ role = 'worker', pending = null, count = 0, principal = true, status = 'working' } = {}) {
+    const built = roleEntry('', { count });
+    if (principal) built.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(built.hash);
+    built.entry.tokens[tokens.PENDING_TOKEN] = pending === null ? null : pendingToken(built.hash, pending);
+    built.entry.agent_status = status;
+    return built;
+  }
+
+  it('exposes the pending token name and parses its role marker', () => {
+    assert.equal(tokens.PENDING_TOKEN, 'gentle_pending_v1');
+    const { hash } = roleEntry('', { count: 0 });
+    assert.deepEqual(tokens.parsePending(pendingToken(hash, 'worker'), hash, NOW), {
+      role: 'worker',
+      expiry: EXPIRY,
+    });
+    assert.deepEqual(tokens.parsePending(pendingToken(hash, 'rdd'), hash, NOW), {
+      role: 'rdd',
+      expiry: EXPIRY,
+    });
+    assert.deepEqual(tokens.parsePending(pendingToken(hash, 'explore'), hash, NOW), {
+      role: 'explorer',
+      expiry: EXPIRY,
+    });
+  });
+
+  it('a blocking worker launch outranks the fresh principal marker', () => {
+    const { entry } = pendingEntry({ pending: 'worker' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'worker');
+    assert.equal(reduced.label, 'worker');
+    assert.notEqual(reduced.label, 'gentle');
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.STATE_TOKENS.worker], 'worker');
+    assert.equal(patch[tokens.TITLE_TOKENS.worker], 'worker');
+    assert.equal(patch[tokens.TITLE_TOKENS.working], null);
+  });
+
+  it('a blocking explorer launch renders its role too', () => {
+    const { entry } = pendingEntry({ pending: 'explorer' });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'explorer');
+    assert.equal(reduced.label, 'explorer');
+  });
+
+  it('without the pending marker the same working principal still reads gentle', () => {
+    const { entry } = pendingEntry({ pending: null });
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('an expired pending marker falls back to gentle', () => {
+    const { entry, hash } = pendingEntry({ pending: null });
+    entry.tokens[tokens.PENDING_TOKEN] = `${hash}:worker:${NOW - 1}`;
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'working');
+    assert.equal(reduced.label, 'gentle');
+  });
+
+  it('unrecognized, overlong, or foreign-session pending evidence falls back to gentle', () => {
+    for (const value of ['working', 'WORKER', 'worker!', 'w'.repeat(40)]) {
+      const { entry, hash } = pendingEntry({ pending: null });
+      entry.tokens[tokens.PENDING_TOKEN] = `${hash}:${value}:${EXPIRY}`;
+      const reduced = tokens.reducePane(entry, NOW);
+      assert.equal(reduced.label, 'gentle', `${value} must not assert a role`);
+    }
+    const foreignHash = sessionHashFor(
+      baseEntry({ agent_session: { agent: 'pi', kind: 'path', value: '/other/pending-session' } }),
+    );
+    const { entry } = pendingEntry({ pending: null });
+    entry.tokens[tokens.PENDING_TOKEN] = `${foreignHash}:worker:${EXPIRY}`;
+    assert.equal(tokens.reducePane(entry, NOW).label, 'gentle');
+  });
+
+  it('error, ask, and review still outrank a fresh pending marker', () => {
+    const error = pendingEntry({ pending: 'worker' });
+    error.entry.tokens[tokens.ERROR_TOKEN] = `${error.hash}:run-failed:${EXPIRY}`;
+    const errorReduced = tokens.reducePane(error.entry, NOW);
+    assert.equal(errorReduced.display, 'error');
+    assert.equal(errorReduced.notify, null);
+
+    const ask = pendingEntry({ pending: 'worker' });
+    ask.entry.tokens[tokens.ASK_TOKEN] = `${ask.hash}:q1:${EXPIRY}`;
+    const askReduced = tokens.reducePane(ask.entry, NOW);
+    assert.equal(askReduced.display, 'ask');
+    assert.deepEqual(askReduced.notify, { sessionHash: ask.hash, intentId: 'q1', expiry: EXPIRY });
+
+    const review = pendingEntry({ pending: 'worker' });
+    review.entry.tokens[tokens.REVIEW_TOKEN] = `${review.hash}:r1:${EXPIRY}`;
+    assert.equal(tokens.reducePane(review.entry, NOW).display, 'review');
+  });
+
+  it('the terminal done gate still wins over a fresh pending marker', () => {
+    // A settled principal never publishes a principal marker, so the only
+    // live-looking evidence left is the pending role marker: `done` stays
+    // terminal and the pending leg must not resurrect a role row.
+    const { entry, hash } = pendingEntry({ pending: 'worker', principal: false, status: 'done' });
+    entry.tokens[tokens.DONE_TOKEN] = `${hash}:${EXPIRY}`;
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'done');
+    assert.equal(reduced.label, 'done');
+  });
+});
