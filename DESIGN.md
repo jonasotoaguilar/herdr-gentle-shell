@@ -28,9 +28,14 @@ explicitly in §10 and are not decided here.
   per-pane key=value tokens via `pane.report_metadata` /
   `workspace.report_metadata` over `HERDR_SOCKET_PATH`, with a CLI fallback
   (`herdr pane report-metadata <pane> --source <src> --token name=value`).
-- The consumer is a poller, not a subscriber: the plugin daemon reads the
-  Herdr snapshot on a cadence and reduces pane tokens to sidebar state.
-  No new socket, webhook, broker, or persistent connection is introduced.
+- The consumer polls the Herdr snapshot and reduces pane tokens to sidebar
+  state. Drawing is subscription-driven: the daemon also holds ONE long-lived
+  socket `events.subscribe` for `pane.updated` (plus the roster kinds), which
+  only marks a dirty flag and wakes the existing sleep, so a landed token
+  report is drawn without waiting for the poll. Polling stays the fallback and
+  remains authoritative for everything no Herdr event can drive (§8). No new
+  socket, webhook, broker, or dependency is introduced: this is the existing
+  plugin socket, used read-only.
 - The existing native producer `herdr-agent-state.ts` (managed-by-herdr, v9,
   source `herdr:pi`) already reports main-agent `working`/`blocked`/`idle` +
   session ref. It is **read-only evidence**: never edited, reinstalled, or
@@ -39,7 +44,9 @@ explicitly in §10 and are not decided here.
 ### Style choice and reason
 
 - Style: **polled token sidecar** (same style as `herdr-pi-tree`): short-TTL
-  `name=value` tokens on the pane, reduced by a snapshot poller.
+  `name=value` tokens on the pane, reduced by a snapshot poller, with one
+  `events.subscribe` wake so the drawing follows the report instead of the
+  clock (§8).
 - Reason (smallest fitting style): the transport, snapshot source, 16-token
   budget, TTL/expiry convention, and sidebar token-name mapping already exist
   and are deployed. A new push channel (SSE/WebSocket/webhook) or a new RPC
@@ -811,6 +818,34 @@ exactly one mechanism writes each piece of state.
   time AND the drawing follows it. N reports in one window collapse into one
   frame, and refresh-driven frames are floored at 250 ms after the frame that
   started the sleep, so a report storm can never spin the loop.
+  The token path is also subscription-driven: the daemon holds exactly ONE
+  long-lived socket `events.subscribe` for `pane.updated` (plus the roster
+  kinds `pane.created`, `pane.closed`, `pane.moved`), because
+  `pane.report_metadata` bumps the pane revision and Herdr then emits
+  `pane.updated` with the full pane payload. Herdr repaints push-driven on that
+  write plus its metadata-TTL expiry, so a token write no longer waits for the
+  poll. An event does nothing but set ONE dirty flag and wake that
+  same sleep: the flag is consumed with the refresh request into a single
+  frame, so a burst collapses to one frame, there is no second frame loop, no
+  timer, no per-event frame, no queue (bounded memory is that one boolean) and
+  no frame sooner than the same `refreshGateMs`/`POLL_MIN_MS` floor. A
+  manifest `[[events]]` hook cannot do this and must not be tried again:
+  `pane.updated` is deliberately excluded from the 22-name hook surface
+  (`PLUGIN_HOOK_EVENT_KINDS`), and the runtime filter drops non-hook kinds, so
+  `on = "pane.updated"` in `herdr-plugin.toml` is inert. Reconnect is bounded
+  and single-flight: 1 s doubling to a 60 s cap, reset only after a connection
+  that stayed live 5 s, so a Herdr restart reconnects promptly while a server
+  that accepts and drops climbs to the cap instead of flapping. A rejected,
+  closed, or unanswered subscription logs one line per distinct reason and
+  changes nothing else — the poll below is unchanged and correct without it.
+  Shutdown closes the socket and its retry timer, and neither keeps the process
+  alive. Idle cost with no events is exactly today's: an idle subscription is
+  silent and the loop sleeps as before.
+  What the subscription can never drive stays poll-only: the row data the
+  daemon derives by itself — the `+N/-N` changes summary and the `↑N` pull
+  marker, read from local git plus `agent.list` — plus the presence prefix,
+  because Herdr emits no event for either. That is why the fast cycle is armed
+  by a rendered non-idle display, and why polling is never removed.
   The sleep is also capped at the nearest live `gentle_done_v1` expiry among
   the panes just rendered (never below the 250 ms floor), so a held `done`
   row reaches `idle` when the hold lapses rather than up to one poll later.

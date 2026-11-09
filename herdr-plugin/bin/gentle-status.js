@@ -29,6 +29,15 @@
 // with one CLI fallback each, so a misbehaving socket degrades to slow, not
 // broken. A failed snapshot is "no data", never "empty": nothing is
 // published or swept on a failed read.
+//
+// Drawing is subscription-driven and polling is the fallback (DESIGN §5, §8):
+// one long-lived socket `events.subscribe` for `pane.updated` (plus the roster
+// kinds) wakes the single frame loop, because `pane.report_metadata` makes
+// Herdr emit that event and repaint. The subscription can never fail the
+// daemon: it reconnects on a bounded backoff, reports one line per distinct
+// failure, and the poll below is unchanged and correct without it. The
+// git-derived `+N/-N` and `↑N` row data and the presence prefix have no Herdr
+// event at all, which is why polling is never removed.
 
 var MIN_MAJOR = 18;
 var major = Number(String(process.versions.node).split('.')[0]);
@@ -484,6 +493,221 @@ async function socketCall(method, params) {
   }
 }
 
+/* ------------------------------------------------------------ events */
+
+// DESIGN §5: the token path is subscription-driven and polling is the
+// fallback. `pane.report_metadata` bumps the pane revision and Herdr emits
+// `pane.updated` with the full pane payload, but that kind is deliberately
+// absent from the manifest hook surface (22 names), so a `[[events]] on =
+// "pane.updated"` hook never fires. The supported route is this long-lived
+// socket subscription. Roster kinds ride along because they cost one array
+// entry each and a roster change is a visible row change.
+//
+// Nothing here parses the payload: an event only marks ONE dirty flag that
+// wakes the single existing sleep, so an event burst collapses into one frame
+// (never a second loop, never a timer, never a frame per event). Nothing is
+// queued, so bounded memory is one boolean.
+const EVENT_SUBSCRIPTIONS = ['pane.updated', 'pane.created', 'pane.closed', 'pane.moved'];
+const EVENT_WAKE_KINDS = new Set();
+for (const kind of EVENT_SUBSCRIPTIONS) {
+  // Pushed envelopes name their kind in snake_case (`pane_updated`); accept
+  // both spellings so a framing change can never silently stop the wakes.
+  EVENT_WAKE_KINDS.add(kind);
+  EVENT_WAKE_KINDS.add(kind.replace('.', '_'));
+}
+const EVENT_LINE_MAX_BYTES = 1024 * 1024;
+const SUBSCRIBE_REQUEST_ID = 'gentle-status-events';
+const SUBSCRIBE_BACKOFF_BASE_MS = 1000;
+const SUBSCRIBE_BACKOFF_CAP_MS = 60000;
+// A connection that lived this long counts as healthy, so its failure resets
+// the backoff ladder. A server that accepts and immediately drops climbs it.
+const SUBSCRIBE_STABLE_MS = 5000;
+
+// Pure and time-free so the ladder is asserted directly instead of through
+// wall-clock behavior: 1 s, 2 s, 4 s ... capped at 60 s, never decreasing. A
+// Herdr restart usually lands inside the first second, and the cap keeps a
+// permanently absent server at one connect attempt a minute — a cost the 10 s
+// baseline poll it can never replace already pays. Garbage input fails closed
+// to the base delay, so no value can produce a 0 delay spin.
+function nextSubscribeDelayMs(attempt, livedMs) {
+  const prior = Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 0;
+  const stable = Number.isFinite(livedMs) && livedMs >= SUBSCRIBE_STABLE_MS;
+  const next = stable ? 1 : Math.min(prior + 1, 31);
+  const delayMs = Math.min(SUBSCRIBE_BACKOFF_BASE_MS * 2 ** Math.min(next - 1, 16), SUBSCRIBE_BACKOFF_CAP_MS);
+  return { attempt: next, delayMs };
+}
+
+// The pushed envelope names the kind at `event` (and repeats it at
+// `data.type`); a reply to our own request carries `id` and is not an event.
+function eventKindOf(message) {
+  if (!message || typeof message !== 'object') return null;
+  if (message.id !== undefined && message.id !== null) return null;
+  const data = message.data;
+  const kind =
+    typeof message.event === 'string'
+      ? message.event
+      : data && typeof data.type === 'string'
+        ? data.type
+        : null;
+  return kind !== null && EVENT_WAKE_KINDS.has(kind) ? kind : null;
+}
+
+// One connection at a time, reconnected on failure. Every failure is reported
+// once per distinct reason (never per attempt) and can never throw or leave an
+// unhandled rejection: without the subscription the poll is unchanged and
+// correct, so degrading is always the safe outcome.
+function startEventSubscription({ onEvent, onFailure } = {}) {
+  const notifyEvent = typeof onEvent === 'function' ? onEvent : () => {};
+  const reportFailure = typeof onFailure === 'function' ? onFailure : () => {};
+  let stream = null;
+  let buffer = '';
+  let attempt = 0;
+  let openedAt = 0;
+  let acknowledged = false;
+  let failed = false; // this connection already reported and scheduled its retry
+  let retryTimer = null;
+  let stopped = false;
+
+  const destroy = () => {
+    const current = stream;
+    stream = null;
+    if (!current) return;
+    try {
+      current.destroy();
+    } catch {
+      // Already gone.
+    }
+  };
+
+  const fail = (reason, detail) => {
+    if (stopped || failed) return;
+    failed = true;
+    const livedMs = openedAt === 0 ? 0 : Date.now() - openedAt;
+    destroy();
+    buffer = '';
+    const next = nextSubscribeDelayMs(attempt, livedMs);
+    attempt = next.attempt;
+    reportFailure(reason, detail);
+    retryTimer = setTimeout(connect, next.delayMs);
+    // A reconnect timer must never be what keeps the daemon alive.
+    if (typeof retryTimer.unref === 'function') retryTimer.unref();
+  };
+
+  const handleLine = (line) => {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (message && message.id === SUBSCRIBE_REQUEST_ID && !acknowledged) {
+      if (message.error) {
+        const detail = message.error.message ?? message.error.code;
+        fail('rejected', typeof detail === 'string' ? detail : undefined);
+        return;
+      }
+      acknowledged = true;
+      // A live subscription is idle traffic, not a request awaiting a reply.
+      try {
+        stream?.setTimeout(0);
+      } catch {
+        // Not fatal; the socket stays subscribed either way.
+      }
+      return;
+    }
+    if (eventKindOf(message) !== null) notifyEvent();
+  };
+
+  function connect() {
+    retryTimer = null;
+    if (stopped) return;
+    failed = false;
+    acknowledged = false;
+    buffer = '';
+    let next;
+    try {
+      next = net.connect({ path: pipePath() });
+    } catch (error) {
+      fail('connect', error?.message);
+      return;
+    }
+    stream = next;
+    openedAt = Date.now();
+    try {
+      next.setEncoding('utf8');
+      // A server that accepts the connection and never answers would leave the
+      // token path silently unpushed: treat silence like a rejection.
+      next.setTimeout(SOCKET_TIMEOUT_MS);
+    } catch {
+      // Timeouts are best-effort; the data path below still works.
+    }
+    next.on('connect', () => {
+      try {
+        next.write(
+          `${JSON.stringify({
+            id: SUBSCRIBE_REQUEST_ID,
+            method: 'events.subscribe',
+            params: { subscriptions: EVENT_SUBSCRIPTIONS.map((type) => ({ type })) },
+          })}\n`,
+        );
+      } catch (error) {
+        fail('connect', error?.message);
+      }
+    });
+    next.on('timeout', () => fail('unanswered', 'no subscribe acknowledgement'));
+    next.on('error', (error) => fail(error?.code ?? 'error', error?.message));
+    next.on('end', () => fail('closed', 'subscription ended'));
+    next.on('close', () => fail('closed', 'subscription closed'));
+    next.on('data', (chunk) => {
+      buffer += chunk;
+      if (buffer.length > EVENT_LINE_MAX_BYTES) {
+        fail('oversize', 'event frame too large');
+        return;
+      }
+      let at;
+      while ((at = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, at);
+        buffer = buffer.slice(at + 1);
+        if (line.trim()) handleLine(line);
+        if (stopped || failed) return;
+      }
+    });
+  }
+
+  connect();
+
+  return {
+    // Idempotent and synchronous: shutdown must never wait on an event.
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      buffer = '';
+      destroy();
+    },
+  };
+}
+
+// Bounded subscription report: one stderr line plus one err-file entry per
+// distinct failure reason. A Herdr that rejects, closes, or never answers the
+// subscription must never be louder than the polling that still covers it.
+function reportSubscriptionError(state, reason, detail) {
+  const key = typeof reason === 'string' && reason.length > 0 ? reason : 'unknown';
+  if (state && state.subscriptionErrorReported === key) return;
+  if (state) state.subscriptionErrorReported = key;
+  const message =
+    `gentle-status: event subscription unavailable (${key}${detail ? `: ${detail}` : ''}); polling continues`;
+  try {
+    console.error(message);
+  } catch {
+    // stderr is best-effort; the err file below is the durable record.
+  }
+  logError(new Error(message));
+}
+
 function binary() {
   return process.env.HERDR_BIN_PATH ?? 'herdr';
 }
@@ -915,13 +1139,35 @@ async function run() {
     interruptions: interruptions.loadInterruptions(stateRoot()),
     clearedWhileDisabled: new Set(),
     sidebarModeErrorReported: null,
+    subscriptionErrorReported: null,
   };
   const pollConfig = resolvePollConfig();
   const pollState = createPollState();
   let stopped = false;
+  // The whole event state: one dirty flag, no queue. An event may only wake
+  // the sleep below; the frame it draws is the same one the poll would draw.
+  let eventWake = false;
+  const takeEventWake = () => {
+    if (!eventWake) return false;
+    eventWake = false;
+    return true;
+  };
+  const subscription = startEventSubscription({
+    onEvent: () => {
+      eventWake = true;
+    },
+    onFailure: (reason, detail) => reportSubscriptionError(state, reason, detail),
+  });
   const shutdown = async () => {
     if (stopped) return;
     stopped = true;
+    // Close the subscription first: a signal must never leave a live socket
+    // (or its reconnect timer) behind, and stop() never waits on it.
+    try {
+      subscription.stop();
+    } catch (error) {
+      logError(error);
+    }
     try {
       fs.rmSync(PID_FILE(), { force: true });
     } catch {
@@ -958,9 +1204,11 @@ async function run() {
     // time. No setInterval, no busy loop (delays floored at POLL_MIN_MS via
     // resolvePollConfig and capDelayToExpiry). The sleep is interruptible: a
     // coalesced refresh request — from a lifecycle hook or from the producer
-    // after every landed token report — breaks the wait early for one
-    // immediate frame, never sooner than POLL_MIN_MS after the frame that
-    // started it. Sequential — the next frame never overlaps the current one;
+    // after every landed token report — or a `pane.updated` burst on the event
+    // subscription breaks the wait early for one immediate frame, never sooner
+    // than POLL_MIN_MS after the frame that started it. Both marks are consumed
+    // together, so a report and an event landing in the same window still draw
+    // one frame. Sequential — the next frame never overlaps the current one;
     // concurrent requests collapse to one.
     const now = Date.now();
     const delay = nextPollDelay(pollState, now, state.pollObserved, pollConfig);
@@ -974,7 +1222,10 @@ async function run() {
       const left = deadline - at;
       if (left <= 0) break;
       const gateMs = refreshGateMs(frameStartedAt, at);
-      if (gateMs === 0 && takeRefresh()) break;
+      if (gateMs === 0) {
+        const requested = takeRefresh();
+        if (takeEventWake() || requested) break;
+      }
       const slice = Math.min(sliceMs, left);
       await new Promise((resolve) => setTimeout(resolve, gateMs > 0 ? Math.min(slice, gateMs) : slice));
     }
@@ -1079,5 +1330,11 @@ if (require.main === module) {
     requestRefresh,
     takeRefresh,
     readSidebarMode,
+    nextSubscribeDelayMs,
+    startEventSubscription,
+    eventKindOf,
+    EVENT_SUBSCRIPTIONS,
+    SUBSCRIBE_BACKOFF_CAP_MS,
+    SUBSCRIBE_STABLE_MS,
   };
 }

@@ -316,15 +316,19 @@ activity, a rendered non-idle display, or send/publish failures are observed);
 `pane.closed` each run `node bin/gentle-status.js --refresh`, which ensures the
 adaptive poll daemon is running and requests one coalesced immediate frame
 so a newly opened project name/state renders without waiting for the next
-poll tick. Drawing follows the report, not the clock: the producer requests
-that same coalesced refresh after every landed token beat, so a status change
+poll tick. Drawing follows the report, not the clock: the daemon also holds one
+long-lived `events.subscribe` for `pane.updated`, so a token write Herdr already
+repaints for wakes the same single frame loop (bounded reconnect, floored at
+250 ms, no second loop, no per-event frame), and the producer requests that same
+coalesced refresh after every landed token beat, so a status change
 it publishes is drawn at once, and the daemon caps each sleep at the nearest
 live `done` expiry, so a settled row reaches `idle` when its short hold (5 s by
 default, `GENTLE_HERDR_DONE_HOLD_MS`-overridable) lapses instead of one poll
 later. Reports in one window collapse into one frame, and refresh-driven frames
 are floored at 250 ms, so a burst can never spin the daemon. Polling stays the
-fallback for every lifecycle signal, so a missed
-or undelivered event never sticks. Read-only
+fallback for every lifecycle signal and the only source for what no Herdr event
+carries (the git-derived `+N/-N` and `↑N` row data and the presence prefix), so a
+missed, undelivered, or rejected event never sticks. Read-only
 supervision triage ships beside it: the `doctor` and `whois` plugin actions
 (`node bin/gentle-doctor.js`, `node bin/gentle-whois.js`) plus the explicit-pane
 `node bin/gentle-trace.js <pane-id>` CLI — all read-only, none mutating state.

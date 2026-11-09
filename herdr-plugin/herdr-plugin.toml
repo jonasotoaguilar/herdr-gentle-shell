@@ -31,8 +31,14 @@ platforms = ["linux"]
 # this daemon emits no notification for any display.
 # No-args mode only ensures the daemon is running; --run is the loop.
 # Poll cadence is adaptive (10 s baseline, GENTLE_STATUS_POLL_MS-overridable,
-# 2 s fast cycle while recent ask activity or send/publish failures are
-# observed); DESIGN §10 U2 sets no normative cadence yet, only << 60 s TTL.
+# 2 s fast cycle while recent ask activity, a rendered non-idle display, or
+# send/publish failures are observed); DESIGN §10 U2 sets no normative cadence
+# yet, only << 60 s TTL. Polling is the FALLBACK: the daemon also holds one
+# long-lived socket `events.subscribe` for pane.updated (plus the roster
+# kinds), which only wakes the same single frame loop, and a token write Herdr
+# already repaints for is drawn without a poll. A `[[events]]` hook cannot do
+# that: pane.updated is deliberately excluded from the manifest hook surface,
+# so `on = "pane.updated"` in this manifest would be inert — do not add it.
 [[startup]]
 command = ["node", "bin/gentle-status.js"]
 
