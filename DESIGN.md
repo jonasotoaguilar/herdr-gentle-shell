@@ -610,6 +610,84 @@ A signal is *fresh* iff its token parses (§4.3) and `expiry > now`. Stale or
 unparseable signals are dropped individually (one bad token never poisons the
 other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 
+### 5.5 `gs`: the label for an isolated Gentle Shell pane
+
+Herdr identifies an agent from the pane's foreground process group, and its
+canonical aliases include `pi` and `gentle-shell` but never `gs`; a path prefix
+is never consulted. An isolated Gentle Shell pane therefore has no Agents row
+of its own unless this plugin supplies a label, which is why the label follows
+a strict ladder that never lies about who owns the pane:
+
+**Which panes belong to an isolated install.** The verified installation shape
+is a user install under the XDG data dir — `<data>/gentle-shell/install`
+(`$XDG_DATA_HOME/gentle-shell/install`, else
+`~/.local/share/gentle-shell/install`), anchored by
+`install/installation.json` (`gentle-shell-user-install/v1`, `Mode:
+"separate"`), whose launcher starts the pane as `node
+<root>/runtime/<channel>/bin/gentle-shell.mjs`. Qualification uses the same
+input Herdr's detection reads, in this order:
+
+- **Primary — the foreground process group.** A pane qualifies when any member
+  of its foreground process group exposes an argv / `argv0` / cmdline path that
+  resolves at or under the install root (a relative script path resolves
+  against that process's own cwd). This is what real panes look like: the
+  isolated pane is launched from the user's PROJECT directory, so its cwd is
+  never inside the install. A readable group with no install member is an
+  authoritative "no" — a cwd inside the root cannot override it.
+- **Secondary — cwd.** Only when the group cannot be read at all (no
+  `pane.process-info` answer) does `cwd` / `foreground_cwd` at or under the root
+decide, and an unreadable group never throws and never logs more than one
+  bounded line.
+
+The root resolves from `GENTLE_SHELL_INSTALL_ROOT`, else the launcher's
+`GENTLE_SHELL_HOME`, else the XDG data dir default. Windows keeps its own user
+data dir (mirroring Herdr's `LOCALAPPDATA` state-dir convention) but is
+unverified, which is why the manifest ships linux-only.
+
+1. **Detection first: display agent only.** A qualifying pane Herdr already
+   detects keeps Herdr's own truthful identity and live state. The plugin only
+   reports `--display-agent gs` through `pane.report-metadata`, which is
+   presentation-only and changes nothing about the state Herdr publishes.
+2. **Reported label as the last resort.** A qualifying pane Herdr does not
+   detect gets `pane report-agent --agent gs --state idle --source
+   plugin:<plugin-id>:gs`, because a row exists only for an agent terminal and
+   an undetected pane is not one. This is the only case in which the plugin
+   states an agent identity, and it states `gs` — never `pi`.
+3. **The report is reversible, never a mask.** Detection is a function of the
+   pane's foreground process group, so an unchanged group owes no re-check
+   while a changed one means a real agent may now be present. On that change the
+   plugin releases exactly its own authority (`pane release-agent`, same
+   source, label `gs`) and re-decides, keeping the display label: `gs` never
+   masks a real `pi` / `gentle-shell` detection for longer than one beat.
+4. **Release on the way out.** `pane.exited` / `pane.closed`, a pane that
+   leaves the qualifying set, a disabled sidebar, and daemon shutdown all clear
+   what this plugin reported — authority first, then the display label.
+   Authority this plugin did not set is never touched: both the source and the
+   label are part of every release.
+
+`gs` is not a canonical Herdr agent, so `rows_by_agent.gs` is a configuration
+error rather than an inert key: `rows_by_agent` stays keyed by a canonical
+agent (`pi`), and `gs` exists only as a label.
+
+Discovery — one bounded `pane list` read plus one `pane.process-info` per pane
+(the read qualification needs; capped, and a scan pays for no answer twice) —
+runs at daemon start, on an explicit `--refresh` (a separate request marker, so
+the producer's per-beat refresh never triggers one), and on a roster event
+(`pane.created`, `pane.closed`, `pane.moved`, `pane.exited`,
+`pane.agent_detected`); never per frame. The only per-frame call is the
+foreground re-check of a pane this plugin currently reports. Every write is
+deduped against what the plugin already reported, every interpolated value is
+checked against a strict identifier grammar before it reaches a fixed argv, and
+any failure (no `pane list`, a CLI error, a disabled sidebar, an unreadable mode
+flag) does nothing to the existing behavior and logs one bounded line per
+distinct reason.
+
+One thing this design cannot fix: the gs pane's own live state. Herdr reports
+state for an agent terminal it knows, and the isolated install does not forward
+`HERDR_ENV` to the pane's agent, so `gs` is a label on a row whose state is
+Herdr's own (`idle` in the reported fallback). Forwarding that environment is a
+gentle-ai concern and explicitly out of scope for this plugin.
+
 ## 6. Failure, retry, idempotency
 
 - Delivery is at-least-once snapshots over an unreliable beat: producer

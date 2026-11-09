@@ -23,8 +23,11 @@ platforms = ["linux"]
 # Sections below are added only as their commands become verifiable.
 #
 # Coexistence: single-writer handoff with herdr-pi-tree, which stays installed
-# but disabled for gentle-owned panes. No Agents-panel ownership is claimed
-# here (DESIGN.md §3 O1, §9).
+# but disabled for gentle-owned panes. No row of the user's own Agents-panel
+# table is claimed here (DESIGN.md §3 O1, §9): the two gentle rows come from
+# the managed pi-only rows_by_agent override, and the daemon's `gs` label for
+# an isolated Gentle Shell pane is just that — a label. `gs` is not a
+# canonical Herdr agent, so it must never key rows_by_agent (DESIGN.md §5.5).
 
 # Consumer daemon (task 7): poll snapshot → reduce → publish owned gentle_*
 # tokens, scoped orphan sweep. Desktop attention is native Herdr (DESIGN §7):

@@ -14,9 +14,22 @@
 //   node bin/gentle-status.js --run    BE the daemon (Herdr [[startup]])
 //   node bin/gentle-status.js --once   single frame, then exit (debugging)
 //   node bin/gentle-status.js --refresh ensure one daemon + coalesced
-//                                        immediate refresh (event hooks)
+//                                        immediate refresh (event hooks); also
+//                                        requests one `gs` discovery scan
 //   node bin/gentle-status.js --stop   stop the daemon (scoped sweep of live
 //   node bin/gentle-status.js --stop --purge   also clear every owned token)
+//
+// `gs` label (DESIGN §5.5, T5): an isolated Gentle Shell pane has no row until
+// this daemon labels it. A pane belongs to the isolated install when a member of
+// its foreground process group runs an argv path under the install root — the
+// same input Herdr's detection reads, because a real pane is launched from the
+// user's project directory and its cwd is never the install; cwd is the fallback
+// only when the group cannot be read. Such a pane gets `--display-agent gs` when
+// Herdr detects it (presentation only, state untouched) and a reported
+// `--agent gs --state idle` label only when it detects nothing, released again
+// as soon as detection appears. The root resolves from
+// GENTLE_SHELL_INSTALL_ROOT, else GENTLE_SHELL_HOME, else
+// <XDG_DATA_HOME|~/.local/share>/gentle-shell/install.
 //
 // S7 sidebar gate: the sibling sidebar writer owns
 // <stateDir>/gentle-sidebar-mode.json ({version:1,enabled:boolean}); this
@@ -38,6 +51,13 @@
 // failure, and the poll below is unchanged and correct without it. The
 // git-derived `+N/-N` and `↑N` row data and the presence prefix have no Herdr
 // event at all, which is why polling is never removed.
+//
+// T5 `gs` label ladder (DESIGN §5.5): an isolated Gentle Shell pane has no
+// Agents row because `gs` is not a canonical Herdr agent. A pane Herdr detects
+// keeps Herdr's own truthful identity and only gets the presentation-only
+// `gs` display label; a pane Herdr does not detect gets a reported `gs` label
+// as the last resort, so a row exists at all, and that reported label is
+// released the moment detection appears.
 
 var MIN_MAJOR = 18;
 var major = Number(String(process.versions.node).split('.')[0]);
@@ -56,6 +76,7 @@ const { spawn, spawnSync } = require('node:child_process');
 
 const contract = require('../lib/gentle-tokens');
 const interruptions = require('../lib/gentle-interruptions');
+const gsLabel = require('../lib/gentle-gs');
 
 // This daemon's token source tag. The producer extension reports under
 // `gentle:v1`; the daemon writes under the plugin convention
@@ -67,8 +88,9 @@ const interruptions = require('../lib/gentle-interruptions');
 // state dir below deliberately keeps the pre-rename segment so upgrades
 // keep their flags, pidfile and ledger with no migration step.
 const PLUGIN_ID = 'herdr-gentle-shell';
+const PLUGIN_SCOPE = process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID;
 const STATE_PLUGIN_ID = 'herdr-gentle-agents';
-const SOURCE = `plugin:${process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID}`;
+const SOURCE = `plugin:${PLUGIN_SCOPE}`;
 
 // DESIGN §10 U2 is unresolved (no normative cadence); the provisional poll
 // is comfortably below the 60 s token TTL and the producer's 15 s beat so
@@ -515,6 +537,15 @@ for (const kind of EVENT_SUBSCRIPTIONS) {
   EVENT_WAKE_KINDS.add(kind);
   EVENT_WAKE_KINDS.add(kind.replace('.', '_'));
 }
+// T5: a roster change is the only moment a pane can enter or leave the
+// qualifying `gs` set, so those kinds request one bounded discovery scan. The
+// scan itself is never per frame; `pane.agent_detected` rides along because a
+// new detection is exactly when a reported label has to be released.
+const GS_SCAN_EVENT_KINDS = new Set();
+for (const kind of ['pane.created', 'pane.closed', 'pane.moved', 'pane.exited', 'pane.agent_detected']) {
+  GS_SCAN_EVENT_KINDS.add(kind);
+  GS_SCAN_EVENT_KINDS.add(kind.replace('.', '_'));
+}
 const EVENT_LINE_MAX_BYTES = 1024 * 1024;
 const SUBSCRIBE_REQUEST_ID = 'gentle-status-events';
 const SUBSCRIBE_BACKOFF_BASE_MS = 1000;
@@ -615,7 +646,8 @@ function startEventSubscription({ onEvent, onFailure } = {}) {
       }
       return;
     }
-    if (eventKindOf(message) !== null) notifyEvent();
+    const kind = eventKindOf(message);
+    if (kind !== null) notifyEvent(kind);
   };
 
   function connect() {
@@ -779,6 +811,250 @@ async function reportChunked(source, paneId, tokens) {
     jobs.push(reportMetadataAsync(paneId, source, patch));
   }
   return (await Promise.all(jobs)).every(Boolean);
+}
+
+/* ------------------------------------------------------------ gs transport */
+
+// T5 transport: the same socket-then-CLI shape as every other call here, and
+// every interpolated value is checked against the lib's identifier grammar
+// first, so an unusable pane id or source is skipped rather than reaching a
+// fixed argv.
+async function paneProcessInfoAsync(paneId) {
+  if (!gsLabel.safePaneId(paneId)) return null;
+  const reply = await socketCall('pane.process_info', { pane_id: paneId });
+  if (reply && !reply.error && reply.result && typeof reply.result === 'object') {
+    const info = reply.result.process_info;
+    if (info && typeof info === 'object') return info;
+  }
+  const viaCli = cliJson('pane', 'process-info', '--pane', paneId)?.result?.process_info;
+  return viaCli && typeof viaCli === 'object' ? viaCli : null;
+}
+
+async function reportAgentAsync(paneId, source, agent, stateName) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source)) return false;
+  const reply = await socketCall('pane.report_agent', { pane_id: paneId, source, agent, state: stateName });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'report-agent', paneId, '--source', source, '--agent', agent, '--state', stateName) !== null;
+}
+
+// Both the source and the label are part of the release: Herdr clears only the
+// authority this plugin reported, never another reporter's label on the pane.
+async function releaseAgentAsync(paneId, source, agent) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source)) return false;
+  const reply = await socketCall('pane.release_agent', { pane_id: paneId, source, agent });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'release-agent', paneId, '--source', source, '--agent', agent) !== null;
+}
+
+async function setDisplayAgentAsync(paneId, source, label) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source) || !gsLabel.safeSource(label)) return false;
+  const reply = await socketCall('pane.report_metadata', { pane_id: paneId, source, display_agent: label });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'report-metadata', paneId, '--source', source, '--display-agent', label) !== null;
+}
+
+async function clearDisplayAgentAsync(paneId, source) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source)) return false;
+  const reply = await socketCall('pane.report_metadata', {
+    pane_id: paneId,
+    source,
+    clear_display_agent: true,
+  });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'report-metadata', paneId, '--source', source, '--clear-display-agent') !== null;
+}
+
+/* ------------------------------------------------------------ gs label */
+
+// Bounded report for the gs path: one stderr line plus one err-file entry per
+// distinct failure, never one per frame and never one per pane. Fail closed:
+// the label simply stays as it was, exactly like every other degraded path.
+const GS_ERROR_KEYS_MAX = 8;
+
+function reportGsError(state, key, message) {
+  const errors = state?.gs?.errors;
+  if (!(errors instanceof Set) || errors.has(key)) return;
+  if (errors.size < GS_ERROR_KEYS_MAX) errors.add(key);
+  try {
+    console.error(message);
+  } catch {
+    // stderr is best-effort; the err file below is the durable record.
+  }
+  logError(new Error(message));
+}
+
+function createGsState() {
+  return {
+    source: gsLabel.gsSource(PLUGIN_SCOPE),
+    root: gsLabel.resolveInstallRoot(process.env),
+    held: new Map(),
+    qualified: new Set(),
+    scanPending: true,
+    errors: new Set(),
+  };
+}
+
+// Release only this plugin's reported authority, keeping the presentation-only
+// display label: that is the shape every "detection appeared" transition needs,
+// and it is also what a departure releases first. Naming our own source AND
+// label is what keeps another reporter's authority untouched.
+async function releaseGsAuthority(state, paneId) {
+  const gsState = state?.gs;
+  const entry = gsState?.held?.get(paneId);
+  if (!entry || !entry.reported) return true;
+  if (!(await releaseAgentAsync(paneId, gsState.source, gsLabel.GS_AGENT))) {
+    reportGsError(state, 'release', 'gentle-status: cannot release the reported gs label; retrying next frame');
+    if (state.pollObserved) state.pollObserved.failure = true;
+    return false;
+  }
+  entry.reported = false;
+  entry.signature = null;
+  return true;
+}
+
+// Clear everything this plugin reported for one pane: its authority first (the
+// masking one), then its display label. A transport failure keeps the entry so
+// the next beat retries; only this plugin's own source and label are named.
+async function releaseGsPane(state, paneId) {
+  const gsState = state?.gs;
+  const entry = gsState?.held?.get(paneId);
+  if (!entry) return;
+  if (!(await releaseGsAuthority(state, paneId))) return;
+  if (entry.display) {
+    if (!(await clearDisplayAgentAsync(paneId, gsState.source))) {
+      reportGsError(state, 'display-clear', 'gentle-status: cannot clear the gs display label; retrying next frame');
+      if (state.pollObserved) state.pollObserved.failure = true;
+      return;
+    }
+    entry.display = false;
+  }
+  gsState.held.delete(paneId);
+}
+
+async function releaseGsHeld(state) {
+  const gsState = state?.gs;
+  if (!gsState || !(gsState.held instanceof Map)) return;
+  for (const paneId of [...gsState.held.keys()]) await releaseGsPane(state, paneId);
+}
+
+// One qualifying pane, decided by the ladder: the display label always, the
+// reported label only while Herdr detects nothing. Every write is deduped by
+// the held entry, so a steady pane costs no call at all. `processInfo` is the
+// read the caller already had to make (the discovery scan decides qualification
+// from it), so a scan never pays for the same answer twice.
+async function applyGsPane(state, paneId, detected, processInfo) {
+  const gsState = state.gs;
+  let entry = gsState.held.get(paneId);
+  if (!entry) {
+    entry = { display: false, reported: false, signature: null };
+    gsState.held.set(paneId, entry);
+  }
+  if (!entry.display) {
+    if (await setDisplayAgentAsync(paneId, gsState.source, gsLabel.GS_AGENT)) entry.display = true;
+    else {
+      reportGsError(state, 'display', 'gentle-status: cannot set the gs display label; retrying next frame');
+      if (state.pollObserved) state.pollObserved.failure = true;
+    }
+  }
+  if (detected) {
+    // Herdr's own identity stands: releasing ours is what stops the mask, while
+    // the display label stays so the row keeps its `gs` word.
+    if (entry.reported) await releaseGsAuthority(state, paneId);
+    return;
+  }
+  if (entry.reported) return;
+  const info = processInfo === undefined ? await paneProcessInfoAsync(paneId) : processInfo;
+  const signature = gsLabel.processSignature(info);
+  if (await reportAgentAsync(paneId, gsState.source, gsLabel.GS_AGENT, gsLabel.GS_STATE)) {
+    entry.reported = true;
+    entry.signature = signature;
+    return;
+  }
+  reportGsError(state, 'report', 'gentle-status: cannot report the gs label; retrying next frame');
+  if (state.pollObserved) state.pollObserved.failure = true;
+}
+
+// One bounded discovery scan: `pane list` names the panes, and one
+// `pane.process_info` per pane answers the qualification question from the same
+// foreground process group Herdr's detection reads. Run at daemon start, on an
+// explicit refresh, and on a roster event — never per frame. A failed pane read
+// is unknown, never empty, so nothing is released on it.
+const GS_SCAN_PANE_MAX = 64;
+
+async function scanGsPanes(state) {
+  const gsState = state.gs;
+  const panes = await panesAsync();
+  if (panes === null) {
+    reportGsError(state, 'pane-list', 'gentle-status: pane list unavailable; gs labels unchanged');
+    return;
+  }
+  const qualified = new Set();
+  const decided = [];
+  let probed = 0;
+  for (const pane of panes) {
+    const paneId = pane?.pane_id;
+    if (!gsLabel.safePaneId(paneId)) continue;
+    if (probed >= GS_SCAN_PANE_MAX) {
+      reportGsError(
+        state,
+        'scan-cap',
+        `gentle-status: pane list over ${GS_SCAN_PANE_MAX} panes; gs discovery stopped at the cap`,
+      );
+      break;
+    }
+    probed += 1;
+    const processInfo = await paneProcessInfoAsync(paneId);
+    const decision = gsLabel.qualifyPaneForGs(pane, processInfo, gsState.root);
+    if (!decision.qualifies) continue;
+    qualified.add(paneId);
+    decided.push([paneId, gsLabel.isDetectedAgent(gsLabel.paneAgentOf(pane)), processInfo]);
+  }
+  gsState.qualified = qualified;
+  for (const [paneId, detected, processInfo] of decided) {
+    await applyGsPane(state, paneId, detected, processInfo);
+  }
+  for (const paneId of [...gsState.held.keys()]) {
+    if (!qualified.has(paneId)) await releaseGsPane(state, paneId);
+  }
+}
+
+// One beat of label maintenance. Detection is a function of the pane's
+// foreground process group and a reported label masks it, so the group is the
+// only thing that can answer "is a real agent there now?": an unchanged group
+// owes nothing, a changed one releases the label and re-decides immediately, so
+// `gs` never masks a detection for longer than the beat it appeared in.
+async function gsBeat(state, sidebarEnabled) {
+  const gsState = state.gs;
+  if (!gsState) return;
+  if (sidebarEnabled !== true) {
+    // The sidebar is disabled (or its flag is unreadable): this plugin's label
+    // is not shown, so it must stop holding agent authority as well.
+    await releaseGsHeld(state);
+    gsState.scanPending = false;
+    return;
+  }
+  if (gsState.scanPending) {
+    gsState.scanPending = false;
+    await scanGsPanes(state);
+  }
+  for (const paneId of [...gsState.held.keys()]) {
+    const entry = gsState.held.get(paneId);
+    if (!entry) continue;
+    if (!gsState.qualified.has(paneId)) {
+      await releaseGsPane(state, paneId);
+      continue;
+    }
+    if (!entry.reported) continue;
+    const signature = gsLabel.processSignature(await paneProcessInfoAsync(paneId));
+    if (signature === null) continue;
+    if (entry.signature === null) {
+      entry.signature = signature;
+      continue;
+    }
+    if (signature === entry.signature) continue;
+    if (!(await releaseGsAuthority(state, paneId))) continue;
+    await scanGsPanes(state);
+  }
 }
 
 // DESIGN §7 notification ownership: desktop attention is native Herdr —
@@ -955,6 +1231,14 @@ async function frame(state, opts = {}) {
     }
   }
   state.live = live;
+  // T5 label ladder, after the token work so a gs failure can never disturb a
+  // publish: bounded discovery on the frames that asked for one, then the
+  // per-beat re-check of whatever this plugin currently reports.
+  try {
+    await gsBeat(state, sidebar.enabled);
+  } catch (error) {
+    logError(error);
+  }
   // Diagnostic-only interruption ledger (daemon loop only): --once must
   // never become a second ledger writer, so it skips this entirely.
   if (opts.persistInterruptions === true) {
@@ -1097,6 +1381,32 @@ function takeRefresh() {
   }
 }
 
+// T5 discovery request: a separate marker so an EXPLICIT --refresh (the CLI, the
+// manifest lifecycle hooks) asks for one `pane list` scan while the producer's
+// per-beat wake below never does — otherwise "on an explicit refresh" would
+// degrade into a scan per frame. Same bounded file discipline: one coalesced
+// timestamp, consumed once, never written by the token path.
+const GS_SCAN_FILE = () => path.join(stateRoot(), 'gentle-status.gs-scan');
+
+function requestGsScan() {
+  try {
+    fs.writeFileSync(GS_SCAN_FILE(), String(Date.now()), 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function takeGsScanRequest() {
+  try {
+    if (!fs.existsSync(GS_SCAN_FILE())) return false;
+    fs.rmSync(GS_SCAN_FILE(), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function ensureRunning() {
   const pid = daemonAlive();
   if (pid !== null) {
@@ -1140,6 +1450,7 @@ async function run() {
     clearedWhileDisabled: new Set(),
     sidebarModeErrorReported: null,
     subscriptionErrorReported: null,
+    gs: createGsState(),
   };
   const pollConfig = resolvePollConfig();
   const pollState = createPollState();
@@ -1153,8 +1464,11 @@ async function run() {
     return true;
   };
   const subscription = startEventSubscription({
-    onEvent: () => {
+    onEvent: (kind) => {
       eventWake = true;
+      // A roster change is when the qualifying set can change, so it asks for
+      // one bounded scan; `pane.updated` alone never does.
+      if (typeof kind === 'string' && GS_SCAN_EVENT_KINDS.has(kind)) state.gs.scanPending = true;
     },
     onFailure: (reason, detail) => reportSubscriptionError(state, reason, detail),
   });
@@ -1172,6 +1486,14 @@ async function run() {
       fs.rmSync(PID_FILE(), { force: true });
     } catch {
       // Already gone.
+    }
+    // T5: never leave a reported `gs` authority behind — it would survive this
+    // daemon and keep masking a real detection forever. Best-effort and scoped
+    // to this plugin's own source and label.
+    try {
+      await releaseGsHeld(state);
+    } catch (error) {
+      logError(error);
     }
     // Detached-child rollback (R4): terminate the poll loop and run the
     // scoped sweep over the last-known live set, so disable/uninstall/
@@ -1224,7 +1546,9 @@ async function run() {
       const gateMs = refreshGateMs(frameStartedAt, at);
       if (gateMs === 0) {
         const requested = takeRefresh();
-        if (takeEventWake() || requested) break;
+        const scanRequested = takeGsScanRequest();
+        if (scanRequested) state.gs.scanPending = true;
+        if (takeEventWake() || requested || scanRequested) break;
       }
       const slice = Math.min(sliceMs, left);
       await new Promise((resolve) => setTimeout(resolve, gateMs > 0 ? Math.min(slice, gateMs) : slice));
@@ -1259,6 +1583,7 @@ async function main() {
       console.error('gentle-status: cannot request refresh');
       process.exit(1);
     }
+    requestGsScan();
     return;
   }
   if (mode === '--stop') {
@@ -1329,6 +1654,8 @@ if (require.main === module) {
     refreshGateMs,
     requestRefresh,
     takeRefresh,
+    requestGsScan,
+    takeGsScanRequest,
     readSidebarMode,
     nextSubscribeDelayMs,
     startEventSubscription,
@@ -1336,5 +1663,9 @@ if (require.main === module) {
     EVENT_SUBSCRIPTIONS,
     SUBSCRIBE_BACKOFF_CAP_MS,
     SUBSCRIBE_STABLE_MS,
+    GS_SCAN_EVENT_KINDS,
+    createGsState,
+    gsBeat,
+    scanGsPanes,
   };
 }
