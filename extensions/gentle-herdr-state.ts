@@ -178,9 +178,17 @@
 //                       as user-facing `rdd` (machine key stays `review`).
 //                       Fail-safe: no provider verdicts are
 //                       invented; the id is a sanitized correlation id only.
-//   error             : subagent task failed status / subagent tool error /
-//                       repeated own-transport failure. Latched until the next
-//                       agent_start (fresh snapshot), TTL-bounded display.
+//   error             : the agent run itself stopped on an error (an assistant
+//                       message whose `stopReason` is `error` — the same
+//                       signal Pi derives `turn_end.outcome === "error"`
+//                       from). Never a tool-level failure, never a failed
+//                       delegate record, never our own transport: those are
+//                       detected and logged, and change no state. Sidebar-only:
+//                       the pane keeps reporting native `working` while the
+//                       label stands, so an error never fires the host's
+//                       NeedsAttention toast or sound. Released by the next
+//                       non-error beat (agent_start, any tool activity, or a
+//                       non-error assistant message), never latched.
 //   changes           : SESSION_CHANGE_ENTRY facts mirroring the Gentle Shell
 //                       SessionChanges model semantics from the session
 //                       transcript (write|edit tool outcomes only, never git
@@ -749,7 +757,6 @@ const MAX_LABEL_CHARS = 64;
 const MAX_TOKEN_BYTES = 512;
 const MAX_TRACKED_TASKS = 128;
 const MAX_CHANGE_PATHS = 256;
-const TRANSPORT_FAIL_LATCH = 3;
 const CLI_FALLBACK_TIMEOUT_MS = 2500;
 
 const ASK_EVENT = "gentle-pi:ask-user-choice:blocked";
@@ -1094,14 +1101,17 @@ function cliFallback(patch) {
 export const NATIVE_STATES = ["working", "blocked", "idle"];
 const NATIVE_MAX_ATTEMPTS = 2;
 
-// Principal-gated native state (pure, testable): blocked on a real
-// principal-stopped error OR an actual human-wait intervention leg
+// Principal-gated native state (pure, testable): blocked on the `hasError`
+// input OR an actual human-wait intervention leg
 // (ask/choice/question/questionnaire/permission — never
 // review/RDD execution, which stays working and silent); working while the
 // principal is active OR running/queued delegates exist OR pending launches
 // exist OR review execution holds; idle ONLY on authoritative principal
 // settled plus zero running+queued plus zero pending plus no human-wait
-// prompt and no review execution. Never infer terminal from child
+// prompt and no review execution. The producer never sets `hasError`: native
+// `blocked` is what fires the host's NeedsAttention toast and sound, so an
+// `error:` label stays sidebar-only and the pane reports `working` while it
+// stands. Never infer terminal from child
 // completion, timeout, or count0 alone (settled required). Never
 // done/finished (only working|blocked|idle) and never a notification
 // method — the host owns finished text plus toast/sound, and desktop ask
@@ -2750,8 +2760,14 @@ export default function (pi) {
   function syncReviewActive() {
     reviewActive = reviewCalls.size > 0;
   }
-  // Error latch: cleared on the next agent_start (fresh snapshot).
+  // Run-error leg: set ONLY when the agent run itself stops on an error, and
+  // released by the next non-error beat (see setRunError/clearRunError). Tool
+  // failures never touch it, so a failed tool can no longer repaint the row.
   let errorCode;
+  const RUN_ERROR = "run-failed";
+  // Tool-level failures are still detected (the reported defect asked for
+  // detection) but are telemetry: a counter plus a debug line, never state.
+  let toolErrors = 0;
   let emittedLabel;
 
   let changes = { files: 0, added: 0, deleted: 0 };
@@ -2851,6 +2867,26 @@ export default function (pi) {
     if (askActiveNow()) return `ask:${askIntentId}`;
     if (reviewActive) return `review:${reviewId}`;
     return undefined;
+  }
+
+  // Detection surface for tool-level failures: recorded, never published. The
+  // state they reach (label, native state, finish hold) is untouched by design
+  // — only a run that stops on an error may show `error:`.
+  function recordToolFailure(site) {
+    toolErrors += 1;
+    debug("tool-error", `${site} count=${toolErrors}`);
+  }
+
+  function setRunError() {
+    if (errorCode) return;
+    errorCode = RUN_ERROR;
+    updateBlocker();
+  }
+
+  function clearRunError() {
+    if (!errorCode) return;
+    errorCode = undefined;
+    updateBlocker();
   }
 
   function ensureAskIntent() {
@@ -3262,15 +3298,22 @@ export default function (pi) {
   // stays consumer-side per DESIGN §7).
   function desiredNativeReport() {
     if (!rootSession) return undefined;
-    const state = computeNativeState({
-      agentActive,
-      settled,
-      activeCount: activeSubs().length,
-      pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
-      askActive: askActiveNow(),
-      reviewActive,
-      hasError: !!errorCode,
-    });
+    // `error:` is sidebar-only: native `blocked` is exactly what fires the
+    // host's NeedsAttention toast and sound (DESIGN §7), so an error label
+    // never claims it. While the label stands the pane reports `working` —
+    // the only native state that raises no attention — and returns to the
+    // lifecycle state on the next non-error beat. `hasError` stays out of
+    // computeNativeState for this reason.
+    const state = errorCode
+      ? "working"
+      : computeNativeState({
+          agentActive,
+          settled,
+          activeCount: activeSubs().length,
+          pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
+          askActive: askActiveNow(),
+          reviewActive,
+        });
     if (!state) return undefined;
     if (state === "blocked") {
       ensureAskIntent();
@@ -3505,17 +3548,15 @@ export default function (pi) {
         // One coalesced wake per landed beat, after the tokens are in Herdr
         // (a request written first could render a frame over stale tokens).
         requestStatusRefresh();
-        if (transportFails >= TRANSPORT_FAIL_LATCH && errorCode === "transport") {
-          errorCode = undefined;
-          updateBlocker();
-        }
+        if (transportFails > 0) debug("transport-ok", `after ${transportFails} failed beat(s)`);
         transportFails = 0;
       } else {
+        // Our own report transport failing is not the agent failing: it is a
+        // telemetry line, never an `error:` label and never native `blocked`
+        // (that latched a stuck red row on a socket hiccup and fired the
+        // host's toast for it). The next landed beat resets the counter.
         transportFails += 1;
-        if (transportFails >= TRANSPORT_FAIL_LATCH && !errorCode) {
-          errorCode = "transport";
-          updateBlocker();
-        }
+        debug("transport-failed", `${transportFails} beat(s) in a row`);
       }
     } finally {
       publishInFlight = false;
@@ -3552,12 +3593,10 @@ export default function (pi) {
       return;
     }
     if (!Array.isArray(applied) || applied.length === 0) return;
-    // An explicitly failed delegate latches the error leg exactly like a
-    // failed tool_result/message_end; absence-driven completion carries no
-    // known terminal state and never latches.
-    if (!errorCode && applied.some((entry) => entry && entry.status === "failed")) {
-      errorCode = "task-failed";
-      updateBlocker();
+    // A delegate that ended failed is a tool-level outcome, not the run
+    // stopping: detected and counted, and no state changes.
+    if (applied.some((entry) => entry && entry.status === "failed")) {
+      recordToolFailure("presence:failed");
     }
   }
 
@@ -3644,6 +3683,7 @@ export default function (pi) {
     jobsSnapshot = undefined;
     clearJobsExpiry();
     errorCode = undefined;
+    toolErrors = 0;
     liveGen += 1;
     liveInFlight = false;
     liveQueued = false;
@@ -3817,6 +3857,9 @@ export default function (pi) {
 
   pi.on("tool_call", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    // A tool starting proves a run is alive: an error left over from a run that
+    // already died is released here rather than sticking until the next turn.
+    clearRunError();
     // Structured ask proposals never open ask (execution does); subagent
     // launch correlation below is unchanged.
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
@@ -3845,6 +3888,7 @@ export default function (pi) {
 
   pi.on("tool_result", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    clearRunError();
     if (typeof event.toolCallId === "string" && askToolCalls.delete(event.toolCallId)) {
       updateBlocker();
     }
@@ -3875,10 +3919,9 @@ export default function (pi) {
     }
     const details = isRecord(event.details) ? event.details.gentleAgents : undefined;
     if (!isRecord(details) || typeof details.taskId !== "string") {
-      if (event.toolName === "subagent_run" && event.isError === true && !errorCode) {
-        errorCode = "task-failed";
-        updateBlocker();
-      }
+      // A tool that failed is detected and counted, and that is all: no label,
+      // no native state, no finish hold, no notification.
+      if (event.isError === true) recordToolFailure(`tool:${event.toolName}`);
       return;
     }
     const previous = tasks.get(details.taskId);
@@ -3945,10 +3988,7 @@ export default function (pi) {
       const oldest = tasks.keys().next().value;
       tasks.delete(oldest);
     }
-    if (status === "failed" && !errorCode) {
-      errorCode = "task-failed";
-      updateBlocker();
-    }
+    if (status === "failed") recordToolFailure(`task:${details.taskId}`);
     schedulePublish();
   });
 
@@ -3967,7 +4007,18 @@ export default function (pi) {
   pi.on("message_end", (event) => {
     if (!rootSession || !isRecord(event)) return;
     const message = event.message;
-    if (!isRecord(message) || message.role !== "custom") return;
+    if (!isRecord(message)) return;
+    if (message.role === "assistant") {
+      // The one real error state. Pi derives `turn_end.outcome === "error"`
+      // from exactly this stopReason, so a run that stopped on an error is
+      // visible here without a second handler; any other assistant message
+      // proves the run is alive again (a retry that succeeded) and releases
+      // the label.
+      if (message.stopReason === "error") setRunError();
+      else clearRunError();
+      return;
+    }
+    if (message.role !== "custom") return;
     if (message.customType !== AGENTS_RESULT_TYPE) return;
     const details = isRecord(message.details) ? message.details.gentleAgents : undefined;
     if (!isRecord(details) || typeof details.taskId !== "string") return;
@@ -3995,10 +4046,7 @@ export default function (pi) {
       const oldest = tasks.keys().next().value;
       tasks.delete(oldest);
     }
-    if (details.status === "failed" && !errorCode) {
-      errorCode = "task-failed";
-      updateBlocker();
-    }
+    if (details.status === "failed") recordToolFailure(`background:${details.taskId}`);
     schedulePublish();
   });
 
@@ -4043,10 +4091,7 @@ export default function (pi) {
     agentActive = true;
     settled = false;
     nativeSettledPending = false;
-    if (errorCode) {
-      errorCode = undefined;
-      updateBlocker();
-    }
+    clearRunError();
     refreshChanges();
     schedulePublish();
   });
@@ -4063,7 +4108,7 @@ export default function (pi) {
     // S62 turn-end: the working tree may have changed without transcript
     // evidence (external/untracked edits), so re-scan before publishing.
     refreshChanges();
-    if (activeSubs().length === 0 && !askActiveNow() && !reviewActive) {
+    if (activeSubs().length === 0 && !askActiveNow() && !reviewActive && !errorCode) {
       clearEmittedLabel();
       void publishNow();
     } else {

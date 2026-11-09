@@ -156,16 +156,27 @@ const finishesFrom = (from) =>
 function harness() {
   const handlers = new Map();
   const busHandlers = new Map();
+  // In-process `herdr:blocked` labels are the producer's own channel into the
+  // consumer (never a Herdr notification): recording them is how a test proves
+  // which label, if any, the sidebar was told to render.
+  const emitted = [];
   const on = (registry) => (kind, fn) => {
     if (!registry.has(kind)) registry.set(kind, []);
     registry.get(kind).push(fn);
   };
   const pi = {
     on: on(handlers),
-    events: { on: on(busHandlers), emit: () => {} },
+    events: {
+      on: on(busHandlers),
+      emit: (kind, payload) => {
+        emitted.push({ kind, payload });
+      },
+    },
   };
   return {
     pi,
+    emitted,
+    labels: () => emitted.filter((entry) => entry.kind === 'herdr:blocked'),
     fire: (kind, event, ctx) => {
       for (const fn of handlers.get(kind) ?? []) fn(event, ctx);
     },
@@ -254,7 +265,223 @@ test('an empty settle lands the native Working -> Idle edge the host finishes on
   );
 });
 
-test('an error episode reports native blocked exactly once', async () => {
+// --- the reported defect: a failed tool call repainted the whole row --------
+//
+// "tiro error y me notificio pero paso a estado idle, ademas que se quedo
+// pegado en error": a tool that failed inside a healthy turn latched
+// `error:task-failed`, which cleared the role/`gentle` display, claimed native
+// `blocked` (the host's NeedsAttention toast + sound) and held the finish
+// back. A failed tool call now changes nothing at all.
+
+async function workingTurn() {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(350);
+  return { h, paneId };
+}
+
+// Every observable effect of one failed tool call at once: no label, no
+// native state, no repaint of the role/`gentle` display, no phone envelope, no
+// held finish.
+const displayOf = (tokens) => ({
+  work:
+    typeof tokens.gentle_work_v1 === 'string'
+      ? tokens.gentle_work_v1.split(':').slice(0, 2).join(':')
+      : null,
+  roles: tokens.gentle_roles_v1 ?? null,
+  principal: tokens.gentle_principal_v1 === null ? null : 'live',
+  errorKeys: Object.keys(tokens).filter((key) => /error/i.test(key)),
+});
+
+async function assertToolFailureChangesNothing(h, paneId, fireFailure) {
+  const before = metadataTokensFrom(paneId, 0).at(-1);
+  assert.ok(before, 'the working turn published its state before the failure');
+  const framesFrom = cursor(paneId);
+  const labelsFrom = h.labels().length;
+  const phoneFrom = moshiFrames.length;
+  fireFailure();
+  await settle(450);
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    [],
+    'a failed tool call publishes no blocked label',
+  );
+  for (const tokens of metadataTokensFrom(paneId, framesFrom)) {
+    assert.deepEqual(
+      displayOf(tokens),
+      displayOf(before),
+      'a failed tool call never repaints the role/working display',
+    );
+  }
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom),
+    [],
+    'a failed tool call publishes no native state',
+  );
+  assert.deepEqual(
+    moshiFrames.slice(phoneFrom),
+    [],
+    'a failed tool call sends no phone envelope',
+  );
+  // The turn keeps its own edges: the settle still reaches native idle and the
+  // finish still ships, which the error leg used to hold back.
+  const settledFrom = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const idle = await waitFrom(
+    paneId,
+    settledFrom,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(idle, 'a settle after a failed tool call still reaches native idle');
+  assert.ok(
+    doneValuesFrom(paneId, settledFrom).length > 0,
+    'a failed tool call never blocks the done edge',
+  );
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom).filter((state) => state === 'blocked'),
+    [],
+    'a tool error never claims native blocked, which is the host NeedsAttention toast',
+  );
+}
+
+test('S-E1: a failed subagent launch changes nothing in the published state', async () => {
+  const { h, paneId } = await workingTurn();
+  await assertToolFailureChangesNothing(h, paneId, () =>
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'tool-err-1', isError: true }),
+  );
+});
+
+test('S-E1: a failed TaskStore status changes nothing in the published state', async () => {
+  const { h, paneId } = await workingTurn();
+  await assertToolFailureChangesNothing(h, paneId, () =>
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'task-err-1',
+      details: { gentleAgents: { taskId: 't-err-1', agent: 'gentle-ai-worker', status: 'failed' } },
+    }),
+  );
+});
+
+test('S-E1: a failed background delegate result changes nothing in the published state', async () => {
+  const { h, paneId } = await workingTurn();
+  await assertToolFailureChangesNothing(h, paneId, () =>
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'bg-err-1', agent: 'gentle-ai-worker', status: 'failed' } },
+      },
+    }),
+  );
+});
+
+// S-E2/S-E3: the one real error state — the run itself stopped on an error
+// (Pi's own `turn_end.outcome === "error"` derives from exactly this
+// stopReason). It is sidebar-only: our own `error:` label, native state stays
+// `working` so no NeedsAttention toast/sound fires, and no phone envelope.
+test('S-E2/S-E3: a run that stops on an error shows our label only, never native blocked', async () => {
+  const { h, paneId } = await workingTurn();
+  const framesFrom = cursor(paneId);
+  const labelsFrom = h.labels().length;
+  const phoneFrom = moshiFrames.length;
+
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+  await settle(500);
+
+  const raised = h.labels().slice(labelsFrom);
+  assert.equal(raised.length, 1, 'a run that stops on an error raises exactly one label');
+  assert.deepEqual(
+    raised[0].payload,
+    { active: true, label: 'error:run-failed' },
+    'the error is our own sidebar label, not a native state',
+  );
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom).filter((state) => state === 'blocked'),
+    [],
+    'native blocked fires the host NeedsAttention toast + sound: an error never claims it',
+  );
+  assert.deepEqual(
+    moshiFrames.slice(phoneFrom),
+    [],
+    'error never reaches the phone channel',
+  );
+
+  // The label survives the settle of the run that died: it is the state, not a
+  // transient. The pane stays on the attention-free native `working` — and a
+  // settle that would otherwise report `idle` (the host's Finished toast) sends
+  // nothing at all.
+  const settledFrom = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(500);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, settledFrom),
+    [],
+    'while the error label stands the pane never reports idle or blocked',
+  );
+  assert.equal(
+    nativeStatesFrom(paneId, 0).at(-1),
+    'working',
+    'the pane sits on native working, the only silent native state, while the error label stands',
+  );
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    raised,
+    'no label churn on the settle of an already-failed run',
+  );
+});
+
+// S-E4: the error must never latch. The first non-error beat clears it.
+test('S-E4: the error label clears on the next non-error beat', async () => {
+  const { h, paneId } = await workingTurn();
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+  await settle(450);
+  assert.equal(
+    h.labels().filter((entry) => entry.payload?.label === 'error:run-failed').length,
+    1,
+    'the run error is up before the recovery beat',
+  );
+  const settledFrom = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(450);
+
+  const labelsFrom = h.labels().length;
+  h.fire('tool_result', { toolName: 'bash', toolCallId: 'alive-1' });
+  await settle(450);
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    [{ kind: 'herdr:blocked', payload: { active: false } }],
+    'the next non-error beat releases the error label instead of sticking',
+  );
+  const idle = await waitFrom(
+    paneId,
+    settledFrom,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(idle, 'once the error is gone the pane returns to the lifecycle state');
+});
+
+test('S-E4: a retried run clears the error without waiting for a new turn', async () => {
+  const { h } = await workingTurn();
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+  await settle(450);
+  const labelsFrom = h.labels().length;
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'stop' } });
+  await settle(450);
+  assert.deepEqual(
+    h.labels().slice(labelsFrom),
+    [{ kind: 'herdr:blocked', payload: { active: false } }],
+    'a successful retry releases the error label',
+  );
+});
+
+// PRESERVE: an actual human-wait intervention is still the leg that claims
+// native `blocked` with its own label (the state this change kept intact).
+test('PRESERVE: an ask still reports native blocked with its label', async () => {
   await listening;
   const { module, paneId } = await loadRuntime();
   const h = harness();
@@ -263,43 +490,17 @@ test('an error episode reports native blocked exactly once', async () => {
   await settle(250);
 
   const from = cursor(paneId);
-  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'err-1', isError: true });
+  h.fireBus('gentle-pi:ask-user-choice:blocked', { active: true });
   const blocked = await waitFrom(
     paneId,
     from,
     (f) => f?.method === 'pane.report_agent' && f.params?.state === 'blocked',
   );
-  assert.ok(blocked, 'a real error reports native blocked, which fires the host NeedsAttention toast');
-  assert.equal(blocked.params.message, 'error:task-failed');
-
-  // Repeated beats while the same error stands never re-report it.
-  const afterFirst = cursor(paneId);
-  h.fire('agent_settled', {}, ctx({ idle: true }));
-  await settle(400);
-  h.fire('agent_settled', {}, ctx({ idle: true }));
-  await settle(400);
-  assert.deepEqual(
-    nativeStatesFrom(paneId, afterFirst),
-    [],
-    'one error notification per error episode, no duplicate on repeated beats',
-  );
-
-  // The next turn clears the latch and a fresh error re-arms exactly once.
-  h.fire('agent_start', {}, ctx({ idle: false }));
-  await settle(400);
-  const resumed = cursor(paneId);
-  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'err-2', isError: true });
-  const again = await waitFrom(
-    paneId,
-    resumed,
-    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'blocked',
-  );
-  assert.ok(again, 'a new error episode re-arms');
-  await settle(400);
-  assert.equal(
-    nativeStatesFrom(paneId, resumed).filter((state) => state === 'blocked').length,
-    1,
-    'exactly one blocked report for the new episode',
+  assert.ok(blocked, 'a real human-wait still reports native blocked');
+  assert.match(blocked.params.message ?? '', /^ask:/, 'blocked carries the ask label');
+  assert.ok(
+    h.labels().some((entry) => entry.payload?.label === blocked.params.message),
+    'the label on the wire is the label the sidebar was told to render',
   );
 });
 

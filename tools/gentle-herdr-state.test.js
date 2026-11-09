@@ -360,11 +360,13 @@ test('error outranks ask outranks review across legs', async () => {
   let labels = blockedLabels(h);
   assert.equal(labels.length, 2);
   assert.match(labels[1].label, /^ask:/);
-  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run1', isError: true });
+  // The one real error leg: the run itself stopped on an error (an assistant
+  // message whose stopReason is `error`), never a failed tool.
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
   labels = blockedLabels(h);
   assert.equal(labels.length, 3);
-  assert.match(labels[2].label, /^error:/);
-  // The error latch clears on the next agent_start; ask still holds.
+  assert.equal(labels[2].label, 'error:run-failed', 'the error leg is our own sidebar label');
+  // The error label releases on the next agent_start; ask still holds.
   h.fire('agent_start', {}, { sessionManager: { getSessionFile: () => { throw new Error('no session file'); } } });
   labels = blockedLabels(h);
   assert.equal(labels.length, 4);
@@ -375,6 +377,22 @@ test('error outranks ask outranks review across legs', async () => {
   assert.match(labels[4].label, /^review:/, 'ask release falls back to the live review call');
   h.fire('tool_result', { toolName: 'gentle_review_capture', toolCallId: 'c1' });
   assert.deepEqual(blockedLabels(h)[5], { active: false });
+  // S-E1 pin: every tool-level failure publishes nothing — no label at all.
+  const before = blockedLabels(h).length;
+  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-pin-1', isError: true });
+  h.fire('tool_result', {
+    toolName: 'subagent_run',
+    toolCallId: 'run-pin-2',
+    details: { gentleAgents: { taskId: 'pin-task', agent: 'gentle-ai-worker', status: 'failed' } },
+  });
+  h.fire('message_end', {
+    message: {
+      role: 'custom',
+      customType: 'gentle-agents.result',
+      details: { gentleAgents: { taskId: 'pin-bg', agent: 'gentle-ai-worker', status: 'failed' } },
+    },
+  });
+  assert.equal(blockedLabels(h).length, before, 'a failed tool, failed task and failed background result publish no label');
 });
 
 test('settled session keeps review until the last call resolves (beats stay alive)', async () => {
@@ -2304,7 +2322,7 @@ test('T2: true empty settle emits idle once with monotonic seq', async () => {
   }
 });
 
-test('T2: error emits blocked once; review execution never blocks; no finished toast', async () => {
+test('T2: a run error stays sidebar-only; review execution never blocks; no finished toast', async () => {
   const wire = await startNativeWire();
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-native-blocked', '1');
   try {
@@ -2323,12 +2341,32 @@ test('T2: error emits blocked once; review execution never blocks; no finished t
     assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'review must never emit blocked');
     h.fire('tool_result', { toolName: 'gentle_review_capture', toolCallId: 'c1' });
     h.fire('tool_execution_end', { toolCallId: 'c1', toolName: 'gentle_review_capture' });
+    // S-E1 pin: the removed trigger publishes nothing — no native state, no label.
+    const statesBefore = nativeStates(wire.received).length;
+    const labelsBefore = blockedLabels(h).length;
     h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-b1', isError: true });
-    const blocked = await wire.waitFor((r) => r.method === 'pane.report_agent' && r.params.state === 'blocked', 5000, 'real error emits blocked');
-    assert.ok(blocked.params.seq >= 1);
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'pin-bg', agent: 'gentle-ai-worker', status: 'failed' } },
+      },
+    });
     await new Promise((r) => setTimeout(r, 400));
-    const blockedCount = nativeTransitionCount(wire.received, 'blocked');
-    assert.equal(blockedCount, 1, 'blocked emits once until the next agent_start');
+    assert.equal(nativeStates(wire.received).length, statesBefore, 'a failed tool publishes no native state');
+    assert.equal(blockedLabels(h).length, labelsBefore, 'a failed tool publishes no label');
+    // The one real error: the run itself stopping on an error. It is
+    // sidebar-only, so native `blocked` — the host NeedsAttention toast and
+    // sound — is never claimed, and the pane stays on the silent `working`.
+    h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(
+      nativeTransitionCount(wire.received, 'blocked'),
+      0,
+      'an error never emits native blocked (no NeedsAttention toast or sound)',
+    );
+    assert.equal(nativeStates(wire.received).every((p) => p.state === 'working'), true, 'the pane stays on working');
+    assert.equal(blockedLabels(h).at(-1).label, 'error:run-failed', 'the error surfaces as our own label');
     for (const r of wire.received) {
       assert.ok(!String(r.method).toLowerCase().includes('notif'), 'never emit a notification toast');
       if (r.method === 'pane.report_agent') assert.ok(['working', 'blocked', 'idle'].includes(r.params.state), `native state ${r.params.state} must stay in working|blocked|idle (never done/finished)`);
@@ -2539,7 +2577,7 @@ test('N1 RED: real human-wait emits blocked once with the ask label', async () =
   }
 });
 
-test('N1 RED: real error emits blocked once with the error label', async () => {
+test('N1 RED: a run error raises our label once and never native blocked', async () => {
   const wire = await startNativeWire();
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-n1-error', '1');
   try {
@@ -2551,16 +2589,37 @@ test('N1 RED: real error emits blocked once with the error label', async () => {
       5000,
       'initial working',
     );
+    // S-E1 pin: the removed trigger publishes nothing at all.
+    const statesBefore = nativeStates(wire.received).length;
+    const labelsBefore = blockedLabels(h).length;
     h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1e1', isError: true });
-    const blocked = await wire.waitFor(
-      (r) => r.method === 'pane.report_agent' && r.params.state === 'blocked',
-      5000,
-      'real error emits blocked',
-    );
-    assert.match(blocked.params.message ?? '', /^error:/, 'blocked carries the error label');
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-n1e2',
+      details: { gentleAgents: { taskId: 'pin-n1', agent: 'gentle-ai-worker', status: 'failed' } },
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(nativeStates(wire.received).length, statesBefore, 'a failed tool or task publishes no native state');
+    assert.equal(blockedLabels(h).length, labelsBefore, 'a failed tool or task publishes no label');
+    // The one real error state: the run itself stopped on an error.
+    h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+    const raised = blockedLabels(h).filter((payload) => payload.active === true);
+    assert.equal(raised.length, 1, 'one error label for one episode');
+    assert.equal(raised[0].label, 'error:run-failed');
+    // Repeated error beats never re-report the episode.
+    h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+    assert.equal(blockedLabels(h).filter((payload) => payload.active === true).length, 1, 'no duplicate label');
     await new Promise((r) => setTimeout(r, 500));
-    assert.equal(nativeTransitionCount(wire.received, 'blocked'), 1, 'error blocked emits once');
-    n1NoNotify(wire.received, 'error blocked');
+    assert.equal(
+      nativeTransitionCount(wire.received, 'blocked'),
+      0,
+      'an error never reports native blocked: no NeedsAttention toast, no sound',
+    );
+    assert.ok(
+      nativeStates(wire.received).every((p) => p.state === 'working'),
+      'while the error label stands the pane reports working, the only silent native state',
+    );
+    n1NoNotify(wire.received, 'run error');
   } finally {
     restoreNativeEnv(prevEnv);
     await wire.close();
@@ -2588,13 +2647,15 @@ test('N1: a publish during an in-flight state send never re-emits that transitio
       'initial working',
     );
     await new Promise((r) => setTimeout(r, 700));
-    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1i1', isError: true });
+    // Native `blocked` is the human-wait leg only (an error is sidebar-only):
+    // one ask episode is the logical transition under test.
+    h.fireEvent('rpiv:ask-user:blocked', { active: true });
     const blocked = await wire.waitFor(
       (r) => r.method === 'pane.report_agent' && r.params.state === 'blocked',
       5000,
       'blocked on the wire',
     );
-    assert.match(blocked.params.message ?? '', /^error:/, 'blocked carries the error label');
+    assert.match(blocked.params.message ?? '', /^ask:/, 'blocked carries the ask label');
     // Same desired report (still `blocked` + the same label) published while
     // that send is unanswered: the wire schedule puts the beat mid-round-trip.
     h.fireEvent('gentle-pi:session-change', { sessionId: 'sess-n1-inflight' });
@@ -2606,6 +2667,13 @@ test('N1: a publish during an in-flight state send never re-emits that transitio
       `one logical blocked transition ships exactly one seq: ${JSON.stringify(reports)}`,
     );
     n1NoNotify(wire.received, 'in-flight republish');
+    // S-E1 pin: a failed tool inside the open episode still publishes nothing.
+    const statesBefore = nativeStates(wire.received).length;
+    const labelsBefore = blockedLabels(h).length;
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1i1', isError: true });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(nativeStates(wire.received).length, statesBefore, 'a failed tool publishes no native state');
+    assert.equal(blockedLabels(h).length, labelsBefore, 'a failed tool publishes no label');
   } finally {
     restoreNativeEnv(prevEnv);
     await wire.close();
@@ -2613,8 +2681,8 @@ test('N1: a publish during an in-flight state send never re-emits that transitio
 });
 
 // The emit-once dedupe must stay a dedupe, never a suppressor: a real return to
-// working followed by a new failure is a second logical transition and keeps
-// its own report and seq.
+// working followed by a new intervention is a second logical transition and
+// keeps its own report and seq.
 test('N1: a second genuine blocked transition still emits after a return to working', async () => {
   const wire = await startNativeWire();
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-n1-again', '1');
@@ -2627,22 +2695,24 @@ test('N1: a second genuine blocked transition still emits after a return to work
       5000,
       'initial working',
     );
-    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1a1', isError: true });
+    // Native `blocked` is the human-wait leg (an error is sidebar-only), so two
+    // ask episodes across a return to working are the two transitions.
+    h.fireEvent('rpiv:ask-user:blocked', { active: true });
     const first = await wire.waitFor(
       (r) => r.method === 'pane.report_agent' && r.params.state === 'blocked',
       5000,
       'first blocked',
     );
-    assert.match(first.params.message ?? '', /^error:/, 'first blocked carries the error label');
-    // agent_start is the fresh snapshot: the error latch clears, the pane
-    // returns to working, and the next failure is a new episode.
-    h.fire('agent_start', {});
+    assert.match(first.params.message ?? '', /^ask:/, 'first blocked carries the ask label');
+    // The intervention is answered: the pane returns to working, and the next
+    // episode is a new logical transition.
+    h.fireEvent('rpiv:ask-user:blocked', { active: false });
     await wire.waitFor(
       (r) => r.method === 'pane.report_agent' && r.params.state === 'working' && r.params.seq > first.params.seq,
       5000,
-      'working after the error latch clears',
+      'working after the ask is answered',
     );
-    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1a2', isError: true });
+    h.fireEvent('rpiv:ask-user:blocked', { active: true });
     const second = await wire.waitFor(
       (r) =>
         r.method === 'pane.report_agent' &&
@@ -2651,9 +2721,24 @@ test('N1: a second genuine blocked transition still emits after a return to work
       5000,
       'second blocked after a real return to working',
     );
-    assert.match(second.params.message ?? '', /^error:/, 'second blocked carries the error label');
+    assert.match(second.params.message ?? '', /^ask:/, 'second blocked carries the ask label');
     assert.equal(nativeTransitionCount(wire.received, 'blocked'), 2, 'working->blocked->working->blocked emits twice');
     n1NoNotify(wire.received, 'second blocked');
+    // S-E1 pin: the removed trigger publishes nothing, not even inside an
+    // open intervention episode.
+    const statesBefore = nativeStates(wire.received).length;
+    const labelsBefore = blockedLabels(h).length;
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-n1a1', isError: true });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'pin-again', agent: 'gentle-ai-worker', status: 'failed' } },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(nativeStates(wire.received).length, statesBefore, 'a failed tool publishes no native state');
+    assert.equal(blockedLabels(h).length, labelsBefore, 'a failed tool publishes no label');
   } finally {
     restoreNativeEnv(prevEnv);
     await wire.close();
