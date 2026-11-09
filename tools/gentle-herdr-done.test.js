@@ -224,6 +224,85 @@ async function startAndSettle(h, paneId) {
   return from;
 }
 
+test('an empty settle lands the native Working -> Idle edge the host finishes on', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+
+  const from = cursor(paneId);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(400);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const idle = await waitFrom(
+    paneId,
+    from,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(
+    idle,
+    'a truly empty settle reports native idle, which is what fires the host Finished toast',
+  );
+  assert.equal(idle.params.message, undefined, 'idle carries no message');
+  await settle(400);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, from),
+    ['working', 'idle'],
+    'the host sees exactly one Working -> Idle transition, never a duplicate',
+  );
+});
+
+test('an error episode reports native blocked exactly once', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+
+  const from = cursor(paneId);
+  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'err-1', isError: true });
+  const blocked = await waitFrom(
+    paneId,
+    from,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'blocked',
+  );
+  assert.ok(blocked, 'a real error reports native blocked, which fires the host NeedsAttention toast');
+  assert.equal(blocked.params.message, 'error:task-failed');
+
+  // Repeated beats while the same error stands never re-report it.
+  const afterFirst = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(400);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(400);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, afterFirst),
+    [],
+    'one error notification per error episode, no duplicate on repeated beats',
+  );
+
+  // The next turn clears the latch and a fresh error re-arms exactly once.
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(400);
+  const resumed = cursor(paneId);
+  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'err-2', isError: true });
+  const again = await waitFrom(
+    paneId,
+    resumed,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'blocked',
+  );
+  assert.ok(again, 'a new error episode re-arms');
+  await settle(400);
+  assert.equal(
+    nativeStatesFrom(paneId, resumed).filter((state) => state === 'blocked').length,
+    1,
+    'exactly one blocked report for the new episode',
+  );
+});
+
 test('computeNativeState takes no job input', async () => {
   const { module } = await loadRuntime();
   const base = {
@@ -351,6 +430,248 @@ test('a snapshot owned by another session is ignored', async () => {
   const from = await startAndSettle(h, paneId);
   const minted = await waitFrom(paneId, from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
   assert.ok(minted, 'a foreign job set never holds this session');
+});
+
+// A finished job keeps appearing in the snapshot as a result tail; only an
+// entry with no `status` is still running (upstream RunningJobDisplay).
+const finishedJob = (id, status = 'exited', label = 'ci') => ({
+  ...job(id, label),
+  status,
+  endedAt: Date.now(),
+  exitCode: 0,
+});
+
+test('a finished-tail job is never pending work, whatever its terminal status', async () => {
+  await listening;
+  for (const status of ['exited', 'stopped', 'failed']) {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [finishedJob('job-1', status)]));
+
+    const from = await startAndSettle(h, paneId);
+    const minted = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(minted, `${status}: a finished-tail entry never holds the finish`);
+    assert.equal(
+      minted.params.tokens[ORCHESTRATING_TOKEN],
+      null,
+      `${status}: the row leaves the pink generic gentle wait on the same beat`,
+    );
+    await settle(400);
+    assert.equal(finishesFrom(moshiBefore).length, 1, `${status}: exactly one finish notification`);
+  }
+});
+
+test('a live job next to a finished tail holds the row, then releases it', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  const moshiBefore = moshiFrames.length;
+  // The live job carries no `status` at all (an older publisher shape): it
+  // still counts as pending work.
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-live'), finishedJob('job-done')]));
+
+  const from = await startAndSettle(h, paneId);
+  const held = await waitFrom(
+    paneId,
+    from,
+    (f) => typeof (f?.params?.tokens ?? {})[ORCHESTRATING_TOKEN] === 'string',
+  );
+  assert.ok(held, 'a live job keeps the row on the pink generic gentle');
+  assert.equal(held.params.tokens[DONE_TOKEN], null, 'and holds the finish');
+  await settle(400);
+  assert.equal(finishesFrom(moshiBefore).length, 0, 'no finish while one job still runs');
+
+  const freedFrom = cursor(paneId);
+  h.fireBus(
+    JOBS_EVENT,
+    jobsSnapshot('sess-1', [finishedJob('job-live'), finishedJob('job-done')]),
+  );
+  const minted = await waitFrom(
+    paneId,
+    freedFrom,
+    (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+  );
+  assert.ok(minted, 'a snapshot of finished tails alone releases the finish');
+  assert.equal(minted.params.tokens[ORCHESTRATING_TOKEN], null, 'and clears the gentle wait');
+  await settle(400);
+  assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification');
+});
+
+test('a job whose exit snapshot never arrives still releases the finish at the TTL', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '1500';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const from = await startAndSettle(h, paneId);
+    await settle(350);
+    assert.deepEqual(
+      doneValuesFrom(paneId, from),
+      [],
+      'a fresh job holds the finish: the beat it painted reports no done token',
+    );
+
+    // No further bus event ever arrives. Only the freshness bound can release
+    // the settle it is holding, and nothing else programs that beat.
+    const releasedFrom = cursor(paneId);
+    const minted = await waitFrom(
+      paneId,
+      releasedFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(
+      minted,
+      'the snapshot going stale publishes a beat of its own, and that beat mints the finish',
+    );
+    assert.equal(
+      minted.params.tokens[ORCHESTRATING_TOKEN],
+      null,
+      'the same beat drops the gentle wait, so the row reads done',
+    );
+    await settle(400);
+    assert.equal(
+      finishesFrom(moshiBefore).length,
+      1,
+      'the expiry beat is enough for the channel-on finish notification: exactly one',
+    );
+    assert.ok(
+      nativeStatesFrom(paneId, from).includes('idle'),
+      'the native Working -> Idle edge still lands on its own',
+    );
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+test('the exiting snapshot mints done on the spot, never waiting for the TTL', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '3000';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const heldFrom = await startAndSettle(h, paneId);
+    await settle(350);
+    assert.deepEqual(doneValuesFrom(paneId, heldFrom), [], 'the live job holds the finish');
+
+    const from = cursor(paneId);
+    const startedAt = Date.now();
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', []));
+    const minted = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+      2500,
+    );
+    assert.ok(minted, 'the exit snapshot releases the finish on the next beat');
+    assert.ok(
+      Date.now() - startedAt < 3000,
+      'it lands on the band the snapshot already describes, not on the staleness bound',
+    );
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+test('a new live snapshot after the expiry mints a second finish, once', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '1200';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const from = await startAndSettle(h, paneId);
+    const first = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(first, 'the first expiry releases the finish');
+    const firstExpiry = first.params.tokens[DONE_TOKEN].split(':')[1];
+    await settle(300);
+    assert.deepEqual(
+      doneValuesFrom(paneId, from).map((token) => token.split(':')[1]),
+      [firstExpiry],
+      'the hold republishes one expiry, never a second mint',
+    );
+
+    // A new live snapshot is activity again: the row returns to `gentle` and
+    // the finish it will hold is a genuinely new edge.
+    const backFrom = cursor(paneId);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-2')]));
+    const back = await waitFrom(
+      paneId,
+      backFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[ORCHESTRATING_TOKEN] === 'string',
+    );
+    assert.ok(back, 'a new live job returns the row to the gentle wait');
+    assert.equal(back.params.tokens[DONE_TOKEN], null, 'and clears the finished row');
+
+    const secondFrom = cursor(paneId);
+    const second = await waitFrom(
+      paneId,
+      secondFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(second, 'the new snapshot is its own expiry: the finish returns at its bound');
+    assert.notEqual(
+      second.params.tokens[DONE_TOKEN].split(':')[1],
+      firstExpiry,
+      'a new finish is a new hold, not the old one replayed',
+    );
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+test('shutdown drops the pending expiry instead of leaving an orphan beat', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '800';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+    h.fire('session_start', { reason: 'startup' }, ctx());
+    await settle(250);
+
+    const afterShutdown = cursor(paneId);
+    h.fire('session_shutdown', {}, ctx());
+    await settle(200);
+    const quietFrom = cursor(paneId);
+    await settle(1200);
+    assert.equal(
+      cursor(paneId),
+      quietFrom,
+      'the expiry timer is dropped with the session: no orphan beat after shutdown',
+    );
+    assert.ok(quietFrom >= afterShutdown, 'the shutdown itself published nothing extra');
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
 });
 
 test('the settle edge mints the finish token and notifies exactly once', async () => {

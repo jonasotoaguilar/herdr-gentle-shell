@@ -407,12 +407,17 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   no argument the command opens the floating panel in Gentle Shell's own
   layout: one left `CATEGORIES` list (`Herdr Sidebar`, `Moshi notifications`)
   and one right pane headed `<Category> · n/m` with its setting rows, each row
-  painting the stored value with `●` and the other with `○`; the footer reads
-  `Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`, and `←/→` or
+  painting the stored value with `●` and the other with `○`; one line above the
+  footer describes the focused setting (`<setting> — <what it changes>`), and
+  the footer reads
+  `←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`, while `←/→` or
   `Tab` moves between the category and value panes, `↑/↓` or `j/k` moves the
-  cursor while `Esc` closes. A click on a category selects it and a click on a
-  row applies it, exactly like `Enter` on the focused row; clicks outside the
-  panes are ignored. The notifications switch appears twice — as its own
+  cursor, `Enter` applies the focused row and `Esc` closes without a write. The
+  legend names only keys: it never advertises `Click`, because every token in
+  it is a key the panel answers to, and a narrow card compacts it instead of
+  wrapping. Pointer input still works without being advertised — a click on a
+  category selects it, a click on a row applies it, and a click outside the
+  panes is ignored. The notifications switch appears twice — as its own
   `Moshi notifications` category and as a `Notifications` row inside
   `Herdr Sidebar` — and both rows read the one flag below, so the state they
   show can never disagree. The plain two-step menu stays as the fallback
@@ -451,7 +456,10 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   session row, terminal context, phone-side approvals) keeps working, but
   notifications follow this plugin's policy — one when Pi really needs your
   input (`ask`) and one when Pi really finishes. Nothing per prompt, nothing per
-  turn. If `extensions/moshi-hooks.ts` is installed, add
+  turn, and nothing at all while the flag is off: every envelope path requires
+  the flag at send time, so a context captured for Chat View while the channel
+  was on can never authorize a notification after it is turned off. If
+  `extensions/moshi-hooks.ts` is installed, add
   `-extensions/moshi-hooks.ts` to the `extensions` list in your Pi
   `settings.json` so the Moshi-managed hook cannot notify in parallel; that edit
   leaves every other settings key and entry untouched. Removal of the flag (or

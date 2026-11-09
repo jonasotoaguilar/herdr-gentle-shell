@@ -719,6 +719,21 @@ const DONE_HOLD_ENV = "GENTLE_HERDR_DONE_HOLD_MS";
 // minutes is the generous end of the [30 s, 5 min] band: a job longer than this
 // fails open early, and a missed exit event delays `done` by at most this long.
 export const JOBS_SNAPSHOT_TTL_MS = 300000;
+const JOBS_TTL_ENV = "GENTLE_HERDR_JOBS_TTL_MS";
+const JOBS_TTL_MIN_MS = 100;
+const JOBS_TTL_MAX_MS = 3600000;
+
+// Same discipline as doneHoldMs: an absent or unparseable value keeps the
+// default and anything outside the band is clamped, so a debugging session (or
+// a test that cannot wait five minutes) can shorten the bound without ever
+// making every snapshot instantly stale.
+export function jobsSnapshotTtlMs(raw = process.env[JOBS_TTL_ENV]) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0) return JOBS_SNAPSHOT_TTL_MS;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return JOBS_SNAPSHOT_TTL_MS;
+  return Math.min(JOBS_TTL_MAX_MS, Math.max(JOBS_TTL_MIN_MS, Math.round(parsed)));
+}
 const MAX_TOKENS_PER_REPORT = 16;
 const MAX_LABEL_CHARS = 64;
 // Herdr's wire ceiling for a single pane-metadata token value, measured in
@@ -1814,16 +1829,20 @@ function moshiSessionIsChild(file) {
   return child;
 }
 
-let moshiFlagCache = { mtimeMs: -1, enabled: false };
+let moshiFlagCache = { key: "", enabled: false };
 
 function moshiEnabled() {
   const path = moshiFlagPath();
   try {
     const stat = fs.statSync(path);
-    if (stat.mtimeMs === moshiFlagCache.mtimeMs) return moshiFlagCache.enabled;
-    moshiFlagCache = { mtimeMs: stat.mtimeMs, enabled: moshiFlagEnabled(path) };
+    // Identity, not just mtime: a rewrite that lands inside the same timestamp
+    // tick (or on a coarse or network filesystem) must still flip the gate. A
+    // stale "enabled" is exactly the notification the user asked not to get.
+    const key = `${stat.mtimeMs}:${stat.size}:${stat.ino}`;
+    if (key === moshiFlagCache.key) return moshiFlagCache.enabled;
+    moshiFlagCache = { key, enabled: moshiFlagEnabled(path) };
   } catch {
-    moshiFlagCache = { mtimeMs: -1, enabled: false };
+    moshiFlagCache = { key: "", enabled: false };
   }
   return moshiFlagCache.enabled;
 }
@@ -2568,10 +2587,37 @@ export default function (pi) {
   // it is never a display state of its own: no job count is published and no
   // `job` token exists to render (odd/tasks/restore-done-idle.md).
   let jobsSnapshot;
+  // One timer per live snapshot, armed for the instant that snapshot goes
+  // stale. The bus is edge-emitted, so a job whose exit snapshot never arrives
+  // would otherwise leave `freshRunningJobCount()` frozen at its last value
+  // with nothing left to publish the settle that follows: no beat, no `done`,
+  // and the row stays on the pink generic `gentle` for good. One beat at the
+  // expiry is enough — from that instant the hint is zero jobs, so the beat
+  // either mints `done` or reports the real activity that still holds it.
+  // Never a poll: a new snapshot replaces the timer, the session reset and
+  // shutdown drop it, and an empty snapshot drops it immediately.
+  let jobsExpiryTimer;
+
+  function clearJobsExpiry() {
+    if (jobsExpiryTimer === undefined) return;
+    clearTimeout(jobsExpiryTimer);
+    jobsExpiryTimer = undefined;
+  }
+
+  function armJobsExpiry(at) {
+    clearJobsExpiry();
+    const delay = Math.max(0, at + jobsSnapshotTtlMs() - Date.now());
+    jobsExpiryTimer = setTimeout(() => {
+      jobsExpiryTimer = undefined;
+      if (!rootSession) return;
+      schedulePublish();
+    }, delay);
+    if (jobsExpiryTimer.unref) jobsExpiryTimer.unref();
+  }
 
   function freshRunningJobCount() {
     if (!jobsSnapshot) return 0;
-    if (Date.now() - jobsSnapshot.at > JOBS_SNAPSHOT_TTL_MS) return 0;
+    if (Date.now() - jobsSnapshot.at > jobsSnapshotTtlMs()) return 0;
     const owner = jobsSnapshot.sessionId;
     const mine = sessionId;
     if (
@@ -2594,11 +2640,23 @@ export default function (pi) {
     const jobs = value.snapshot.jobs.filter(
       (entry) => isRecord(entry) && typeof entry.id === "string" && entry.id.length > 0,
     );
+    // Gentle Shell publishes a FINISHED TAIL: a job that already ended stays in
+    // the array carrying `status: "exited" | "stopped" | "failed"` (its
+    // `RunningJobDisplay`, optional so older publishers that list running jobs
+    // only keep validating). Only an entry with NO status is still running.
+    // Counting a tail entry made `activity` true forever: the row stayed on the
+    // pink generic `gentle` and the `done` mint — hence the finish token, the
+    // host `idle` edge and the Finished toast — never happened, on a panel that
+    // read `none running`. Any status, known or not, therefore stops counting.
+    // `jobs` is only read by freshRunningJobCount, so the filter lives here.
+    const live = jobs.filter((entry) => entry.status === undefined);
     jobsSnapshot = {
       sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined,
-      jobs,
+      jobs: live,
       at: Date.now(),
     };
+    if (live.length > 0) armJobsExpiry(jobsSnapshot.at);
+    else clearJobsExpiry();
     schedulePublish();
   }
 
@@ -2627,6 +2685,10 @@ export default function (pi) {
 
   function moshiEmit(eventName, extra = {}) {
     if (!rootSession) return;
+    // THE gate for every envelope path: the opt-in flag is required here, on
+    // every path, with no per-event exception. A context captured while the
+    // channel was on is Chat View prefill only — it never authorizes a send.
+    if (!moshiEnabled()) return;
     if (!moshiContext && !moshiEnsureContext()) return;
     const context = moshiContext;
     if (!context) return;
@@ -2647,6 +2709,15 @@ export default function (pi) {
       envelope.contextRemaining = Math.round(context.contextRemaining);
     }
     moshiSendEnvelope(envelope);
+  }
+
+  // The notifications name the project, so they must resolve it the way a send
+  // resolves its context — capturing on demand, which also keeps a channel
+  // enabled mid-session from announcing itself as a bare "Gentle".
+  function moshiNotifyProject() {
+    if (!moshiEnabled()) return "Gentle";
+    moshiEnsureContext();
+    return moshiContext?.project ?? "Gentle";
   }
 
   // Captures on demand and sends the silent carrier once per session, so
@@ -2789,14 +2860,16 @@ export default function (pi) {
       // Moshi replacement (DESIGN §7): a real ask episode is the only
       // intervention that reaches the phone — one approval_required per
       // intentId, exactly like the Herdr toast, and never a speculative ask.
-      if (moshiContext || moshiEnabled()) {
+      // `moshiContext` alone never authorizes it: the flag gates every send.
+      if (moshiEnabled()) {
+        const project = moshiNotifyProject();
         moshiEmit("PermissionRequest", {
           category: "approval_required",
           phase: "waitingForApproval",
           actionId: askIntentId,
-          title: `Gentle ask: ${moshiContext?.project ?? "Gentle"}`,
+          title: `Gentle ask: ${project}`,
           subtitle: "Answer in terminal",
-          message: `${moshiContext?.project ?? "Gentle"} has a question and is waiting for your answer. Return to Pi to respond.`,
+          message: `${project} has a question and is waiting for your answer. Return to Pi to respond.`,
           ...(lastAskToolName ? { toolName: lastAskToolName } : {}),
         });
       }
@@ -3314,7 +3387,7 @@ export default function (pi) {
   // live jobs — never off a raw native working->idle transition, which fires
   // with work still left and used to skip `done` entirely.
   function emitFinish() {
-    const project = moshiContext?.project ?? "Gentle";
+    const project = moshiNotifyProject();
     const lastLabel = lastFinishedLabel(tasks);
     moshiEmit("AgentEnd", {
       category: "task_complete",
@@ -3416,6 +3489,15 @@ export default function (pi) {
       maybeStopBeat();
       return;
     }
+    // The finish notification is a Moshi envelope, not a Herdr token: it hangs
+    // off the minted done edge above, and announcing it here — before, and
+    // regardless of, the token publish — keeps a transport failure from
+    // swallowing it. Cleared with the announcement, so a retried beat can
+    // never duplicate it.
+    if (donePending) {
+      donePending = false;
+      emitFinish();
+    }
     publishInFlight = true;
     try {
       const ok = await sendTokens(tokens);
@@ -3423,10 +3505,6 @@ export default function (pi) {
         // One coalesced wake per landed beat, after the tokens are in Herdr
         // (a request written first could render a frame over stale tokens).
         requestStatusRefresh();
-        if (donePending) {
-          donePending = false;
-          emitFinish();
-        }
         if (transportFails >= TRANSPORT_FAIL_LATCH && errorCode === "transport") {
           errorCode = undefined;
           updateBlocker();
@@ -3564,6 +3642,7 @@ export default function (pi) {
     donePending = false;
     sawActivity = false;
     jobsSnapshot = undefined;
+    clearJobsExpiry();
     errorCode = undefined;
     liveGen += 1;
     liveInFlight = false;

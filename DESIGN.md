@@ -751,7 +751,12 @@ gentle-ai concern and explicitly out of scope for this plugin.
   running/queued plus zero pending plus zero live background jobs plus no
   human wait — never a raw native `working → idle` transition, which fires
   with work still left and skipped `done` entirely),
-  never per prompt and never per turn. A `session.closed` (`session_ended`)
+  never per prompt and never per turn. Every envelope path requires the flag at
+  send time: a context captured for Chat View while the channel was on is
+  prefill only and never authorizes a notification after it is turned off, and
+  `task_complete` is announced at the minted `done` edge itself rather than
+  after a successful Herdr publish, so a failed token beat cannot drop it. A
+  `session.closed` (`session_ended`)
   envelope closes the row on shutdown, and the host-awaited handler flushes
   in-flight sends. `task_complete` carries title `Gentle finished: <project>`
   and names the last finished task: `<project> finished — <label>. Return to
@@ -790,7 +795,7 @@ report after a Pi restart or `/new` (both recreate the extension runtime)
 lose, freezing the pane's `agent_session` binding at the old session while
 the producer keeps beating for the new one — the consumer then rejects those
 fresh tokens as a session-hash mismatch and the pane stays on `idle` until a
-report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped and emitted on job edges only, so a snapshot counts only while it is fresh — a stale or foreign snapshot is zero jobs; an absent Gentle Shell simply reports none (today's behavior). While such a job waits with the principal settled and no delegate running or launching, the producer keeps the root marker live so the row stays on the pink generic `gentle` (§5.2) and the finish is held back; the wait ends on the beat the principal resumes, a delegate starts, the last job ends, or the snapshot ages past its staleness bound. `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning (it reads `working` while any delegate runs, which is what Herdr's own pane state means): the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` instead (§5.2), so an idle principal with a running delegate shows the delegate role word rather than `gentle`. Single publisher by design: the managed native extension file is excluded
+report with a higher seq lands. Parity contract: `working` carries the specific working role in the message (oldest running role word from the same roles resolution — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once with no re-emit on repeat settles). Live background jobs come from Gentle Shell's own bus event `gentle-ai:jobs-sidebar` (`bash_background` / `monitor`), session-scoped and emitted on job edges only, so a snapshot counts only while it is fresh — a stale or foreign snapshot is zero jobs; an absent Gentle Shell simply reports none (today's behavior). Only an entry with no `status` is pending work: Gentle Shell keeps a finished job in the array as a result tail (`status: exited|stopped|failed`), and counting that tail is what pinned the row on the pink generic `gentle` — and blocked `done` — while the panel read no running job. One `unref()`-ed timer per live snapshot publishes a single beat at the instant the snapshot goes stale, so a missed exit event cannot leave the settle without a beat. While such a job waits with the principal settled and no delegate running or launching, the producer keeps the root marker live so the row stays on the pink generic `gentle` (§5.2) and the finish is held back; the wait ends on the beat the principal resumes, a delegate starts, the last job ends, or the snapshot ages past its staleness bound. `blocked` only for a real principal-stopped error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning (it reads `working` while any delegate runs, which is what Herdr's own pane state means): the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` instead (§5.2), so an idle principal with a running delegate shows the delegate role word rather than `gentle`. Single publisher by design: the managed native extension file is excluded
   reversibly (`-extensions/herdr-agent-state.ts` in Pi settings, bytes
   preserved on disk, never auto-loaded next to ours). `node
   bin/gentle-sidebar.js (enable|disable|status|toggle)` selects the
@@ -831,11 +836,15 @@ argument, Esc, or a cancelled menu writes nothing. With no argument the
 command opens the floating panel (`lib/customize-panel.js`, painted through its
 own palette) over `ctx.ui.custom` in Gentle Shell's own layout: one left
 `CATEGORIES` list, one right pane headed `<Category> · n/m` with its setting
-rows, each row painting the stored value with `●` and the other with `○`, and
-the footer
-`Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`. There is no
+rows, each row painting the stored value with `●` and the other with `○`; one
+line above the footer describes the focused setting
+(`<setting> — <what it changes>`), and the footer
+`←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`. There is no
+`Click` token and no
 `Preview · …` band and no `p profiles` key: this plugin owns no profiles
-concept, so the footer advertises nothing it cannot do. `←/→` or `Tab` moves
+concept, so the footer advertises nothing it cannot do — every token in it is a
+key the panel answers to, and a narrow card compacts the legend instead of
+wrapping it. `←/→` or `Tab` moves
 between the category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter`
 applies the focused row and `Esc` closes without a write; a click on a category
 selects it, a click on a row applies it, and a click outside the panes is
