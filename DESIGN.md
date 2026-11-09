@@ -205,7 +205,7 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 | TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total of delegates — never a principal-working signal) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | the oldest running role word (known short word or unknown sanitized name) whenever the principal itself is not working; a working principal reads `gentle` instead; role labels show the total when two or more delegates run |
 | `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt` dialog spans (`kind` other than `custom` — a panel or overlay such as the agents view, ODD viewer, changes view or design canvas never counts, because opening a panel is navigation, not a question), plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
 | Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` with `reviewerRunAcknowledged: true` in the runtime args; `correctionLines` (native planning, never a reviewer), forecast-only calls, `gentle_review` (any operation), `gentle_review_scope`, and all sidebar/hook signals never enter — unknown legacy shapes stay dark (conservative) | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label. Bounded approximation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today |
-| the agent run itself stops on an error (an assistant message whose `stopReason` is `error` — the same signal Pi derives `turn_end.outcome === "error"` from) | `herdr:blocked` label `error:run-failed` only; no native state is derived from it (the pane stays on its lifecycle state — `working` while the label stands) | `error` (row word `blocked`) — never a native `blocked` |
+| the agent run itself stops on an error (an assistant message whose `stopReason` is `error` — the same signal Pi derives `turn_end.outcome === "error"` from) | durable `gentle_error_v1=<hash>:run-failed:<exp>` on every beat while the leg stands (null/clear the beat it releases, §4.3) + `herdr:blocked` label `error:run-failed`; no native state is derived from it (the pane stays on its lifecycle state — `working` — while the leg stands, so the host raises no NeedsAttention toast or sound) | `error` (row word `blocked`) — never a native `blocked` |
 | a tool call fails, a delegate record ends `failed`, or a beat transport fails | nothing — detection only (a counter and a debug line under `GENTLE_HERDR_DEBUG=1`) | nothing: no label, no native state, no finish hold, no notification |
 | `agent_settled` + 0 active subs | `gentle_work_v1=<hash>:0:<exp>`; clear `blocked` labels | `done` |
 | `SESSION_CHANGE_ENTRY` `gentle-pi.session-change/v1` tool outcome (G1/G2) | `gentle_changes_v2=<hash>:<files>:<added>:<deleted>:<exp>` (+ legacy `gentle_changes_v1` dual-emit, §4.3) | change segments only (orthogonal to state) |
@@ -357,6 +357,17 @@ gentle_review_v1      = sessionHash ":" reviewId ":" expiry
                     ; execution is in flight, null (clear) otherwise; silent
                     ; working natively, never a notification (full def:
                     ; extensions/gentle-herdr-state.ts, herdr-plugin/lib/gentle-tokens.js)
+gentle_error_v1       = sessionHash ":" code ":" expiry
+                    ; durable run-error signal, session-bound + TTL-fresh —
+                    ; emitted on every beat while the run-error leg stands
+                    ; (the agent run itself stopped on an error), null
+                    ; (clear) the beat it releases; the sidebar's ONLY error
+                    ; carrier (the native report never claims `blocked`, so
+                    ; no toast, no sound, no phone envelope). Tool-level
+                    ; failures never reach it (they are telemetry only).
+                    ; Consumer: fresh token => `error` display (row word
+                    ; `blocked`, silent) with the same
+                    ; error > ask > review priority as the label leg.
 herdr:blocked     = "ask:" intentId / "review:" reviewId / "error:" code
 ```
 
@@ -383,6 +394,7 @@ pane.report_metadata --source gentle:v1 --token gentle_orchestrating_v1=Ab3_xK9q
 pane.report_metadata --source gentle:v1 --token gentle_principal_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:1789000000000
 pane.report_metadata --source gentle:v1 --token gentle_names_v1=planner,code-writer
 pane.report_metadata --source gentle:v1 --token gentle_changes_v2=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:5:110:22:1789000000000
+pane.report_metadata --source gentle:v1 --token gentle_error_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:run-failed:1789000000000
 herdr:blocked labels: ["ask:q-7f3a"] | ["review:r-42"] | ["error:run-failed"]
 ```
 
@@ -453,6 +465,8 @@ count), `gentle_principal_v1` (principal-only activity marker + freshness
 gate for the working-vs-idle decision — never rendered as a count),
 `gentle_done_v1` (synthesized finish signal + its own hold freshness gate
 for the reachable `done` display — the host never reports `done`, §4.3),
+`gentle_error_v1` (durable run-error signal + freshness gate for the `error`
+display — repairs a missed `error:` label edge, §4.3),
 `gentle_roles_v1` (authoritative activity roles,
 oldest-first by immutable firstSeen), `gentle_names_v1` (compat transport only — never
 rendered), `gentle_changes_v2` (normative; a
@@ -464,7 +478,9 @@ ignore them under O1 (never parsed for state, never deleted).
 ### 5.2 Reducer (priority order, first match wins)
 
 ```text
-error         := herdr:blocked has error:* (fresh, §5.4)
+error         := fresh `gentle_error_v1` (durable per-beat token, §4.3)
+                 OR herdr:blocked has error:* (fresh, §5.4) — one shared
+                 priority: error > ask > review
 ask           := fresh `gentle_ask_v1` (durable per-beat token, §4.3)
                  OR herdr:blocked has ask:* (fresh)
 review        := herdr:blocked has review:* (fresh)
@@ -570,7 +586,8 @@ marker, and only after the minted finish hold lapses does it recede to
   machine key; a delegated rdd and a tool-only review both render `rdd` —
   review execution is silent, never a notification; only
   a waiting `ask` intent notifies once) | `blocked` (user-facing row word for the `error`
-  machine key; the pane's native state never claims `blocked` for it) | `done` (settled-plus-empty only: principal settled with no
+  machine key; carried by the durable `gentle_error_v1` token or the `error:`
+  label, and the pane's native state never claims `blocked` for it) | `done` (settled-plus-empty only: principal settled with no
   running delegates and no pending launches; a settled principal with
   running delegates keeps the role word) | `idle`. Role labels append the
   total count when at least two delegates run.
@@ -711,10 +728,14 @@ gentle-ai concern and explicitly out of scope for this plugin.
 - Error containment: a failed beat transport is telemetry (a counter and a
   debug line), never state: it is our own report mechanism failing, not the
   agent, so it neither paints `error:` nor raises native `blocked`, and the
-  next landed beat resets the counter. The one real `error:` label — the run
+  next landed beat resets the counter. The one real error leg — the run
   itself stopping on an error — is released by the next non-error beat
   (`agent_start`, any tool activity, or a non-error assistant message), never
-  latched; no exception path ever stops the producer beat.
+  latched; no exception path ever stops the producer beat. While the leg
+  stands it publishes the durable `gentle_error_v1` token on every beat, so
+  an error the sidebar missed on one beat is repaired by the next, and the
+  release beat clears it (the missed-beat discipline of the ask/review
+  tokens).
 - No exactly-once end-to-end claim: at-least-once beats + TTL expiry is the
   engineered scope (consistent with the async/events guidance: never claim
   exactly-once without a deliberate mechanism). Desktop toast dedup is
@@ -878,11 +899,12 @@ exactly one mechanism writes each piece of state.
 ## 8. Limits
 
 - Token budget: ≤ 16 tokens per report per pane (E8 discipline); the
-  producer emits at most 11 tokens per beat (including the retired
+  producer emits at most 12 tokens per beat (including the retired
   `gentle_subs_v1` clear) (`gentle_work_v1`,
   `gentle_roles_v1`, `gentle_names_v1`,
   `gentle_orchestrating_v1`, `gentle_principal_v1`, `gentle_done_v1`,
-  `gentle_ask_v1`, `gentle_review_v1`, `gentle_changes_v2`,
+  `gentle_ask_v1`, `gentle_review_v1`, `gentle_error_v1`,
+  `gentle_changes_v2`,
   `gentle_changes_v1`) and the daemon publishes its 72-token owned family
   chunked ≤ 16 per report (row 1 is the 3 native tokens
   `state_icon`/`workspace`/`agent`; the legacy 11 `gentle_heading_*` compat

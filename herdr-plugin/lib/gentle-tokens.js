@@ -102,6 +102,18 @@ const ASK_RE = /^([A-Za-z0-9_-]{43}):([A-Za-z0-9_-]{1,64}):([1-9]\d{0,15})$/;
 // grammar, binding, or freshness failure — fail closed.
 const REVIEW_TOKEN = 'gentle_review_v1';
 const REVIEW_RE = /^([A-Za-z0-9_-]{43}):([A-Za-z0-9_-]{1,64}):([1-9]\d{0,15})$/;
+// Durable run-error signal (DESIGN §4.3): `<hash>:<code>:<expiry>` — the same
+// session binding and TTL discipline as gentle_ask_v1. Emitted on every
+// producer beat while the run-error leg stands (the agent run itself stopped
+// on an error), null (clear) the beat it releases. This is the sidebar's only
+// error carrier: the producer never claims native `blocked` for it, because
+// that is what fires the host NeedsAttention toast and sound. The reducer
+// treats a fresh token as `error` (row word `blocked`, silent) with the same
+// error > ask > review priority the blocked-label leg uses, independently of
+// work token presence. Null on any grammar, binding, or freshness failure —
+// fail closed.
+const ERROR_TOKEN = 'gentle_error_v1';
+const ERROR_RE = /^([A-Za-z0-9_-]{43}):([A-Za-z0-9_-]{1,64}):([1-9]\d{0,15})$/;
 // herdr:blocked labels, DESIGN §4.2. Id charset mirrors the producer's ID_RE.
 const BLOCKED_RE = /^(ask|review|error):([A-Za-z0-9_-]{1,64})$/;
 // Advisory names: printable, no CSV separators or quotes (producer strips
@@ -525,6 +537,22 @@ function parseReview(value, sessionHash, now) {
   return { reviewId, expiry };
 }
 
+// gentle_error_v1 = <hash>:<code>:<expiry>. The durable run-error signal:
+// session-bound + TTL-fresh like gentle_ask_v1. Null on any grammar, binding,
+// or freshness failure — a bad token never asserts an error, it simply falls
+// through to the lower branches (fail closed). The code is the producer's
+// sanitized reason slug (today only `run-failed`), never tool output.
+function parseError(value, sessionHash, now) {
+  if (typeof value !== 'string') return null;
+  const match = ERROR_RE.exec(value);
+  if (!match) return null;
+  const [, hash, code, rawExpiry] = match;
+  if (hash !== sessionHash) return null;
+  const expiry = Number(rawExpiry);
+  if (!expiryFresh(expiry, now)) return null;
+  return { code, expiry };
+}
+
 // gentle_changes_v1 = <hash>:<files>:<added+deleted>:<expiry>. Legacy:
 // the summed delta cannot be split into exact +N/-N, so the consumer keeps
 // this parser only for backward compatibility and never displays v1 values.
@@ -691,7 +719,10 @@ function piTreeOwnsPane(tokens, sessionHash, now) {
 //   deciding signal is the principal's own activity marker, never the delegate
 //   count and never the aggregate native status; role labels carry the running
 //   count as a suffix when above one.
-// `notify` is set only for ask (DESIGN §7; review/error stay silent).
+// `notify` is set only for ask (DESIGN §7; review/error stay silent). The
+// error leg has two carriers — a fresh `gentle_error_v1` durable token and the
+// `error:` blocked label — sharing that one priority, so the sidebar still
+// shows a stopped run when the label edge never reached state_labels.
 // A native `blocked` with no fresh gentle label clears our family (fail
 // closed): the block belongs to another writer or the producer died, so we
 // must not paint `working` over it — native attention still fires.
@@ -726,6 +757,12 @@ function reducePane(entry, now = Date.now()) {
   // review display no longer depends on work token presence. Stale,
   // foreign, or malformed tokens fail closed (null) above.
   const reviewToken = sessionHash === null ? null : parseReview(tokens[REVIEW_TOKEN], sessionHash, now);
+  // Durable run-error-token repair: fresh iff its own session binding and TTL
+  // hold (parseError). Independent of the work-token gate and of the
+  // blocked-label leg on purpose — the token IS the error liveness proxy, so
+  // a missed label edge (or a beat that never reached state_labels) cannot
+  // hide a stopped run. Stale, foreign, or malformed tokens fail closed.
+  const errorToken = sessionHash === null ? null : parseError(tokens[ERROR_TOKEN], sessionHash, now);
   // Synthesized finish signal (S2/D2): the producer mints it at the
   // settled-and-empty edge, so a fresh token is the ONLY reachable `done`
   // evidence in practice — the host never reports `agent_status === 'done'`.
@@ -759,12 +796,20 @@ function reducePane(entry, now = Date.now()) {
   const roles = parseRoles(tokens[ROLES_TOKEN]);
   const hasDelegatedReview = roles.some((role) => role === 'rdd' || role === 'review');
 
-  if (blocked !== null) {
+  if (blocked !== null && blocked.kind === 'error') {
     // The sidebar-facing words for error/review/orchestrating are
-    // `blocked`/`rdd`/`gentle`
-    // (native attention already fires on herdr:blocked); the machine keys
-    // stay `error`/`review`/`orchestrating` (DISPLAY_LABELS).
-    if (blocked.kind === 'error') return out('error');
+    // `blocked`/`rdd`/`gentle`; the machine keys stay
+    // `error`/`review`/`orchestrating` (DISPLAY_LABELS). The `error:` label
+    // itself is silent — native attention is raised only by a native
+    // `blocked`, which the producer never claims for an error.
+    return out('error');
+  }
+  // Durable run-error repair: a fresh session-bound gentle_error_v1 asserts
+  // `error` (row word `blocked`, silent — no notify) on its own TTL, checked
+  // before the ask/review legs below so the durable token and the label share
+  // one precedence: error > ask > review.
+  if (errorToken !== null) return out('error');
+  if (blocked !== null) {
     if (blocked.kind === 'ask') {
       return out('ask', { sessionHash, intentId: blocked.id, expiry: work.expiry });
     }
@@ -1004,6 +1049,7 @@ module.exports = {
   PRINCIPAL_TOKEN,
   ASK_TOKEN,
   REVIEW_TOKEN,
+  ERROR_TOKEN,
   DONE_TOKEN,
   FINISH_HOLD_MAX_MS,
   STATE_TOKENS,
@@ -1033,6 +1079,7 @@ module.exports = {
   parsePrincipal,
   parseAsk,
   parseReview,
+  parseError,
   parseDone,
   roleToDisplay,
   parseBlockedLabel,

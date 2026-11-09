@@ -38,6 +38,10 @@ assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed')
 const JOBS_EVENT = 'gentle-ai:jobs-sidebar';
 const DONE_TOKEN = 'gentle_done_v1';
 const ORCHESTRATING_TOKEN = 'gentle_orchestrating_v1';
+const ERROR_TOKEN = 'gentle_error_v1';
+// The sidebar daemon derives the pane's binding hash from exactly the same
+// agent_session path, so this is the hash both sides must agree on.
+const contract = require('../herdr-plugin/lib/gentle-tokens.js');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-herdr-done-'));
 const herdrSock = path.join(root, 'herdr.sock');
@@ -46,6 +50,9 @@ const stateDir = path.join(root, 'state');
 const sessionFile = path.join(root, 'sess.jsonl');
 fs.mkdirSync(stateDir, { recursive: true });
 fs.writeFileSync(sessionFile, '{"type":"session"}\n');
+const SESSION_HASH = contract.expectedSessionHash({
+  agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+});
 fs.writeFileSync(path.join(stateDir, 'gentle-moshi.json'), '{"enabled":true}\n');
 const fakeHerdr = path.join(root, 'herdr-fake.sh');
 fs.writeFileSync(fakeHerdr, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
@@ -347,6 +354,17 @@ async function assertToolFailureChangesNothing(h, paneId, fireFailure) {
     [],
     'a tool error never claims native blocked, which is the host NeedsAttention toast',
   );
+  // The durable error token is the run-error signal: a tool-level failure
+  // never publishes it, so the settle beat above carries an explicit clear.
+  const settledTokens = metadataTokensFrom(paneId, settledFrom);
+  assert.ok(settledTokens.length > 0, 'the settle beat still publishes a full snapshot');
+  for (const published of settledTokens) {
+    assert.equal(
+      published[ERROR_TOKEN],
+      null,
+      'a failed tool call never publishes the run-error token',
+    );
+  }
 }
 
 test('S-E1: a failed subagent launch changes nothing in the published state', async () => {
@@ -477,6 +495,135 @@ test('S-E4: a retried run clears the error without waiting for a new turn', asyn
     [{ kind: 'herdr:blocked', payload: { active: false } }],
     'a successful retry releases the error label',
   );
+});
+
+// S-E5: the run error is OUR OWN durable sidebar signal, not the native
+// `blocked` state. `blocked` is exactly what fires the host NeedsAttention
+// toast and sound, so the error rides a session-bound, TTL-fresh token that
+// the consumer reduces to the `error` display word, while the pane keeps
+// reporting the attention-free native `working`.
+
+function parsedError(value, now = Date.now()) {
+  return contract.parseError(value, SESSION_HASH, now);
+}
+
+async function fireRunError(h) {
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+}
+
+const publishedErrorToken = (frame) => {
+  const published = frame?.params?.tokens ?? {};
+  return typeof published[ERROR_TOKEN] === 'string' ? published[ERROR_TOKEN] : undefined;
+};
+
+test('S-E5: a run error publishes its own durable token, never native blocked', async () => {
+  const { h, paneId } = await workingTurn();
+  const framesFrom = cursor(paneId);
+  const phoneFrom = moshiFrames.length;
+
+  await fireRunError(h);
+  const beat = await waitFrom(
+    paneId,
+    framesFrom,
+    (f) => publishedErrorToken(f) !== undefined,
+  );
+  assert.ok(beat, 'the run error reaches the sidebar as our own durable token');
+  const value = publishedErrorToken(beat);
+  assert.match(
+    value,
+    /^[A-Za-z0-9_-]{43}:run-failed:[1-9]\d{0,15}$/,
+    'the error token mirrors the durable ask/review grammar',
+  );
+  assert.deepEqual(
+    parsedError(value),
+    { code: 'run-failed', expiry: Number(value.split(':')[2]) },
+    'the token is session-bound and TTL-fresh for this pane',
+  );
+
+  await settle(300);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, framesFrom).filter((state) => state === 'blocked'),
+    [],
+    'an error never claims native blocked: no NeedsAttention toast, no sound',
+  );
+  assert.equal(
+    nativeStatesFrom(paneId, 0).at(-1),
+    'working',
+    'the pane stays on the only attention-free native state',
+  );
+  assert.deepEqual(
+    moshiFrames.slice(phoneFrom),
+    [],
+    'an error never sends a phone envelope',
+  );
+});
+
+test('S-E5: the error token is republished on every beat while the leg stands', async () => {
+  const { h, paneId } = await workingTurn();
+  await fireRunError(h);
+  const first = await waitFrom(paneId, 0, (f) => publishedErrorToken(f) !== undefined);
+  assert.ok(first, 'the error beat publishes the token');
+
+  // The settle of the run that died is a second beat while the leg still
+  // stands: a durable signal is republished there, never fired once on the
+  // error edge, so a missed beat cannot strand the row.
+  const from = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  const second = await waitFrom(paneId, from, (f) => publishedErrorToken(f) !== undefined);
+  assert.ok(second, 'a later beat republishes the error token instead of firing it once');
+
+  const firstExpiry = parsedError(publishedErrorToken(first)).expiry;
+  const secondExpiry = parsedError(publishedErrorToken(second)).expiry;
+  assert.ok(secondExpiry >= firstExpiry, 'each beat mints a fresh expiry for the live leg');
+  assert.equal(
+    contract.reducePane({
+      agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+      agent_status: 'working',
+      group: 'myproj',
+      state_labels: {},
+      tokens: second.params.tokens,
+    }).display,
+    'error',
+    'the republished token still reads as the error state',
+  );
+});
+
+test('S-E5: the release beat clears the error token to null', async () => {
+  const { h, paneId } = await workingTurn();
+  await fireRunError(h);
+  await waitFrom(paneId, 0, (f) => publishedErrorToken(f) !== undefined);
+
+  const from = cursor(paneId);
+  h.fire('tool_result', { toolName: 'bash', toolCallId: 'alive-1' });
+  const cleared = await waitFrom(paneId, from, (f) => {
+    const published = f?.params?.tokens;
+    return !!published && ERROR_TOKEN in published && published[ERROR_TOKEN] === null;
+  });
+  assert.ok(cleared, 'the beat that releases the leg publishes the clear');
+
+  await settle(250);
+  const after = metadataTokensFrom(paneId, from);
+  assert.equal(after.at(-1)[ERROR_TOKEN], null, 'the token stays cleared while the leg is down');
+});
+
+// The assertion that was missing and let this regress: the run error actually
+// reaches the sidebar row, through the real producer output.
+test('S-E5 end-to-end: the run error renders as `error` in the sidebar reducer', async () => {
+  const { h, paneId } = await workingTurn();
+  await fireRunError(h);
+  const beat = await waitFrom(paneId, 0, (f) => publishedErrorToken(f) !== undefined);
+  assert.ok(beat, 'the producer published the error token');
+
+  const reduced = contract.reducePane({
+    agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+    agent_status: 'working',
+    group: 'myproj',
+    state_labels: {},
+    tokens: beat.params.tokens,
+  });
+  assert.equal(reduced.display, 'error', 'the row shows the run error, not generic `gentle`');
+  assert.equal(reduced.label, 'blocked', 'the error row word is the existing one');
+  assert.equal(reduced.notify, null, 'and the error never notifies');
 });
 
 // PRESERVE: an actual human-wait intervention is still the leg that claims

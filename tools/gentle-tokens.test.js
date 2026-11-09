@@ -924,6 +924,109 @@ describe('durable review token (gentle_review_v1)', () => {
   });
 });
 
+describe('durable error token (gentle_error_v1)', () => {
+  function errorCase({ code = 'run-failed', expiry = EXPIRY, roles = '', count, stateLabels } = {}) {
+    const built = roleEntry(roles, { count: count ?? 0, stateLabels });
+    // Independent of work token presence, like the review token: the error
+    // token is its own liveness proof.
+    if (count === undefined) delete built.entry.tokens.gentle_work_v1;
+    built.entry.tokens.gentle_error_v1 = `${built.hash}:${code}:${expiry}`;
+    return built;
+  }
+
+  it('a fresh error token renders error/blocked silently, with no work token at all', () => {
+    assert.equal(tokens.ERROR_TOKEN, 'gentle_error_v1');
+    const { entry, hash } = errorCase({});
+    assert.ok(!('gentle_work_v1' in entry.tokens));
+    const reduced = tokens.reducePane(entry, NOW);
+    assert.equal(reduced.display, 'error');
+    assert.equal(reduced.label, 'blocked');
+    assert.equal(reduced.notify, null);
+    assert.equal(reduced.owned, true);
+    assert.deepEqual(tokens.parseError(entry.tokens.gentle_error_v1, hash, NOW), {
+      code: 'run-failed',
+      expiry: EXPIRY,
+    });
+    const patch = tokens.displayTokens(reduced);
+    assert.equal(patch[tokens.STATE_TOKENS.error], 'error');
+    assert.equal(patch[tokens.TITLE_TOKENS.error], 'blocked');
+  });
+
+  it('error token outranks role words, the activity markers, and done', () => {
+    const { entry: roleBuilt } = errorCase({ roles: 'worker', count: 1 });
+    assert.equal(tokens.reducePane(roleBuilt, NOW).display, 'error');
+
+    const orchBuilt = errorCase({ roles: '', count: 1 });
+    orchBuilt.entry.tokens[tokens.ORCH_TOKEN] = `${orchBuilt.hash}:${EXPIRY}`;
+    orchBuilt.entry.tokens[tokens.PRINCIPAL_TOKEN] = `${orchBuilt.hash}:${EXPIRY}`;
+    assert.equal(tokens.reducePane(orchBuilt.entry, NOW).display, 'error');
+
+    const doneBuilt = errorCase({ roles: '', count: 0 });
+    doneBuilt.entry.tokens[tokens.DONE_TOKEN] = `${doneBuilt.hash}:${EXPIRY}`;
+    doneBuilt.entry.agent_status = 'done';
+    assert.equal(tokens.reducePane(doneBuilt.entry, NOW).display, 'error');
+  });
+
+  it('pinned precedence: error > ask > review, identical to the label leg', () => {
+    // The producer's own label precedence orders these the same way, so an
+    // ask that stands beside an error never repaints the row over it.
+    const { entry: askLabelEntry } = errorCase({
+      roles: '',
+      count: 1,
+      stateLabels: { 0: 'ask:q2' },
+    });
+    const askLabelReduced = tokens.reducePane(askLabelEntry, NOW);
+    assert.equal(askLabelReduced.display, 'error');
+    assert.equal(askLabelReduced.label, 'blocked');
+    assert.equal(askLabelReduced.notify, null);
+
+    const askBuilt = errorCase({ roles: '', count: 1 });
+    askBuilt.entry.tokens.gentle_ask_v1 = `${askBuilt.hash}:q7:${EXPIRY}`;
+    const askTokenReduced = tokens.reducePane(askBuilt.entry, NOW);
+    assert.equal(askTokenReduced.display, 'error');
+    assert.equal(askTokenReduced.notify, null);
+
+    const reviewBuilt = errorCase({ roles: 'rdd', count: 1, stateLabels: { 0: 'review:r1' } });
+    assert.equal(tokens.reducePane(reviewBuilt.entry, NOW).display, 'error');
+  });
+
+  it('expired, absent, malformed, and foreign-session tokens render nothing', () => {
+    const { entry } = errorCase({ expiry: NOW, roles: 'worker', count: 1 });
+    assert.equal(tokens.parseError(entry.tokens.gentle_error_v1, sessionHashFor(entry), NOW), null);
+    const stale = tokens.reducePane(entry, NOW);
+    assert.equal(stale.display, 'worker');
+    assert.equal(stale.notify, null);
+
+    const absent = roleEntry('worker', { count: 1 });
+    assert.equal(tokens.reducePane(absent.entry, NOW).display, 'worker');
+
+    const hash = 'x'.repeat(43);
+    for (const bad of [
+      'not-a-token',
+      '',
+      null,
+      `${hash}:run-failed`,
+      `${hash}:run-failed:${EXPIRY}:extra`,
+      `${hash}:bad code!:${EXPIRY}`,
+      `${hash}:run-failed:0`,
+      `${hash}:run-failed:${NOW + 60001}`,
+    ]) {
+      assert.equal(tokens.parseError(bad, hash, NOW), null);
+    }
+
+    const foreign = sessionHashFor(
+      baseEntry({ agent_session: { agent: 'pi', kind: 'path', value: '/other/session' } }),
+    );
+    const foreignBuilt = errorCase({ roles: 'worker', count: 1 });
+    foreignBuilt.entry.tokens.gentle_error_v1 = `${foreign}:run-failed:${EXPIRY}`;
+    assert.equal(
+      tokens.parseError(foreignBuilt.entry.tokens.gentle_error_v1, foreignBuilt.hash, NOW),
+      null,
+    );
+    assert.equal(tokens.reducePane(foreignBuilt.entry, NOW).display, 'worker');
+  });
+});
+
 describe('T2b role words and running delegate count', () => {
   it('grammar accepts judge; judge maps distinctly (not rdd)', () => {
     assert.deepEqual(tokens.parseRoles('judge'), ['judge']);

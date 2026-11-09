@@ -90,6 +90,17 @@
 //                       (single effective label, priority error > ask >
 //                       review, edge-triggered so the native counter in
 //                       herdr-agent-state.ts stays balanced)
+//   gentle_error_v1       = <hash>:<code>:<expiry>
+//                       (durable run-error signal, session-bound + TTL-fresh
+//                       like gentle_ask_v1: emitted on every beat while the
+//                       run-error leg stands, null / clear the beat it
+//                       releases. It is the sidebar's ONLY error carrier —
+//                       the native pane report never claims `blocked`, so an
+//                       error raises no host NeedsAttention toast or sound
+//                       and sends no phone envelope. The consumer reduces a
+//                       fresh token to `error` (row word `blocked`) with the
+//                       same error > ask > review priority the label leg
+//                       uses, independently of work token presence.)
 //
 // Event seams (all in-process; this extension imports nothing from
 // gentle-shell — DESIGN §10 U6 source pin is unresolved, so the producer is
@@ -815,6 +826,13 @@ const ASK_TOKEN = "gentle_ask_v1";
 // review is active (acknowledged capture/group execution only). Null /
 // clear the beat the last execution resolves — NO GRACE, no timers.
 const REVIEW_TOKEN = "gentle_review_v1";
+// Durable run-error token name (DESIGN §4.3): session-bound + TTL-fresh
+// `<hash>:<code>:<expiry>`, emitted on every beat while the run-error leg
+// stands and cleared to null the beat it releases. This is the sidebar's only
+// error carrier: the native report stays `working` while the leg stands, so an
+// error never raises the host's NeedsAttention toast, its sound, or a phone
+// envelope (DESIGN §7).
+const ERROR_TOKEN = "gentle_error_v1";
 // Principal-only activity marker (DESIGN §4.3): session-bound + TTL-fresh
 // `<hash>:<expiry>`, emitted while this session's own agent is active and
 // cleared when it settles. It carries the principal input of
@@ -3158,6 +3176,16 @@ export default function (pi) {
     if (!reviewActive) reviewId = undefined;
     if (reviewActive && reviewId) tokens[REVIEW_TOKEN] = `${sessionHash}:${reviewId}:${expiry}`;
     else tokens[REVIEW_TOKEN] = null;
+    // Durable run-error signal: session-bound + TTL-fresh
+    // `<hash>:<code>:<expiry>`, republished on every beat while the run-error
+    // leg stands (durable, never edge-only, so a missed beat cannot strand the
+    // row) and cleared to null on the beat the leg releases. It is the only
+    // carrier of the error to the sidebar: the native report stays `working`
+    // while it stands, which is what keeps the host from firing a
+    // NeedsAttention toast or sound for it (DESIGN §7). Tool-level failures
+    // never reach this leg (recordToolFailure is telemetry only).
+    if (errorCode) tokens[ERROR_TOKEN] = `${sessionHash}:${errorCode}:${expiry}`;
+    else tokens[ERROR_TOKEN] = null;
     // Root-only orchestrating marker (DESIGN §4.3): session-bound freshness
     // (<hash>:<expiry>, same binding/TTL style as gentle_work_v1, no count)
     // emitted by the root Pi session while the main session is actively
@@ -3265,6 +3293,10 @@ export default function (pi) {
       askToolCalls.size > 0 ||
       uiPromptActive ||
       reviewActive ||
+      // The standing run error keeps a beat alive so its durable token stays
+      // republished (and TTL-fresh) until the leg releases, even after the
+      // session settles.
+      errorCode !== undefined ||
       emittedLabel !== undefined ||
       doneExpiry !== undefined
     );
