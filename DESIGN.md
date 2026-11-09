@@ -289,7 +289,20 @@ running delegate or a pending launch — neither of which says the
 principal itself works. The native status keeps that aggregate meaning for
 Herdr's own pane state; the row's working-vs-idle decision reads only
 `gentle_principal_v1` (§5.2). It carries no count and alters neither the work
-total nor the roles CSV.
+total nor the roles CSV. `agentActive` alone would render that blocked call
+as generic `gentle`.
+The root session additionally emits `gentle_pending_v1` (`<hash>:<role>:<exp>`)
+while a synchronous (task mode) `subagent_run`/`subagent_continue` tool call
+is still in flight: such a call blocks the principal's own turn, so the
+session is executing a tool call and waiting on the child rather than doing
+its own model work. The value is the role word of the OLDEST in-flight
+recognized launch (`agentToRole` of the pending record), republished on every
+beat so a long child run stays covered by the ordinary beat, and cleared to
+null the beat the call resolves, the agent settles, or the session resets.
+It carries no count and alters neither the work total nor the roles CSV. A
+background launch resolves its tool call immediately, so a queued or running
+background delegate never publishes this marker and never changes the
+principal's own display (S3).
 
 ### 4.3 Token formats (ABNF-ish, strict)
 
@@ -330,6 +343,21 @@ gentle_principal_v1   = sessionHash ":" expiry
                     ; principal settles; decides working vs idle in §5.2
                     ; while the native status keeps its aggregate meaning
                     ; (running delegate / pending launch = working)
+                    ; caveat: a synchronous launch keeps it fresh for the
+                    ; whole blocked call — gentle_pending_v1 below carries the
+                    ; child's role for that window
+gentle_pending_v1     = sessionHash ":" role ":" expiry
+                    ; blocking-delegate marker — fresh while a synchronous
+                    ; (task mode) subagent_run/subagent_continue tool call is
+                    ; in flight, carrying the role word of the OLDEST
+                    ; in-flight recognized launch; republished on every beat
+                    ; (same TTL discipline as gentle_work_v1) and null (clear)
+                    ; the beat the call resolves, the agent settles, or the
+                    ; session resets. Renders at role precedence in §5.2:
+                    ; below attention and terminal done, above the principal
+                    ; marker — the principal's turn is blocked on that child.
+                    ; Background launches resolve immediately and never
+                    ; publish it, so they never change the principal's row.
 gentle_done_v1        = sessionHash ":" expiry
                     ; synthesized finish signal, no count — minted ONCE at the
                     ; settled-and-empty edge (principal settled, zero
@@ -392,6 +420,7 @@ pane.report_metadata --source gentle:v1 --token gentle_work_v1=Ab3_xK9q2mZ7QwErT
 pane.report_metadata --source gentle:v1 --token gentle_roles_v1=worker,explorer
 pane.report_metadata --source gentle:v1 --token gentle_orchestrating_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:1789000000000
 pane.report_metadata --source gentle:v1 --token gentle_principal_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:1789000000000
+pane.report_metadata --source gentle:v1 --token gentle_pending_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:worker:1789000000000
 pane.report_metadata --source gentle:v1 --token gentle_names_v1=planner,code-writer
 pane.report_metadata --source gentle:v1 --token gentle_changes_v2=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:5:110:22:1789000000000
 pane.report_metadata --source gentle:v1 --token gentle_error_v1=Ab3_xK9q2mZ7QwErTyUiOpAsDfGhJkL012345678:run-failed:1789000000000
@@ -448,7 +477,10 @@ principal marker the pane shows the oldest role word (or `idle`), never
   new/reloaded session under a different session hash cannot retain the prior
   session's change token. `gentle_names_v1` clears the same way when the
   authoritative active TaskStore list has no labels, and `gentle_roles_v1`
-  clears (null) when no delegation is active. The retired disclosure token is
+  clears (null) when no delegation is active. `gentle_pending_v1` clears
+  (null) on the first beat after the blocking call resolves, the agent
+  settles, or the session resets — the same full-state discipline, never a
+  lingering edge. The retired disclosure token is
   cleared to remove any stale metadata. v2 stays the visible
   normative source; v1 remains legacy only.
 
@@ -463,6 +495,9 @@ carry it as a suffix only when above one), `gentle_orchestrating_v1` (root-only 
 + freshness gate for the `orchestrating` display — never rendered as a
 count), `gentle_principal_v1` (principal-only activity marker + freshness
 gate for the working-vs-idle decision — never rendered as a count),
+`gentle_pending_v1` (blocking-delegate role marker + freshness gate for the
+in-flight synchronous launch — renders the child's role word while the
+principal's own turn is blocked on it),
 `gentle_done_v1` (synthesized finish signal + its own hold freshness gate
 for the reachable `done` display — the host never reports `done`, §4.3),
 `gentle_error_v1` (durable run-error signal + freshness gate for the `error`
@@ -484,6 +519,16 @@ error         := fresh `gentle_error_v1` (durable per-beat token, §4.3)
 ask           := fresh `gentle_ask_v1` (durable per-beat token, §4.3)
                  OR herdr:blocked has ask:* (fresh)
 review        := herdr:blocked has review:* (fresh)
+blockingRole  := fresh gentle_pending_v1 (session-bound, TTL-fresh) whose
+                 role word is recognized — a synchronous subagent call is in
+                 flight, so the principal's turn is blocked on that child;
+                 renders exactly like the role branch below (display +
+                 label via the role helpers, count suffix unchanged) and
+                 outranks the principal marker, which stays fresh for the
+                 whole blocked call. Stale, foreign, malformed, or
+                 unrecognized evidence falls through. Background launches
+                 resolve their tool call immediately, so a running background
+                 delegate never reaches this branch.
 principalWorking := fresh gentle_principal_v1 (session-bound, TTL-fresh) —
                  the principal's OWN activity, never the delegate count and
                  never the aggregate native status (which reads working for
@@ -520,7 +565,7 @@ done          := (native done OR fresh gentle_done_v1) AND gentle_work_v1
 idle          := otherwise (native fallback; also all-gentle-tokens-missing-or-expired)
 ```
 
-Priority: `error > ask > review > done > principal working > role > orchestrating > working(main) > idle`.
+Priority: `error > ask > review > done > blockingRole > principal working > role > orchestrating > working(main) > idle`.
 `done` is matched before the principal/role branches in the reducer; it is
 listed here below the activity branches only so its settled-and-empty
 precondition reads together.
@@ -533,7 +578,13 @@ principal** renders `gentle` (pink
 `orchestrating` while a fresh root marker is live) and outranks every
 delegate role word; an **idle principal** shows the oldest running role word
 (`explorer`, `worker`, `verify`, `judge`, or `rdd` when it is the oldest)
-however many delegates run. The fresh marker is not a principal-working
+however many delegates run. The one exception sits between them and is
+evidence-based, never a precedence guess: while a **synchronous**
+`subagent_run`/`subagent_continue` call is in flight the principal's own turn
+is blocked on the child, so the fresh `gentle_pending_v1` role word decides
+the row (below attention and the terminal `done`, above the principal
+marker). Background launches resolve their tool call immediately, so a queued
+or running background delegate never changes the principal's own display. The fresh marker is not a principal-working
 signal (it stays live while the principal is idle with queued or running
 delegates), so it never outranks a role word. An in-flight attention `review`
 (fresh `review:` label or durable `gentle_review_v1` token) overrides the
@@ -881,11 +932,13 @@ applies the focused row and `Esc` closes without a write; a click on a category
 selects it, a click on a row applies it, and a click outside the panes is
 ignored (a press only captures the gesture, so a drag never applies a row).
 Each switch is one row that paints the stored state and carries the opposite
-value. The notifications switch appears under both `Herdr Sidebar` (as
-`Notifications`, where the plugin's own switches are looked for) and its own
-`Moshi notifications` category: a row names the switch it drives, so both
-apply the one `gentle-moshi.json` flag through `applyMoshiNotifications` and
-whosever change it was is what both rows read on the next render.
+value. Each category owns exactly one switch: `Herdr Sidebar` shows the single
+`Sidebar agent rows` row and its description names the managed agent rows only,
+while the only Moshi switch is the `Notifications` row under
+`Moshi notifications`, which applies the `gentle-moshi.json` flag through
+`applyMoshiNotifications`. The two channels are never mixed: the sidebar-rows
+switch neither reads nor writes that flag, so disabling the agent rows leaves
+the notification channel exactly as it was.
 An inconclusive sidebar verdict (`unknown`) renders as `● Unknown` with a note
 instead of hiding the row: toggling still attempts the repair and reports the
 apply step's own error, exactly like the menu. The plain

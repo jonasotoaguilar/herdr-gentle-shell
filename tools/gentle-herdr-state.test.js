@@ -3869,3 +3869,196 @@ test('L2c: aborted executed ask clears on execution end without tool_result', as
   assert.equal(labels.length, 4);
   assert.deepEqual(labels[3], { active: false });
 });
+
+// --- Blocking pending marker: gentle_pending_v1 ---------------------------
+// A task-mode `subagent_run`/`subagent_continue` call blocks the principal's
+// own turn, so `agentActive` stays true for the whole call and the principal
+// marker would paint generic `gentle` while the child runs. The producer
+// publishes one dedicated marker for the in-flight blocking call
+// (`<hash>:<role>:<expiry>`, refreshed on every beat) and clears it the beat
+// the call settles, the agent settles, or the session resets
+// (odd/tasks/pending-role-display.md S2, S4).
+
+async function stopWire(wire) {
+  process.env.HERDR_ENV = wire.prevEnv.HERDR_ENV;
+  process.env.HERDR_SOCKET_PATH = wire.prevEnv.HERDR_SOCKET_PATH;
+  process.env.HERDR_PANE_ID = wire.prevEnv.HERDR_PANE_ID;
+  await wire.close();
+}
+
+function pendingExpiry(tokens) {
+  const value = tokens.gentle_pending_v1;
+  assert.equal(typeof value, 'string', 'a pending marker must be published');
+  const parts = value.split(':');
+  assert.equal(parts.length, 3, 'pending marker is <hash>:<role>:<expiry>');
+  return Number(parts[2]);
+}
+
+test('blocking launch publishes its role marker, keeps it fresh per beat, and clears it on the result', async () => {
+  const wire = await startT2bWire('test-pane-pending-role');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-role');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-role', sessionFile);
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-block-1',
+      input: { agent: 'gentle-ai-worker', label: 'blocking work' },
+    });
+    const launched = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_pending_v1 === 'string' && p.gentle_pending_v1.startsWith(`${paneHash}:worker:`),
+      5000,
+      'the blocking launch pending marker',
+    );
+    const firstExpiry = pendingExpiry(launched);
+    assert.ok(firstExpiry > Date.now(), 'the marker carries a future absolute expiry');
+    assert.ok(firstExpiry <= Date.now() + 60000, 'the marker expiry stays inside the producer TTL');
+    // The pending hint still carries the role CSV as before (unchanged leg).
+    assert.equal(launched.gentle_roles_v1, 'worker');
+    // A later beat while the call is still in flight refreshes the marker
+    // instead of letting it age out: the same role with a newer expiry.
+    const beforeRepublish = wire.received.length;
+    h.fire('agent_start', {});
+    const refreshed = await wire.waitForFrom(
+      beforeRepublish,
+      (p) =>
+        typeof p.gentle_pending_v1 === 'string' &&
+        p.gentle_pending_v1.startsWith(`${paneHash}:worker:`) &&
+        Number(p.gentle_pending_v1.split(':')[2]) > firstExpiry,
+      5000,
+      'a refreshed pending marker on a later beat',
+    );
+    assert.equal(refreshed.gentle_roles_v1, 'worker');
+    // The launch resolves: no task record (no gentleAgents details), so the
+    // marker must clear on that beat instead of lingering to its TTL.
+    const beforeResult = wire.received.length;
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-block-1', isError: true });
+    const cleared = await wire.waitForFrom(
+      beforeResult,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_pending_v1 === null,
+      5000,
+      'the pending marker cleared when the call settled',
+    );
+    assert.equal(cleared.gentle_pending_v1, null);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('agent settle and session reset clear the blocking pending marker', async () => {
+  const wire = await startT2bWire('test-pane-pending-clear');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-clear');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-clear', sessionFile);
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 'run-block-2',
+      input: { agent: 'jd-judge-a', task_id: 't1' },
+    });
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_pending_v1 === 'string' && p.gentle_pending_v1.startsWith(`${paneHash}:judge:`),
+      5000,
+      'the blocking judge marker',
+    );
+    const beforeSettle = wire.received.length;
+    h.fire('agent_settled', {}, { isIdle: () => true });
+    const settled = await wire.waitForFrom(
+      beforeSettle,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_pending_v1 === null,
+      5000,
+      'the pending marker cleared on agent settle',
+    );
+    assert.equal(settled.gentle_pending_v1, null);
+    // Session reset: a fresh blocking call in the next session, then a new
+    // session id drops it with the rest of the session state.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-block-3',
+      input: { agent: 'gentle-ai-verify', label: 'blocking verify' },
+    });
+    await wire.waitForFrom(
+      beforeSettle,
+      (p) => typeof p.gentle_pending_v1 === 'string' && p.gentle_pending_v1.startsWith(`${paneHash}:verify:`),
+      5000,
+      'the blocking verify marker',
+    );
+    const beforeReset = wire.received.length;
+    startT2bSession(h, 'sess-pending-clear-b', sessionFile);
+    h.fire('agent_start', {});
+    const reset = await wire.waitForFrom(
+      beforeReset,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_pending_v1 === null,
+      5000,
+      'the pending marker cleared on session reset',
+    );
+    assert.equal(reset.gentle_pending_v1, null);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a background launch ack and an unrecognized agent leave no lingering marker', async () => {
+  const wire = await startT2bWire('test-pane-pending-background');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-background');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-background', sessionFile);
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-bg-1',
+      input: { agent: 'gentle-ai-verify', label: 'live verify work', mode: 'background' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-bg-1',
+      details: { gentleAgents: { taskId: 'bg1', agent: 'gentle-ai-verify', status: 'queued', mode: 'background' } },
+    });
+    const counted = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'the background delegate counted as running',
+    );
+    // The ack resolved the call, so the principal's own display is untouched:
+    // the role CSV carries the delegate, the pending marker is gone.
+    assert.equal(counted.gentle_pending_v1, null);
+    assert.equal(counted.gentle_roles_v1, 'verify');
+    const beforeLater = wire.received.length;
+    h.fire('agent_start', {});
+    const later = await wire.waitForFrom(
+      beforeLater,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'a later beat with the background delegate still running',
+    );
+    assert.equal(later.gentle_pending_v1, null, 'a running background delegate never leaves a pending marker');
+    // An unrecognized agent (the banned bare `working` word) publishes nothing.
+    const beforeUnknown = wire.received.length;
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-unknown-1',
+      input: { agent: 'working', label: 'unknown delegation' },
+    });
+    const unknown = await wire.waitForFrom(
+      beforeUnknown,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'a beat after an unrecognized launch',
+    );
+    assert.equal(unknown.gentle_pending_v1, null);
+  } finally {
+    await stopWire(wire);
+  }
+});

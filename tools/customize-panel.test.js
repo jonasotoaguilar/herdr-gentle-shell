@@ -4,16 +4,16 @@
 // T1/T3, S1/S4).
 //
 // The panel is the two-pane card reduced to the switches this package owns: the
-// managed Herdr sidebar rows and the notification channel, the latter reachable
-// from BOTH its own category and the `Herdr Sidebar` category. These tests pin,
-// through the component's public contract only (render(width),
-// handleInput(data), handleMouse(event) and the done() result the host
-// receives):
+// managed Herdr sidebar rows and the Moshi notification channel, each under its
+// own category. These tests pin, through the component's public contract only
+// (render(width), handleInput(data), handleMouse(event) and the done() result
+// the host receives):
 // - the Shell's layout: left `CATEGORIES` list, right `<Category> · n/m`
 //   heading, pill rows (`●` stored / `○` other), no `Preview · …` band and the
 //   Shell's footer wording with no invented `p profiles` key;
-// - the notification row inside `Herdr Sidebar` reading the same stored value
-//   as the `Moshi notifications` category;
+// - `Herdr Sidebar` carrying exactly one row (`Sidebar agent rows`) and no
+//   notification row, while the only Moshi switch lives under
+//   `Moshi notifications`;
 // - category and value navigation (↑/↓ or j/k, ←/→ or Tab) without finishing;
 // - Enter resolving the focused row and Esc resolving null;
 // - mouse hits: a category click selects, a row click applies, a hover only
@@ -109,30 +109,36 @@ describe('customize panel model', () => {
     const model = customizePanelModel({ sidebar: 'off', moshi: 'on' });
     assert.deepEqual(model.map((category) => category.id), ['sidebar', 'moshi']);
     assert.deepEqual(model.map((category) => category.title), ['Herdr Sidebar', 'Moshi notifications']);
-    // The notifications row lives under `Herdr Sidebar` as well, and both rows
-    // are driven by the one moshi switch.
-    assert.deepEqual(model[0].rows.map((row) => row.setting), ['Sidebar agent rows', 'Notifications']);
-    assert.deepEqual(model[0].rows.map((row) => row.switchId), ['sidebar', 'moshi']);
+    // `Herdr Sidebar` owns the managed agent rows only: the Moshi channel has
+    // its own category and is never duplicated here.
+    assert.deepEqual(model[0].rows.map((row) => row.setting), ['Sidebar agent rows']);
+    assert.deepEqual(model[0].rows.map((row) => row.switchId), ['sidebar']);
     assert.deepEqual(model[1].rows.map((row) => row.setting), ['Notifications']);
     assert.deepEqual(model[1].rows.map((row) => row.switchId), ['moshi']);
     // One toggle row per switch: it paints the stored value and carries the
     // value Enter applies, so a single row is the whole interaction.
-    assert.deepEqual(model[0].rows.map((row) => row.id), ['on', 'off'], 'sidebar off toggles back on');
-    assert.deepEqual(model[0].rows.map((row) => row.current), ['off', 'on']);
-    assert.deepEqual(model[0].rows.map((row) => row.currentLabel), ['Off', 'On']);
+    assert.deepEqual(model[0].rows.map((row) => row.id), ['on'], 'sidebar off toggles back on');
+    assert.deepEqual(model[0].rows.map((row) => row.current), ['off']);
+    assert.deepEqual(model[0].rows.map((row) => row.currentLabel), ['Off']);
   });
 
-  test('both notification rows read the one stored flag', () => {
+  test('the Moshi notifications category reads the one stored flag', () => {
     const off = customizePanelModel({ sidebar: 'on', moshi: 'off' });
-    assert.equal(off[0].rows[1].current, 'off');
     assert.equal(off[1].rows[0].current, 'off');
-    assert.equal(off[0].rows[1].id, 'on', 'Off toggles on from either place');
-    assert.equal(off[1].rows[0].id, 'on');
+    assert.equal(off[1].rows[0].id, 'on', 'Off toggles on');
     const on = customizePanelModel({ sidebar: 'on', moshi: 'on' });
-    assert.equal(on[0].rows[1].current, 'on');
     assert.equal(on[1].rows[0].current, 'on');
-    assert.equal(on[0].rows[1].id, 'off', 'On toggles off from either place');
-    assert.equal(on[1].rows[0].id, 'off');
+    assert.equal(on[1].rows[0].id, 'off', 'On toggles off');
+    for (const model of [off, on]) {
+      assert.deepEqual(model[0].rows.filter((row) => row.switchId === 'moshi'), [], 'no moshi row under Herdr Sidebar');
+    }
+  });
+
+  test('the Herdr Sidebar description names agent rows and never the Moshi channel', () => {
+    const [sidebar, moshi] = customizePanelModel({ sidebar: 'on', moshi: 'off' });
+    assert.match(sidebar.description, /agent rows/);
+    assert.equal(sidebar.description.includes('Moshi'), false, 'the sidebar description never names Moshi');
+    assert.match(moshi.description, /Moshi/);
   });
 
   test('an unknown sidebar state carries a note but stays repairable', () => {
@@ -151,30 +157,30 @@ describe('customize panel render', () => {
     for (const copy of [
       'Customize · Herdr Gentle Shell',
       'CATEGORIES',
-      'Herdr Sidebar · 1/2',
+      'Herdr Sidebar · 1/1',
       'Sidebar agent rows',
-      'Notifications',
       '● On',
       '○ Off',
       FOOTER,
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }
+    assert.equal(seen.includes('Notifications'), false, 'the Herdr Sidebar category has no notification row');
     for (const gone of ['Preview', 'p profiles', 'Enter toggle', 'j/k']) {
       assert.equal(seen.includes(gone), false, `the Shell layout has no ${gone}`);
     }
   });
 
-  test('the notification row is reachable inside the Herdr Sidebar category', () => {
+  test('Herdr Sidebar shows exactly one row and no notification row', () => {
     const { component } = open();
     const lines = component.render(100);
     const heading = lines.find((line) => line.includes('Herdr Sidebar ·'));
     assert.ok(heading, 'the right pane is headed by the category and its row count');
+    assert.ok(heading.includes('Herdr Sidebar · 1/1'), 'the category counts its one row');
     const sidebarRow = lines.find((line) => line.includes('Sidebar agent rows'));
-    const notificationRow = lines.find((line) => line.includes('Notifications'));
-    assert.ok(sidebarRow.includes('● On'), 'the first sidebar row paints the stored On');
-    assert.ok(notificationRow.includes('● Off'), 'the notifications row paints the stored Off');
-    assert.ok(notificationRow.includes('○ On'), 'and the other value as the target');
+    assert.ok(sidebarRow.includes('● On'), 'the row paints the stored On');
+    assert.ok(sidebarRow.includes('○ Off'), 'and the other value as the target');
+    assert.equal(lines.some((line) => line.includes('Notifications')), false, 'no notification row lives here');
   });
 
   test('the Moshi notifications category keeps its own row and heading', () => {
@@ -260,7 +266,7 @@ describe('customize panel focused description', () => {
     const { component } = open();
     const lines = component.render(100);
     const legend = lines.findIndex((line) => line.includes('Enter apply'));
-    const described = lines.findIndex((line) => line.includes('Sidebar agent rows plus the Moshi notification channel.'));
+    const described = lines.findIndex((line) => line.includes('The managed agent rows this plugin hands to the Herdr sidebar.'));
     assert.ok(legend > 0, 'the legend is rendered');
     assert.ok(described >= 0, 'the focused category is described');
     assert.equal(described, legend - 1, 'the description sits directly above the legend');
@@ -270,11 +276,11 @@ describe('customize panel focused description', () => {
   test('describes the focused setting and follows the focus', () => {
     const { component } = open();
     // The category list owns the focus first, so the card describes that category.
-    assert.ok(seenAt(component, 100).includes('Herdr Sidebar — Sidebar agent rows plus the Moshi notification channel.'));
+    assert.ok(seenAt(component, 100).includes('Herdr Sidebar — The managed agent rows this plugin hands to the Herdr sidebar.'));
     component.handleInput('down');
     const moshi = seenAt(component, 100);
     assert.ok(moshi.includes('Moshi notifications — The Moshi notification channel this plugin owns.'));
-    assert.equal(moshi.includes('Sidebar agent rows plus the Moshi notification channel.'), false);
+    assert.equal(moshi.includes('The managed agent rows this plugin hands'), false);
     // The values pane describes the setting Enter would apply.
     component.handleInput('right');
     assert.ok(seenAt(component, 100).includes('Notifications — Replaces the Moshi hook with this plugin'));
@@ -364,9 +370,15 @@ describe('customize panel navigation', () => {
     const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     component.handleInput('right');
     assert.ok(seenAt(component, 100).includes('▸ Sidebar agent rows'));
+    // One row only: ↓ wraps back onto it and can never reach a moshi row here.
     component.handleInput('down');
-    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the second sidebar row takes the focus');
+    assert.ok(seenAt(component, 100).includes('▸ Sidebar agent rows'));
+    assert.equal(seenAt(component, 100).includes('▸ Notifications'), false);
+    // The Moshi row is reachable through its own category, and only there.
     component.handleInput('tab');
+    component.handleInput('down');
+    component.handleInput('tab');
+    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the Moshi category owns that row');
     component.handleInput('k');
     assert.equal(done(), 'pending');
   });
@@ -381,13 +393,13 @@ describe('customize panel navigation', () => {
     assert.deepEqual(second.done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'on' }, 'Off toggles on');
   });
 
-  test('Enter on the notifications row applies the moshi switch from the sidebar category', () => {
+  test('Enter inside Herdr Sidebar can only reach the sidebar switch', () => {
     const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     component.handleInput('right');
     component.handleInput('down');
-    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the sidebar category holds the notifications row');
+    assert.ok(seenAt(component, 100).includes('▸ Sidebar agent rows'), 'the one row keeps the focus');
     component.handleInput('enter');
-    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
+    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' });
   });
 
   test('Enter in the Moshi notifications category still resolves that pane row', () => {
@@ -429,14 +441,16 @@ describe('customize panel mouse', () => {
     assert.equal(done(), 'pending', 'selecting a category is not applying a row');
   });
 
-  test('clicking a row applies it, including the notifications row under Herdr Sidebar', () => {
+  test('clicking a row applies it, and the Moshi row lives only in its own category', () => {
     const sidebar = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
     click(sidebar.component, 100, 'Sidebar agent rows');
     assert.deepEqual(sidebar.done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' });
 
     const notifications = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    click(notifications.component, 100, 'Moshi notifications');
+    assert.equal(notifications.done(), 'pending', 'selecting the category applies nothing');
     click(notifications.component, 100, 'Notifications');
-    assert.deepEqual(notifications.done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
+    assert.deepEqual(notifications.done(), { categoryId: 'moshi', switchId: 'moshi', valueId: 'on' });
   });
 
   test('a box the host clipped shorter never turns a legal click into a no-op', () => {
@@ -465,13 +479,13 @@ describe('customize panel mouse', () => {
 
   test('a hover moves the focus without applying anything', () => {
     const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
-    const moved = click(component, 100, 'Notifications', { type: 'move' });
+    const moved = click(component, 100, 'Sidebar agent rows', { type: 'move' });
     assert.deepEqual(moved, { handled: true, render: true });
-    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the hovered row takes the focus');
-    assert.ok(seenAt(component, 100).includes('Herdr Sidebar · 2/2'), 'and the heading follows the focus');
+    assert.ok(seenAt(component, 100).includes('▸ Sidebar agent rows'), 'the hovered row takes the focus');
+    assert.ok(seenAt(component, 100).includes('Herdr Sidebar · 1/1'), 'and the heading follows the focus');
     assert.equal(done(), 'pending', 'a hover never applies a switch');
     // Hovering the row that already has the focus repaints nothing.
-    assert.deepEqual(click(component, 100, 'Notifications', { type: 'move' }), { handled: true, render: false });
+    assert.deepEqual(click(component, 100, 'Sidebar agent rows', { type: 'move' }), { handled: true, render: false });
   });
 
   test('a click outside the panes is ignored', () => {
@@ -496,14 +510,14 @@ describe('customize panel mouse', () => {
 
   test('a press only captures the gesture; the click applies', () => {
     const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
-    assert.deepEqual(click(component, 100, 'Notifications', { type: 'press' }), {
+    assert.deepEqual(click(component, 100, 'Sidebar agent rows', { type: 'press' }), {
       handled: true,
       capture: true,
       render: false,
     });
     assert.equal(done(), 'pending', 'a drag that never becomes a click applies nothing');
-    click(component, 100, 'Notifications');
-    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
+    click(component, 100, 'Sidebar agent rows');
+    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' });
   });
 
   test('a click that misses every hit target is ignored', () => {

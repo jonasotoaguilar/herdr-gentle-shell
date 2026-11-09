@@ -67,6 +67,21 @@ const ORCH_TOKEN = 'gentle_orchestrating_v1';
 // runs), so using it here would paint an idle principal `gentle`. The native
 // status keeps its own aggregate meaning everywhere else in this module.
 const PRINCIPAL_TOKEN = 'gentle_principal_v1';
+// Blocking-delegate marker (DESIGN §4.3): `<hash>:<role>:<expiry>` — one role
+// word, the same session binding and TTL discipline as gentle_roles_v1.
+// Emitted on every beat while a synchronous `subagent_run`/
+// `subagent_continue` tool call is in flight. That call blocks the
+// principal's own turn, so `gentle_principal_v1` stays fresh for the whole
+// child run and would otherwise paint generic `gentle`; this marker is the
+// evidence that the row shows the child's role instead. Background launches
+// resolve their tool call immediately, so a running background delegate
+// never publishes one and never changes the principal's own display. The
+// consumer renders a fresh recognized role at role precedence: below
+// attention and the terminal `done`, above the principal marker. Stale,
+// foreign, malformed, or unrecognized evidence falls through to today's
+// behavior (fail closed).
+const PENDING_TOKEN = 'gentle_pending_v1';
+const PENDING_RE = /^([A-Za-z0-9_-]{43}):([A-Za-z0-9_-]{1,32}):([1-9]\d{0,15})$/;
 // Synthesized finish signal (DESIGN §4.3, S2): `<hash>:<expiry>` — the same
 // session binding and absolute-expiry discipline as the presence markers,
 // minted by the producer ONCE at the settled-and-empty edge (principal
@@ -488,6 +503,25 @@ function parseMarker(value, sessionHash, now) {
 const parseOrchestrating = parseMarker;
 const parsePrincipal = parseMarker;
 
+// gentle_pending_v1 = <hash>:<role>:<expiry>. The blocking-delegate marker:
+// session-bound + TTL-fresh like gentle_work_v1, one role word. Canonical
+// aliases collapse exactly like parseRoles (`review`→`rdd`,
+// `explore`→`explorer`); anything else is returned verbatim and left to
+// roleToDisplay, which drops unrecognized slugs. Null on any grammar,
+// binding, or freshness failure — a bad marker is no evidence at all, it
+// simply falls through to the branches below.
+function parsePending(value, sessionHash, now) {
+  if (typeof value !== 'string') return null;
+  const match = PENDING_RE.exec(value);
+  if (!match) return null;
+  const [, hash, rawRole, rawExpiry] = match;
+  if (sessionHash === null || hash !== sessionHash) return null;
+  const expiry = Number(rawExpiry);
+  if (!expiryFresh(expiry, now)) return null;
+  const role = rawRole === 'review' ? 'rdd' : rawRole === 'explore' ? 'explorer' : rawRole;
+  return { role, expiry };
+}
+
 // gentle_done_v1 = <hash>:<expiry>. The synthesized finish signal: the same
 // grammar, session binding, and fail-closed rule as the presence markers, with
 // its own freshness ceiling because the hold (not the 60 s token TTL) is what
@@ -712,6 +746,8 @@ function piTreeOwnsPane(tokens, sessionHash, now) {
 
 // Reducer, DESIGN §5.2. First match wins:
 //   error > ask > review > done (terminal) >
+//   blocking pending delegate role (fresh `gentle_pending_v1` with a
+//   recognized role: the principal's turn is blocked on that child) >
 //   principal working (fresh `gentle_principal_v1`: `orchestrating` while a
 //   fresh root marker is live, else generic activity) > role activity (oldest
 //   recognized role — the principal is not working) > orchestrating (marker
@@ -849,6 +885,15 @@ function reducePane(entry, now = Date.now()) {
   // running delegate.
   const principal =
     sessionHash === null ? null : parseMarker(tokens[PRINCIPAL_TOKEN], sessionHash, now);
+  // Blocking-delegate role: a synchronous launch keeps the principal's own
+  // agent active for the whole child run, so the principal marker above would
+  // paint generic `gentle` while the child works. The marker is its own
+  // liveness proxy (like the ask/review/error tokens), so it needs no work
+  // token present; it renders through the same role helpers as every other
+  // role row, and its role word is validated exactly like a roles entry, so
+  // unrecognized evidence falls through instead of guessing.
+  const pending =
+    sessionHash === null ? null : parsePending(tokens[PENDING_TOKEN], sessionHash, now);
   // Terminal `done` NEVER outranks live evidence: the principal Pi session
   // may settle while background delegates run, and that is NOT terminal.
   // Done requires settled-plus-empty — a fresh native done OR the producer's
@@ -886,6 +931,19 @@ function reducePane(entry, now = Date.now()) {
   // an idle principal with a running explorer would read `gentle` too. The
   // marker is no substitute either: it stays live while the principal is
   // idle with queued or running delegates.
+  // EXCEPTION, checked first: a synchronous launch blocks the principal's own
+  // turn. The principal marker is legitimately fresh for the whole child run,
+  // but the session is executing a tool call and waiting on the child, not
+  // doing its own model work — so the child's role decides the row. Attention
+  // and the terminal `done` gate already returned above; a background delegate
+  // publishes no marker, so it changes nothing here.
+  if (pending !== null) {
+    const display = roleToDisplay(pending.role);
+    if (display !== null) {
+      if (display === 'working') return outRole(display, pending.role);
+      return outRole(display);
+    }
+  }
   if (principal !== null) {
     return out(orchestrating !== null ? 'orchestrating' : 'working');
   }
@@ -1047,6 +1105,7 @@ module.exports = {
   ROLES_TOKEN,
   ORCH_TOKEN,
   PRINCIPAL_TOKEN,
+  PENDING_TOKEN,
   ASK_TOKEN,
   REVIEW_TOKEN,
   ERROR_TOKEN,
@@ -1077,6 +1136,7 @@ module.exports = {
   parseRoles,
   parseOrchestrating,
   parsePrincipal,
+  parsePending,
   parseAsk,
   parseReview,
   parseError,

@@ -98,6 +98,7 @@ describe('state sidecar', () => {
       'gentle_work_v1',
       'gentle_roles_v1',
       'gentle_orchestrating_v1',
+      'gentle_pending_v1',
       'gentle_changes_v2',
       'gentle_ask_v1',
       'gentle_review_v1',
@@ -128,6 +129,14 @@ describe('state sidecar', () => {
     assert.ok(registered < gate, 'the command must register before the enabled() pane gate');
   });
 
+  test('registers exactly one Pi command and no standalone Moshi command', () => {
+    // One command carries both switches; a separate `/herdr-gentle:moshi` was
+    // never requested and must not come back (odd/tasks/customize-notifications.md S1).
+    const registrations = [...source.matchAll(/registerCommand\(\s*"([^"]+)"/g)].map((match) => match[1]);
+    assert.deepEqual(registrations, ['herdr-gentle:customize'], 'the package registers one command');
+    assert.equal(source.includes('herdr-gentle:moshi'), false, 'the standalone Moshi command stays gone');
+  });
+
   test('no longer carries worktree, ODD or issues surfaces', () => {
     for (const needle of ['worktree_warp', 'worktree_create', 'herdr-gentle:odd', 'herdr-gentle:issues']) {
       assert.equal(source.includes(needle), false, `${needle} left in the producer`);
@@ -143,6 +152,7 @@ describe('documentation', () => {
     const banned = [
       '/herdr-gentle:odd',
       '/herdr-gentle:issues',
+      '/herdr-gentle:moshi',
       '/herdr-gentle:warp',
       '/herdr-gentle:worktree',
       'worktree_create',

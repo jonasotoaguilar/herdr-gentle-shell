@@ -1,6 +1,6 @@
 {
   "name": "herdr-gentle-shell",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Pi package for Herdr sidebar states: the Pi extension sidecar that publishes session facts as Herdr pane-metadata tokens, the optional Moshi notification channel, and the Pi-side helpers the Herdr Gentle Shell plugin drives.",
   "keywords": [
     "pi-package",

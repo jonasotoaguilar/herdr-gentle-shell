@@ -50,6 +50,22 @@
 //                       busy. The consumer uses it for the working-vs-idle
 //                       decision; the aggregate native status keeps its own
 //                       meaning. Never alters the work count or roles CSV.)
+//   gentle_pending_v1 = <hash>:<role>:<expiry>
+//                       (blocking-delegate marker, session-bound + TTL-fresh
+//                       like gentle_work_v1: the role word of the oldest
+//                       in-flight `subagent_run`/`subagent_continue` call,
+//                       republished on every beat while the call blocks, null
+//                       / clear the beat it settles, the agent settles, or
+//                       the session resets. A synchronous launch blocks the
+//                       principal's own turn, so agentActive stays true and
+//                       the principal marker would paint generic `gentle`
+//                       while the child runs; this marker is the evidence
+//                       that the row must show the child's role instead.
+//                       Background launches resolve their tool call
+//                       immediately, so they never leave a marker: a running
+//                       background delegate never changes the principal's
+//                       own display. Never alters the work count or roles
+//                       CSV.)
 //   gentle_changes_v2 = <hash>:<files>:<added>:<deleted>:<expiry>
 //                       (normative; exact added/deleted totals kept separate)
 //   gentle_changes_v1 = <hash>:<files>:<added+deleted>:<expiry>
@@ -839,6 +855,13 @@ const ERROR_TOKEN = "gentle_error_v1";
 // computeNativeState alone — the aggregate native status answers `working`
 // for any delegate, so the consumer cannot use it to decide the row.
 const PRINCIPAL_TOKEN = "gentle_principal_v1";
+// Blocking-delegate marker: session-bound + TTL-fresh `<hash>:<role>:<expiry>`,
+// the role word of the oldest in-flight synchronous
+// `subagent_run`/`subagent_continue` call. It exists because such a call
+// blocks the principal's turn (agentActive stays true) while the child runs,
+// so the principal marker alone renders generic `gentle`. Recognized roles
+// only; null / clear when no blocking call is in flight.
+const PENDING_TOKEN = "gentle_pending_v1";
 
 const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
 const COUNT_RE = /^(0|[1-9]\d{0,15})$/;
@@ -2418,10 +2441,9 @@ async function applyCustomizeSwitch(id, value, ctx) {
 // The single apply path shared by the overlay and the menu fallback. An
 // inconclusive sidebar verdict is never a refusal: choosing On still attempts
 // the repair and reports the apply step's own error, exactly like the baseline
-// menu did. `switchId` names the switch a row drives when it lives under
-// another category — the notifications row inside `Herdr Sidebar` applies the
-// same `moshi` switch as the `Moshi notifications` category, so the one flag
-// file stays the single source of truth.
+// menu did. `switchId` names the switch a row drives, never the category it is
+// painted under: each category now owns exactly one switch, so the sidebar rows
+// can only ever resolve `sidebar` and the notification row only `moshi`.
 async function applyCustomizeChoice(categoryId, valueId, ctx, switchId) {
   const target = switchId === "sidebar" || switchId === "moshi" ? switchId : categoryId;
   if (target !== "sidebar" && target !== "moshi") return;
@@ -3032,6 +3054,16 @@ export default function (pi) {
     return out;
   }
 
+  // Role word of the OLDEST in-flight blocking launch, or undefined when no
+  // recognized role is pending. `pendingRoleSubs` is already oldest-first by
+  // call time, so the first entry is the one the row must show; recognized
+  // filtering there means an unsalvageable agent name yields no role (the
+  // consumer then stays on its own evidence instead of guessing).
+  function pendingRole() {
+    const oldest = pendingRoleSubs()[0];
+    return oldest === undefined ? undefined : agentToRole(oldest.agent);
+  }
+
   // Merged role sources, oldest-first by first-seen: authoritative running
   // TaskStore subs plus pending role hints. Authoritative entries win on
   // duplicates via rolesCsv dedup (first wins = oldest wins).
@@ -3215,6 +3247,17 @@ export default function (pi) {
     // how many delegates keep running.
     if (agentActive) tokens[PRINCIPAL_TOKEN] = `${sessionHash}:${expiry}`;
     else tokens[PRINCIPAL_TOKEN] = null;
+    // Blocking-delegate marker (same binding/TTL discipline): a synchronous
+    // launch keeps the principal's agent active for the whole child run, so
+    // the principal marker above is fresh while the row should instead show
+    // the child's role. This carries that evidence per beat (never
+    // edge-only), so a long child run stays covered by the ordinary beat and
+    // a missed beat cannot strand the row. Cleared to null the beat the call
+    // settles; background launches resolve their tool call immediately and so
+    // never publish it.
+    const pending = pendingRole();
+    if (pending !== undefined) tokens[PENDING_TOKEN] = `${sessionHash}:${pending}:${expiry}`;
+    else tokens[PENDING_TOKEN] = null;
     // Synthesized finish signal (S2/D2): minted once at the settled-and-empty
     // edge — principal settled with no running/queued delegate, no pending
     // launch, no live background job, and no human-wait, review, or error leg
@@ -3926,7 +3969,12 @@ export default function (pi) {
     }
     const pending =
       typeof event.toolCallId === "string" ? pendingCalls.get(event.toolCallId) : undefined;
-    if (typeof event.toolCallId === "string") pendingCalls.delete(event.toolCallId);
+    const pendingResolved =
+      typeof event.toolCallId === "string" ? pendingCalls.delete(event.toolCallId) : false;
+    // A resolved launch releases the blocking-delegate marker on THIS beat,
+    // not on the next periodic one: a failed/aborted launch carries no
+    // gentleAgents details, so the record path below never publishes.
+    if (pendingResolved) schedulePublish();
     // A launch resolution retires the settle-time pending guard: the
     // outcome is now covered by the task record (working via activeSubs),
     // the error latch (blocked), or genuine emptiness (idle on next beat).

@@ -15,11 +15,18 @@ subagents — (machine display key
 (`gentle_principal_v1`, published while the principal session itself works and
 cleared when it settles) decides the row — never the delegate count, and
 never Herdr's aggregate native status (which reads `working` whenever any
-delegate runs): while the principal is working it
-reads `gentle` and no delegate role word wins; while the principal is idle
+delegate runs): the default is still the principal's own state, so while the
+principal works its own turn it reads `gentle` and no delegate role word
+wins; while the principal is idle
 the oldest running delegate role shows — `explorer`, `worker`, `verify`,
 `judge`, `rdd` — with the total running count in parentheses when two or
-more subagents run, for example `explorer (3)`),
+more subagents run, for example `explorer (3)`). The single exception is a
+blocking synchronous subagent call (`gentle_pending_v1`): a task-mode
+`subagent_run`/`subagent_continue` holds the principal's turn open until the
+child returns, so the principal is waiting on that child rather than working
+and the in-flight child's role renders instead. A queued or running
+background delegate publishes no such marker and leaves the principal's
+display untouched),
 `ask` (three independent event legs — choice, native questionnaire, legacy rpiv — plus
 executed `ask_user_question`/`ask_user_choice` tool calls (execution opens, end/result closes;
 proposals never block), tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD
@@ -253,12 +260,19 @@ aggregate native status (the work token counts running delegates, and the
 native status reads `working` for any running delegate or pending launch — so
 neither can say the principal works): the dedicated
 `gentle_principal_v1` marker is published while the principal session itself
-works and cleared when it settles. A **working principal** reads `gentle` —
-pink
+works and cleared when it settles. That is the default: a **working
+principal** reads `gentle` — pink
 `orchestrating` while a fresh root marker is live — and no delegate role word
 wins; an **idle principal** shows the oldest running TaskStore role
 (`explorer`, `worker`, `verify`, `judge`, `rdd`), however many delegates run.
-Both yield to `ask`/`rdd`/`blocked` and terminal `done` — where `done` needs
+The one exception is a blocking synchronous subagent call: while a task-mode
+`subagent_run`/`subagent_continue` is in flight the principal's own turn is
+blocked on the child, so the producer publishes that child's role in
+`gentle_pending_v1` and it renders instead of `gentle`, for as long as the
+call lasts. Background launches resolve their tool call immediately, so a
+queued or running background delegate publishes no such marker and leaves
+the principal's own display untouched. These yield to `ask`/`rdd`/`blocked`
+and terminal `done` — where `done` needs
 settled-plus-empty (principal settled with no running delegates and no
 pending launches; a settled principal with running delegates keeps the role
 word, never `done`). A role word is not a subagent label; it carries the
@@ -306,8 +320,9 @@ and confirm row 2 shows pink `gentle` (machine key
 `orchestrating`) while
 the principal session actively works — even with zero subagents — and keeps
 `gentle` while its delegates run (a role word such as `worker`, `explorer`,
-`verify`, `judge` shows once the principal itself is idle), row 1 shows
-the single heading cell (`● <project>` plus ` +N`/` -N`/` ↑N` inline, zero `·`) after edits / when behind upstream; then `ask` on an open
+`verify`, `judge` shows once the principal itself is idle — and also while a
+task-mode subagent call blocks the principal's turn, until it returns), row 1
+shows the single heading cell (`● <project>` plus ` +N`/` -N`/` ↑N` inline, zero `·`) after edits / when behind upstream; then `ask` on an open
 question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD viewer, changes view, design canvas — never counts, because opening a panel is navigation, not a question), or permission waiting; `gentle_review` starts never speculate ask, and no failed tool ever does either: a tool error changes nothing, see the error rule below). `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
 `HERDR_CONFIG_PATH` on a temp file for apply/uninstall checks.
 
@@ -353,9 +368,13 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   settled-plus-empty)) and the authoritative TaskStore role signal
   (`explorer` / `worker` / `verify` / `judge` / `rdd` from `TaskRecord.agent`,
   oldest running first by immutable first-seen, shown while the principal
-  itself is idle — a working principal keeps `gentle`, asserted by the
-  principal-only `gentle_principal_v1` marker rather than by the delegate
-  count or Herdr's aggregate native status; `gentle` (machine
+  itself is idle — a working principal's own turn keeps `gentle`, asserted by
+  the principal-only `gentle_principal_v1` marker rather than by the delegate
+  count or Herdr's aggregate native status, with one exception: a blocking
+  synchronous `subagent_run`/`subagent_continue` call holds the principal's
+  turn open, so the in-flight child's role shows instead (the
+  `gentle_pending_v1` role marker) until that call resolves, while a
+  background delegate never takes that path; `gentle` (machine
   key `working`) for the principal's own working state; an unknown delegation
   keeps its original sanitized name, 32-char bound — never a generic
   collapse), with a running-count suffix on role labels when two or more
@@ -426,10 +445,12 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   it is a key the panel answers to, and a narrow card compacts it instead of
   wrapping. Pointer input still works without being advertised — a click on a
   category selects it, a click on a row applies it, and a click outside the
-  panes is ignored. The notifications switch appears twice — as its own
-  `Moshi notifications` category and as a `Notifications` row inside
-  `Herdr Sidebar` — and both rows read the one flag below, so the state they
-  show can never disagree. The plain two-step menu stays as the fallback
+  panes is ignored. Each category owns exactly one switch: `Herdr Sidebar`
+  shows the single `Sidebar agent rows` row, and the only Moshi switch is the
+  `Notifications` row under `Moshi notifications`. The two are never mixed —
+  `Sidebar agent rows` neither reads nor writes `gentle-moshi.json`, so turning
+  the agent rows off never turns the notification channel off. The plain
+  two-step menu stays as the fallback
   when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
   (`--check` to read, `--apply --reload` / `--uninstall --reload` to change) and
@@ -454,8 +475,8 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   mkdir -p "$dir" && echo '{"enabled":true}' > "$dir/gentle-moshi.json"
   ```
 
-  `/herdr-gentle:customize` → `Moshi notifications` (or the `Notifications` row
-  inside `Herdr Sidebar`) writes this flag for you, and enabling there first
+  `/herdr-gentle:customize` → `Moshi notifications` writes this flag for you,
+  and enabling there first
   requires the `moshi-hook` CLI on `PATH` with `moshi-hook status --json`
   reporting `paired: true` (an unpaired host is refused and nothing is
   written).
