@@ -1,6 +1,6 @@
 id = "herdr-gentle-shell"
 name = "Herdr Gentle Shell"
-version = "1.2.0"
+version = "1.3.0"
 min_herdr_version = "0.9.4"
 description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
 platforms = ["linux"]
@@ -23,16 +23,25 @@ platforms = ["linux"]
 # Sections below are added only as their commands become verifiable.
 #
 # Coexistence: single-writer handoff with herdr-pi-tree, which stays installed
-# but disabled for gentle-owned panes. No Agents-panel ownership is claimed
-# here (DESIGN.md §3 O1, §9).
+# but disabled for gentle-owned panes. No row of the user's own Agents-panel
+# table is claimed here (DESIGN.md §3 O1, §9): the two gentle rows come from
+# the managed pi-only rows_by_agent override, and the daemon's `gs` label for
+# an isolated Gentle Shell pane is just that — a label. `gs` is not a
+# canonical Herdr agent, so it must never key rows_by_agent (DESIGN.md §5.5).
 
 # Consumer daemon (task 7): poll snapshot → reduce → publish owned gentle_*
 # tokens, scoped orphan sweep. Desktop attention is native Herdr (DESIGN §7):
 # this daemon emits no notification for any display.
 # No-args mode only ensures the daemon is running; --run is the loop.
 # Poll cadence is adaptive (10 s baseline, GENTLE_STATUS_POLL_MS-overridable,
-# 2 s fast cycle while recent ask activity or send/publish failures are
-# observed); DESIGN §10 U2 sets no normative cadence yet, only << 60 s TTL.
+# 2 s fast cycle while recent ask activity, a rendered non-idle display, or
+# send/publish failures are observed); DESIGN §10 U2 sets no normative cadence
+# yet, only << 60 s TTL. Polling is the FALLBACK: the daemon also holds one
+# long-lived socket `events.subscribe` for pane.updated (plus the roster
+# kinds), which only wakes the same single frame loop, and a token write Herdr
+# already repaints for is drawn without a poll. A `[[events]]` hook cannot do
+# that: pane.updated is deliberately excluded from the manifest hook surface,
+# so `on = "pane.updated"` in this manifest would be inert — do not add it.
 [[startup]]
 command = ["node", "bin/gentle-status.js"]
 

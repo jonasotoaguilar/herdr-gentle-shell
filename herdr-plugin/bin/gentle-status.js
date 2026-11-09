@@ -14,9 +14,22 @@
 //   node bin/gentle-status.js --run    BE the daemon (Herdr [[startup]])
 //   node bin/gentle-status.js --once   single frame, then exit (debugging)
 //   node bin/gentle-status.js --refresh ensure one daemon + coalesced
-//                                        immediate refresh (event hooks)
+//                                        immediate refresh (event hooks); also
+//                                        requests one `gs` discovery scan
 //   node bin/gentle-status.js --stop   stop the daemon (scoped sweep of live
 //   node bin/gentle-status.js --stop --purge   also clear every owned token)
+//
+// `gs` label (DESIGN §5.5, T5): an isolated Gentle Shell pane has no row until
+// this daemon labels it. A pane belongs to the isolated install when a member of
+// its foreground process group runs an argv path under the install root — the
+// same input Herdr's detection reads, because a real pane is launched from the
+// user's project directory and its cwd is never the install; cwd is the fallback
+// only when the group cannot be read. Such a pane gets `--display-agent gs` when
+// Herdr detects it (presentation only, state untouched) and a reported
+// `--agent gs --state idle` label only when it detects nothing, released again
+// as soon as detection appears. The root resolves from
+// GENTLE_SHELL_INSTALL_ROOT, else GENTLE_SHELL_HOME, else
+// <XDG_DATA_HOME|~/.local/share>/gentle-shell/install.
 //
 // S7 sidebar gate: the sibling sidebar writer owns
 // <stateDir>/gentle-sidebar-mode.json ({version:1,enabled:boolean}); this
@@ -29,6 +42,22 @@
 // with one CLI fallback each, so a misbehaving socket degrades to slow, not
 // broken. A failed snapshot is "no data", never "empty": nothing is
 // published or swept on a failed read.
+//
+// Drawing is subscription-driven and polling is the fallback (DESIGN §5, §8):
+// one long-lived socket `events.subscribe` for `pane.updated` (plus the roster
+// kinds) wakes the single frame loop, because `pane.report_metadata` makes
+// Herdr emit that event and repaint. The subscription can never fail the
+// daemon: it reconnects on a bounded backoff, reports one line per distinct
+// failure, and the poll below is unchanged and correct without it. The
+// git-derived `+N/-N` and `↑N` row data and the presence prefix have no Herdr
+// event at all, which is why polling is never removed.
+//
+// T5 `gs` label ladder (DESIGN §5.5): an isolated Gentle Shell pane has no
+// Agents row because `gs` is not a canonical Herdr agent. A pane Herdr detects
+// keeps Herdr's own truthful identity and only gets the presentation-only
+// `gs` display label; a pane Herdr does not detect gets a reported `gs` label
+// as the last resort, so a row exists at all, and that reported label is
+// released the moment detection appears.
 
 var MIN_MAJOR = 18;
 var major = Number(String(process.versions.node).split('.')[0]);
@@ -47,6 +76,7 @@ const { spawn, spawnSync } = require('node:child_process');
 
 const contract = require('../lib/gentle-tokens');
 const interruptions = require('../lib/gentle-interruptions');
+const gsLabel = require('../lib/gentle-gs');
 
 // This daemon's token source tag. The producer extension reports under
 // `gentle:v1`; the daemon writes under the plugin convention
@@ -58,17 +88,19 @@ const interruptions = require('../lib/gentle-interruptions');
 // state dir below deliberately keeps the pre-rename segment so upgrades
 // keep their flags, pidfile and ledger with no migration step.
 const PLUGIN_ID = 'herdr-gentle-shell';
+const PLUGIN_SCOPE = process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID;
 const STATE_PLUGIN_ID = 'herdr-gentle-agents';
-const SOURCE = `plugin:${process.env.HERDR_PLUGIN_ID ?? PLUGIN_ID}`;
+const SOURCE = `plugin:${PLUGIN_SCOPE}`;
 
 // DESIGN §10 U2 is unresolved (no normative cadence); the provisional poll
 // is comfortably below the 60 s token TTL and the producer's 15 s beat so
 // every beat is observed at least once. Env-overridable, documented here
 // rather than normatively fixed. P1 adaptive poll: the loop idles at the
-// baseline cadence and drops to a fast cycle while recent ask activity or
-// send/publish failures are observed, recovering after N quiet frames or
-// when the TTL-bounded fast window expires. Single setTimeout chain with a
-// dynamic delay — never a busy loop, never setInterval.
+// baseline cadence and drops to a fast cycle while recent ask activity, an
+// active (non-idle) display, or send/publish failures are observed,
+// recovering after N quiet frames or when the TTL-bounded fast window
+// expires. Single setTimeout chain with a dynamic delay — never a busy loop,
+// never setInterval.
 const POLL_MS = Number(process.env.GENTLE_STATUS_POLL_MS ?? 10000) || 10000;
 const POLL_MIN_MS = 250;
 
@@ -100,14 +132,27 @@ function createPollState() {
 }
 
 function createPollStateObserved() {
-  return { askActivity: false, failure: false };
+  return { askActivity: false, failure: false, active: false };
 }
 
-// Decide the next loop delay and advance pollState. Any ask activity or
-// send/publish failure (re)arms the TTL-bounded fast window; N consecutive
-// quiet frames inside the window recover to baseline early.
+// S4: the row data this daemon derives itself — the `+N/-N` changes summary
+// and the `↑N` pull marker, read from local git plus `agent.list` — is
+// refreshed by a frame, not by a producer report, so an idle pane waits a
+// whole baseline for a git change to appear. The reduced display a frame
+// already computed is the only classification used: anything other than the
+// settled `idle` is active, while an absent or unknown display counts as
+// settled and keeps today's baseline (fail closed, like every parser).
+function observeDisplay(observed, display) {
+  const active = typeof display === 'string' && display.length > 0 && display !== 'idle';
+  if (active && observed) observed.active = true;
+  return active;
+}
+
+// Decide the next loop delay and advance pollState. Any ask activity, active
+// display, or send/publish failure (re)arms the TTL-bounded fast window; N
+// consecutive quiet frames inside the window recover to baseline early.
 function nextPollDelay(pollState, now, observed = {}, config = resolvePollConfig()) {
-  if (observed.askActivity || observed.failure) {
+  if (observed.askActivity || observed.failure || observed.active) {
     pollState.fastUntil = now + config.windowMs;
     pollState.quietFrames = 0;
   } else if (pollState.fastUntil > now) {
@@ -121,6 +166,56 @@ function nextPollDelay(pollState, now, observed = {}, config = resolvePollConfig
     pollState.quietFrames = 0;
   }
   return pollState.fastUntil > now ? config.fastMs : config.baselineMs;
+}
+
+// A `done` display IS a token expiry (DESIGN §4.3): it recedes to `idle` when
+// the hold lapses, so a sleep that runs past it keeps a settled row on `done`
+// for up to one whole poll after the hold ended. Capping the sleep at the
+// nearest pending expiry fixes that without a second timer. The cap may only
+// SHORTEN the delay it was given: a distant expiry returns the delay
+// unchanged, an absent or unparseable one returns it unchanged (fail closed,
+// exactly like the token parsers), and an already-expired or near expiry falls
+// to POLL_MIN_MS instead of 0 so no busy loop is possible.
+function capDelayToExpiry(delayMs, nearestExpiry, now = Date.now()) {
+  if (typeof nearestExpiry !== 'number' || !Number.isFinite(nearestExpiry)) return delayMs;
+  const remaining = nearestExpiry - now;
+  if (!(remaining < delayMs)) return delayMs;
+  if (!(remaining > POLL_MIN_MS)) return Math.min(delayMs, POLL_MIN_MS);
+  return Math.floor(remaining);
+}
+
+// Event-synchronized drawing floor (DESIGN §8): a token report lands in Herdr,
+// not in this loop, so the producer requests the coalesced refresh above. The
+// request may break the sleep, but never sooner than POLL_MIN_MS after the
+// frame that started it, so a burst of reports cannot spin the loop faster
+// than the poll floor. Returns 0 when a wake may fire now, else how long is
+// left before it may — the sleep slices to that instant so an eligible request
+// is consumed on the next pass (a naive boolean check would re-test at the
+// same phase every slice and could starve while the poll delay IS the floor).
+// The request is only consumed once this allows the wake, so nothing is lost.
+function refreshGateMs(lastFrameAt, now = Date.now()) {
+  if (!Number.isFinite(lastFrameAt)) return 0;
+  const elapsed = now - lastFrameAt;
+  if (elapsed >= POLL_MIN_MS) return 0;
+  return Math.min(POLL_MIN_MS, POLL_MIN_MS - elapsed);
+}
+
+// B: the soonest live `done` expiry among the panes a frame reduced. The
+// contract's own parser fails closed (foreign session, malformed, already
+// expired, or beyond the freshness ceiling all yield null), so a bad token
+// never schedules a wake and no value is ever re-derived here.
+function doneExpiryOf(entry, now) {
+  const tokens =
+    entry && typeof entry === 'object' && entry.tokens && typeof entry.tokens === 'object'
+      ? entry.tokens
+      : null;
+  if (tokens === null) return null;
+  const done = contract.parseDone(
+    tokens[contract.DONE_TOKEN],
+    contract.expectedSessionHash(entry),
+    now,
+  );
+  return done === null ? null : done.expiry;
 }
 const MAX_TOKENS_PER_REPORT = 16;
 const SOCKET_TIMEOUT_MS = 4000;
@@ -420,6 +515,229 @@ async function socketCall(method, params) {
   }
 }
 
+/* ------------------------------------------------------------ events */
+
+// DESIGN §5: the token path is subscription-driven and polling is the
+// fallback. `pane.report_metadata` bumps the pane revision and Herdr emits
+// `pane.updated` with the full pane payload, but that kind is deliberately
+// absent from the manifest hook surface (22 names), so a `[[events]] on =
+// "pane.updated"` hook never fires. The supported route is this long-lived
+// socket subscription. Roster kinds ride along because they cost one array
+// entry each and a roster change is a visible row change.
+//
+// Nothing here parses the payload: an event only marks ONE dirty flag that
+// wakes the single existing sleep, so an event burst collapses into one frame
+// (never a second loop, never a timer, never a frame per event). Nothing is
+// queued, so bounded memory is one boolean.
+const EVENT_SUBSCRIPTIONS = ['pane.updated', 'pane.created', 'pane.closed', 'pane.moved'];
+const EVENT_WAKE_KINDS = new Set();
+for (const kind of EVENT_SUBSCRIPTIONS) {
+  // Pushed envelopes name their kind in snake_case (`pane_updated`); accept
+  // both spellings so a framing change can never silently stop the wakes.
+  EVENT_WAKE_KINDS.add(kind);
+  EVENT_WAKE_KINDS.add(kind.replace('.', '_'));
+}
+// T5: a roster change is the only moment a pane can enter or leave the
+// qualifying `gs` set, so those kinds request one bounded discovery scan. The
+// scan itself is never per frame; `pane.agent_detected` rides along because a
+// new detection is exactly when a reported label has to be released.
+const GS_SCAN_EVENT_KINDS = new Set();
+for (const kind of ['pane.created', 'pane.closed', 'pane.moved', 'pane.exited', 'pane.agent_detected']) {
+  GS_SCAN_EVENT_KINDS.add(kind);
+  GS_SCAN_EVENT_KINDS.add(kind.replace('.', '_'));
+}
+const EVENT_LINE_MAX_BYTES = 1024 * 1024;
+const SUBSCRIBE_REQUEST_ID = 'gentle-status-events';
+const SUBSCRIBE_BACKOFF_BASE_MS = 1000;
+const SUBSCRIBE_BACKOFF_CAP_MS = 60000;
+// A connection that lived this long counts as healthy, so its failure resets
+// the backoff ladder. A server that accepts and immediately drops climbs it.
+const SUBSCRIBE_STABLE_MS = 5000;
+
+// Pure and time-free so the ladder is asserted directly instead of through
+// wall-clock behavior: 1 s, 2 s, 4 s ... capped at 60 s, never decreasing. A
+// Herdr restart usually lands inside the first second, and the cap keeps a
+// permanently absent server at one connect attempt a minute — a cost the 10 s
+// baseline poll it can never replace already pays. Garbage input fails closed
+// to the base delay, so no value can produce a 0 delay spin.
+function nextSubscribeDelayMs(attempt, livedMs) {
+  const prior = Number.isSafeInteger(attempt) && attempt > 0 ? attempt : 0;
+  const stable = Number.isFinite(livedMs) && livedMs >= SUBSCRIBE_STABLE_MS;
+  const next = stable ? 1 : Math.min(prior + 1, 31);
+  const delayMs = Math.min(SUBSCRIBE_BACKOFF_BASE_MS * 2 ** Math.min(next - 1, 16), SUBSCRIBE_BACKOFF_CAP_MS);
+  return { attempt: next, delayMs };
+}
+
+// The pushed envelope names the kind at `event` (and repeats it at
+// `data.type`); a reply to our own request carries `id` and is not an event.
+function eventKindOf(message) {
+  if (!message || typeof message !== 'object') return null;
+  if (message.id !== undefined && message.id !== null) return null;
+  const data = message.data;
+  let kind = null;
+  if (typeof message.event === 'string') kind = message.event;
+  else if (data && typeof data.type === 'string') kind = data.type;
+  if (kind === null || !EVENT_WAKE_KINDS.has(kind)) return null;
+  return kind;
+}
+
+// One connection at a time, reconnected on failure. Every failure is reported
+// once per distinct reason (never per attempt) and can never throw or leave an
+// unhandled rejection: without the subscription the poll is unchanged and
+// correct, so degrading is always the safe outcome.
+function startEventSubscription({ onEvent, onFailure } = {}) {
+  const notifyEvent = typeof onEvent === 'function' ? onEvent : () => {};
+  const reportFailure = typeof onFailure === 'function' ? onFailure : () => {};
+  let stream = null;
+  let buffer = '';
+  let attempt = 0;
+  let openedAt = 0;
+  let acknowledged = false;
+  let failed = false; // this connection already reported and scheduled its retry
+  let retryTimer = null;
+  let stopped = false;
+
+  const destroy = () => {
+    const current = stream;
+    stream = null;
+    if (!current) return;
+    try {
+      current.destroy();
+    } catch {
+      // Already gone.
+    }
+  };
+
+  const fail = (reason, detail) => {
+    if (stopped || failed) return;
+    failed = true;
+    const livedMs = openedAt === 0 ? 0 : Date.now() - openedAt;
+    destroy();
+    buffer = '';
+    const next = nextSubscribeDelayMs(attempt, livedMs);
+    attempt = next.attempt;
+    reportFailure(reason, detail);
+    retryTimer = setTimeout(connect, next.delayMs);
+    // A reconnect timer must never be what keeps the daemon alive.
+    if (typeof retryTimer.unref === 'function') retryTimer.unref();
+  };
+
+  const handleLine = (line) => {
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (message && message.id === SUBSCRIBE_REQUEST_ID && !acknowledged) {
+      if (message.error) {
+        const detail = message.error.message ?? message.error.code;
+        fail('rejected', typeof detail === 'string' ? detail : undefined);
+        return;
+      }
+      acknowledged = true;
+      // A live subscription is idle traffic, not a request awaiting a reply.
+      try {
+        stream?.setTimeout(0);
+      } catch {
+        // Not fatal; the socket stays subscribed either way.
+      }
+      return;
+    }
+    const kind = eventKindOf(message);
+    if (kind !== null) notifyEvent(kind);
+  };
+
+  function connect() {
+    retryTimer = null;
+    if (stopped) return;
+    failed = false;
+    acknowledged = false;
+    buffer = '';
+    let next;
+    try {
+      next = net.connect({ path: pipePath() });
+    } catch (error) {
+      fail('connect', error?.message);
+      return;
+    }
+    stream = next;
+    openedAt = Date.now();
+    try {
+      next.setEncoding('utf8');
+      // A server that accepts the connection and never answers would leave the
+      // token path silently unpushed: treat silence like a rejection.
+      next.setTimeout(SOCKET_TIMEOUT_MS);
+    } catch {
+      // Timeouts are best-effort; the data path below still works.
+    }
+    next.on('connect', () => {
+      try {
+        next.write(
+          `${JSON.stringify({
+            id: SUBSCRIBE_REQUEST_ID,
+            method: 'events.subscribe',
+            params: { subscriptions: EVENT_SUBSCRIPTIONS.map((type) => ({ type })) },
+          })}\n`,
+        );
+      } catch (error) {
+        fail('connect', error?.message);
+      }
+    });
+    next.on('timeout', () => fail('unanswered', 'no subscribe acknowledgement'));
+    next.on('error', (error) => fail(error?.code ?? 'error', error?.message));
+    next.on('end', () => fail('closed', 'subscription ended'));
+    next.on('close', () => fail('closed', 'subscription closed'));
+    next.on('data', (chunk) => {
+      buffer += chunk;
+      if (buffer.length > EVENT_LINE_MAX_BYTES) {
+        fail('oversize', 'event frame too large');
+        return;
+      }
+      let at;
+      while ((at = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, at);
+        buffer = buffer.slice(at + 1);
+        if (line.trim()) handleLine(line);
+        if (stopped || failed) return;
+      }
+    });
+  }
+
+  connect();
+
+  return {
+    // Idempotent and synchronous: shutdown must never wait on an event.
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      buffer = '';
+      destroy();
+    },
+  };
+}
+
+// Bounded subscription report: one stderr line plus one err-file entry per
+// distinct failure reason. A Herdr that rejects, closes, or never answers the
+// subscription must never be louder than the polling that still covers it.
+function reportSubscriptionError(state, reason, detail) {
+  const key = typeof reason === 'string' && reason.length > 0 ? reason : 'unknown';
+  if (state && state.subscriptionErrorReported === key) return;
+  if (state) state.subscriptionErrorReported = key;
+  const message =
+    `gentle-status: event subscription unavailable (${key}${detail ? `: ${detail}` : ''}); polling continues`;
+  try {
+    console.error(message);
+  } catch {
+    // stderr is best-effort; the err file below is the durable record.
+  }
+  logError(new Error(message));
+}
+
 function binary() {
   return process.env.HERDR_BIN_PATH ?? 'herdr';
 }
@@ -493,6 +811,250 @@ async function reportChunked(source, paneId, tokens) {
   return (await Promise.all(jobs)).every(Boolean);
 }
 
+/* ------------------------------------------------------------ gs transport */
+
+// T5 transport: the same socket-then-CLI shape as every other call here, and
+// every interpolated value is checked against the lib's identifier grammar
+// first, so an unusable pane id or source is skipped rather than reaching a
+// fixed argv.
+async function paneProcessInfoAsync(paneId) {
+  if (!gsLabel.safePaneId(paneId)) return null;
+  const reply = await socketCall('pane.process_info', { pane_id: paneId });
+  if (reply && !reply.error && reply.result && typeof reply.result === 'object') {
+    const info = reply.result.process_info;
+    if (info && typeof info === 'object') return info;
+  }
+  const viaCli = cliJson('pane', 'process-info', '--pane', paneId)?.result?.process_info;
+  return viaCli && typeof viaCli === 'object' ? viaCli : null;
+}
+
+async function reportAgentAsync(paneId, source, agent, stateName) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source)) return false;
+  const reply = await socketCall('pane.report_agent', { pane_id: paneId, source, agent, state: stateName });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'report-agent', paneId, '--source', source, '--agent', agent, '--state', stateName) !== null;
+}
+
+// Both the source and the label are part of the release: Herdr clears only the
+// authority this plugin reported, never another reporter's label on the pane.
+async function releaseAgentAsync(paneId, source, agent) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source)) return false;
+  const reply = await socketCall('pane.release_agent', { pane_id: paneId, source, agent });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'release-agent', paneId, '--source', source, '--agent', agent) !== null;
+}
+
+async function setDisplayAgentAsync(paneId, source, label) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source) || !gsLabel.safeSource(label)) return false;
+  const reply = await socketCall('pane.report_metadata', { pane_id: paneId, source, display_agent: label });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'report-metadata', paneId, '--source', source, '--display-agent', label) !== null;
+}
+
+async function clearDisplayAgentAsync(paneId, source) {
+  if (!gsLabel.safePaneId(paneId) || !gsLabel.safeSource(source)) return false;
+  const reply = await socketCall('pane.report_metadata', {
+    pane_id: paneId,
+    source,
+    clear_display_agent: true,
+  });
+  if (reply) return !reply.error;
+  return cliJson('pane', 'report-metadata', paneId, '--source', source, '--clear-display-agent') !== null;
+}
+
+/* ------------------------------------------------------------ gs label */
+
+// Bounded report for the gs path: one stderr line plus one err-file entry per
+// distinct failure, never one per frame and never one per pane. Fail closed:
+// the label simply stays as it was, exactly like every other degraded path.
+const GS_ERROR_KEYS_MAX = 8;
+
+function reportGsError(state, key, message) {
+  const errors = state?.gs?.errors;
+  if (!(errors instanceof Set) || errors.has(key)) return;
+  if (errors.size < GS_ERROR_KEYS_MAX) errors.add(key);
+  try {
+    console.error(message);
+  } catch {
+    // stderr is best-effort; the err file below is the durable record.
+  }
+  logError(new Error(message));
+}
+
+function createGsState() {
+  return {
+    source: gsLabel.gsSource(PLUGIN_SCOPE),
+    root: gsLabel.resolveInstallRoot(process.env),
+    held: new Map(),
+    qualified: new Set(),
+    scanPending: true,
+    errors: new Set(),
+  };
+}
+
+// Release only this plugin's reported authority, keeping the presentation-only
+// display label: that is the shape every "detection appeared" transition needs,
+// and it is also what a departure releases first. Naming our own source AND
+// label is what keeps another reporter's authority untouched.
+async function releaseGsAuthority(state, paneId) {
+  const gsState = state?.gs;
+  const entry = gsState?.held?.get(paneId);
+  if (!entry || !entry.reported) return true;
+  if (!(await releaseAgentAsync(paneId, gsState.source, gsLabel.GS_AGENT))) {
+    reportGsError(state, 'release', 'gentle-status: cannot release the reported gs label; retrying next frame');
+    if (state.pollObserved) state.pollObserved.failure = true;
+    return false;
+  }
+  entry.reported = false;
+  entry.signature = null;
+  return true;
+}
+
+// Clear everything this plugin reported for one pane: its authority first (the
+// masking one), then its display label. A transport failure keeps the entry so
+// the next beat retries; only this plugin's own source and label are named.
+async function releaseGsPane(state, paneId) {
+  const gsState = state?.gs;
+  const entry = gsState?.held?.get(paneId);
+  if (!entry) return;
+  if (!(await releaseGsAuthority(state, paneId))) return;
+  if (entry.display) {
+    if (!(await clearDisplayAgentAsync(paneId, gsState.source))) {
+      reportGsError(state, 'display-clear', 'gentle-status: cannot clear the gs display label; retrying next frame');
+      if (state.pollObserved) state.pollObserved.failure = true;
+      return;
+    }
+    entry.display = false;
+  }
+  gsState.held.delete(paneId);
+}
+
+async function releaseGsHeld(state) {
+  const gsState = state?.gs;
+  if (!gsState || !(gsState.held instanceof Map)) return;
+  for (const paneId of [...gsState.held.keys()]) await releaseGsPane(state, paneId);
+}
+
+// One qualifying pane, decided by the ladder: the display label always, the
+// reported label only while Herdr detects nothing. Every write is deduped by
+// the held entry, so a steady pane costs no call at all. `processInfo` is the
+// read the caller already had to make (the discovery scan decides qualification
+// from it), so a scan never pays for the same answer twice.
+async function applyGsPane(state, paneId, detected, processInfo) {
+  const gsState = state.gs;
+  let entry = gsState.held.get(paneId);
+  if (!entry) {
+    entry = { display: false, reported: false, signature: null };
+    gsState.held.set(paneId, entry);
+  }
+  if (!entry.display) {
+    if (await setDisplayAgentAsync(paneId, gsState.source, gsLabel.GS_AGENT)) entry.display = true;
+    else {
+      reportGsError(state, 'display', 'gentle-status: cannot set the gs display label; retrying next frame');
+      if (state.pollObserved) state.pollObserved.failure = true;
+    }
+  }
+  if (detected) {
+    // Herdr's own identity stands: releasing ours is what stops the mask, while
+    // the display label stays so the row keeps its `gs` word.
+    if (entry.reported) await releaseGsAuthority(state, paneId);
+    return;
+  }
+  if (entry.reported) return;
+  const info = processInfo === undefined ? await paneProcessInfoAsync(paneId) : processInfo;
+  const signature = gsLabel.processSignature(info);
+  if (await reportAgentAsync(paneId, gsState.source, gsLabel.GS_AGENT, gsLabel.GS_STATE)) {
+    entry.reported = true;
+    entry.signature = signature;
+    return;
+  }
+  reportGsError(state, 'report', 'gentle-status: cannot report the gs label; retrying next frame');
+  if (state.pollObserved) state.pollObserved.failure = true;
+}
+
+// One bounded discovery scan: `pane list` names the panes, and one
+// `pane.process_info` per pane answers the qualification question from the same
+// foreground process group Herdr's detection reads. Run at daemon start, on an
+// explicit refresh, and on a roster event — never per frame. A failed pane read
+// is unknown, never empty, so nothing is released on it.
+const GS_SCAN_PANE_MAX = 64;
+
+async function scanGsPanes(state) {
+  const gsState = state.gs;
+  const panes = await panesAsync();
+  if (panes === null) {
+    reportGsError(state, 'pane-list', 'gentle-status: pane list unavailable; gs labels unchanged');
+    return;
+  }
+  const qualified = new Set();
+  const decided = [];
+  let probed = 0;
+  for (const pane of panes) {
+    const paneId = pane?.pane_id;
+    if (!gsLabel.safePaneId(paneId)) continue;
+    if (probed >= GS_SCAN_PANE_MAX) {
+      reportGsError(
+        state,
+        'scan-cap',
+        `gentle-status: pane list over ${GS_SCAN_PANE_MAX} panes; gs discovery stopped at the cap`,
+      );
+      break;
+    }
+    probed += 1;
+    const processInfo = await paneProcessInfoAsync(paneId);
+    const decision = gsLabel.qualifyPaneForGs(pane, processInfo, gsState.root);
+    if (!decision.qualifies) continue;
+    qualified.add(paneId);
+    decided.push([paneId, gsLabel.isDetectedAgent(gsLabel.paneAgentOf(pane)), processInfo]);
+  }
+  gsState.qualified = qualified;
+  for (const [paneId, detected, processInfo] of decided) {
+    await applyGsPane(state, paneId, detected, processInfo);
+  }
+  for (const paneId of [...gsState.held.keys()]) {
+    if (!qualified.has(paneId)) await releaseGsPane(state, paneId);
+  }
+}
+
+// One beat of label maintenance. Detection is a function of the pane's
+// foreground process group and a reported label masks it, so the group is the
+// only thing that can answer "is a real agent there now?": an unchanged group
+// owes nothing, a changed one releases the label and re-decides immediately, so
+// `gs` never masks a detection for longer than the beat it appeared in.
+async function gsBeat(state, sidebarEnabled) {
+  const gsState = state.gs;
+  if (!gsState) return;
+  if (sidebarEnabled !== true) {
+    // The sidebar is disabled (or its flag is unreadable): this plugin's label
+    // is not shown, so it must stop holding agent authority as well.
+    await releaseGsHeld(state);
+    gsState.scanPending = false;
+    return;
+  }
+  if (gsState.scanPending) {
+    gsState.scanPending = false;
+    await scanGsPanes(state);
+  }
+  for (const paneId of [...gsState.held.keys()]) {
+    const entry = gsState.held.get(paneId);
+    if (!entry) continue;
+    if (!gsState.qualified.has(paneId)) {
+      await releaseGsPane(state, paneId);
+      continue;
+    }
+    if (!entry.reported) continue;
+    const signature = gsLabel.processSignature(await paneProcessInfoAsync(paneId));
+    if (signature === null) continue;
+    if (entry.signature === null) {
+      entry.signature = signature;
+      continue;
+    }
+    if (signature === entry.signature) continue;
+    if (!(await releaseGsAuthority(state, paneId))) continue;
+    await scanGsPanes(state);
+  }
+}
+
 // DESIGN §7 notification ownership: desktop attention is native Herdr —
 // this consumer emits `herdr notification` for nothing. The ask token still
 // drives the sidebar ask display; the Moshi phone path lives in the
@@ -553,9 +1115,15 @@ async function frame(state, opts = {}) {
   const tracing = traceEnabled(trace);
   const started = tracing ? process.hrtime.bigint() : 0n;
   const now = Date.now();
+  // Cleared every frame, including the failed-snapshot path below: a stale
+  // expiry must never cap a later sleep (it would floor every poll at
+  // POLL_MIN_MS until the snapshot recovers), and no expiry means today's
+  // delay applies.
+  state.nearestExpiry = null;
   if (state.pollObserved) {
     state.pollObserved.askActivity = false;
     state.pollObserved.failure = false;
+    state.pollObserved.active = false;
   }
   const agents = await agentsAsync();
   if (agents === null) {
@@ -570,6 +1138,7 @@ async function frame(state, opts = {}) {
   const liveOwned = []; // owned pane ids (disabled-mode clear-once)
   const sightings = {}; // paneId -> {entry, reduced} (ledger, daemon only)
   const publishJobs = [];
+  let nearestExpiry = null;
   for (const entry of agents) {
     const paneId = entry?.pane_id;
     if (typeof paneId !== 'string') continue;
@@ -579,6 +1148,8 @@ async function frame(state, opts = {}) {
       debug(`pane ${paneId}: pi-tree owns; yielding`);
       continue;
     }
+    const expiry = doneExpiryOf(entry, now);
+    if (expiry !== null && (nearestExpiry === null || expiry < nearestExpiry)) nearestExpiry = expiry;
     sightings[paneId] = { entry, reduced };
     if (!sidebar.enabled) {
       // Native sidebar selected (or malformed flag): never compose a
@@ -594,11 +1165,18 @@ async function frame(state, opts = {}) {
     if (reduced.display === 'ask' && reduced.notify && state.pollObserved) {
       state.pollObserved.askActivity = true;
     }
+    // S4: any non-idle display keeps the fast cycle armed too, so the git
+    // changes summary and pull marker this daemon derives by itself stop
+    // lagging up to a whole baseline. Set before the signature short-circuit
+    // below: an unchanged row is still a rendered one.
+    observeDisplay(state.pollObserved, reduced.display);
     const patch = contract.displayTokens(reduced);
     const signature = JSON.stringify(patch);
     if (lastSent.get(paneId) === signature) continue;
     publishJobs.push({ paneId, patch, signature });
   }
+  // The next sleep may not outlive the soonest hold it just drew.
+  state.nearestExpiry = nearestExpiry;
   // Publishes land every frame; with no notification path nothing gates them.
   // Suppressed entirely while the native sidebar is selected (S7 gate).
   if (sidebar.enabled) {
@@ -651,6 +1229,14 @@ async function frame(state, opts = {}) {
     }
   }
   state.live = live;
+  // T5 label ladder, after the token work so a gs failure can never disturb a
+  // publish: bounded discovery on the frames that asked for one, then the
+  // per-beat re-check of whatever this plugin currently reports.
+  try {
+    await gsBeat(state, sidebar.enabled);
+  } catch (error) {
+    logError(error);
+  }
   // Diagnostic-only interruption ledger (daemon loop only): --once must
   // never become a second ledger writer, so it skips this entirely.
   if (opts.persistInterruptions === true) {
@@ -766,10 +1352,11 @@ function daemonAlive() {
 
 const REFRESH_FILE = () => path.join(stateRoot(), 'gentle-status.refresh');
 
-// Coalesced immediate-refresh request: event hooks (and operators) touch
-// this file; the daemon loop consumes it (delete) and runs one extra
-// frame. N concurrent requests collapse to one frame. The file carries
-// only a timestamp — never tokens, pane data, or sidebar mode — so an
+// Coalesced immediate-refresh request: event hooks, the producer extension
+// (after every landed token report) and operators touch this file; the daemon
+// loop consumes it (delete) and runs one extra frame. N concurrent requests
+// collapse to one frame. The file carries only a timestamp — never tokens,
+// pane data, or sidebar mode — so an
 // event-triggered wake cannot self-feedback: this daemon's own metadata
 // writes emit no agent lifecycle events, --refresh itself publishes
 // nothing, and the sidebar flag is never written here.
@@ -786,6 +1373,32 @@ function takeRefresh() {
   try {
     if (!fs.existsSync(REFRESH_FILE())) return false;
     fs.rmSync(REFRESH_FILE(), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// T5 discovery request: a separate marker so an EXPLICIT --refresh (the CLI, the
+// manifest lifecycle hooks) asks for one `pane list` scan while the producer's
+// per-beat wake below never does — otherwise "on an explicit refresh" would
+// degrade into a scan per frame. Same bounded file discipline: one coalesced
+// timestamp, consumed once, never written by the token path.
+const GS_SCAN_FILE = () => path.join(stateRoot(), 'gentle-status.gs-scan');
+
+function requestGsScan() {
+  try {
+    fs.writeFileSync(GS_SCAN_FILE(), String(Date.now()), 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function takeGsScanRequest() {
+  try {
+    if (!fs.existsSync(GS_SCAN_FILE())) return false;
+    fs.rmSync(GS_SCAN_FILE(), { force: true });
     return true;
   } catch {
     return false;
@@ -829,21 +1442,56 @@ async function run() {
   const state = {
     live: new Set(),
     pollObserved: createPollStateObserved(),
+    nearestExpiry: null,
     interruptionsPrior: {},
     interruptions: interruptions.loadInterruptions(stateRoot()),
     clearedWhileDisabled: new Set(),
     sidebarModeErrorReported: null,
+    subscriptionErrorReported: null,
+    gs: createGsState(),
   };
   const pollConfig = resolvePollConfig();
   const pollState = createPollState();
   let stopped = false;
+  // The whole event state: one dirty flag, no queue. An event may only wake
+  // the sleep below; the frame it draws is the same one the poll would draw.
+  let eventWake = false;
+  const takeEventWake = () => {
+    if (!eventWake) return false;
+    eventWake = false;
+    return true;
+  };
+  const subscription = startEventSubscription({
+    onEvent: (kind) => {
+      eventWake = true;
+      // A roster change is when the qualifying set can change, so it asks for
+      // one bounded scan; `pane.updated` alone never does.
+      if (typeof kind === 'string' && GS_SCAN_EVENT_KINDS.has(kind)) state.gs.scanPending = true;
+    },
+    onFailure: (reason, detail) => reportSubscriptionError(state, reason, detail),
+  });
   const shutdown = async () => {
     if (stopped) return;
     stopped = true;
+    // Close the subscription first: a signal must never leave a live socket
+    // (or its reconnect timer) behind, and stop() never waits on it.
+    try {
+      subscription.stop();
+    } catch (error) {
+      logError(error);
+    }
     try {
       fs.rmSync(PID_FILE(), { force: true });
     } catch {
       // Already gone.
+    }
+    // T5: never leave a reported `gs` authority behind — it would survive this
+    // daemon and keep masking a real detection forever. Best-effort and scoped
+    // to this plugin's own source and label.
+    try {
+      await releaseGsHeld(state);
+    } catch (error) {
+      logError(error);
     }
     // Detached-child rollback (R4): terminate the poll loop and run the
     // scoped sweep over the last-known live set, so disable/uninstall/
@@ -863,25 +1511,45 @@ async function run() {
   });
   for (;;) {
     if (stopped) break;
+    const frameStartedAt = Date.now();
     try {
       await frame(state, { persistInterruptions: true });
     } catch (error) {
       logError(error);
     }
     if (stopped) break;
-    // Single-loop dynamic delay: fast cycle while recent ask activity or
-    // failures were observed, baseline otherwise. No setInterval, no busy
-    // loop (delays floored at POLL_MIN_MS via resolvePollConfig). The
-    // sleep is interruptible: a coalesced --refresh request breaks the
-    // wait early for one immediate frame. Sequential — the next frame
-    // never overlaps the current one; concurrent requests collapse to one.
-    const delay = nextPollDelay(pollState, Date.now(), state.pollObserved, pollConfig);
+    // Single-loop dynamic delay: fast cycle while recent ask activity, an
+    // active display or failures were observed, baseline otherwise, capped at
+    // the nearest pending token expiry so a `done` row reaches `idle` on
+    // time. No setInterval, no busy loop (delays floored at POLL_MIN_MS via
+    // resolvePollConfig and capDelayToExpiry). The sleep is interruptible: a
+    // coalesced refresh request — from a lifecycle hook or from the producer
+    // after every landed token report — or a `pane.updated` burst on the event
+    // subscription breaks the wait early for one immediate frame, never sooner
+    // than POLL_MIN_MS after the frame that started it. Both marks are consumed
+    // together, so a report and an event landing in the same window still draw
+    // one frame. Sequential — the next frame never overlaps the current one;
+    // concurrent requests collapse to one.
+    const now = Date.now();
+    const delay = nextPollDelay(pollState, now, state.pollObserved, pollConfig);
+    const sleepMs = capDelayToExpiry(delay, state.nearestExpiry, now);
+    // Slice accounting stays whole slices to a deadline, so the sleep can only
+    // be shortened by a coalesced refresh request, never extended.
+    const deadline = now + sleepMs;
     const sliceMs = 250;
-    let remaining = delay;
-    while (remaining > 0 && !stopped) {
-      if (takeRefresh()) break;
-      await new Promise((resolve) => setTimeout(resolve, Math.min(sliceMs, remaining)));
-      remaining -= sliceMs;
+    while (!stopped) {
+      const at = Date.now();
+      const left = deadline - at;
+      if (left <= 0) break;
+      const gateMs = refreshGateMs(frameStartedAt, at);
+      if (gateMs === 0) {
+        const requested = takeRefresh();
+        const scanRequested = takeGsScanRequest();
+        if (scanRequested) state.gs.scanPending = true;
+        if (takeEventWake() || requested || scanRequested) break;
+      }
+      const slice = Math.min(sliceMs, left);
+      await new Promise((resolve) => setTimeout(resolve, gateMs > 0 ? Math.min(slice, gateMs) : slice));
     }
   }
 }
@@ -913,6 +1581,7 @@ async function main() {
       console.error('gentle-status: cannot request refresh');
       process.exit(1);
     }
+    requestGsScan();
     return;
   }
   if (mode === '--stop') {
@@ -978,6 +1647,23 @@ if (require.main === module) {
     createPollState,
     createPollStateObserved,
     nextPollDelay,
+    observeDisplay,
+    capDelayToExpiry,
+    refreshGateMs,
+    requestRefresh,
+    takeRefresh,
+    requestGsScan,
+    takeGsScanRequest,
     readSidebarMode,
+    nextSubscribeDelayMs,
+    startEventSubscription,
+    eventKindOf,
+    EVENT_SUBSCRIPTIONS,
+    SUBSCRIBE_BACKOFF_CAP_MS,
+    SUBSCRIBE_STABLE_MS,
+    GS_SCAN_EVENT_KINDS,
+    createGsState,
+    gsBeat,
+    scanGsPanes,
   };
 }

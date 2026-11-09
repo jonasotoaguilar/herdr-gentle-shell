@@ -698,11 +698,13 @@ const BEAT_MS = 15000;
 // `<hash>:<expiry>` token per finish at the settled-and-empty edge, carrying
 // the hold as its absolute expiry. The sidebar reads it as `done` while it is
 // fresh and recedes to `idle` once it expires — the delay IS that expiry, so
-// no timer and no extra idle hold exists. The hold defaults to 60 s and is
-// overridden through GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min]; the
-// consumer rejects any expiry beyond the same ceiling.
+// no timer and no extra idle hold exists. The hold is short on purpose (5 s):
+// it exists to make a finish visible, never to pin a settled row, so `idle`
+// follows the finish within seconds. Overridden through
+// GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min]; the consumer rejects any
+// expiry beyond the same ceiling.
 const DONE_TOKEN = "gentle_done_v1";
-const DONE_HOLD_MS = 60000;
+const DONE_HOLD_MS = 5000;
 const DONE_HOLD_MIN_MS = 1000;
 export const DONE_HOLD_MAX_MS = 300000;
 const DONE_HOLD_ENV = "GENTLE_HERDR_DONE_HOLD_MS";
@@ -852,7 +854,7 @@ function utf8Bytes(value) {
   return Buffer.byteLength(value, "utf8");
 }
 
-// Finish-hold override: an absent or unparseable value keeps the 60 s
+// Finish-hold override: an absent or unparseable value keeps the 5 s
 // default, and anything outside the ceiling is clamped, so the producer can
 // never publish an expiry the consumer reads as foreign.
 export function doneHoldMs(raw = process.env[DONE_HOLD_ENV]) {
@@ -1563,6 +1565,30 @@ function sidebarEffectiveDir() {
     // Fall through to the injected dir on unexpected failure.
   }
   return injected;
+}
+
+// Status-refresh request file, owned by the consumer daemon: a single
+// timestamp that `bin/gentle-status.js --refresh` also writes. Reading it (not
+// spawning) is the whole point — the daemon loop deletes it and draws one
+// frame, so N beats in one window collapse into one wake and this extension
+// never renders a frame, never writes a pidfile, and never starts a second
+// writer loop (DESIGN §8, §10 U2).
+const STATUS_REFRESH_FILE = "gentle-status.refresh";
+
+// Event-synchronized drawing: the daemon CANNOT see a report as it lands — it
+// polls the Herdr snapshot — so without this request a state change stays
+// invisible for up to one whole baseline poll, which is the sidebar lag. Every
+// landed beat therefore requests the daemon's coalesced refresh: the drawing
+// follows the report, and polling stays pure fallback. Best effort by design:
+// a missing state dir or a read-only filesystem degrades to polling only.
+function requestStatusRefresh() {
+  if (!enabled()) return false;
+  try {
+    fs.writeFileSync(join(sidebarEffectiveDir(), STATUS_REFRESH_FILE), String(Date.now()), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Optional Moshi notification mirror (DESIGN §7): one flag file, read per
@@ -3386,6 +3412,9 @@ export default function (pi) {
     try {
       const ok = await sendTokens(tokens);
       if (ok) {
+        // One coalesced wake per landed beat, after the tokens are in Herdr
+        // (a request written first could render a frame over stale tokens).
+        requestStatusRefresh();
         if (donePending) {
           donePending = false;
           emitFinish();

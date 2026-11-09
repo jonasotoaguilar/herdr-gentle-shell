@@ -28,9 +28,14 @@ explicitly in §10 and are not decided here.
   per-pane key=value tokens via `pane.report_metadata` /
   `workspace.report_metadata` over `HERDR_SOCKET_PATH`, with a CLI fallback
   (`herdr pane report-metadata <pane> --source <src> --token name=value`).
-- The consumer is a poller, not a subscriber: the plugin daemon reads the
-  Herdr snapshot on a cadence and reduces pane tokens to sidebar state.
-  No new socket, webhook, broker, or persistent connection is introduced.
+- The consumer polls the Herdr snapshot and reduces pane tokens to sidebar
+  state. Drawing is subscription-driven: the daemon also holds ONE long-lived
+  socket `events.subscribe` for `pane.updated` (plus the roster kinds), which
+  only marks a dirty flag and wakes the existing sleep, so a landed token
+  report is drawn without waiting for the poll. Polling stays the fallback and
+  remains authoritative for everything no Herdr event can drive (§8). No new
+  socket, webhook, broker, or dependency is introduced: this is the existing
+  plugin socket, used read-only.
 - The existing native producer `herdr-agent-state.ts` (managed-by-herdr, v9,
   source `herdr:pi`) already reports main-agent `working`/`blocked`/`idle` +
   session ref. It is **read-only evidence**: never edited, reinstalled, or
@@ -39,7 +44,9 @@ explicitly in §10 and are not decided here.
 ### Style choice and reason
 
 - Style: **polled token sidecar** (same style as `herdr-pi-tree`): short-TTL
-  `name=value` tokens on the pane, reduced by a snapshot poller.
+  `name=value` tokens on the pane, reduced by a snapshot poller, with one
+  `events.subscribe` wake so the drawing follows the report instead of the
+  clock (§8).
 - Reason (smallest fitting style): the transport, snapshot source, 16-token
   budget, TTL/expiry convention, and sidebar token-name mapping already exist
   and are deployed. A new push channel (SSE/WebSocket/webhook) or a new RPC
@@ -328,11 +335,14 @@ gentle_done_v1        = sessionHash ":" expiry
                     ; republished with the SAME expiry (never refreshed) until
                     ; it lapses; null (clear) whenever work reappears or the
                     ; session resets. Its expiry IS the done hold: default
-                    ; 60 s, overridden by GENTLE_HERDR_DONE_HOLD_MS clamped to
-                    ; [1000, 300000], and the consumer accepts no expiry beyond
-                    ; now+300000 at read (the only token whose ceiling is not
-                    ; the 60 s TTL). A session that never worked never mints
-                    ; one.
+                    ; 5 s (short on purpose — the hold only makes a finish
+                    ; visible, it never pins a settled row, so `idle` follows
+                    ; within seconds), overridden by
+                    ; GENTLE_HERDR_DONE_HOLD_MS clamped to [1000, 300000], and
+                    ; the consumer accepts no expiry beyond now+300000 at read
+                    ; (the only token whose ceiling is not the 60 s TTL). The
+                    ; daemon also caps its next sleep at that expiry (§8). A
+                    ; session that never worked never mints one.
 gentle_ask_v1         = sessionHash ":" intentId ":" expiry
                     ; durable ask signal, session-bound + TTL-fresh like
                     ; gentle_orchestrating_v1 — emitted on every beat while
@@ -600,6 +610,84 @@ A signal is *fresh* iff its token parses (§4.3) and `expiry > now`. Stale or
 unparseable signals are dropped individually (one bad token never poisons the
 other two). All gentle signals stale/missing → `idle` (native fallback, O5).
 
+### 5.5 `gs`: the label for an isolated Gentle Shell pane
+
+Herdr identifies an agent from the pane's foreground process group, and its
+canonical aliases include `pi` and `gentle-shell` but never `gs`; a path prefix
+is never consulted. An isolated Gentle Shell pane therefore has no Agents row
+of its own unless this plugin supplies a label, which is why the label follows
+a strict ladder that never lies about who owns the pane:
+
+**Which panes belong to an isolated install.** The verified installation shape
+is a user install under the XDG data dir — `<data>/gentle-shell/install`
+(`$XDG_DATA_HOME/gentle-shell/install`, else
+`~/.local/share/gentle-shell/install`), anchored by
+`install/installation.json` (`gentle-shell-user-install/v1`, `Mode:
+"separate"`), whose launcher starts the pane as `node
+<root>/runtime/<channel>/bin/gentle-shell.mjs`. Qualification uses the same
+input Herdr's detection reads, in this order:
+
+- **Primary — the foreground process group.** A pane qualifies when any member
+  of its foreground process group exposes an argv / `argv0` / cmdline path that
+  resolves at or under the install root (a relative script path resolves
+  against that process's own cwd). This is what real panes look like: the
+  isolated pane is launched from the user's PROJECT directory, so its cwd is
+  never inside the install. A readable group with no install member is an
+  authoritative "no" — a cwd inside the root cannot override it.
+- **Secondary — cwd.** Only when the group cannot be read at all (no
+  `pane.process-info` answer) does `cwd` / `foreground_cwd` at or under the root
+decide, and an unreadable group never throws and never logs more than one
+  bounded line.
+
+The root resolves from `GENTLE_SHELL_INSTALL_ROOT`, else the launcher's
+`GENTLE_SHELL_HOME`, else the XDG data dir default. Windows keeps its own user
+data dir (mirroring Herdr's `LOCALAPPDATA` state-dir convention) but is
+unverified, which is why the manifest ships linux-only.
+
+1. **Detection first: display agent only.** A qualifying pane Herdr already
+   detects keeps Herdr's own truthful identity and live state. The plugin only
+   reports `--display-agent gs` through `pane.report-metadata`, which is
+   presentation-only and changes nothing about the state Herdr publishes.
+2. **Reported label as the last resort.** A qualifying pane Herdr does not
+   detect gets `pane report-agent --agent gs --state idle --source
+   plugin:<plugin-id>:gs`, because a row exists only for an agent terminal and
+   an undetected pane is not one. This is the only case in which the plugin
+   states an agent identity, and it states `gs` — never `pi`.
+3. **The report is reversible, never a mask.** Detection is a function of the
+   pane's foreground process group, so an unchanged group owes no re-check
+   while a changed one means a real agent may now be present. On that change the
+   plugin releases exactly its own authority (`pane release-agent`, same
+   source, label `gs`) and re-decides, keeping the display label: `gs` never
+   masks a real `pi` / `gentle-shell` detection for longer than one beat.
+4. **Release on the way out.** `pane.exited` / `pane.closed`, a pane that
+   leaves the qualifying set, a disabled sidebar, and daemon shutdown all clear
+   what this plugin reported — authority first, then the display label.
+   Authority this plugin did not set is never touched: both the source and the
+   label are part of every release.
+
+`gs` is not a canonical Herdr agent, so `rows_by_agent.gs` is a configuration
+error rather than an inert key: `rows_by_agent` stays keyed by a canonical
+agent (`pi`), and `gs` exists only as a label.
+
+Discovery — one bounded `pane list` read plus one `pane.process-info` per pane
+(the read qualification needs; capped, and a scan pays for no answer twice) —
+runs at daemon start, on an explicit `--refresh` (a separate request marker, so
+the producer's per-beat refresh never triggers one), and on a roster event
+(`pane.created`, `pane.closed`, `pane.moved`, `pane.exited`,
+`pane.agent_detected`); never per frame. The only per-frame call is the
+foreground re-check of a pane this plugin currently reports. Every write is
+deduped against what the plugin already reported, every interpolated value is
+checked against a strict identifier grammar before it reaches a fixed argv, and
+any failure (no `pane list`, a CLI error, a disabled sidebar, an unreadable mode
+flag) does nothing to the existing behavior and logs one bounded line per
+distinct reason.
+
+One thing this design cannot fix: the gs pane's own live state. Herdr reports
+state for an agent terminal it knows, and the isolated install does not forward
+`HERDR_ENV` to the pane's agent, so `gs` is a label on a row whose state is
+Herdr's own (`idle` in the reported fallback). Forwarding that environment is a
+gentle-ai concern and explicitly out of scope for this plugin.
+
 ## 6. Failure, retry, idempotency
 
 - Delivery is at-least-once snapshots over an unreliable beat: producer
@@ -791,11 +879,58 @@ exactly one mechanism writes each piece of state.
 - Poll cadence: resolved — must be ≪ 60 s TTL to avoid flapping
   (see §10 U2). The daemon runs an adaptive poll (10 s baseline,
   `GENTLE_STATUS_POLL_MS`-overridable, 2 s fast cycle
-  (`GENTLE_STATUS_FAST_POLL_MS`) while recent ask activity or send/publish
-  failures are observed, recovering after N quiet frames
+  (`GENTLE_STATUS_FAST_POLL_MS`) while recent ask activity, a rendered
+  non-idle display, or send/publish failures are observed, recovering after
+  N quiet frames
   (`GENTLE_STATUS_FAST_QUIET_FRAMES`) or a TTL-bounded window
   (`GENTLE_STATUS_FAST_WINDOW_MS`), 250 ms floor, single dynamic
-  `setTimeout` chain.
+  `setTimeout` chain. The active-display trigger exists because the row data
+  the daemon derives by itself — the `+N/-N` changes summary and the `↑N`
+  pull marker, read from local git plus `agent.list` — cannot be driven by a
+  producer report; only `idle` counts as settled, so an idle pane keeps the
+  baseline exactly.
+  Drawing is event-synchronized; polling is only the fallback. Every landed
+  producer beat requests the daemon's ONE coalesced refresh (the same request
+  file `--refresh` touches, §10 U2), so a report that changes state draws an
+  immediate frame instead of waiting for the next poll — the event lands on
+  time AND the drawing follows it. N reports in one window collapse into one
+  frame, and refresh-driven frames are floored at 250 ms after the frame that
+  started the sleep, so a report storm can never spin the loop.
+  The token path is also subscription-driven: the daemon holds exactly ONE
+  long-lived socket `events.subscribe` for `pane.updated` (plus the roster
+  kinds `pane.created`, `pane.closed`, `pane.moved`), because
+  `pane.report_metadata` bumps the pane revision and Herdr then emits
+  `pane.updated` with the full pane payload. Herdr repaints push-driven on that
+  write plus its metadata-TTL expiry, so a token write no longer waits for the
+  poll. An event does nothing but set ONE dirty flag and wake that
+  same sleep: the flag is consumed with the refresh request into a single
+  frame, so a burst collapses to one frame, there is no second frame loop, no
+  timer, no per-event frame, no queue (bounded memory is that one boolean) and
+  no frame sooner than the same `refreshGateMs`/`POLL_MIN_MS` floor. A
+  manifest `[[events]]` hook cannot do this and must not be tried again:
+  `pane.updated` is deliberately excluded from the 22-name hook surface
+  (`PLUGIN_HOOK_EVENT_KINDS`), and the runtime filter drops non-hook kinds, so
+  `on = "pane.updated"` in `herdr-plugin.toml` is inert. Reconnect is bounded
+  and single-flight: 1 s doubling to a 60 s cap, reset only after a connection
+  that stayed live 5 s, so a Herdr restart reconnects promptly while a server
+  that accepts and drops climbs to the cap instead of flapping. A rejected,
+  closed, or unanswered subscription logs one line per distinct reason and
+  changes nothing else — the poll below is unchanged and correct without it.
+  Shutdown closes the socket and its retry timer, and neither keeps the process
+  alive. Idle cost with no events is exactly today's: an idle subscription is
+  silent and the loop sleeps as before.
+  What the subscription can never drive stays poll-only: the row data the
+  daemon derives by itself — the `+N/-N` changes summary and the `↑N` pull
+  marker, read from local git plus `agent.list` — plus the presence prefix,
+  because Herdr emits no event for either. That is why the fast cycle is armed
+  by a rendered non-idle display, and why polling is never removed.
+  The sleep is also capped at the nearest live `gentle_done_v1` expiry among
+  the panes just rendered (never below the 250 ms floor), so a held `done`
+  row reaches `idle` when the hold lapses rather than up to one poll later.
+  A pending expiry may only SHORTEN the delay: with no pending expiry the
+  delay is exactly the adaptive value above, and an already-expired or
+  unparseable value falls to the floor (fail closed, like every parser)
+  rather than returning 0.
   The four lifecycle hooks (`pane.agent_detected`, `pane.agent_status_changed`,
   `pane.exited`, `pane.closed`) each run `node bin/gentle-status.js --refresh`
   (daemon ensure plus one coalesced immediate frame), not the cadence itself;
@@ -874,7 +1009,12 @@ exactly one mechanism writes each piece of state.
   — each invoke `node bin/gentle-status.js --refresh` (L6: daemon ensure
   plus one coalesced immediate frame, never a second writer loop), while
   `[[startup]]` (no args) remains the polling-daemon bootstrap and polling
-  remains the fallback for every lifecycle signal. `--once` keeps its
+  remains the fallback for every lifecycle signal. The producer extension is
+  the second requester of that same coalesced refresh — it requests one after
+  every landed token beat, so a status change it publishes is drawn at once
+  rather than at the next poll — and the daemon caps each sleep at the nearest
+  live `gentle_done_v1` expiry (§8), so `idle` does not wait for a poll either.
+  Neither requester renders a frame or writes tokens. `--once` keeps its
   existing one-frame public behavior for manual use and is not wired as a
   hook. Runtime proofs of the `--refresh` contract belong to the lifecycle
   unit's tests, not this protocol record.

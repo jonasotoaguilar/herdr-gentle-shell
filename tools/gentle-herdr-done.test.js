@@ -367,7 +367,7 @@ test('the settle edge mints the finish token and notifies exactly once', async (
   assert.match(value, /^[A-Za-z0-9_-]{43}:\d+$/, 'the finish token is session-bound with an expiry');
   const expiry = Number(value.split(':')[1]);
   assert.ok(expiry > Date.now(), 'the finish hold is still in the future');
-  assert.ok(expiry <= Date.now() + 60000 + 1000, 'the hold defaults to 60 s');
+  assert.ok(expiry <= Date.now() + 5000 + 1000, 'the hold defaults to 5 s');
 
   await settle(700);
   assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification for one finish');
@@ -390,9 +390,9 @@ test('the finish hold is overridable and its expiry clears the token', async () 
   await listening;
   const { module, paneId } = await loadRuntime();
   assert.equal(typeof module.doneHoldMs, 'function');
-  assert.equal(module.doneHoldMs(undefined), 60000, 'default hold is 60 s');
+  assert.equal(module.doneHoldMs(undefined), 5000, 'default hold is 5 s');
   assert.equal(module.doneHoldMs('1500'), 1500, 'the hold is overridable');
-  assert.equal(module.doneHoldMs('nonsense'), 60000, 'an unparseable override keeps the default');
+  assert.equal(module.doneHoldMs('nonsense'), 5000, 'an unparseable override keeps the default');
   assert.equal(module.doneHoldMs('0'), 1000, 'clamped up to the floor');
   assert.equal(module.doneHoldMs('99999999'), module.DONE_HOLD_MAX_MS, 'clamped down to the ceiling');
 
@@ -420,6 +420,38 @@ test('the finish hold is overridable and its expiry clears the token', async () 
     if (previous === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
     else process.env.GENTLE_HERDR_DONE_HOLD_MS = previous;
   }
+});
+
+test('a landed beat requests the daemon coalesced refresh, never a second writer', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  const refreshFile = path.join(stateDir, 'gentle-status.refresh');
+  fs.rmSync(refreshFile, { force: true });
+
+  assert.equal(fs.existsSync(refreshFile), false, 'no request exists before a beat lands');
+  const from = cursor(paneId);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  const first = await waitFrom(paneId, from, (f) => f?.method === 'pane.report_metadata');
+  assert.ok(first, 'the beat landed');
+  assert.ok(fs.existsSync(refreshFile), 'a landed report requests one daemon refresh');
+  const body = fs.readFileSync(refreshFile, 'utf8');
+  assert.match(body, /^\d+$/, 'the request carries a timestamp only, never tokens or pane data');
+
+  // A second beat overwrites the SAME request instead of queueing a second
+  // one: N reports in one window collapse into one wake.
+  const before = Number(body);
+  const secondFrom = cursor(paneId);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  const second = await waitFrom(paneId, secondFrom, (f) => f?.method === 'pane.report_metadata');
+  assert.ok(second, 'the second beat landed');
+  const queued = fs.readdirSync(stateDir).filter((name) => name === 'gentle-status.refresh');
+  assert.equal(queued.length, 1, 'one request file, never a second wake queue');
+  assert.ok(
+    Number(fs.readFileSync(refreshFile, 'utf8')) >= before,
+    'the surviving request carries the newest timestamp',
+  );
 });
 
 test('the producer hold ceiling and the consumer freshness ceiling agree', async () => {

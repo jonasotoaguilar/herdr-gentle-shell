@@ -309,6 +309,147 @@ describe('adaptive poll (P1)', () => {
     const source = fs.readFileSync(DAEMON, 'utf8');
     assert.ok(!/setInterval\s*\(/.test(source), 'daemon must not use setInterval');
   });
+
+  // The `done` display IS a token expiry (§4.3), so a sleep that runs past it
+  // keeps a settled row on `done` for up to one whole poll after the hold
+  // lapsed. The cap can only shorten a delay.
+  it('an expiry-aware wakeup shortens the delay to the nearest expiry, floored', () => {
+    const now = 4000000;
+    assert.equal(daemon.capDelayToExpiry(10000, now + 1500, now), 1500, 'a pending expiry shortens the sleep');
+    assert.equal(daemon.capDelayToExpiry(10000, now - 5000, now), 250, 'an already-past expiry falls to the floor');
+    assert.equal(daemon.capDelayToExpiry(10000, now + 100, now), 250, 'an expiry inside the floor falls to the floor');
+    assert.equal(daemon.capDelayToExpiry(2000, now + 60000, now), 2000, 'a distant expiry never lengthens the delay');
+    assert.equal(daemon.capDelayToExpiry(250, now + 100, now), 250, 'the floor never raises the delay it was given');
+    assert.equal(daemon.capDelayToExpiry(10000, null, now), 10000, 'no pending expiry keeps the delay exactly');
+    assert.equal(daemon.capDelayToExpiry(10000, undefined, now), 10000, 'an absent expiry keeps the delay exactly');
+    assert.equal(daemon.capDelayToExpiry(10000, Number.NaN, now), 10000, 'an unparseable expiry keeps the delay exactly');
+  });
+
+  // A token report lands in Herdr, not in this loop: the producer requests the
+  // daemon's one coalesced refresh (the same file `--refresh` touches) so the
+  // frame follows the report instead of the poll.
+  it('a report request wakes one coalesced frame, floored at POLL_MIN_MS', () => {
+    const previous = process.env.GENTLE_STATUS_STATE_DIR;
+    process.env.GENTLE_STATUS_STATE_DIR = sandbox.stateDir;
+    try {
+      assert.equal(daemon.takeRefresh(), false, 'a quiet sleep carries no request');
+      assert.equal(daemon.requestRefresh(), true, 'a landed report requests a wake');
+      assert.equal(
+        daemon.refreshGateMs(Date.now(), Date.now()),
+        daemon.POLL_MIN_MS,
+        'a wake waits out the floor after the frame that started the sleep',
+      );
+      assert.equal(
+        daemon.refreshGateMs(Date.now() + 1000, Date.now()),
+        daemon.POLL_MIN_MS,
+        'clock skew never widens the gate past the floor',
+      );
+      assert.equal(
+        daemon.refreshGateMs(Date.now() - daemon.POLL_MIN_MS, Date.now()),
+        0,
+        'past the floor the wake is immediate',
+      );
+      assert.equal(daemon.takeRefresh(), true, 'the request breaks the sleep once');
+      assert.equal(daemon.takeRefresh(), false, 'the same request never breaks a second frame');
+
+      daemon.requestRefresh();
+      daemon.requestRefresh();
+      assert.equal(daemon.takeRefresh(), true, 'two reports in one tick collapse into one frame');
+      assert.equal(daemon.takeRefresh(), false, 'and leave nothing queued behind');
+
+      const config = daemon.resolvePollConfig({});
+      assert.equal(
+        daemon.capDelayToExpiry(config.baselineMs, null, Date.now()),
+        config.baselineMs,
+        'with no request and no pending expiry the delay is exactly the baseline',
+      );
+    } finally {
+      if (previous === undefined) delete process.env.GENTLE_STATUS_STATE_DIR;
+      else process.env.GENTLE_STATUS_STATE_DIR = previous;
+    }
+  });
+
+  // S4: the row data this daemon derives by itself (the `+N/-N` changes
+  // summary and the `↑N` pull marker) is read from local git plus
+  // `agent.list`, so no producer report can drive it. Any display other than
+  // the settled `idle` therefore keeps the fast cycle armed on its own.
+  it('an active display arms the fast cycle', () => {
+    const config = daemon.resolvePollConfig({});
+    const t0 = 5000000;
+    assert.equal(
+      daemon.nextPollDelay(daemon.createPollState(), t0, { active: true, askActivity: false, failure: false }, config),
+      2000,
+      'a rendered non-idle display polls at the fast cycle',
+    );
+    // One classification, taken from the contract's own display list: only
+    // `idle` is settled, and a pane with no usable display counts as settled
+    // (fail closed to today's baseline).
+    const observed = daemon.createPollStateObserved();
+    assert.equal(daemon.observeDisplay(observed, 'idle'), false, 'idle is not an active display');
+    assert.equal(observed.active, false, 'idle never arms the window');
+    for (const display of contract.DISPLAYS) {
+      if (display === 'idle') continue;
+      assert.equal(daemon.observeDisplay(observed, display), true, `${display} is active`);
+    }
+    assert.equal(observed.active, true, 'every non-idle display arms the window');
+    for (const unknown of [undefined, null, '', 42]) {
+      const empty = daemon.createPollStateObserved();
+      assert.equal(daemon.observeDisplay(empty, unknown), false, `${String(unknown)} is not an active display`);
+      assert.equal(empty.active, false, `${String(unknown)} never arms the window`);
+    }
+  });
+
+  it('all-idle frames keep the baseline and still recover after quiet frames', () => {
+    const config = daemon.resolvePollConfig({ GENTLE_STATUS_FAST_QUIET_FRAMES: '3' });
+    const t0 = 6000000;
+    const poll = daemon.createPollState();
+    assert.equal(
+      daemon.nextPollDelay(poll, t0, { active: false, askActivity: false, failure: false }, config),
+      10000,
+      'a cold all-idle frame keeps the baseline exactly',
+    );
+    assert.equal(daemon.nextPollDelay(poll, t0 + 2000, { active: true }, config), 2000, 'an active frame arms');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 4000, { active: false }, config), 2000, 'quiet frame 1');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 6000, { active: false }, config), 2000, 'quiet frame 2');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 8000, { active: false }, config), 10000, 'quiet frame 3 recovers');
+    assert.equal(
+      daemon.nextPollDelay(poll, t0 + 28000, { active: false }, config),
+      10000,
+      'and the loop stays at the baseline afterwards',
+    );
+  });
+
+  it('the active fast cycle composes with the expiry cap: the shorter delay wins', () => {
+    const config = daemon.resolvePollConfig({});
+    const t0 = 7000000;
+    const fast = daemon.nextPollDelay(daemon.createPollState(), t0, { active: true }, config);
+    assert.equal(fast, 2000, 'the active frame polls at the fast cycle');
+    assert.equal(
+      daemon.capDelayToExpiry(fast, t0 + 1500, t0),
+      1500,
+      'a nearer done expiry shortens the active fast delay',
+    );
+    assert.equal(
+      daemon.capDelayToExpiry(fast, t0 + 60000, t0),
+      2000,
+      'a distant expiry leaves the active fast delay exactly',
+    );
+  });
+
+  it('clearing the active display recovers to baseline without a new timer', () => {
+    const config = daemon.resolvePollConfig({ GENTLE_STATUS_FAST_QUIET_FRAMES: '3' });
+    const t0 = 8000000;
+    const poll = daemon.createPollState();
+    assert.equal(daemon.nextPollDelay(poll, t0, { active: true }, config), 2000);
+    assert.deepEqual(
+      Object.keys(poll).sort(),
+      ['fastUntil', 'quietFrames'],
+      'recovery reuses the one poll state: no second timer and no separate decay',
+    );
+    assert.equal(daemon.nextPollDelay(poll, t0 + 2000, { active: false }, config), 2000, 'still fast on the first quiet frame');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 4000, { active: false }, config), 2000, 'still fast on the second');
+    assert.equal(daemon.nextPollDelay(poll, t0 + 6000, { active: false }, config), 10000, 'back to baseline on the third');
+  });
 });
 
 

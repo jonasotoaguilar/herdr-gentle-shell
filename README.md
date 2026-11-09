@@ -215,6 +215,10 @@ encoding), so row 2 shows the current state word plus any nonempty change
 segments while the rest render empty; native separators on row 2 are
 acceptable. Row 1 holds 3 native cells and row 2 holds 14 cells (11 state
 + 3 changes), each within Herdr's 16-token per-row ceiling (full block below).
+The `gs` label of an isolated Gentle Shell pane needs no key here: `gs` is not
+one of Herdr's canonical agents, so `rows_by_agent.gs` is a configuration error
+rather than an inert key. Only the daemon's label ladder (DESIGN.md §5.5)
+makes that row appear, and `rows_by_agent` stays keyed by the canonical `pi`.
 
 ```toml
 # BEGIN herdr-gentle-agents (managed; do not edit)
@@ -310,13 +314,25 @@ and TTL discipline as `herdr-pi-tree`, new token names, no new socket or
 webhook. `[[startup]] node bin/gentle-status.js` (no args) is the polling-daemon
 bootstrap (ensures the adaptive poll daemon is running: 10 s baseline,
 `GENTLE_STATUS_POLL_MS`-overridable, with a 2 s fast cycle while recent ask
-activity or send/publish failures are observed); `[[events]] on =
-"pane.agent_detected"`, `pane.agent_status_changed`, `pane.exited`, and
+activity, a rendered non-idle display, or send/publish failures are observed);
+`[[events]] on = "pane.agent_detected"`, `pane.agent_status_changed`,
+`pane.exited`, and
 `pane.closed` each run `node bin/gentle-status.js --refresh`, which ensures the
 adaptive poll daemon is running and requests one coalesced immediate frame
 so a newly opened project name/state renders without waiting for the next
-poll tick. Polling stays the fallback for every lifecycle signal, so a missed
-or undelivered event never sticks. Read-only
+poll tick. Drawing follows the report, not the clock: the daemon also holds one
+long-lived `events.subscribe` for `pane.updated`, so a token write Herdr already
+repaints for wakes the same single frame loop (bounded reconnect, floored at
+250 ms, no second loop, no per-event frame), and the producer requests that same
+coalesced refresh after every landed token beat, so a status change
+it publishes is drawn at once, and the daemon caps each sleep at the nearest
+live `done` expiry, so a settled row reaches `idle` when its short hold (5 s by
+default, `GENTLE_HERDR_DONE_HOLD_MS`-overridable) lapses instead of one poll
+later. Reports in one window collapse into one frame, and refresh-driven frames
+are floored at 250 ms, so a burst can never spin the daemon. Polling stays the
+fallback for every lifecycle signal and the only source for what no Herdr event
+carries (the git-derived `+N/-N` and `↑N` row data and the presence prefix), so a
+missed, undelivered, or rejected event never sticks. Read-only
 supervision triage ships beside it: the `doctor` and `whois` plugin actions
 (`node bin/gentle-doctor.js`, `node bin/gentle-whois.js`) plus the explicit-pane
 `node bin/gentle-trace.js <pane-id>` CLI — all read-only, none mutating state.
@@ -354,6 +370,31 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   session model and never carried across sessions.
 - Single-writer coexistence with `herdr-pi-tree`: no shared token names, no
   dual-write, scoped sweep of own tokens on handover.
+- An isolated Gentle Shell pane gets a `gs` row in the Agents sidebar, and the
+  label never lies. Herdr identifies an agent from the pane's foreground
+  process group, whose canonical aliases are `pi` and `gentle-shell` — never
+  `gs` — so an isolated pane is detected only when its foreground group exposes
+  the gentle-shell process, and otherwise has no row at all. Qualification uses
+  that same input first: a pane belongs to the isolated install when a member of
+  its foreground process group exposes an argv/`argv0`/cmdline path under
+  `$XDG_DATA_HOME/gentle-shell/install` (else
+  `~/.local/share/gentle-shell/install`, anchored by `install/installation.json`)
+  — a real pane is launched from the user's project directory, so its cwd is
+  never the install, and cwd is only the fallback for an unreadable group. When
+  Herdr detects the pane, the daemon keeps Herdr's truthful identity and state
+  and only reports the presentation-only `--display-agent gs` label; when Herdr
+  detects nothing, it reports `pane report-agent --agent gs --state idle` from a
+  stable per-session source (`plugin:<plugin-id>:gs`) so the row exists at all.
+  That reported label is the last resort and is reversible: a changed foreground
+  group (the only thing that can make a new detection appear) releases exactly
+  this plugin's authority and re-decides within one beat, and `pane.exited` /
+  `pane.closed`, a pane leaving the install, a disabled sidebar, and daemon
+  shutdown all release it too. Discovery is one bounded `pane list` read plus
+  one `pane.process-info` per pane at start, on an explicit `--refresh`, and on
+  roster events — never per frame; writes are deduped, and a failure does
+  nothing and logs one line per reason. The gs pane's own live state stays
+  unobservable until the isolated install forwards `HERDR_ENV` to its agent (a
+  gentle-ai concern, out of scope here).
 - Gentle mode is enabled by default: while selected, this extension is the single publisher of native `pane.report_agent` (`working`/`blocked`/`idle`) alongside its metadata beats, with session path-or-id binding, monotonic seq, and a serial latest-wins coalesced queue. Parity contract: `working` carries the specific working role in the message (oldest running role word — known short word, unknown sanitized name, or `gentle` with no delegation; never bare generic `working`; machine keys unchanged); terminal `idle` fires only on a truly empty settle (principal settled plus zero running/queued plus zero pending plus zero live background jobs plus no human-wait prompt; settle-with-delegates/pending/jobs stays `working`, emitted once). Live background jobs (`bash_background` / `monitor`) are read from Gentle Shell's session-scoped `gentle-ai:jobs-sidebar` bus event, so waiting on a CI run or a long command keeps the row on `gentle` and never reaches `done`; `blocked` fires only for a real error or an actual human-wait intervention leg with its label (review/RDD execution stays `working`, silent). The native status keeps its aggregate meaning — it reads `working` while any delegate runs — while the sidebar row's working-vs-idle decision reads the principal-only `gentle_principal_v1` marker, so an idle principal with a running delegate shows the delegate role word instead of `gentle`. Our code never emits `done`/`finished` native states or a Herdr notification (the opt-in Moshi replacement below is a separate, off-by-default channel): the host owns finished text on `done`, `blocked`/unknown presentation, sound, and all desktop attention toasts (ask + finish) — there is no consumer toast path left to dedup. Single publisher by design: the managed native extension file stays on disk and is excluded through an ownership-bound Pi settings entry while Gentle mode is selected. `node bin/gentle-sidebar.js disable` removes only our owned exclusion and managed rows, gates our producer/daemon, and hands the sidebar back to the native publisher (running Pi sessions need `/reload`); never run both publishers on the same pane. Limits (unverified, host-owned): the host `idle`→`done`→`finished` mapping and unknown-state handling are owned by Herdr.
 - Sidebar switch (`enable` / `disable` / `status` / `toggle`):
   `node bin/gentle-sidebar.js <verb>` picks between this plugin's sidebar rows
