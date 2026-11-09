@@ -1932,6 +1932,11 @@ const CUSTOMIZE_OVERLAY_OPTIONS = {
   overlay: true,
   overlayOptions: { anchor: "center", width: "70%", minWidth: 60, maxHeight: "85%" },
 };
+// The overlay caps its own box at `maxHeight` of the terminal, so the panel's
+// row budget is that box and never the whole terminal: a card taller than the
+// box is clipped by the host, and the pointer would then hit-test rows the user
+// cannot see (the reported "the switch never changes" bug).
+const CUSTOMIZE_OVERLAY_MAX_HEIGHT = 0.85;
 let customizeTuiLoader = () => import("@earendil-works/pi-tui");
 
 export function setCustomizeTuiLoader(loader) {
@@ -2449,7 +2454,10 @@ async function executeCustomize(rawArgs, ctx) {
             theme,
             rowsAvailable: () => {
               try {
-                return hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+                const rows = hostTui && hostTui.terminal ? hostTui.terminal.rows : undefined;
+                return Number.isFinite(rows)
+                  ? Math.floor(rows * CUSTOMIZE_OVERLAY_MAX_HEIGHT)
+                  : undefined;
               } catch {
                 return undefined;
               }

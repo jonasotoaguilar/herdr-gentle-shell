@@ -16,8 +16,13 @@
 //   as the `Moshi notifications` category;
 // - category and value navigation (↑/↓ or j/k, ←/→ or Tab) without finishing;
 // - Enter resolving the focused row and Esc resolving null;
-// - mouse hits: a category click selects, a row click applies, anything outside
-//   the panes is ignored and a press alone applies nothing;
+// - mouse hits: a category click selects, a row click applies, a hover only
+//   moves the focus, anything outside the panes is ignored and a press alone
+//   applies nothing; the hit test reads the frame the panel actually rendered,
+//   so a box the host clipped shorter never turns a legal click into a no-op;
+// - the one-line description of the focused setting above the legend, which
+//   follows the focus and costs no width;
+// - a legend that names only keys: `Click` is gone;
 // - the key-release guard, the narrow single-pane fallback, the unknown note,
 //   short-terminal clipping and a hostile theme degrading to plain text.
 
@@ -38,7 +43,15 @@ const stubTui = {
   isKeyRelease: (key) => key === 'release',
 };
 
-const FOOTER = 'Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close';
+const FOOTER = '←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close';
+
+// A theme that answers `bg`, so the focus band (the active pane's marker) is
+// observable as text instead of a terminal colour.
+const bandTheme = {
+  fg: (_role, text) => text,
+  bold: (text) => text,
+  bg: (_role, text) => `[${text}]`,
+};
 
 function makeHostTui() {
   const paints = [];
@@ -69,14 +82,18 @@ function seenAt(component, width) {
 
 // A pointer event on the rendered line that carries `needle`, at the column
 // where that needle starts — the way the host reports a local-frame click.
-function click(component, width, needle, { type = 'click', column } = {}) {
-  const lines = component.render(width);
+// `boxHeight` reproduces the overlay's own clipping: the host renders the card
+// and hands back only the rows that fit its box, so the reported height can be
+// shorter than the frame the panel computed for itself.
+function click(component, width, needle, { type = 'click', column, boxHeight } = {}) {
+  const rendered = component.render(width);
+  const lines = boxHeight === undefined ? rendered : rendered.slice(0, boxHeight);
   const y = lines.findIndex((line) => line.includes(needle));
   assert.ok(y >= 0, `no rendered line carries ${needle}`);
   const x = column === undefined ? lines[y].indexOf(needle) : column;
   return component.handleMouse({
     type,
-    button: 'left',
+    button: type === 'move' ? 'none' : 'left',
     x,
     y,
     width,
@@ -238,7 +255,101 @@ describe('customize panel render', () => {
   });
 });
 
+describe('customize panel focused description', () => {
+  test('describes the focused category on the line above the legend', () => {
+    const { component } = open();
+    const lines = component.render(100);
+    const legend = lines.findIndex((line) => line.includes('Enter apply'));
+    const described = lines.findIndex((line) => line.includes('Sidebar agent rows plus the Moshi notification channel.'));
+    assert.ok(legend > 0, 'the legend is rendered');
+    assert.ok(described >= 0, 'the focused category is described');
+    assert.equal(described, legend - 1, 'the description sits directly above the legend');
+    assert.ok(lines[described].includes('Herdr Sidebar'), 'the description names what it describes');
+  });
+
+  test('describes the focused setting and follows the focus', () => {
+    const { component } = open();
+    // The category list owns the focus first, so the card describes that category.
+    assert.ok(seenAt(component, 100).includes('Herdr Sidebar — Sidebar agent rows plus the Moshi notification channel.'));
+    component.handleInput('down');
+    const moshi = seenAt(component, 100);
+    assert.ok(moshi.includes('Moshi notifications — The Moshi notification channel this plugin owns.'));
+    assert.equal(moshi.includes('Sidebar agent rows plus the Moshi notification channel.'), false);
+    // The values pane describes the setting Enter would apply.
+    component.handleInput('right');
+    assert.ok(seenAt(component, 100).includes('Notifications — Replaces the Moshi hook with this plugin'));
+    // And the line follows the focus back to the other category's row.
+    component.handleInput('tab');
+    component.handleInput('up');
+    component.handleInput('tab');
+    assert.ok(seenAt(component, 100).includes('Sidebar agent rows — Hands the Herdr sidebar to this plugin'));
+  });
+
+  test('the description never widens or grows the card', () => {
+    for (const width of [60, 80, 100, 120]) {
+      const lines = open().component.render(width);
+      for (const line of lines) {
+        assert.equal([...line].length, width, `a line of the ${width}-column card is ${[...line].length} wide`);
+      }
+      assert.ok(lines.length <= 24, `the card stays within 24 rows at ${width} columns`);
+    }
+    // A description wider than the pane is clipped, never wrapped onto a new row.
+    const narrow = open().component.render(62);
+    const legend = narrow.findIndex((line) => line.includes('Enter apply'));
+    assert.ok(narrow[legend - 1].includes('Herdr Sidebar'), 'the clipped description still names its setting');
+  });
+});
+
+describe('customize panel legend', () => {
+  test('names the keys and never mentions Click', () => {
+    const { component } = open();
+    const lines = component.render(100);
+    const legend = lines.find((line) => line.includes('Enter apply'));
+    assert.ok(legend, 'the legend is rendered');
+    assert.equal(legend.slice(2, -2).trim(), FOOTER);
+    assert.equal(seenAt(component, 100).includes('Click'), false, 'the pointer needs no legend entry');
+  });
+
+  test('no width keeps a Click entry in the compact legend', () => {
+    for (const width of [40, 50, 62, 80, 100]) {
+      const { component } = open();
+      assert.equal(seenAt(component, width).includes('Click'), false, `Click survives at ${width} columns`);
+      assert.ok(seenAt(component, width).includes('Esc close'), `the close key survives at ${width} columns`);
+    }
+  });
+});
+
 describe('customize panel navigation', () => {
+  test('the row Enter applies is marked before any key is pressed', () => {
+    const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    const first = seenAt(component, 100);
+    assert.ok(first.includes('▸ Herdr Sidebar'), 'the category list owns the focus first');
+    assert.ok(first.includes('▸ Sidebar agent rows'), 'and the row Enter would apply is visible');
+    assert.equal(first.includes('▸ Notifications'), false, 'only the focused row carries the marker');
+    component.handleInput('enter');
+    assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' }, 'On toggles off');
+  });
+
+  test('arrows and Tab move the focus band between panes from the opening state', () => {
+    const { component, done } = open({ theme: bandTheme });
+    const opening = seenAt(component, 100);
+    assert.ok(opening.includes('[  Herdr Sidebar'), 'the category pane opens with the band on its cursor');
+    assert.equal(opening.includes('[  Sidebar agent rows'), false, 'the values pane is not active yet');
+    // ↓ moves inside the active pane: the category cursor, not a setting row.
+    component.handleInput('down');
+    assert.ok(seenAt(component, 100).includes('[  Moshi notifications'), 'the band follows the category cursor');
+    assert.equal(done(), 'pending');
+    // → hands the band to the values pane; ↑/↓ then move the setting row.
+    component.handleInput('right');
+    assert.equal(seenAt(component, 100).includes('[  Moshi notifications'), false, 'the category list gave the band up');
+    assert.ok(seenAt(component, 100).includes('[▸ Notifications'), 'the focused row carries the band');
+    component.handleInput('tab');
+    assert.ok(seenAt(component, 100).includes('[  Moshi notifications'), 'Tab returns to the categories');
+    component.handleInput('tab');
+    assert.ok(seenAt(component, 100).includes('[▸ Notifications'), 'Tab returns to the values');
+    component.handleInput('enter');
+    assert.deepEqual(done(), { categoryId: 'moshi', switchId: 'moshi', valueId: 'on' }, 'a stored Off toggles on');
+  });
   test('↓/j moves the category cursor and repaints without finishing', () => {
     const { component, host, done } = open();
     component.handleInput('down');
@@ -312,7 +423,7 @@ describe('customize panel mouse', () => {
   test('clicking a category selects it without finishing', () => {
     const { component, done } = open();
     const result = click(component, 100, 'Moshi notifications');
-    assert.deepEqual(result, { handled: true, render: true });
+    assert.deepEqual(result, { handled: true, render: true, focus: true });
     assert.ok(seenAt(component, 100).includes('▸ Moshi notifications'));
     assert.ok(seenAt(component, 100).includes('Moshi notifications · 1/1'));
     assert.equal(done(), 'pending', 'selecting a category is not applying a row');
@@ -328,7 +439,42 @@ describe('customize panel mouse', () => {
     assert.deepEqual(notifications.done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
   });
 
-  test('clicking outside the panes is ignored', () => {
+  test('a box the host clipped shorter never turns a legal click into a no-op', () => {
+    // The overlay is capped at 85% of the terminal while the panel budgets rows
+    // from the terminal height, so the host hands back a box shorter than the
+    // frame the panel computed for itself. The click must still land.
+    const row = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }), rowsAvailable: () => 20 });
+    assert.equal(row.component.render(100).length, 20, 'the panel fills the rows it was given');
+    const result = click(row.component, 100, 'Sidebar agent rows', { boxHeight: 17 });
+    assert.equal(result.handled, true, 'the click is handled');
+    assert.deepEqual(row.done(), { categoryId: 'sidebar', switchId: 'sidebar', valueId: 'off' });
+
+    const category = open({ rowsAvailable: () => 20 });
+    const selected = click(category.component, 100, 'Moshi notifications', { boxHeight: 17 });
+    assert.equal(selected.handled, true);
+    assert.ok(seenAt(category.component, 100).includes('▸ Moshi notifications'));
+    assert.equal(category.done(), 'pending', 'selecting a category is not applying a row');
+  });
+
+  test('an activating click hands the panel keyboard focus', () => {
+    const row = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    assert.equal(click(row.component, 100, 'Sidebar agent rows').focus, true);
+    const category = open();
+    assert.equal(click(category.component, 100, 'Moshi notifications').focus, true);
+  });
+
+  test('a hover moves the focus without applying anything', () => {
+    const { component, done } = open({ model: customizePanelModel({ sidebar: 'on', moshi: 'off' }) });
+    const moved = click(component, 100, 'Notifications', { type: 'move' });
+    assert.deepEqual(moved, { handled: true, render: true });
+    assert.ok(seenAt(component, 100).includes('▸ Notifications'), 'the hovered row takes the focus');
+    assert.ok(seenAt(component, 100).includes('Herdr Sidebar · 2/2'), 'and the heading follows the focus');
+    assert.equal(done(), 'pending', 'a hover never applies a switch');
+    // Hovering the row that already has the focus repaints nothing.
+    assert.deepEqual(click(component, 100, 'Notifications', { type: 'move' }), { handled: true, render: false });
+  });
+
+  test('a click outside the panes is ignored', () => {
     const { component, done } = open();
     const lines = component.render(100);
     const height = lines.length;
@@ -360,15 +506,14 @@ describe('customize panel mouse', () => {
     assert.deepEqual(done(), { categoryId: 'sidebar', switchId: 'moshi', valueId: 'on' });
   });
 
-  test('events that do not match the rendered frame are ignored', () => {
+  test('a click that misses every hit target is ignored', () => {
     const { component, done } = open();
     const lines = component.render(100);
     const y = lines.findIndex((line) => line.includes('Sidebar agent rows'));
     const x = lines[y].indexOf('Sidebar agent rows');
-    const base = { type: 'click', button: 'left', x, y, shift: false, alt: false, ctrl: false };
-    assert.equal(component.handleMouse({ ...base, width: 80, height: lines.length }), undefined);
-    assert.equal(component.handleMouse({ ...base, width: 100, height: lines.length + 4 }), undefined);
-    assert.equal(component.handleMouse({ ...base, width: 100, height: lines.length, button: 'right' }), undefined);
+    const base = { type: 'click', x, y, width: 100, height: lines.length, shift: false, alt: false, ctrl: false };
+    assert.equal(component.handleMouse({ ...base, button: 'right' }), undefined, 'only the left button acts');
+    assert.equal(component.handleMouse({ ...base, button: 'left', type: 'wheel' }), undefined, 'a wheel never applies');
     assert.equal(done(), 'pending');
   });
 });

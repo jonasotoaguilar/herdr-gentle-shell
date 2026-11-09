@@ -517,13 +517,58 @@ describe('floating customize panel', () => {
       'Notifications',
       '● Off',
       '○ On',
-      'Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close',
+      '←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close',
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }
+    assert.equal(seen.includes('Click'), false, 'the legend names keys only');
     for (const gone of ['Plugin tools', 'Worktree tools', 'Preview', 'Reset every option']) {
       assert.equal(seen.includes(gone), false, `removed section still rendered: ${gone}`);
     }
+  });
+
+  test('the panel budgets rows for the overlay box the host actually renders', async () => {
+    // The overlay is capped at 85% of the terminal. A panel that budgets the
+    // whole terminal renders a taller card, the host clips it, and every click
+    // lands on a frame height the panel never rendered — the reported bug.
+    const env = setupEnvironment('overlay-clipped-box');
+    fs.writeFileSync(env.configPath, '');
+    const host = { terminal: { rows: 20 }, requestRender() {} };
+    const observed = {};
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, host);
+        const rendered = component.render(100);
+        const box = rendered.slice(0, Math.floor(20 * 0.85));
+        observed.rendered = rendered.length;
+        observed.box = box.length;
+        const y = box.findIndex((line) => line.includes('Sidebar agent rows'));
+        observed.rowVisible = y >= 0;
+        const result = component.handleMouse({
+          type: 'click',
+          button: 'left',
+          x: y >= 0 ? box[y].indexOf('Sidebar agent rows') : 0,
+          y: y >= 0 ? y : 0,
+          width: 100,
+          height: box.length,
+          shift: false,
+          alt: false,
+          ctrl: false,
+        });
+        observed.result = result;
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.equal(observed.box, 17, 'the overlay box is 85% of a 20-row terminal');
+    assert.equal(observed.rendered, observed.box, 'the card already fits the overlay box');
+    assert.equal(observed.rowVisible, true, 'the first sidebar row is inside the box');
+    assert.equal(observed.result?.handled, true, 'the click on the rendered row is handled');
+    assert.deepEqual(noticeTexts(h), [
+      'Sidebar agent rows enabled; the managed block is in place and Herdr reloaded its config.',
+    ]);
   });
 
   test('movement repaints and writes nothing', async () => {
