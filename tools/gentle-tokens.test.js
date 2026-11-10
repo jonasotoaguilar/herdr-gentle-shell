@@ -1760,6 +1760,25 @@ describe('blocking pending delegate call decides the row', () => {
     assert.equal(tokens.reducePane(entry, NOW).label, 'gentle');
   });
 
+  // The producer once published a literal `subagent` sentinel as the pending
+  // role for a resume call (which carries no `agent`). That word is banned
+  // exactly like `working`: a foreign/legacy wire value must degrade to the
+  // generic display instead of rendering as the row label.
+  it('the subagent sentinel degrades to generic display, never the raw word', () => {
+    const pending = pendingEntry({ pending: 'subagent' });
+    const reducedPending = tokens.reducePane(pending.entry, NOW);
+    assert.equal(reducedPending.display, 'working');
+    assert.equal(reducedPending.label, 'gentle');
+    assert.notEqual(reducedPending.label, 'subagent');
+
+    for (const count of [0, 1]) {
+      const { entry } = roleEntry('subagent', { count });
+      const reducedRoles = tokens.reducePane(entry, NOW);
+      assert.equal(reducedRoles.display, 'working', `count ${count} falls through to generic activity`);
+      assert.equal(reducedRoles.label, 'gentle', `count ${count} never renders the sentinel`);
+    }
+  });
+
   it('error, ask, and review still outrank a fresh pending marker', () => {
     const error = pendingEntry({ pending: 'worker' });
     error.entry.tokens[tokens.ERROR_TOKEN] = `${error.hash}:run-failed:${EXPIRY}`;

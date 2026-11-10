@@ -4062,3 +4062,407 @@ test('a background launch ack and an unrecognized agent leave no lingering marke
     await stopWire(wire);
   }
 });
+
+// S1/S2/S3: a resume call (`subagent_continue`) carries no `agent` — only
+// `task_id`, `prompt`, `label`, `mode`. Falling back to a literal `subagent`
+// placeholder made that word a publishable role: `sanitizeAgentSlug` keeps it
+// and only `working` was banned, so the sidebar rendered `subagent` verbatim.
+// The child's agent lives on the tracked task record for the resumed task id;
+// with neither source there is no role evidence at all.
+function assertNoSubagentSentinel(tokens) {
+  for (const [name, value] of Object.entries(tokens)) {
+    if (typeof value !== 'string') continue;
+    assert.ok(!value.includes('subagent'), `${name} must never carry the subagent sentinel: ${value}`);
+  }
+}
+
+test('a resume launch resolves its role from the tracked task record', async () => {
+  const wire = await startT2bWire('test-pane-pending-resume');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-resume');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-resume', sessionFile);
+    // The original launch records the child's agent under the task id the
+    // resume names. A queued record supplies no role of its own, so the role
+    // below can only come from the pending hint.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-resume-1',
+      input: { agent: 'gentle-ai-worker', label: 'resume target' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-resume-1',
+      details: { gentleAgents: { taskId: 'rs1', agent: 'gentle-ai-worker', status: 'queued' } },
+    });
+    await new Promise((r) => setTimeout(r, 350));
+    const beforeResume = wire.received.length;
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-1',
+      input: { task_id: 'rs1', prompt: 'keep going', label: 'resume work' },
+    });
+    h.fire('agent_start', {});
+    const resumed = await wire.waitForFrom(
+      beforeResume,
+      (p) => typeof p.gentle_pending_v1 === 'string' && p.gentle_pending_v1.startsWith(`${paneHash}:worker:`),
+      5000,
+      'the resume pending marker carries the record agent role',
+    );
+    assert.ok(
+      typeof resumed.gentle_work_v1 === 'string' && resumed.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      'the queued record never counts as running',
+    );
+    assert.equal(resumed.gentle_roles_v1, 'worker', 'the resume hint merges the record role');
+    assert.equal(resumed.gentle_names_v1, null, 'the pending hint is role-only, never a name');
+    assertNoSubagentSentinel(resumed);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a resume launch with no record and no agent publishes no role hint', async () => {
+  const wire = await startT2bWire('test-pane-pending-unresolvable');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-unresolvable');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-unresolvable', sessionFile);
+    const beforeResume = wire.received.length;
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-2',
+      input: { task_id: 'missing-1', prompt: 'keep going', label: 'resume work' },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      beforeResume,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      5000,
+      'a beat after an unresolvable resume',
+    );
+    assert.equal(beat.gentle_pending_v1, null, 'no agent means no pending role');
+    assert.equal(beat.gentle_roles_v1, null, 'no role in the merged slice either');
+    assert.equal(beat.gentle_names_v1, null);
+    assert.equal(
+      typeof beat.gentle_orchestrating_v1,
+      'string',
+      'the in-flight launch still covers the row (blocking/orchestrating coverage is unchanged)',
+    );
+    assertNoSubagentSentinel(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('the subagent sentinel is never published as a role word', async () => {
+  const wire = await startT2bWire('test-pane-pending-sentinel');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-sentinel');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-sentinel', sessionFile);
+    const beforeSentinel = wire.received.length;
+    // An explicit `subagent` agent is banned exactly like the bare `working`
+    // word: no role, no name.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-sentinel-1',
+      input: { agent: 'subagent', label: 'placeholder' },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      beforeSentinel,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      5000,
+      'a beat after a sentinel-agent launch',
+    );
+    assert.equal(beat.gentle_pending_v1, null);
+    assert.equal(beat.gentle_roles_v1, null);
+    assert.equal(beat.gentle_names_v1, null);
+    assertNoSubagentSentinel(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a resume launch with an explicit agent maps exactly as before', async () => {
+  const wire = await startT2bWire('test-pane-pending-resume-explicit');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-resume-explicit');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-resume-explicit', sessionFile);
+    // The tracked record says worker; the explicit agent wins.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-resume-x1',
+      input: { agent: 'gentle-ai-worker', label: 'resume target' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-resume-x1',
+      details: { gentleAgents: { taskId: 'rx1', agent: 'gentle-ai-worker', status: 'queued' } },
+    });
+    await new Promise((r) => setTimeout(r, 350));
+    const beforeResume = wire.received.length;
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-x1',
+      input: { agent: 'gentle-ai-explore', task_id: 'rx1', prompt: 'keep going' },
+    });
+    h.fire('agent_start', {});
+    const resumed = await wire.waitForFrom(
+      beforeResume,
+      (p) => typeof p.gentle_pending_v1 === 'string' && p.gentle_pending_v1.startsWith(`${paneHash}:explorer:`),
+      5000,
+      'the explicit agent still decides the resume role',
+    );
+    assert.equal(resumed.gentle_roles_v1, 'explorer');
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+// --- no invented task identity -------------------------------------------
+// The launch-correlation placeholder `subagent` is banned as a ROLE word
+// (`agentToRole`), and it must never become a NAME either: a task record
+// carries an agent only when an observation or a previous record supplies
+// one. Two hazards share this path — the write sites used to invent the
+// literal `subagent` as the record's agent, and `namesCsv` handed both an
+// absent label and an absent agent to `sanitizeLabel`, which stringifies
+// whatever fallback it receives and therefore published `undefined`. A
+// record with no identity contributes no name and no role, but its active
+// status still counts.
+function assertNoPlaceholderNames(tokens) {
+  for (const [name, value] of Object.entries(tokens)) {
+    if (typeof value !== 'string') continue;
+    assert.ok(
+      !value.includes('subagent'),
+      `${name} must never carry the subagent placeholder: ${value}`,
+    );
+    assert.ok(
+      !value.includes('undefined'),
+      `${name} must never carry a stringified undefined: ${value}`,
+    );
+  }
+}
+
+test('a launch outcome with no agent counts but publishes no name', async () => {
+  const wire = await startT2bWire('test-pane-no-agent-task');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('no-agent-task');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-no-agent-task', sessionFile);
+    // taskId + status only, and no preceding tool_call that could carry an
+    // agent: neither the observation nor a previous record has an identity.
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-na-1',
+      details: { gentleAgents: { taskId: 'na1', status: 'running' } },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'a running record without an agent still counts',
+    );
+    assert.equal(beat.gentle_names_v1, null, 'no identity means no name, never a placeholder');
+    assert.equal(beat.gentle_roles_v1, null, 'no agent contributes no role');
+    assert.equal(beat.gentle_pending_v1, null);
+    assertNoPlaceholderNames(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a launch outcome whose pending call had no agent or label publishes no name', async () => {
+  const wire = await startT2bWire('test-pane-no-identity-task');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('no-identity-task');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-no-identity-task', sessionFile);
+    // The in-flight launch carries neither an agent nor a label, so the
+    // resolved record has no identity at all — the case where an absent
+    // fallback used to reach the wire as the string `undefined`.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-ni-1',
+      input: { prompt: 'keep going' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-ni-1',
+      details: { gentleAgents: { taskId: 'ni1', status: 'running' } },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'a running record with no identity still counts',
+    );
+    assert.equal(beat.gentle_names_v1, null, 'no entry may reach the names token');
+    assert.equal(beat.gentle_roles_v1, null);
+    assert.equal(beat.gentle_pending_v1, null);
+    assertNoPlaceholderNames(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a background lifecycle message with no agent counts but publishes no name', async () => {
+  const wire = await startT2bWire('test-pane-bg-no-agent');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('bg-no-agent');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-bg-no-agent', sessionFile);
+    // The background record path takes the same decision: an ACTIVE status
+    // without an agent enters the map with no identity instead of inventing
+    // the launch-correlation placeholder.
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'bna1', status: 'running' } },
+      },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'a background record without an agent still counts',
+    );
+    assert.equal(beat.gentle_names_v1, null, 'no identity means no name, never a placeholder');
+    assert.equal(beat.gentle_roles_v1, null, 'no agent contributes no role');
+    assertNoPlaceholderNames(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a tracked record with a label but no agent still publishes the label', async () => {
+  const wire = await startT2bWire('test-pane-label-only');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('label-only');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-label-only', sessionFile);
+    // Label first: a label survives with no agent at all, exactly as before.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-lo-1',
+      input: { label: 'label only work' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-lo-1',
+      details: { gentleAgents: { taskId: 'lo1', status: 'running' } },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'a labeled running record',
+    );
+    assert.equal(beat.gentle_names_v1, 'label only work');
+    assert.equal(beat.gentle_roles_v1, null);
+    assertNoPlaceholderNames(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('a tracked record with an agent but no label still publishes the agent', async () => {
+  const wire = await startT2bWire('test-pane-agent-only');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('agent-only');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-agent-only', sessionFile);
+    // Agent fallback: with no label the agent name is the published name and
+    // its role slug the published role, exactly as before.
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-ao-1',
+      details: { gentleAgents: { taskId: 'ao1', agent: 'gentle-ai-worker', status: 'running' } },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'an agent-only running record',
+    );
+    assert.equal(beat.gentle_names_v1, 'gentle-ai-worker');
+    assert.equal(beat.gentle_roles_v1, 'worker');
+    assertNoPlaceholderNames(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('an observation without an agent keeps the previous record agent', async () => {
+  const wire = await startT2bWire('test-pane-agent-precedence');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('agent-precedence');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-agent-precedence', sessionFile);
+    launchRunning(h, 'run-ap-1', 'ap1', 'gentle-ai-worker');
+    await new Promise((r) => setTimeout(r, 350));
+    const beforeReads = wire.received.length;
+    // A same-status progress read that omits the agent keeps the recorded one.
+    h.fire('tool_result', {
+      toolName: 'subagent_status',
+      toolCallId: 'status-ap-1',
+      details: { gentleAgents: { taskId: 'ap1', status: 'running' } },
+    });
+    // A stale non-final read is distrusted with its status AND its missing
+    // agent: the live record keeps both.
+    h.fire('tool_result', {
+      toolName: 'subagent_status',
+      toolCallId: 'status-ap-2',
+      details: { gentleAgents: { taskId: 'ap1', status: 'queued' } },
+    });
+    h.fire('agent_start', {});
+    const stable = await wire.waitForFrom(
+      beforeReads,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'the live record survives agent-less reads',
+    );
+    assert.equal(stable.gentle_roles_v1, 'worker', 'the recorded agent still supplies the role');
+    assert.equal(stable.gentle_names_v1, 'ap1 work', 'the recorded label still supplies the name');
+    assertNoPlaceholderNames(stable);
+  } finally {
+    await stopWire(wire);
+  }
+});

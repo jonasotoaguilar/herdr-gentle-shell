@@ -73,10 +73,13 @@
 //   gentle_names_v1   = CSV of TaskRecord.label/agent (sanitized, ≤64 chars
 //                       each, oldest-first, total ≤ 512 UTF-8 BYTES; excess
 //                       advisory names are dropped whole, never chunked — the
-//                       §4.5 #p= overflow form never triggers by construction)
+//                       §4.5 #p= overflow form never triggers by construction;
+//                       a record whose label and agent are both absent has no
+//                       identity to publish and is skipped, never replaced by a
+//                       placeholder or a stringified absent value)
 //                       Compatibility transport only: the consumer renders
 //                       roles, never names. Null (clear) when the active
-//                       TaskStore list has no labels; null change tokens when the session model has
+//                       TaskStore list has no names; null change tokens when the session model has
 //                       zero changed files — refreshed/cleared from the live
 //                       session model, never carried across sessions.
 //   gentle_ask_v1         = <hash>:<intentId>:<expiry>
@@ -2438,17 +2441,21 @@ async function applyCustomizeSwitch(id, value, ctx) {
   if (result.needsReload && typeof ctx?.reload === "function") await ctx.reload();
 }
 
-// The single apply path shared by the overlay and the menu fallback. An
-// inconclusive sidebar verdict is never a refusal: choosing On still attempts
-// the repair and reports the apply step's own error, exactly like the baseline
-// menu did. `switchId` names the switch a row drives, never the category it is
-// painted under: each category now owns exactly one switch, so the sidebar rows
-// can only ever resolve `sidebar` and the notification row only `moshi`.
-async function applyCustomizeChoice(categoryId, valueId, ctx, switchId) {
-  const target = switchId === "sidebar" || switchId === "moshi" ? switchId : categoryId;
-  if (target !== "sidebar" && target !== "moshi") return;
+// The single apply path shared by the overlay and the menu fallback. The choice
+// the panel resolves names the switch it drives (`switchId`) and the value to
+// apply; that switch id is the only thing read here, so a row can never apply a
+// switch its category does not own. An inconclusive sidebar verdict is never a
+// refusal: choosing On still attempts the repair and reports the apply step's
+// own error, exactly like the baseline menu did.
+const CUSTOMIZE_SWITCH_IDS = ["sidebar", "moshi"];
+
+async function applyCustomizeChoice(choice, ctx) {
+  if (!isRecord(choice)) return;
+  const switchId = choice.switchId;
+  const valueId = choice.valueId;
+  if (!CUSTOMIZE_SWITCH_IDS.includes(switchId)) return;
   if (valueId !== "on" && valueId !== "off") return;
-  await applyCustomizeSwitch(target, valueId, ctx);
+  await applyCustomizeSwitch(switchId, valueId, ctx);
 }
 
 // The former plain menu, kept as the fallback when the TUI helpers or
@@ -2477,7 +2484,7 @@ async function runCustomizeFallback(ctx) {
     choice = undefined;
   }
   if (choice !== CUSTOMIZE_ON && choice !== CUSTOMIZE_OFF) return;
-  await applyCustomizeChoice(id, choice === CUSTOMIZE_ON ? "on" : "off", ctx);
+  await applyCustomizeChoice({ switchId: id, valueId: choice === CUSTOMIZE_ON ? "on" : "off" }, ctx);
 }
 
 async function executeCustomize(rawArgs, ctx) {
@@ -2548,7 +2555,7 @@ async function executeCustomize(rawArgs, ctx) {
     // Esc (null) does nothing at all: no notification, no write, no reload.
     // Anything else runs the single apply path once the overlay is disposed.
     if (!choice || typeof choice !== "object") return;
-    await applyCustomizeChoice(choice.categoryId, choice.valueId, ctx, choice.switchId);
+    await applyCustomizeChoice(choice, ctx);
     return;
   }
   await runCustomizeFallback(ctx);
@@ -2590,7 +2597,7 @@ export default function (pi) {
   // Finished/failed/cancelled/waiting entries may linger in the map but
   // never count; the map is cleared only on session reset (plus the
   // bounded-map guard) — never by a local staleness timeout.
-  const pendingCalls = new Map(); // toolCallId -> { agent, label, at }
+  const pendingCalls = new Map(); // toolCallId -> { agent, label, at }; agent/label are undefined when no agent is resolvable
   const tasks = new Map(); // taskId -> { agent, label, status, at }
 
   // Blocker legs. ask combines choice + native questionnaire + legacy
@@ -3082,7 +3089,20 @@ export default function (pi) {
     const parts = [];
     let length = 0;
     for (const sub of subs) {
-      const name = sanitizeLabel(sub.label, sub.agent);
+      // An entry whose label and agent are both absent has no name to publish:
+      // a record can carry no identity at all (an observation without an agent
+      // and no previous record), and `sanitizeLabel` stringifies whatever
+      // fallback it is handed, so passing the absence through would put the
+      // literal `undefined` on the wire as a name.
+      const label =
+        typeof sub.label === "string" && sub.label.length > 0 ? sub.label : undefined;
+      const subAgent =
+        typeof sub.agent === "string" && sub.agent.length > 0 ? sub.agent : undefined;
+      if (label === undefined && subAgent === undefined) continue;
+      // Label first, agent as fallback, unchanged for every entry that has
+      // either; the fallback is never absent here, so the sanitizer always has
+      // a real string to fall back to.
+      const name = sanitizeLabel(label, subAgent ?? label);
       if (parts.includes(name)) continue;
       const add = (parts.length === 0 ? 0 : 1) + utf8Bytes(name);
       if (length + add > MAX_TOKEN_BYTES) break;
@@ -3130,11 +3150,13 @@ export default function (pi) {
     ) {
       return "rdd";
     }
-    // The bare visible word `working` is banned: a sanitized unknown slug
-    // exactly equal to `working` degrades to no role (generic `gentle`)
-    // in metadata roles and the native message alike.
+    // The bare visible words `working` and `subagent` are banned: a sanitized
+    // unknown slug exactly equal to either degrades to no role (generic
+    // `gentle`) in metadata roles and the native message alike. `subagent` is
+    // the launch-correlation placeholder, never an agent name, so it must
+    // never reach the wire as a role word.
     const slug = sanitizeAgentSlug(agent);
-    return slug === "working" ? undefined : slug;
+    return slug === "working" || slug === "subagent" ? undefined : slug;
   }
 
   // Bounded CSV of role words, oldest-first (subs already arrive
@@ -3923,11 +3945,23 @@ export default function (pi) {
 
   // -- subagent activity -----------------------------------------------------
 
+  // `subagent_run` carries the agent in its input, but `subagent_continue`
+  // carries only `task_id`/`prompt`/`label`/`mode`: a resume names the task
+  // whose record already holds the child's agent. Neither source means no
+  // role evidence at all — the pending call still covers the blocking/
+  // orchestrating marker, but it contributes no role and no name, and it
+  // must never publish the launch-correlation placeholder as a role word.
   function launchInput(input) {
     if (!isRecord(input)) return undefined;
-    const agent = typeof input.agent === "string" ? input.agent : "subagent";
-    const label = sanitizeLabel(typeof input.label === "string" ? input.label : agent, agent);
-    return { agent: truncateChars(agent, MAX_LABEL_CHARS), label };
+    const taskId = typeof input.task_id === "string" ? input.task_id : undefined;
+    const inputAgent =
+      typeof input.agent === "string" && input.agent.length > 0 ? input.agent : undefined;
+    const agent =
+      inputAgent ?? (taskId !== undefined ? tasks.get(taskId)?.agent : undefined);
+    const labelSource =
+      typeof input.label === "string" && input.label.length > 0 ? input.label : agent;
+    const label = labelSource === undefined ? undefined : sanitizeLabel(labelSource, labelSource);
+    return { agent: agent === undefined ? undefined : truncateChars(agent, MAX_LABEL_CHARS), label };
   }
 
   pi.on("tool_call", (event) => {
@@ -4051,10 +4085,13 @@ export default function (pi) {
         : undefined;
     // A stale read's agent is distrusted with its status, and a missing
     // agent keeps the previous record's agent (never reset to a guess).
+    // With neither source the record has no agent at all: `subagent` is the
+    // launch-correlation placeholder, never an identity, so inventing it here
+    // would publish that word as the record's name.
     const agent =
       staleRead && previous?.agent
         ? previous.agent
-        : (incomingAgent ?? previous?.agent ?? "subagent");
+        : (incomingAgent ?? previous?.agent);
     const now = Date.now();
     tasks.set(details.taskId, {
       agent,
@@ -4105,10 +4142,13 @@ export default function (pi) {
     if (typeof details.status !== "string") return;
     if (!FINAL_TASK.has(details.status) && !ACTIVE_TASK.has(details.status)) return;
     const previous = tasks.get(details.taskId);
+    // Same rule as the tool_result path: an observation without an agent keeps
+    // the previous record's agent, and with neither there is no agent at all —
+    // the launch-correlation placeholder must never become a record identity.
     const agent =
       typeof details.agent === "string" && details.agent.length > 0
         ? truncateChars(details.agent, MAX_LABEL_CHARS)
-        : (previous?.agent ?? "subagent");
+        : previous?.agent;
     // Record identity is immutable per taskId: firstSeen never moves (T2b
     // ordering only) whether this observation promotes a background start
     // or replaces the record with its terminal status; completion still
