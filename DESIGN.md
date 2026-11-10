@@ -804,6 +804,10 @@ gentle-ai concern and explicitly out of scope for this plugin.
   the poll after the native one for the same question, a systematic
   duplication. The ask token still drives the sidebar ask display; sounds,
   suppression, and delay stay Herdr's.
+- Herdr's own done/ask attention — the finished and needs-attention pop-ups and
+  their sound — is Herdr's native behavior, configured in Herdr itself (its
+  config and its settings). This package deliberately offers no switch for it;
+  its only notification surface is the optional Moshi channel.
 - `review` and `error` never emit a plugin notification: `review` attention
   stays in-flow/native; `error` is sidebar state only — our own `error:` label
   with the pane left on native `working`, so neither the `NeedsAttention`

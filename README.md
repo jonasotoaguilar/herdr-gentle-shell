@@ -454,7 +454,12 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   shows the single `Sidebar agent rows` row, and the only Moshi switch is the
   `Notifications` row under `Moshi notifications`. The two are never mixed —
   `Sidebar agent rows` neither reads nor writes `gentle-moshi.json`, so turning
-  the agent rows off never turns the notification channel off. The plain
+  the agent rows off never turns the notification channel off. Herdr's own
+  done/ask attention (the finished and needs-attention pop-ups and their
+  sound) is Herdr's native behavior, configured in Herdr itself — its config
+  and its settings — and this package deliberately offers no switch for it:
+  the optional Moshi channel below is the only notification surface the
+  package owns. The plain
   two-step menu stays as the fallback
   when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
