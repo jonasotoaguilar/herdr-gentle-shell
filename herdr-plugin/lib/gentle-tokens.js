@@ -683,10 +683,12 @@ function roleToDisplay(role) {
   if (role === 'rdd' || role === 'review') return 'review';
   if (role === 'explorer' || role === 'explore') return 'explorer';
   if (role === 'worker' || role === 'verify' || role === 'judge') return role;
-  // The bare visible word `working` is banned: a passthrough slug exactly
-  // equal to `working` (foreign or legacy wire) degrades to null so the
-  // caller falls through to generic `gentle` instead of rendering it.
-  if (role === 'working') return null;
+  // The bare visible words `working` and `subagent` are banned: a passthrough
+  // slug exactly equal to either (foreign or legacy wire) degrades to null so
+  // the caller falls through to generic `gentle` instead of rendering it.
+  // `subagent` is the producer's launch-correlation placeholder, never an
+  // agent name, so a legacy wire value must not become the row label.
+  if (role === 'working' || role === 'subagent') return null;
   if (typeof role === 'string' && ROLE_PASSTHROUGH_RE.test(role)) return 'working';
   return null;
 }

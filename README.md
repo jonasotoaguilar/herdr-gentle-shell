@@ -269,7 +269,10 @@ The one exception is a blocking synchronous subagent call: while a task-mode
 `subagent_run`/`subagent_continue` is in flight the principal's own turn is
 blocked on the child, so the producer publishes that child's role in
 `gentle_pending_v1` and it renders instead of `gentle`, for as long as the
-call lasts. Background launches resolve their tool call immediately, so a
+call lasts. A resume (`subagent_continue`) carries no agent, so its role is
+the tracked task record's agent for its `task_id`; when neither the input nor
+a record names one, the call publishes no role and the row keeps its generic
+display. Background launches resolve their tool call immediately, so a
 queued or running background delegate publishes no such marker and leaves
 the principal's own display untouched. These yield to `ask`/`rdd`/`blocked`
 and terminal `done` — where `done` needs
@@ -281,15 +284,17 @@ work total is a direct projection of the
 Gentle Shell TaskStore `running` records (only `running` counts as
 executing; queued/waiting never count), never a calculated
 pending-call estimate: pending tool calls are role-only display hints (exact
-in-flight subagent agent -> role slug, so task-mode launches show the active
+in-flight subagent agent -> role slug, resolved from the tool input or, for a
+resume, from the tracked task record, so task-mode launches show the active
 role even at count 0) plus label correlation, and
 true concurrent tasks all count. A live `running` record is never regressed
 by a racy non-final status read (only the authoritative launch outcomes,
 completions, and presence terminals move it), so principal activity with
 live delegates keeps `gentle` while an idle principal keeps the role word; a
 sanitized unknown slug exactly
-equal to `working` degrades to `gentle` (the bare word `working` never
-renders).
+equal to `working` or `subagent` degrades to `gentle` (neither bare word ever
+renders; `subagent` is the producer's launch-correlation placeholder, never
+an agent name).
 Background launches (`subagent_run` with `mode: background`) announce
 lifecycle over `message_end` custom results: an ACTIVE status promotes the
 start into the tasks map like a task-mode record, so an active background
@@ -449,7 +454,12 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   shows the single `Sidebar agent rows` row, and the only Moshi switch is the
   `Notifications` row under `Moshi notifications`. The two are never mixed —
   `Sidebar agent rows` neither reads nor writes `gentle-moshi.json`, so turning
-  the agent rows off never turns the notification channel off. The plain
+  the agent rows off never turns the notification channel off. Herdr's own
+  done/ask attention (the finished and needs-attention pop-ups and their
+  sound) is Herdr's native behavior, configured in Herdr itself — its config
+  and its settings — and this package deliberately offers no switch for it:
+  the optional Moshi channel below is the only notification surface the
+  package owns. The plain
   two-step menu stays as the fallback
   when the TUI helpers or `ctx.ui.custom` are unavailable.
   `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js`
