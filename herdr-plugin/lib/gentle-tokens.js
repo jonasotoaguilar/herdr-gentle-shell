@@ -142,16 +142,17 @@ const TTL_MS = 60000;
 // Reduced displays, DESIGN §5.2. Activity states are the TaskStore roles
 // (explorer/worker/verify/judge) plus the root-session `orchestrating`
 // marker (fresh while the main session actively works, even with zero
-// subagents) plus generic activity (machine key `working`, visible word
-// `gentle`). The principal's own activity marker decides working vs idle,
-// never the delegate count and never the aggregate native status: a working
-// principal renders `gentle` (pink `orchestrating` with a fresh marker) and
-// outranks a delegate role word, while an idle principal shows the oldest
-// role word however many delegates run. Attention states (ask/review/error)
-// outrank both and sit above the terminal `done`. Role labels carry the
-// running delegate total when it exceeds one. No background-job display
-// exists: a live job is pending work the producer keeps out of `done`, never
-// a row state of its own.
+// subagents) plus the amber `working` display, which exists only to carry a
+// non-contemplated subagent's own name — it never renders the word `gentle`.
+// The principal's own activity marker decides working vs idle, never the
+// delegate count and never the aggregate native status: a working principal
+// renders `gentle` (the pink `orchestrating` display) with or without a
+// fresh root marker, and outranks a delegate role word, while an idle
+// principal shows the oldest role word however many delegates run.
+// Attention states (ask/review/error) outrank both and sit above the
+// terminal `done`. Role labels carry the running delegate total when it
+// exceeds one. No background-job display exists: a live job is pending work
+// the producer keeps out of `done`, never a row state of its own.
 const DISPLAYS = ['working', 'orchestrating', 'explorer', 'worker', 'verify', 'judge', 'ask', 'review', 'error', 'done', 'idle'];
 
 const STATE_TOKENS = {
