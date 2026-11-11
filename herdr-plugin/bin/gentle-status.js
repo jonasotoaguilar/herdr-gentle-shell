@@ -301,12 +301,12 @@ function herdrStateDir() {
   return path.join(os.homedir(), '.local', 'state', 'herdr');
 }
 
-// Family of files proving a state dir is ours: when the Herdr-injected
-// dir (which changes with the plugin id) holds none of these while the
-// stored dir does, the stored dir wins so pre-rename flags stay readable.
-// Fresh installs with no stored files converge on the injected dir.
-// GENTLE_STATUS_STATE_DIR (explicit user override) is always used as-is.
-// This family is IDENTICAL in the sidebar, diagnostics, worktree-mode and
+// Family of files proving a state dir is ours: the stored dir wins whenever it
+// holds one of these, so pre-rename flags stay readable and one stray known
+// file in the Herdr-injected dir (which changes with the plugin id) may never
+// outrank the stored state. Fresh installs with no stored files converge on the
+// injected dir. GENTLE_STATUS_STATE_DIR (explicit user override) is always used
+// as-is. This family is IDENTICAL in the sidebar, diagnostics, worktree-mode and
 // state-extension resolvers. The daemon also WRITES here (pidfile, mode,
 // ledger), so a file it cannot see is a file whose dir it splits off: the
 // stored ODD/Issues toggle then reads as missing, i.e. enabled.
@@ -362,8 +362,8 @@ function stateRoot() {
   let dir = stored;
   if (typeof injected === 'string' && injected.length > 0 && injected !== stored) {
     try {
-      if (dirHasKnownFiles(injected)) dir = injected;
-      else if (dirHasKnownFiles(stored)) dir = stored;
+      if (dirHasKnownFiles(stored)) dir = stored;
+      else if (dirHasKnownFiles(injected)) dir = injected;
       else dir = injected;
     } catch {
       dir = injected;

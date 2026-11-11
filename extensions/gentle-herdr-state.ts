@@ -1611,9 +1611,11 @@ export async function liveSummarizeRoots(roots) {
 
 // Producer state, resolved once for both flag files below. GENTLE_STATUS_STATE_DIR
 // (explicit user override) is used as-is; HERDR_PLUGIN_STATE_DIR is
-// Herdr-injected and changes with the plugin id, so when it holds none of our
-// files while the stored dir does, the stored dir wins. Fresh installs with no
-// stored files converge on the injected dir.
+// Herdr-injected and changes with the plugin id, so the stored dir wins
+// whenever it holds any of our files — one stray known file in the injected
+// dir may never outrank it, because the daemon writes its pidfile into the dir
+// it resolves and that made the split self-perpetuating. The injected dir is
+// used only when neither holds a known file (fresh install).
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1656,6 +1658,13 @@ function sidebarEffectiveDir() {
   if (typeof injected !== "string" || injected.length === 0) return stored;
   if (injected === stored) return injected;
   try {
+    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+      try {
+        if (fs.existsSync(join(stored, name))) return stored;
+      } catch {
+        // A single unreadable entry never decides; keep scanning.
+      }
+    }
     let injectedHas = false;
     for (const name of SIDEBAR_STATE_KNOWN_FILES) {
       try {
@@ -1668,13 +1677,6 @@ function sidebarEffectiveDir() {
       }
     }
     if (injectedHas) return injected;
-    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
-      try {
-        if (fs.existsSync(join(stored, name))) return stored;
-      } catch {
-        // A single unreadable entry never decides; keep scanning.
-      }
-    }
   } catch {
     // Fall through to the injected dir on unexpected failure.
   }
