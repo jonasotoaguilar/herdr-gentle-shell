@@ -738,6 +738,16 @@ const BEAT_ENV = "GENTLE_HERDR_BEAT_MS";
 // evidence and no host truth to settle on (`quietWithoutTruth` in the
 // factory): three beats, one BEAT_MS each. See the comment there.
 const QUIET_BEAT_LIMIT = 3;
+// Consecutive beats a producer must see the lost-settle contradiction (it
+// believes a turn is running, the host answers `isIdle() === true`, and
+// nothing else keeps the session busy) before it applies the settle the host
+// already reports (`reconcileSettled` in the factory). One beat is not enough:
+// the host flips to idle at the very end of a run, so a genuine `agent_settled`
+// can reach the producer one host tick later, and a single sample would repaint
+// a still-settling turn as idle. Two consecutive samples — 30 s of
+// host-confirmed idle at the 15 s beat — cannot be that race, and a lost edge
+// still recovers within one beat period after the window closes.
+const LOST_SETTLE_BEATS = 2;
 // Synthesized finish signal (DESIGN §4.3, S2/D2). The host never reports
 // `done`, so the producer mints the finish itself: one session-bound
 // `<hash>:<expiry>` token per finish at the settled-and-empty edge, carrying
@@ -1164,7 +1174,9 @@ function cliFallback(patch) {
 //
 // T2 (the pane must never freeze at `working`): the settle this owner gates on
 // is reconciled from the host's own live truth on every beat instead of being
-// inferred; a quiet producer the host never confirms stops beating after a
+// inferred — including when a turn was seen to start but its settle edge was
+// lost, which needs a bounded window of contradictory beats rather than a
+// single sample; a quiet producer the host never confirms stops beating after a
 // bounded budget instead of republishing a count-0 work token forever; and the
 // settle-time pending latch stops counting once the finish hold that raised it
 // expires.
@@ -1190,8 +1202,9 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // attention (including toast dedup) is host-owned (DESIGN §7).
 //
 // The `settled` input is never inferred here: the beat reconciles it from the
-// host's own live truth (`ctx.isIdle()`) whenever nothing is active, so a
-// missed `agent_settled` cannot leave this producer unable to reach `idle`.
+// host's own live truth (`ctx.isIdle()`), so a missed `agent_settled` cannot
+// leave this producer unable to reach `idle` — not when no turn was observed,
+// and not when a turn this producer saw start never delivered its settle edge.
 export function computeNativeState({
   agentActive,
   settled,
@@ -2730,6 +2743,7 @@ export default function (pi) {
   // freshness bound measures from.
   function onJobsSnapshot(value) {
     if (!isRecord(value) || !isRecord(value.snapshot) || !Array.isArray(value.snapshot.jobs)) return;
+    noteActivity();
     const jobs = value.snapshot.jobs.filter(
       (entry) => isRecord(entry) && typeof entry.id === "string" && entry.id.length > 0,
     );
@@ -2869,6 +2883,10 @@ export default function (pi) {
   // Consecutive quiet beats published without host truth (see
   // `quietWithoutTruth`); bounded by QUIET_BEAT_LIMIT and reset by work.
   let quietBeats = 0;
+  // Consecutive beats that contradict a turn this producer saw start (see
+  // `lostSettleContradiction`); bounded by LOST_SETTLE_BEATS and reset by any
+  // activity edge.
+  let lostSettleBeats = 0;
   let publishQueued = false;
   let publishInFlight = false;
   // Native owner queue (always on): monotonic seq per logical report,
@@ -2952,7 +2970,16 @@ export default function (pi) {
     agentActive = false;
     settled = true;
     turnSettled = fromTurn === true;
+    lostSettleBeats = 0;
     clearSettledPending();
+  }
+
+  // Every activity edge restarts the lost-settle window: a tool call, a
+  // delegate, a job, an ask/review/error leg (the contradiction predicate reads
+  // those legs directly) or a new `agent_start`. Only consecutive beats that
+  // still contradict the host may settle.
+  function noteActivity() {
+    lostSettleBeats = 0;
   }
 
   // Nothing observable keeps this session busy: no authoritative
@@ -2982,25 +3009,50 @@ export default function (pi) {
     }
   }
 
+  // The lost-settle contradiction: this producer still believes its turn runs,
+  // the host answers that nothing is processing, and no work evidence or
+  // owning leg keeps the session busy. Both sides are live truth re-read on
+  // every beat, so the contradiction is never remembered from a stale sample.
+  function lostSettleContradiction() {
+    return (
+      agentActive &&
+      hostIdleTruth() === true &&
+      noWorkEvidence() &&
+      !askActiveNow() &&
+      !reviewActive &&
+      errorCode === undefined
+    );
+  }
+
   // Recover a settle this producer missed. `settled` flips only in
   // `agent_settled`, which early-returns unless the host already reports idle,
-  // so an aborted or failed run — or a session first observed while idle —
-  // leaves `settled` false with nothing active: `computeNativeState` returns
-  // undefined, the pane keeps the last native `working`, and every beat
-  // republishes a fresh count-0 `gentle_work_v1`. The host answers the same
-  // question `agent_settled` asks, so read its live truth here instead of
-  // inferring a terminal from a timeout or from a count.
+  // so a session first observed while idle — or an aborted or failed run whose
+  // `agent_settled` never arrived — leaves `settled` false: `computeNativeState`
+  // returns undefined and the pane keeps the last native `working`. The host
+  // answers the same question `agent_settled` asks, so read its live truth here
+  // instead of inferring a terminal from a timeout or from a count.
   function reconcileSettled() {
     if (!rootSession || settled) return;
+    // No turn edge was ever observed: nothing local contradicts the host, so
+    // its answer settles the producer on the same beat.
+    if (!agentActive) {
+      if (!noWorkEvidence()) return;
+      if (hostIdleTruth() !== true) return;
+      applySettled(false);
+      return;
+    }
     // A turn the producer itself saw start is local evidence of a running
-    // agent: it is never overridden from here (that would undo `agent_start`
-    // and repaint a genuinely working session as idle). The case this
-    // recovers is the one where no turn edge was ever observed — a producer
-    // attached to a session that is already idle, or a settle whose
-    // `agent_settled` never reached it before `agentActive` was cleared.
-    if (agentActive) return;
-    if (!noWorkEvidence()) return;
-    if (hostIdleTruth() !== true) return;
+    // agent, and `isIdle()` turns true at the end of the run — so a genuine
+    // settle edge can still be in flight. Only a bounded window of consecutive
+    // contradictory beats proves the edge was lost.
+    if (!lostSettleContradiction()) {
+      lostSettleBeats = 0;
+      return;
+    }
+    lostSettleBeats += 1;
+    if (lostSettleBeats < LOST_SETTLE_BEATS) return;
+    // `fromTurn` false: a recovered settle is never a turn, so it can mint no
+    // finish episode (no `gentle_done_v1`, no finish notification).
     applySettled(false);
   }
 
@@ -3964,6 +4016,7 @@ export default function (pi) {
     sessionCwd = undefined;
     settleCtx = undefined;
     quietBeats = 0;
+    lostSettleBeats = 0;
     changes = { files: 0, added: 0, deleted: 0 };
     agentActive = false;
     settled = false;
@@ -4022,6 +4075,7 @@ export default function (pi) {
 
   pi.on("tool_execution_start", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolCallId !== "string") return;
+    noteActivity();
     runningTools.add(event.toolCallId);
     // Structured ask tools open ONLY on genuine execution (never on
     // `tool_call` proposal), keyed by call id so the matching end or
@@ -4147,6 +4201,7 @@ export default function (pi) {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
     // A tool starting proves a run is alive: an error left over from a run that
     // already died is released here rather than sticking until the next turn.
+    noteActivity();
     clearRunError();
     // Structured ask proposals never open ask (execution does); subagent
     // launch correlation below is unchanged.
@@ -4176,6 +4231,7 @@ export default function (pi) {
 
   pi.on("tool_result", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    noteActivity();
     clearRunError();
     if (typeof event.toolCallId === "string" && askToolCalls.delete(event.toolCallId)) {
       updateBlocker();
@@ -4302,6 +4358,7 @@ export default function (pi) {
   // never passes through `tool_result` details.
   pi.on("message_end", (event) => {
     if (!rootSession || !isRecord(event)) return;
+    noteActivity();
     const message = event.message;
     if (!isRecord(message)) return;
     if (message.role === "assistant") {
@@ -4392,6 +4449,7 @@ export default function (pi) {
     turnSettled = false;
     clearSettledPending();
     quietBeats = 0;
+    noteActivity();
     clearRunError();
     refreshChanges();
     schedulePublish();

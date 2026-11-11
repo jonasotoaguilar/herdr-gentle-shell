@@ -2638,6 +2638,159 @@ test('T2: the settle-time pending latch is bounded by the finish hold', async ()
   }
 });
 
+test('T2 RED: a settle lost after agent_start is reconciled from host truth: idle, no done, beat stopped', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, 1000);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-lost-settle', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    // The host answers truthfully on every beat (nothing is processing) while
+    // the producer's own turn evidence says the run is still going: the run's
+    // `agent_settled` never arrives. Pre-fix the reconcile refuses to act while
+    // `agentActive` is true, so the pane keeps the last native `working` and
+    // every beat repaints the row. The working report below is itself proof of
+    // the window: a one-beat reconcile would publish idle on the first
+    // contradictory beat and never report working at all.
+    h.fire('session_start', {}, beatSessionCtx('sess-lost', '/tmp/gentle-lost-settle-session', () => true));
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'working while the local turn evidence stands',
+    );
+    const idle = await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'idle',
+      5000,
+      'idle once the lost-settle window closes',
+    );
+    assert.ok(idle.params.seq > 0, 'the recovered idle carries a real seq');
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 1, 'idle publishes exactly once');
+    assert.equal(nativeStates(wire.received).at(-1).state, 'idle', 'the pane ends on idle, never back on working');
+    // A recovered settle is not a turn: no finish episode can be minted.
+    assert.equal(
+      wire.received.filter((r) => r.method === 'pane.report_metadata' && r.params.tokens?.gentle_done_v1).length,
+      0,
+      'a reconcile-recovered settle mints no done token',
+    );
+    await new Promise((r) => setTimeout(r, 500));
+    await assertBeatStopped(wire);
+    assert.equal(nativeStates(wire.received).at(-1).state, 'idle', 'nothing repaints the pane after the stop');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: a host that answers busy keeps the lost run on working', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, 1000);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-busy-lost', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    // The host keeps answering `false`: it still considers the agent busy, so
+    // whatever the producer believes about its own turn is never overridden.
+    h.fire('session_start', {}, beatSessionCtx('sess-busy-lost', '/tmp/gentle-busy-lost-session', () => false));
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'native working while the host says busy',
+    );
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'a host that answers false is never overridden');
+    assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'the pane stays on working');
+    assert.ok(metadataBeats(wire.received).length >= 3, 'the beat keeps running while the host says busy');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: activity inside the lost-settle window keeps the session working', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, undefined);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-lost-settle-activity', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    let hostIdle = false;
+    h.fire('session_start', {}, beatSessionCtx('sess-window', '/tmp/gentle-lost-window-session', () => hostIdle));
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'working while the host says busy',
+    );
+    // Drain any coalesced startup publish, so the next beat is the first
+    // contradictory one and can be observed on its own.
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'a busy host never settles the run');
+    // The host goes idle: the lost-settle window opens on the next beat.
+    hostIdle = true;
+    const before = metadataBeats(wire.received).length;
+    const deadline = Date.now() + 5000;
+    while (metadataBeats(wire.received).length === before && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.ok(metadataBeats(wire.received).length > before, 'the first contradictory beat published');
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'one contradictory beat is not a settle');
+    // A delegate starts now, between the first and the second contradictory
+    // beat: the window restarts, so the session cannot be settled while that
+    // live work stands.
+    launchRunning(h, 'run-win1', 'win1', 'gentle-ai-worker');
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'activity inside the window keeps the turn alive');
+    assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'the pane never reports idle');
+    assert.equal(nativeStates(wire.received).at(-1).message, 'worker', 'the running role still reports');
+    assert.ok(metadataBeats(wire.received).length >= before + 3, 'the beat keeps running for the live delegate');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: an in-flight launch is a genuinely active turn and is never settled', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, undefined);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-launch-in-flight', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    h.fire('session_start', {}, beatSessionCtx('sess-in-flight', '/tmp/gentle-launch-in-flight-session', () => true));
+    h.fire('agent_start', {});
+    // A launch that has not reported back is work evidence, present from the
+    // first beat on: the window never closes on it, however long the host
+    // insists it is idle.
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-in-flight',
+      input: { agent: 'gentle-ai-worker', label: 'in-flight work' },
+    });
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working' && r.params.message === 'gentle',
+      5000,
+      'working from the in-flight launch',
+    );
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'a launch in flight is never settled');
+    assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'the pane stays on working');
+    assert.equal(
+      wire.received.filter((r) => r.method === 'pane.report_metadata' && r.params.tokens?.gentle_done_v1).length,
+      0,
+      'a live launch never mints a done token',
+    );
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
 test('T2 PRESERVE: an active session keeps reporting working across beats', async () => {
   const wire = await startNativeWire();
   const prevBeatEnv = setBeatEnv(100, undefined);
