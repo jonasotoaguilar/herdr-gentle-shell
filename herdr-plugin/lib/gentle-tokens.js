@@ -313,12 +313,13 @@ const ROW_ICONS = {
 };
 
 // User-facing words per display (DESIGN §5.3). The machine keys `review`,
-// `error`, `orchestrating`, `explorer`, and `working` stay stable; their rendered
-// words are `rdd`/`blocked`/`gentle`/`explorer`/`gentle` — visible generic
-// activity is always per-agent (`gentle`, never `working`). Role labels
+// `error`, `orchestrating`, `explorer`, and `working` stay stable; their
+// rendered words are `rdd`/`blocked`/`gentle`/`explorer` and, for `working`,
+// the caller's label override (the subagent's own name). `working` has no
+// generic word: the amber cell must never render `gentle` (S1), so a bare
+// `working` display fails closed to `orchestrating` in `out`. Role labels
 // may carry a running-count suffix and never contain a subagent label.
 const DISPLAY_LABELS = {
-  working: 'gentle',
   orchestrating: 'gentle',
   explorer: 'explorer',
   worker: 'worker',
@@ -692,6 +693,16 @@ function roleToDisplay(role) {
   if (typeof role === 'string' && ROLE_PASSTHROUGH_RE.test(role)) return 'working';
   return null;
 }
+
+// Fail-closed display guard (S1): the amber `working` machine key exists only
+// to carry a resolvable subagent name through `outRole`'s label override. A
+// bare `working` display has no name to show, so it degrades to the pink
+// generic `orchestrating` instead of resurrecting a generic word on the amber
+// cell. Every other display passes through unchanged.
+function failClosedDisplay(display) {
+  return display === 'working' ? 'orchestrating' : display;
+}
+
 // Strongest fresh blocked label wins: error > ask > review (DESIGN §5.2).
 // Reads the snapshot's state_labels map (populated from pane.report_agent
 // `message`, which the managed herdr-agent-state.ts sets to the
@@ -750,10 +761,13 @@ function piTreeOwnsPane(tokens, sessionHash, now) {
 //   error > ask > review > done (terminal) >
 //   blocking pending delegate role (fresh `gentle_pending_v1` with a
 //   recognized role: the principal's turn is blocked on that child) >
-//   principal working (fresh `gentle_principal_v1`: `orchestrating` while a
-//   fresh root marker is live, else generic activity) > role activity (oldest
+//   principal working (fresh `gentle_principal_v1`: the pink `orchestrating`
+//   display, with or without a fresh root marker) > role activity (oldest
 //   recognized role — the principal is not working) > orchestrating (marker
-//   fallback) > main working (positive running count, no role) > idle. The
+//   fallback) > generic activity from a positive running count with no role
+//   word (pink `orchestrating`) > idle (including a live count-0 beat whose
+//   native status is neither done nor idle). The amber `working` display has
+//   exactly one producer, the passthrough name path below. The
 //   deciding signal is the principal's own activity marker, never the delegate
 //   count and never the aggregate native status; role labels carry the running
 //   count as a suffix when above one.
@@ -806,17 +820,20 @@ function reducePane(entry, now = Date.now()) {
   // evidence in practice — the host never reports `agent_status === 'done'`.
   const done = sessionHash === null ? null : parseDone(tokens[DONE_TOKEN], sessionHash, now);
 
-  const out = (display, notify = null) => ({
-    display,
-    label: DISPLAY_LABELS[display] ?? display,
-    agent,
-    workspace,
-    added,
-    deleted,
-    pull: '', // filled by the daemon from branch-ab status (DESIGN §5.3)
-    notify,
-    owned: true,
-  });
+  const out = (display, notify = null) => {
+    const resolved = failClosedDisplay(display);
+    return {
+      display: resolved,
+      label: DISPLAY_LABELS[resolved] ?? resolved,
+      agent,
+      workspace,
+      added,
+      deleted,
+      pull: '', // filled by the daemon from branch-ab status (DESIGN §5.3)
+      notify,
+      owned: true,
+    };
+  };
 
   // Role labels carry the total running-delegate count when above one.
   // The label rides the title cell via displayTokens.
@@ -921,10 +938,10 @@ function reducePane(entry, now = Date.now()) {
     return out('done');
   }
   // The principal's own activity decides, never the delegate count: a
-  // working principal renders the session's own state and outranks every
-  // delegate role word. A fresh root marker keeps the `orchestrating`
-  // display (pink `gentle`) for that working state; absent, stale, or
-  // foreign, the display is generic activity (`working`, visible `gentle`).
+  // working principal renders the session's own pink generic `gentle`, which
+  // outranks every delegate role word. The display is always `orchestrating`:
+  // a fresh root marker does not change the color, and absent, stale, or
+  // foreign markers must not fall back to the amber generic either.
   // WHY not the count: `gentle_work_v1` counts RUNNING DELEGATES, so a
   // positive count says nothing about the principal — gating on it would
   // turn an idle principal with running delegates into `gentle` instead of
@@ -947,7 +964,7 @@ function reducePane(entry, now = Date.now()) {
     }
   }
   if (principal !== null) {
-    return out(orchestrating !== null ? 'orchestrating' : 'working');
+    return out('orchestrating');
   }
   // Principal not working: the oldest role word wins, however many delegates
   // run. Visible text is the oldest role (oldest-first): known agents render
@@ -968,14 +985,14 @@ function reducePane(entry, now = Date.now()) {
   // queued/running sub or a pending launch exists, so it keeps covering
   // queued subs the running-only count excludes once no role word is left.
   if (orchestrating !== null) return out('orchestrating');
-  // Main working: a fresh work token with a positive count but no role word —
-  // machine key `working`, visible word `gentle`, never bare `working`.
-  if (work !== null && work.count > 0) return out('working');
-  // Fallback: a live count-0 work-token beat whose native status is neither
-  // done nor idle — generic activity (`gentle`).
-  if (work !== null && work.count === 0 && native !== 'done' && native !== 'idle') {
-    return out('working');
-  }
+  // Generic activity from a positive running count with no resolvable name
+  // (S5): the fallback is the principal session's pink generic `gentle`, never
+  // a delegate `gentle` on the amber cell.
+  if (work !== null && work.count > 0) return out('orchestrating');
+  // A live count-0 work-token beat whose native status is neither done nor
+  // idle used to read generic activity; the producer's unsettled beat made
+  // that pin `gentle` on an idle session (S2), so it no longer asserts
+  // activity and falls through to the terminal `idle` below.
   return out('idle');
 }
 
@@ -1122,6 +1139,7 @@ module.exports = {
   HEADING_TOKENS,
   ROW_TOKENS,
   ROW_ICONS,
+  failClosedDisplay,
   BADGE_TOKEN,
   CHANGES_ADDED_TOKEN,
   CHANGES_DELETED_TOKEN,
