@@ -2563,24 +2563,18 @@ test('T2: a reconcile never mints a finish episode from non-turn activity', asyn
   }
 });
 
-test('T2: no host truth and nothing active stops the beat (no eternal count-0 work token)', async () => {
+test('T2: no host truth and no observed turn stops the beat (no eternal count-0 work token)', async () => {
   const wire = await startNativeWire();
   const prevBeatEnv = setBeatEnv(100, undefined);
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-no-host-truth', '1');
   try {
     const h = harness();
     factory(h.pi);
-    // The context carries no `isIdle`: there is no host truth to settle on.
+    // The context carries no `isIdle`: there is no host truth to settle on, and
+    // this producer never observed a turn (no `agent_start`). Nothing is
+    // active, so the beat must stop instead of refreshing the count-0 work
+    // token forever.
     h.fire('session_start', {}, beatSessionCtx('sess-no-truth', '/tmp/gentle-no-truth-session'));
-    h.fire('agent_start', {});
-    await wire.waitFor(
-      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
-      5000,
-      'native working while the agent runs',
-    );
-    // Nothing is active any more (no delegates, no launches, no jobs) and no
-    // settle can ever be confirmed: the beat must stop instead of refreshing
-    // the count-0 work token forever.
     await new Promise((r) => setTimeout(r, 1000));
     await assertBeatStopped(wire);
     assert.equal(
@@ -2588,6 +2582,43 @@ test('T2: no host truth and nothing active stops the beat (no eternal count-0 wo
       0,
       'a native state the host never confirmed is never published',
     );
+    assert.deepEqual(nativeStates(wire.received), [], 'no native state is inferred without truth');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: a live turn on a truth-less host keeps beating past the quiet budget', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, undefined);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-live-no-truth', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    // The producer saw its own turn start (`agent_start`) and the host offers
+    // no `isIdle` at all, so no settle can ever be confirmed here. That is
+    // live work, not a quiet producer: the beat must keep publishing beats
+    // instead of stopping after the budget and leaving the turn unpainted.
+    h.fire('session_start', {}, beatSessionCtx('sess-live-no-truth', '/tmp/gentle-live-no-truth-session'));
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'native working while the agent runs',
+    );
+    const before = metadataBeats(wire.received).length;
+    // An ordinary tool edge schedules no publish of its own (only the ask,
+    // review, launch, changes, and jobs edges do): the row is kept live by the
+    // beat, never by re-arming.
+    h.fire('tool_execution_start', { toolCallId: 'tool-live-1', toolName: 'read' });
+    h.fire('tool_execution_end', { toolCallId: 'tool-live-1' });
+    await new Promise((r) => setTimeout(r, 900));
+    const beats = metadataBeats(wire.received).length - before;
+    assert.ok(beats >= 5, `a live turn keeps beating past the three-beat budget (saw ${beats})`);
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'a live turn never reads idle');
+    assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'the pane stays on working');
   } finally {
     restoreBeatEnv(prevBeatEnv);
     restoreNativeEnv(prevEnv);
@@ -4610,6 +4641,49 @@ test('the subagent sentinel is never published as a role word', async () => {
     assert.equal(beat.gentle_roles_v1, null);
     assert.equal(beat.gentle_names_v1, null);
     assertNoSubagentSentinel(beat);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('an agent named gentle is never published as a role word', async () => {
+  const wire = await startT2bWire('test-pane-pending-gentle');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('pending-gentle');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-pending-gentle', sessionFile);
+    // S1/S5: `gentle` is the pink generic's own word. An agent literally named
+    // `gentle` sanitizes to a valid passthrough slug, so it used to publish as
+    // a role word and the reducer painted the amber cell with it.
+    const beforePending = wire.received.length;
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'run-gentle-1',
+      input: { agent: 'gentle', label: 'principal work' },
+    });
+    h.fire('agent_start', {});
+    const pendingBeat = await wire.waitForFrom(
+      beforePending,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      5000,
+      'a beat after a gentle-agent launch',
+    );
+    assert.equal(pendingBeat.gentle_pending_v1, null, 'the reserved word is never a pending role');
+    assert.equal(pendingBeat.gentle_roles_v1, null, 'the reserved word is never a pending role entry');
+
+    const beforeRunning = wire.received.length;
+    launchRunning(h, 'run-gentle-2', 'gnt1', 'gentle');
+    const running = await wire.waitForFrom(
+      beforeRunning,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'work count 1 while the gentle-agent delegate runs',
+    );
+    assert.equal(running.gentle_roles_v1, null, 'a running gentle agent resolves to no role');
+    assert.equal(running.gentle_pending_v1, null);
   } finally {
     await stopWire(wire);
   }

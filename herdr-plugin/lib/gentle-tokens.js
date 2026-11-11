@@ -318,7 +318,9 @@ const ROW_ICONS = {
 // rendered words are `rdd`/`blocked`/`gentle`/`explorer` and, for `working`,
 // the caller's label override (the subagent's own name). `working` has no
 // generic word: the amber cell must never render `gentle` (S1), so a bare
-// `working` display fails closed to `orchestrating` in `out`. Role labels
+// `working` display fails closed to `orchestrating` in `out`, and an override
+// that resolves to a reserved word fails closed the same way in `outRole`
+// (`failClosedRoleDisplay`). Role labels
 // may carry a running-count suffix and never contain a subagent label.
 const DISPLAY_LABELS = {
   orchestrating: 'gentle',
@@ -685,14 +687,28 @@ function roleToDisplay(role) {
   if (role === 'rdd' || role === 'review') return 'review';
   if (role === 'explorer' || role === 'explore') return 'explorer';
   if (role === 'worker' || role === 'verify' || role === 'judge') return role;
-  // The bare visible words `working` and `subagent` are banned: a passthrough
-  // slug exactly equal to either (foreign or legacy wire) degrades to null so
-  // the caller falls through to generic `gentle` instead of rendering it.
-  // `subagent` is the producer's launch-correlation placeholder, never an
-  // agent name, so a legacy wire value must not become the row label.
-  if (role === 'working' || role === 'subagent') return null;
+  // The bare visible words `working`, `subagent`, and `gentle` are banned: a
+  // passthrough slug exactly equal to one of them (foreign or legacy wire)
+  // degrades to null so the caller falls through to generic `gentle` instead
+  // of rendering it on the amber cell. `subagent` is the producer's
+  // launch-correlation placeholder, never an agent name, so a legacy wire value
+  // must not become the row label, and `gentle` is the pink generic's own word
+  // (S1): it may only ever render on the pink `orchestrating` display.
+  if (role === 'working' || role === 'subagent' || role === 'gentle') return null;
   if (typeof role === 'string' && ROLE_PASSTHROUGH_RE.test(role)) return 'working';
   return null;
+}
+
+// Fail-closed role-label guard (S1/S5): the amber `working` cell renders the
+// caller's label override — a delegate's own name — and nothing else. An
+// override that resolves to a reserved word has no name to show: `gentle` is
+// the pink generic's word (S1 allows exactly one, and it is not this one) and
+// `working` is the bare machine word the amber cell must never render. Both
+// degrade to the pink `orchestrating` display, exactly like a bare `working`
+// display does in `out`.
+const RESERVED_LABELS = new Set(['gentle', 'working']);
+function failClosedRoleDisplay(display, label) {
+  return RESERVED_LABELS.has(label) ? 'orchestrating' : display;
 }
 
 // Fail-closed display guard (S1): the amber `working` machine key exists only
@@ -837,18 +853,26 @@ function reducePane(entry, now = Date.now()) {
   };
 
   // Role labels carry the total running-delegate count when above one.
-  // The label rides the title cell via displayTokens.
-  const outRole = (display, labelOverride = null, notify = null) => ({
-    display,
-    label: `${labelOverride ?? DISPLAY_LABELS[display] ?? display}${work !== null && work.count > 1 ? ` (${work.count})` : ''}`,
-    agent,
-    workspace,
-    added,
-    deleted,
-    pull: '',
-    notify,
-    owned: true,
-  });
+  // The label rides the title cell via displayTokens. The label resolves
+  // fail-closed first (`failClosedRoleDisplay`): a reserved word is no name,
+  // so the row degrades to the pink generic instead of painting it on the
+  // amber cell — with or without the count suffix.
+  const outRole = (display, labelOverride = null, notify = null) => {
+    const base = labelOverride ?? DISPLAY_LABELS[display] ?? display;
+    const resolved = failClosedRoleDisplay(display, base);
+    if (resolved !== display) return out(resolved, notify);
+    return {
+      display,
+      label: `${base}${work !== null && work.count > 1 ? ` (${work.count})` : ''}`,
+      agent,
+      workspace,
+      added,
+      deleted,
+      pull: '',
+      notify,
+      owned: true,
+    };
+  };
   const roles = parseRoles(tokens[ROLES_TOKEN]);
   const hasDelegatedReview = roles.some((role) => role === 'rdd' || role === 'review');
 
@@ -1141,6 +1165,7 @@ module.exports = {
   ROW_TOKENS,
   ROW_ICONS,
   failClosedDisplay,
+  failClosedRoleDisplay,
   BADGE_TOKEN,
   CHANGES_ADDED_TOKEN,
   CHANGES_DELETED_TOKEN,

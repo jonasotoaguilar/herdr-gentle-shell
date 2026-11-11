@@ -1294,21 +1294,29 @@ describe('generic activity reads the pink gentle, never amber working', () => {
     }
   });
 
-  it('no reachable reducer input yields display working with label gentle', () => {
+  it('no reachable reducer input yields display working with a reserved word label', () => {
     const inputs = [
       roleEntry('', { count: 3 }).entry,
       roleEntry('bogus!', { count: 2 }).entry,
       roleEntry('', { count: 0, agent_status: 'working' }).entry,
       roleEntry('', { count: 0, agent_status: 'unknown' }).entry,
       roleEntry('working', { count: 1 }).entry,
+      roleEntry('subagent', { count: 1 }).entry,
+      roleEntry('gentle', { count: 1 }).entry,
+      roleEntry('gentle', { count: 3 }).entry,
+      roleEntry('_leading', { count: 1 }).entry,
+      roleEntry('a'.repeat(33), { count: 1 }).entry,
       roleEntry('my-custom-scout', { count: 1 }).entry,
       roleEntry('my-custom-scout', { count: 3 }).entry,
     ];
     for (const entry of inputs) {
       const reduced = tokens.reducePane(entry, NOW);
+      // The count suffix rides the label, so the bare-equality check alone
+      // missed `gentle (n)`: the amber cell must never carry either reserved
+      // word in any form.
       assert.ok(
-        !(reduced.display === 'working' && reduced.label === 'gentle'),
-        'display working must always carry a subagent name, never the generic gentle',
+        !(reduced.display === 'working' && /^(gentle|working)(\s|$)/.test(reduced.label)),
+        `display working must always carry a subagent name, never a reserved word: ${reduced.label}`,
       );
     }
   });
@@ -1354,6 +1362,22 @@ describe('unknown delegation surfaces its sanitized name without own principal s
   it('roleToDisplay routes passthrough to the working machine key', () => {
     assert.equal(tokens.roleToDisplay('my-custom-scout'), 'working');
     assert.equal(tokens.roleToDisplay('bogus!'), null);
+  });
+
+  it('roleToDisplay refuses the reserved words, including the pink generic own word', () => {
+    for (const role of ['gentle', 'working', 'subagent']) {
+      assert.equal(tokens.roleToDisplay(role), null, `${role} must never reach the amber cell`);
+    }
+  });
+
+  it('a label override that resolves to a reserved word degrades to the pink generic', () => {
+    // Last hole in `outRole`: the amber cell paints the caller's override, so
+    // an override that resolves to a reserved word has no name to show and
+    // must degrade exactly like a bare `working` display does in `out`.
+    assert.equal(tokens.failClosedRoleDisplay('working', 'gentle'), 'orchestrating');
+    assert.equal(tokens.failClosedRoleDisplay('working', 'working'), 'orchestrating');
+    assert.equal(tokens.failClosedRoleDisplay('working', 'my-custom-scout'), 'working');
+    assert.equal(tokens.failClosedRoleDisplay('orchestrating', 'gentle'), 'orchestrating');
   });
 
   it('unknown delegation renders its name with no count (machine key working)', () => {
@@ -1832,6 +1856,29 @@ describe('blocking pending delegate call decides the row', () => {
       assert.equal(reducedRoles.display, display, `count ${count} falls through to the pink generic`);
       assert.equal(reducedRoles.label, label, `count ${count} never renders the sentinel`);
     }
+  });
+
+  // S1/S5 defense in depth: `gentle` is the pink generic's own word. A
+  // producer bans the slug, and the reducer bans it again, so a foreign or
+  // legacy wire value carrying it can never paint the amber cell — with or
+  // without the running-count suffix, on the roles CSV or on the pending hint.
+  it('the reserved word gentle degrades to the pink generic, never the amber cell', () => {
+    for (const count of [1, 3]) {
+      const { entry } = roleEntry('gentle', { count });
+      const reduced = tokens.reducePane(entry, NOW);
+      assert.equal(reduced.display, 'orchestrating', `count ${count} falls through to the pink generic`);
+      assert.equal(reduced.label, 'gentle', `count ${count} renders the pink word only`);
+      assert.doesNotMatch(reduced.label, /\(\d+\)/, 'the pink generic never carries the count suffix');
+      const patch = tokens.displayTokens(reduced);
+      assert.equal(patch[tokens.TITLE_TOKENS.working], null, 'the amber cell stays unset');
+      assert.equal(patch[tokens.TITLE_TOKENS.orchestrating], 'gentle');
+    }
+
+    const pending = pendingEntry({ pending: 'gentle' });
+    const reducedPending = tokens.reducePane(pending.entry, NOW);
+    assert.equal(reducedPending.display, 'orchestrating', 'the pending hint falls through too');
+    assert.equal(reducedPending.label, 'gentle');
+    assert.equal(tokens.displayTokens(reducedPending)[tokens.TITLE_TOKENS.working], null);
   });
 
   it('error, ask, and review still outrank a fresh pending marker', () => {

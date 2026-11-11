@@ -238,7 +238,8 @@ exact `gentle-ai-worker` → `worker`, exact `gentle-ai-verify` → `verify`,
 `jd-fix-` families) → the distinct `judge` slug (never `rdd`), and a
 review agent / `gentle-ai-review*` / any role containing `review` → `rdd`;
 any other agent keeps its original sanitized name (lowercase `[a-z0-9_-]`
-slug, 32-char bound — never a generic collapse; unsalvageable shapes read
+slug, 32-char bound — never a generic collapse; unsalvageable shapes and the
+reserved slugs `gentle`, `working`, and `subagent` read
 the pink generic `gentle`, machine key `orchestrating`).
 The consumer displays the oldest role word (known short word or unknown
 sanitized name) whenever the principal itself is not working, regardless of
@@ -332,7 +333,10 @@ role            = "explorer" / "worker" / "verify" / "judge" / "rdd" / passthrou
                     ; stays distinct, never `rdd`)
                     ; passthrough = 1*32 lowercase [a-z0-9_-], leading [a-z0-9]
                     ; (unknown delegation keeps its sanitized original name —
-                    ; never a generic collapse; producer truncates to 32)
+                    ; never a generic collapse; producer truncates to 32;
+                    ; the reserved words `gentle`, `working`, and `subagent`
+                    ; resolve to no role on both sides — producer and reducer —
+                    ; so they degrade to the pink generic `gentle`)
 gentle_roles_v1   = role *("," role)       ; total <= 512 UTF-8 bytes; null (clear)
                     ; when no delegation is active (no role words)
 gentle_orchestrating_v1 = sessionHash ":" expiry
@@ -487,11 +491,15 @@ because delegates run.
   `settled`, so a run whose `agent_settled` never reached the producer still
   reaches native `idle` instead of republishing a fresh count-0 work token
   forever. A turn this producer saw start is never overridden from there.
-  When the host offers no truth at all, a quiet producer stops beating after
-  a bounded budget (three beats) instead of publishing a native state the
-  host never confirmed; every work edge re-arms the beat. A settle recovered
-  this way is not an observed turn, so it mints no `gentle_done_v1` and sends
-  no finish notification.
+  When the host offers no truth at all, a producer that observed no turn stops
+  beating after a bounded budget (three beats) instead of publishing a native
+  state the host never confirmed; a turn this producer saw start is never
+  bounded, so the budget cannot trade a truthful `working` for a false `idle`
+  on a host with no truth to settle on. The beat is re-armed by the edges that
+  schedule a publish (ask, review, launch, session changes, jobs), while an
+  ordinary tool edge reaches the row through the host's own truth rather than
+  by re-arming it. A settle recovered this way is not an observed turn, so it
+  mints no `gentle_done_v1` and sends no finish notification.
 - The settle-time pending latch (`pendingCount`) is bounded by the finish hold
   of the settle that raised it: past that hold a launch that never reports
   back stops counting, so it cannot pin the native report at `working`.

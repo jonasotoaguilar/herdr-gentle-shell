@@ -3328,13 +3328,15 @@ export default function (pi) {
     ) {
       return "rdd";
     }
-    // The bare visible words `working` and `subagent` are banned: a sanitized
-    // unknown slug exactly equal to either degrades to no role (generic
-    // `gentle`) in metadata roles and the native message alike. `subagent` is
-    // the launch-correlation placeholder, never an agent name, so it must
-    // never reach the wire as a role word.
+    // The bare visible words `working`, `subagent`, and `gentle` are banned: a
+    // sanitized unknown slug exactly equal to one of them degrades to no role
+    // (generic `gentle`) in metadata roles and the native message alike.
+    // `subagent` is the launch-correlation placeholder, never an agent name, so
+    // it must never reach the wire as a role word. `gentle` is the pink
+    // generic's own word (S1), so an agent literally named `gentle` must not
+    // become a second one on the amber cell.
     const slug = sanitizeAgentSlug(agent);
-    return slug === "working" || slug === "subagent" ? undefined : slug;
+    return slug === "working" || slug === "subagent" || slug === "gentle" ? undefined : slug;
   }
 
   // Bounded CSV of role words, oldest-first (subs already arrive
@@ -3563,9 +3565,12 @@ export default function (pi) {
       // eternal fresh work token is what keeps the row from ever reaching
       // idle. The beat spends a bounded budget of quiet beats (one BEAT_MS
       // each) and then stops. Stopping is the honest outcome: a native state
-      // the host never confirmed must not be published in its place. Every
-      // work edge re-arms the beat through schedulePublish, so a real turn is
-      // never throttled.
+      // the host never confirmed must not be published in its place. The
+      // bound never applies to a turn this producer saw start (see
+      // `quietWithoutTruth`), so it cannot leave live work unpainted; the
+      // edges that schedule a publish (ask, review, launch, session changes,
+      // jobs) re-arm the beat, while an ordinary tool edge reaches the row
+      // through the host's own truth rather than by re-arming it.
       if (quietWithoutTruth()) {
         quietBeats += 1;
         if (quietBeats >= QUIET_BEAT_LIMIT) {
@@ -3595,8 +3600,16 @@ export default function (pi) {
   // still owns the row. A host that answers `false` is not quiet — it says the
   // agent is still running — and a host that answers `true` settles through
   // `reconcileSettled` instead. No native state is ever inferred here.
+  //
+  // `agentActive` is excluded on purpose: a turn this producer saw start is
+  // live work, and the host offers no way to confirm its settle. Bounding that
+  // beat would stop painting a running turn, which is exactly the pin the bound
+  // exists to avoid (S2) — the bound must never trade a truthful "still
+  // working" for a false `idle`. It therefore covers only a producer with no
+  // observed turn behind it and no host truth to settle on.
   function quietWithoutTruth() {
     return (
+      !agentActive &&
       !settled &&
       hostIdleTruth() === undefined &&
       noWorkEvidence() &&
