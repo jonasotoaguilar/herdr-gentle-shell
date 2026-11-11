@@ -2427,6 +2427,275 @@ test('T2: settle with only pending launches stays working (no idle)', async () =
   }
 });
 
+// --- T2: the pane must never freeze at native `working` -------------------
+// A producer that never settles pins the row: `computeNativeState` returns
+// undefined, so no native state is published and the host keeps the last
+// `working`, while every beat republishes a fresh count-0 `gentle_work_v1`.
+// The settle now comes from the host's own live truth (`ctx.isIdle()`), a
+// quiet producer the host never confirms stops beating after a bounded
+// budget, and the settle-time pending latch stops counting once the finish
+// hold that raised it expires. The beat cadence is overridable
+// (GENTLE_HERDR_BEAT_MS, same discipline as GENTLE_HERDR_DONE_HOLD_MS) so a
+// test can watch several beats — and watch them stop — without waiting 15 s
+// per period.
+
+function setBeatEnv(beatMs, doneHoldMs) {
+  const prev = { beat: process.env.GENTLE_HERDR_BEAT_MS, hold: process.env.GENTLE_HERDR_DONE_HOLD_MS };
+  if (beatMs === undefined) delete process.env.GENTLE_HERDR_BEAT_MS;
+  else process.env.GENTLE_HERDR_BEAT_MS = String(beatMs);
+  if (doneHoldMs === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+  else process.env.GENTLE_HERDR_DONE_HOLD_MS = String(doneHoldMs);
+  return prev;
+}
+
+function restoreBeatEnv(prev) {
+  if (prev.beat === undefined) delete process.env.GENTLE_HERDR_BEAT_MS;
+  else process.env.GENTLE_HERDR_BEAT_MS = prev.beat;
+  if (prev.hold === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+  else process.env.GENTLE_HERDR_DONE_HOLD_MS = prev.hold;
+}
+
+// Metadata beats actually on the wire: the observable count-0 `gentle_work_v1`
+// republish (the native report is asserted separately).
+function metadataBeats(received) {
+  return received.filter((r) => r.method === 'pane.report_metadata');
+}
+
+// Session context with a live-idle probe; `idle` omitted when the host offers
+// no truth at all (no `isIdle` method), the T2 no-truth case.
+function beatSessionCtx(sessionId, sessionFile, idle) {
+  const ctx = {
+    mode: 'tui',
+    sessionManager: { getSessionId: () => sessionId, getSessionFile: () => sessionFile, getEntries: () => [] },
+  };
+  if (idle !== undefined) ctx.isIdle = idle;
+  return ctx;
+}
+
+// The beat stopped: the published metadata count is stable across four beat
+// periods. A loaded machine may still be draining one coalesced publish, so
+// this polls instead of sampling a single window — a beat that never stops
+// fails with the published count.
+async function assertBeatStopped(wire, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = metadataBeats(wire.received).length;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 400));
+    const now = metadataBeats(wire.received).length;
+    if (now === last) return;
+    last = now;
+  }
+  assert.fail(`the beat never stopped: ${last} metadata beats published`);
+}
+
+test('T2: a settle the producer never saw is reconciled from host truth: native idle, beat stopped', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, 1000);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-missed-settle', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    // The producer is attached to a session that is already idle and no
+    // `agent_settled` will ever reach it (the settle predates it, or the event
+    // was missed): `settled` stays false while the host reports that no turn
+    // is running. Pre-fix this state publishes no native state at all, so the
+    // pane keeps the last `working`, and every beat refreshes a count-0 work
+    // token — an idle session painted `gentle` (S2).
+    const ctx = beatSessionCtx('sess-missed', '/tmp/gentle-missed-settle-session', () => true);
+    h.fire('session_start', {}, ctx);
+    const idle = await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'idle',
+      5000,
+      'native idle reconciled from the host truth',
+    );
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 1, 'idle publishes exactly once');
+    assert.ok(idle.params.seq > 0, 'the reconciled idle carries a real seq');
+    assert.equal(nativeStates(wire.received).at(-1).state, 'idle', 'the pane ends on idle, never back on working');
+    // A settle recovered from host truth has no observed turn behind it, so it
+    // must never mint a finish episode: no `done` token, no phone notification.
+    assert.equal(
+      wire.received.filter((r) => r.method === 'pane.report_metadata' && r.params.tokens?.gentle_done_v1).length,
+      0,
+      'a reconciled settle never mints a done token',
+    );
+    // The beat stops on its own: nothing is republished, so no fresh count-0
+    // work token can keep the row painted.
+    await new Promise((r) => setTimeout(r, 500));
+    await assertBeatStopped(wire);
+    assert.equal(nativeStates(wire.received).at(-1).state, 'idle', 'nothing repaints the pane after the stop');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: a reconcile never mints a finish episode from non-turn activity', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, 1000);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-reconcile-no-finish', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    // An idle session where the only activity was an ask episode: that is not
+    // a turn, so the settle recovered from host truth must not announce a
+    // finish (the row goes straight to idle).
+    h.fire('session_start', {}, beatSessionCtx('sess-no-finish', '/tmp/gentle-no-finish-session', () => true));
+    h.fire('tool_execution_start', { toolCallId: 'ask-1', toolName: 'ask_user_question' });
+    await new Promise((r) => setTimeout(r, 300));
+    h.fire('tool_execution_end', { toolCallId: 'ask-1' });
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'idle',
+      5000,
+      'idle after the ask episode closes on an idle host',
+    );
+    assert.equal(
+      wire.received.filter((r) => r.method === 'pane.report_metadata' && r.params.tokens?.gentle_done_v1).length,
+      0,
+      'non-turn activity never mints a done token',
+    );
+    await new Promise((r) => setTimeout(r, 500));
+    await assertBeatStopped(wire);
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: no host truth and nothing active stops the beat (no eternal count-0 work token)', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, undefined);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-no-host-truth', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    // The context carries no `isIdle`: there is no host truth to settle on.
+    h.fire('session_start', {}, beatSessionCtx('sess-no-truth', '/tmp/gentle-no-truth-session'));
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'native working while the agent runs',
+    );
+    // Nothing is active any more (no delegates, no launches, no jobs) and no
+    // settle can ever be confirmed: the beat must stop instead of refreshing
+    // the count-0 work token forever.
+    await new Promise((r) => setTimeout(r, 1000));
+    await assertBeatStopped(wire);
+    assert.equal(
+      nativeTransitionCount(wire.received, 'idle'),
+      0,
+      'a native state the host never confirmed is never published',
+    );
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2: the settle-time pending latch is bounded by the finish hold', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, 1000);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-settled-pending', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    let hostIdle = false;
+    const ctx = beatSessionCtx('sess-settled-pending', '/tmp/gentle-settled-pending-session', () => hostIdle);
+    h.fire('session_start', {}, ctx);
+    h.fire('agent_start', {});
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'native working while the agent runs',
+    );
+    // A launch is in flight when the principal settles, and its result never
+    // arrives: the retained evidence keeps the pane on working for the
+    // settle's finish hold, and no longer.
+    h.fire('tool_call', { toolName: 'subagent_run', toolCallId: 'lost-1', input: { agent: 'gentle-ai-worker', label: 'lost launch' } });
+    hostIdle = true;
+    h.fire('agent_settled', {}, ctx);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(
+      nativeStates(wire.received).every((p) => p.state === 'working'),
+      true,
+      'inside the hold the settle-time launch keeps working',
+    );
+    const idle = await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'idle',
+      5000,
+      'idle once the settle hold expires with the launch still lost',
+    );
+    assert.ok(idle.params.seq > 0);
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 1, 'idle publishes exactly once');
+    assert.equal(nativeStates(wire.received).at(-1).state, 'idle', 'the latch never pins the pane past its bound');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2 PRESERVE: an active session keeps reporting working across beats', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, undefined);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-still-active', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    h.fire('session_start', {}, beatSessionCtx('sess-active', '/tmp/gentle-still-active-session', () => false));
+    h.fire('agent_start', {});
+    launchRunning(h, 'run-act1', 'act1', 'gentle-ai-worker');
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working' && r.params.message === 'worker',
+      5000,
+      'working with the running role',
+    );
+    await new Promise((r) => setTimeout(r, 500));
+    assert.ok(metadataBeats(wire.received).length >= 2, 'the beat keeps running for real activity');
+    assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'an active session stays working');
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'an active session never reports idle');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
+test('T2 PRESERVE: a run error stays on working, never blocked or idle', async () => {
+  const wire = await startNativeWire();
+  const prevBeatEnv = setBeatEnv(100, undefined);
+  const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-error-working', '1');
+  try {
+    const h = harness();
+    factory(h.pi);
+    let hostIdle = false;
+    const ctx = beatSessionCtx('sess-error', '/tmp/gentle-error-session', () => hostIdle);
+    h.fire('session_start', {}, ctx);
+    h.fire('agent_start', {});
+    h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'error' } });
+    await wire.waitFor(
+      (r) => r.method === 'pane.report_agent' && r.params.state === 'working',
+      5000,
+      'native working for a run error',
+    );
+    // The host reports the run is over while the error leg stands: native
+    // stays on the silent working state (never blocked, never idle).
+    hostIdle = true;
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(nativeTransitionCount(wire.received, 'blocked'), 0, 'an error never claims native blocked');
+    assert.equal(nativeTransitionCount(wire.received, 'idle'), 0, 'an error leg never reports idle');
+    assert.ok(nativeStates(wire.received).every((p) => p.state === 'working'), 'the pane stays on working');
+    assert.equal(blockedLabels(h).at(-1).label, 'error:run-failed', 'the error stays sidebar-only');
+  } finally {
+    restoreBeatEnv(prevBeatEnv);
+    restoreNativeEnv(prevEnv);
+    await wire.close();
+  }
+});
+
 // --- N1 notification parity: specific working message + gated idle + wait-only blocked ---
 // RED regressions: working carries the oldest running role in message (never
 // bare generic working while a role is known); idle only on true-empty
