@@ -731,6 +731,23 @@ const paneId = process.env.HERDR_PANE_ID;
 
 const TTL_MS = 60000;
 const BEAT_MS = 15000;
+const BEAT_MIN_MS = 100;
+const BEAT_MAX_MS = 300000;
+const BEAT_ENV = "GENTLE_HERDR_BEAT_MS";
+// Bounded budget of quiet beats a producer may publish while it has no work
+// evidence and no host truth to settle on (`quietWithoutTruth` in the
+// factory): three beats, one BEAT_MS each. See the comment there.
+const QUIET_BEAT_LIMIT = 3;
+// Consecutive beats a producer must see the lost-settle contradiction (it
+// believes a turn is running, the host answers `isIdle() === true`, and
+// nothing else keeps the session busy) before it applies the settle the host
+// already reports (`reconcileSettled` in the factory). One beat is not enough:
+// the host flips to idle at the very end of a run, so a genuine `agent_settled`
+// can reach the producer one host tick later, and a single sample would repaint
+// a still-settling turn as idle. Two consecutive samples — 30 s of
+// host-confirmed idle at the 15 s beat — cannot be that race, and a lost edge
+// still recovers within one beat period after the window closes.
+const LOST_SETTLE_BEATS = 2;
 // Synthesized finish signal (DESIGN §4.3, S2/D2). The host never reports
 // `done`, so the producer mints the finish itself: one session-bound
 // `<hash>:<expiry>` token per finish at the settled-and-empty edge, carrying
@@ -929,6 +946,20 @@ export function doneHoldMs(raw = process.env[DONE_HOLD_ENV]) {
   const parsed = Number(text);
   if (!Number.isFinite(parsed)) return DONE_HOLD_MS;
   return Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(parsed)));
+}
+
+// Beat cadence override, the same discipline as doneHoldMs: an absent or
+// unparseable value keeps the 15 s default and anything outside the band is
+// clamped, so a debugging session (or a test that cannot wait 15 s per beat)
+// can shorten the beat without touching the 60 s token TTL or the transport's
+// own 500/1500 ms bounds. The 100 ms floor keeps every beat far slower than a
+// single send.
+function beatMs(raw = process.env[BEAT_ENV]) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0) return BEAT_MS;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return BEAT_MS;
+  return Math.min(BEAT_MAX_MS, Math.max(BEAT_MIN_MS, Math.round(parsed)));
 }
 
 // Cap a label at MAX_LABEL_CHARS UTF-16 units — the same unit the consumer's
@@ -1140,6 +1171,15 @@ function cliFallback(patch) {
 // unverified) and no new imports (self-contained single file). Do NOT
 // reinstall the native publisher from Herdr: two publishers for the same
 // pane collide (dual-publish).
+//
+// T2 (the pane must never freeze at `working`): the settle this owner gates on
+// is reconciled from the host's own live truth on every beat instead of being
+// inferred — including when a turn was seen to start but its settle edge was
+// lost, which needs a bounded window of contradictory beats rather than a
+// single sample; a quiet producer the host never confirms stops beating after a
+// bounded budget instead of republishing a count-0 work token forever; and the
+// settle-time pending latch stops counting once the finish hold that raised it
+// expires.
 // ---------------------------------------------------------------------------
 
 export const NATIVE_STATES = ["working", "blocked", "idle"];
@@ -1160,6 +1200,11 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // done/finished (only working|blocked|idle) and never a notification
 // method — the host owns finished text plus toast/sound, and desktop ask
 // attention (including toast dedup) is host-owned (DESIGN §7).
+//
+// The `settled` input is never inferred here: the beat reconciles it from the
+// host's own live truth (`ctx.isIdle()`), so a missed `agent_settled` cannot
+// leave this producer unable to reach `idle` — not when no turn was observed,
+// and not when a turn this producer saw start never delivered its settle edge.
 export function computeNativeState({
   agentActive,
   settled,
@@ -2635,6 +2680,10 @@ export default function (pi) {
   // opened the current ask episode.
   let moshiContext;
   let moshiCtxRef;
+  // Last context the host handed us, retained so a beat can ask the host's own
+  // live truth (`isIdle()`) instead of inferring a settle. Kept apart from
+  // `moshiCtxRef`, whose capture leg owns that reference.
+  let settleCtx;
   let lastAskToolName;
 
   // Live background jobs (Gentle Shell `bash_background` / `monitor`) from the
@@ -2694,6 +2743,7 @@ export default function (pi) {
   // freshness bound measures from.
   function onJobsSnapshot(value) {
     if (!isRecord(value) || !isRecord(value.snapshot) || !Array.isArray(value.snapshot.jobs)) return;
+    noteActivity();
     const jobs = value.snapshot.jobs.filter(
       (entry) => isRecord(entry) && typeof entry.id === "string" && entry.id.length > 0,
     );
@@ -2830,6 +2880,13 @@ export default function (pi) {
   let presenceReconciler = createPresenceReconciler();
   let transportFails = 0;
   let beatTimer;
+  // Consecutive quiet beats published without host truth (see
+  // `quietWithoutTruth`); bounded by QUIET_BEAT_LIMIT and reset by work.
+  let quietBeats = 0;
+  // Consecutive beats that contradict a turn this producer saw start (see
+  // `lostSettleContradiction`); bounded by LOST_SETTLE_BEATS and reset by any
+  // activity edge.
+  let lostSettleBeats = 0;
   let publishQueued = false;
   let publishInFlight = false;
   // Native owner queue (always on): monotonic seq per logical report,
@@ -2852,7 +2909,17 @@ export default function (pi) {
   // beat arriving mid-send is describing.
   let nativeSending = null;
   let nativeLastOk = undefined;
+  // T2 native-only terminal guard: agent_settled clears the metadata
+  // pending-launch hint below, but a settle that observes in-flight launches
+  // retains pending evidence here so native idle gating stays working until
+  // those launches resolve. Metadata/tasks untouched; the guard clears when a
+  // launch resolves, on agent_start, with the session, and — when a launch
+  // never reports back — at `nativeSettledPendingUntil`, the finish-hold
+  // deadline of the settle that raised it. Past that hold the evidence stops
+  // counting, so a lost launch result can never pin the native report at
+  // `working` for good (seq itself never resets).
   let nativeSettledPending = false;
+  let nativeSettledPendingUntil = 0;
   // Finish-hold episode (S2): minted once at the settled-and-empty edge so the
   // row reads `done`, then republished unchanged (never refreshed) until the
   // hold expires. `donePending` carries the unannounced finish to the beat
@@ -2862,6 +2929,12 @@ export default function (pi) {
   let doneExpiry;
   let donePending = false;
   let sawActivity = false;
+  // Whether the settle this row sits in came from an observed turn
+  // (`agent_settled`) rather than from the host-truth reconcile: only an
+  // observed turn can mint a finish, so non-turn activity (an ask, a review, a
+  // job) on a producer that never saw a turn can never announce `done` or the
+  // phone's `task_complete`.
+  let turnSettled = false;
   // LIVE-1 startup latency: the session binding is still INITIATED on
   // session_start (so Herdr can attribute the pane from the first frame), but
   // the host no longer waits for it. The host awaits every session_start
@@ -2871,12 +2944,117 @@ export default function (pi) {
   // unchanged, only the host's startup return is freed. Reset with the session
   // so a stale binding can never gate the next one.
   let sessionReportPending = null;
-  // T2 native-only terminal guard: agent_settled clears the metadata
-  // pending-launch hint below, but a settle that observes in-flight
-  // launches retains pending evidence here so native idle gating stays
-  // working until those launches resolve. Metadata/tasks untouched; the
-  // guard clears when a launch resolves, on agent_start, and with the
-  // session (seq itself never resets).
+
+  // Retain the host context the settle reconcile reads (`isIdle()`), next to
+  // the Moshi capture reference it already replaced. A lifecycle event that
+  // arrives without a context must not erase the last truth we hold.
+  function retainContext(ctx) {
+    moshiCtxRef = ctx;
+    if (ctx) settleCtx = ctx;
+  }
+
+  function clearSettledPending() {
+    nativeSettledPending = false;
+    nativeSettledPendingUntil = 0;
+  }
+
+  // Past the finish hold of the settle that raised it, the retained pending
+  // evidence stops counting: the hold is the span it exists to cover.
+  function settledPendingHeld() {
+    return nativeSettledPending && Date.now() < nativeSettledPendingUntil;
+  }
+
+  // The settle state `agent_settled` applies, shared with the reconcile below
+  // so both paths agree on every field except the finish episode.
+  function applySettled(fromTurn) {
+    agentActive = false;
+    settled = true;
+    turnSettled = fromTurn === true;
+    lostSettleBeats = 0;
+    clearSettledPending();
+  }
+
+  // Every activity edge restarts the lost-settle window: a tool call, a
+  // delegate, a job, an ask/review/error leg (the contradiction predicate reads
+  // those legs directly) or a new `agent_start`. Only consecutive beats that
+  // still contradict the host may settle.
+  function noteActivity() {
+    lostSettleBeats = 0;
+  }
+
+  // Nothing observable keeps this session busy: no authoritative
+  // running|queued delegate, no launch in flight, no live background job.
+  // `agentActive` is not part of this evidence: it is this producer's own
+  // inference from turn events, so the reconcile guards it separately and
+  // never overrides a turn it saw start.
+  function noWorkEvidence() {
+    return (
+      activeSubs().length === 0 &&
+      pendingCalls.size === 0 &&
+      freshRunningJobCount() === 0
+    );
+  }
+
+  // Live host truth for the settle decision: the retained context's `isIdle()`.
+  // `undefined` means the host offers no truth (no context yet, or one without
+  // the method); `false` means the host still considers the agent busy, which
+  // is never this producer's to override.
+  function hostIdleTruth() {
+    const probe = settleCtx?.isIdle;
+    if (typeof probe !== "function") return undefined;
+    try {
+      return probe.call(settleCtx) === true;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // The lost-settle contradiction: this producer still believes its turn runs,
+  // the host answers that nothing is processing, and no work evidence or
+  // owning leg keeps the session busy. Both sides are live truth re-read on
+  // every beat, so the contradiction is never remembered from a stale sample.
+  function lostSettleContradiction() {
+    return (
+      agentActive &&
+      hostIdleTruth() === true &&
+      noWorkEvidence() &&
+      !askActiveNow() &&
+      !reviewActive &&
+      errorCode === undefined
+    );
+  }
+
+  // Recover a settle this producer missed. `settled` flips only in
+  // `agent_settled`, which early-returns unless the host already reports idle,
+  // so a session first observed while idle — or an aborted or failed run whose
+  // `agent_settled` never arrived — leaves `settled` false: `computeNativeState`
+  // returns undefined and the pane keeps the last native `working`. The host
+  // answers the same question `agent_settled` asks, so read its live truth here
+  // instead of inferring a terminal from a timeout or from a count.
+  function reconcileSettled() {
+    if (!rootSession || settled) return;
+    // No turn edge was ever observed: nothing local contradicts the host, so
+    // its answer settles the producer on the same beat.
+    if (!agentActive) {
+      if (!noWorkEvidence()) return;
+      if (hostIdleTruth() !== true) return;
+      applySettled(false);
+      return;
+    }
+    // A turn the producer itself saw start is local evidence of a running
+    // agent, and `isIdle()` turns true at the end of the run — so a genuine
+    // settle edge can still be in flight. Only a bounded window of consecutive
+    // contradictory beats proves the edge was lost.
+    if (!lostSettleContradiction()) {
+      lostSettleBeats = 0;
+      return;
+    }
+    lostSettleBeats += 1;
+    if (lostSettleBeats < LOST_SETTLE_BEATS) return;
+    // `fromTurn` false: a recovered settle is never a turn, so it can mint no
+    // finish episode (no `gentle_done_v1`, no finish notification).
+    applySettled(false);
+  }
 
   function refreshSessionRef(ctx) {
     try {
@@ -3150,13 +3328,15 @@ export default function (pi) {
     ) {
       return "rdd";
     }
-    // The bare visible words `working` and `subagent` are banned: a sanitized
-    // unknown slug exactly equal to either degrades to no role (generic
-    // `gentle`) in metadata roles and the native message alike. `subagent` is
-    // the launch-correlation placeholder, never an agent name, so it must
-    // never reach the wire as a role word.
+    // The bare visible words `working`, `subagent`, and `gentle` are banned: a
+    // sanitized unknown slug exactly equal to one of them degrades to no role
+    // (generic `gentle`) in metadata roles and the native message alike.
+    // `subagent` is the launch-correlation placeholder, never an agent name, so
+    // it must never reach the wire as a role word. `gentle` is the pink
+    // generic's own word (S1), so an agent literally named `gentle` must not
+    // become a second one on the amber cell.
     const slug = sanitizeAgentSlug(agent);
-    return slug === "working" || slug === "subagent" ? undefined : slug;
+    return slug === "working" || slug === "subagent" || slug === "gentle" ? undefined : slug;
   }
 
   // Bounded CSV of role words, oldest-first (subs already arrive
@@ -3300,7 +3480,7 @@ export default function (pi) {
       sawActivity = true;
       doneExpiry = undefined;
       donePending = false;
-    } else if (settled) {
+    } else if (settled && turnSettled) {
       if (doneExpiry === undefined && sawActivity) {
         doneExpiry = Date.now() + doneHoldMs();
         donePending = true;
@@ -3371,16 +3551,73 @@ export default function (pi) {
     if (beatTimer || !rootSession) return;
     if (!interesting() && settled) return;
     beatTimer = setInterval(() => {
+      // A tick with nothing interesting to publish has nothing to do. Stopping
+      // here (instead of only after a landed publish) is what keeps a slow
+      // send from re-arming the interval through `publishQueued` and spinning
+      // a beat nobody needs.
+      if (!interesting()) {
+        stopBeat();
+        return;
+      }
+      // T2 quiet bound: a beat with no work evidence, no host truth, and no
+      // leg that still owns the row has nothing confirmed to publish — every
+      // such beat republishes a fresh count-0 `gentle_work_v1`, and that
+      // eternal fresh work token is what keeps the row from ever reaching
+      // idle. The beat spends a bounded budget of quiet beats (one BEAT_MS
+      // each) and then stops. Stopping is the honest outcome: a native state
+      // the host never confirmed must not be published in its place. The
+      // bound never applies to a turn this producer saw start (see
+      // `quietWithoutTruth`), so it cannot leave live work unpainted; the
+      // edges that schedule a publish (ask, review, launch, session changes,
+      // jobs) re-arm the beat, while an ordinary tool edge reaches the row
+      // through the host's own truth rather than by re-arming it.
+      if (quietWithoutTruth()) {
+        quietBeats += 1;
+        if (quietBeats >= QUIET_BEAT_LIMIT) {
+          stopBeat();
+          return;
+        }
+      } else {
+        quietBeats = 0;
+      }
       void publishNow();
-    }, BEAT_MS);
+    }, beatMs());
     if (beatTimer.unref) beatTimer.unref();
   }
 
+  function stopBeat() {
+    if (!beatTimer) return;
+    clearInterval(beatTimer);
+    beatTimer = undefined;
+  }
+
   function maybeStopBeat() {
-    if (beatTimer && !interesting()) {
-      clearInterval(beatTimer);
-      beatTimer = undefined;
-    }
+    if (beatTimer && !interesting()) stopBeat();
+  }
+
+  // T2 quiet bound predicate (see the budget applied inside `ensureBeat`): the
+  // host offers no truth at all, nothing is active by evidence, and no leg
+  // still owns the row. A host that answers `false` is not quiet — it says the
+  // agent is still running — and a host that answers `true` settles through
+  // `reconcileSettled` instead. No native state is ever inferred here.
+  //
+  // `agentActive` is excluded on purpose: a turn this producer saw start is
+  // live work, and the host offers no way to confirm its settle. Bounding that
+  // beat would stop painting a running turn, which is exactly the pin the bound
+  // exists to avoid (S2) — the bound must never trade a truthful "still
+  // working" for a false `idle`. It therefore covers only a producer with no
+  // observed turn behind it and no host truth to settle on.
+  function quietWithoutTruth() {
+    return (
+      !agentActive &&
+      !settled &&
+      hostIdleTruth() === undefined &&
+      noWorkEvidence() &&
+      !askActiveNow() &&
+      !reviewActive &&
+      errorCode === undefined &&
+      doneExpiry === undefined
+    );
   }
 
   // N1 parity report: state + message. Working carries the SPECIFIC
@@ -3407,7 +3644,7 @@ export default function (pi) {
           agentActive,
           settled,
           activeCount: activeSubs().length,
-          pendingCount: pendingCalls.size + (nativeSettledPending ? 1 : 0),
+          pendingCount: pendingCalls.size + (settledPendingHeld() ? 1 : 0),
           askActive: askActiveNow(),
           reviewActive,
         });
@@ -3622,6 +3859,9 @@ export default function (pi) {
     // flight publishes nothing: `rootSession` is re-read after the wait.
     await awaitSessionBinding();
     if (!rootSession || !sidebarPublishingEnabled()) return;
+    // Host truth first: a settle this producer missed must be visible to both
+    // the native report and the tokens built below.
+    reconcileSettled();
     reconcilePresence();
     queueNative();
     const tokens = buildTokens();
@@ -3773,10 +4013,11 @@ export default function (pi) {
     nativePending = null;
     nativeSending = null;
     nativeLastOk = undefined;
-    nativeSettledPending = false;
+    clearSettledPending();
     doneExpiry = undefined;
     donePending = false;
     sawActivity = false;
+    turnSettled = false;
     jobsSnapshot = undefined;
     clearJobsExpiry();
     errorCode = undefined;
@@ -3786,9 +4027,13 @@ export default function (pi) {
     liveQueued = false;
     sessionReportPending = null;
     sessionCwd = undefined;
+    settleCtx = undefined;
+    quietBeats = 0;
+    lostSettleBeats = 0;
     changes = { files: 0, added: 0, deleted: 0 };
     agentActive = false;
     settled = false;
+    turnSettled = false;
   }
 
   function clearEmittedLabel() {
@@ -3843,6 +4088,7 @@ export default function (pi) {
 
   pi.on("tool_execution_start", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolCallId !== "string") return;
+    noteActivity();
     runningTools.add(event.toolCallId);
     // Structured ask tools open ONLY on genuine execution (never on
     // `tool_call` proposal), keyed by call id so the matching end or
@@ -3968,6 +4214,7 @@ export default function (pi) {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
     // A tool starting proves a run is alive: an error left over from a run that
     // already died is released here rather than sticking until the next turn.
+    noteActivity();
     clearRunError();
     // Structured ask proposals never open ask (execution does); subagent
     // launch correlation below is unchanged.
@@ -3997,6 +4244,7 @@ export default function (pi) {
 
   pi.on("tool_result", (event) => {
     if (!rootSession || !isRecord(event) || typeof event.toolName !== "string") return;
+    noteActivity();
     clearRunError();
     if (typeof event.toolCallId === "string" && askToolCalls.delete(event.toolCallId)) {
       updateBlocker();
@@ -4013,7 +4261,7 @@ export default function (pi) {
     // outcome is now covered by the task record (working via activeSubs),
     // the error latch (blocked), or genuine emptiness (idle on next beat).
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
-      nativeSettledPending = false;
+      clearSettledPending();
     }
     if (typeof event.toolCallId === "string" ? reviewCalls.delete(event.toolCallId) : false) {
       // The ended id was a known acknowledged execution; remaining tracked
@@ -4123,6 +4371,7 @@ export default function (pi) {
   // never passes through `tool_result` details.
   pi.on("message_end", (event) => {
     if (!rootSession || !isRecord(event)) return;
+    noteActivity();
     const message = event.message;
     if (!isRecord(message)) return;
     if (message.role === "assistant") {
@@ -4185,7 +4434,7 @@ export default function (pi) {
     rootSession = true;
     sessionManager = ctx.sessionManager;
     refreshSessionRef(ctx);
-    moshiCtxRef = ctx;
+    retainContext(ctx);
     if (moshiEnabled()) moshiEnsureContext();
     // LIVE-1: bind the session before any state beat so Herdr attributes the
     // pane from the first frame (mirrors the managed publisher). The binding is
@@ -4203,14 +4452,17 @@ export default function (pi) {
   pi.on("agent_start", (_event, ctx) => {
     if (!rootSession) return;
     refreshSessionRef(ctx);
-    moshiCtxRef = ctx;
+    retainContext(ctx);
     // LIVE-1: re-bind the session like the managed publisher did, so a
     // restart or re-announcement never leaves the pane binding-less while
     // metadata beats flow.
     void reportSession();
     agentActive = true;
     settled = false;
-    nativeSettledPending = false;
+    turnSettled = false;
+    clearSettledPending();
+    quietBeats = 0;
+    noteActivity();
     clearRunError();
     refreshChanges();
     schedulePublish();
@@ -4218,13 +4470,17 @@ export default function (pi) {
 
   pi.on("agent_settled", (_event, ctx) => {
     if (!rootSession || ctx?.isIdle?.() !== true) return;
-    moshiCtxRef = ctx;
-    agentActive = false;
-    settled = true;
+    retainContext(ctx);
     // Retain settle-time pending evidence for native gating before the
-    // metadata hint clears (see nativeSettledPending above).
-    if (pendingCalls.size > 0) nativeSettledPending = true;
+    // metadata hint clears (see nativeSettledPending above), bounded by the
+    // finish hold this settle opens.
+    const pendingAtSettle = pendingCalls.size > 0;
     pendingCalls.clear();
+    applySettled(true);
+    if (pendingAtSettle) {
+      nativeSettledPending = true;
+      nativeSettledPendingUntil = Date.now() + doneHoldMs();
+    }
     // S62 turn-end: the working tree may have changed without transcript
     // evidence (external/untracked edits), so re-scan before publishing.
     refreshChanges();
