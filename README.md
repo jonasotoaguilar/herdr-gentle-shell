@@ -282,8 +282,11 @@ word, never `done`). A role word is not a subagent label; it carries the
 total running delegate count in parentheses when that count exceeds one. The
 work total is a direct projection of the
 Gentle Shell TaskStore `running` records (only `running` counts as
-executing; queued/waiting never count), never a calculated
-pending-call estimate: pending tool calls are role-only display hints (exact
+executing; queued/waiting never count), narrowed the same way to the ids the
+session's presence snapshot lists running, so a run that finished without a
+delivered final contributes no count, no role and no name; with no usable
+snapshot the local map stands in full, never at zero. It is never a
+calculated pending-call estimate: pending tool calls are role-only display hints (exact
 in-flight subagent agent -> role slug, resolved from the tool input or, for a
 resume, from the tracked task record, so task-mode launches show the active
 role even at count 0) plus label correlation, and
