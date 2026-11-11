@@ -89,6 +89,18 @@ if [ "\${1:-}" = "pack" ]; then
   exit "\${MOCK_PACK_EXIT:-0}"
 fi
 if [ "\${1:-}" = "view" ]; then
+  fail_first="\${MOCK_NPM_VIEW_FAIL_FIRST:-0}"
+  if [ "$fail_first" -gt 0 ]; then
+    probes=0
+    if [ -f "$log" ]; then
+      probes="$(grep -c '^view' "$log" 2>/dev/null || true)"
+      [ -n "$probes" ] || probes=0
+    fi
+    if [ "$probes" -le "$fail_first" ]; then
+      echo "npm error (mock): herdr-gentle-shell@\${3:-?} is not served yet" >&2
+      exit 1
+    fi
+  fi
   printf '%s\\n' "\${MOCK_NPM_VIEW:-0.2.0}"
   exit "\${MOCK_NPM_VIEW_EXIT:-0}"
 fi
@@ -195,7 +207,8 @@ function baseEnv(fx, overrides = {}) {
     'GH_TOKEN', 'RELEASE_TAG', 'RELEASE_COMMIT', 'RELEASE_REPOSITORY',
     'MOCK_VIEW', 'MOCK_CREATE', 'MOCK_UPLOAD',
     'MOCK_PACK_JSON', 'MOCK_PACK_EXIT', 'MOCK_NPM_VIEW', 'MOCK_NPM_VIEW_EXIT',
-    'MOCK_SHELLCHECK_EXIT',
+    'MOCK_NPM_VIEW_FAIL_FIRST', 'MOCK_SHELLCHECK_EXIT',
+    'RELEASE_NPM_PROBE_ATTEMPTS', 'RELEASE_NPM_PROBE_DELAY_SECONDS',
   ]) delete env[k];
   Object.assign(env, {
     PATH: `${fx.fakeBin}${path.delimiter}${process.env.PATH}`,
@@ -239,6 +252,14 @@ function ghLogLines(fx) {
 
 function npmLogLines(fx) {
   return fs.readFileSync(fx.npmLog, 'utf8').split('\n').filter((l) => l.length > 0);
+}
+
+function npmViewLines(fx) {
+  return npmLogLines(fx).filter((l) => l.startsWith('view'));
+}
+
+function waitLines(result) {
+  return result.stdout.split('\n').filter((l) => l.includes('waiting for registry propagation'));
 }
 
 function createLines(fx) {
@@ -564,6 +585,93 @@ describe('release-verify verdicts', () => {
     const r = runVerify(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'published' });
     assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
     assert.equal(npmLogLines(fx).length, 0, `npm must not run for herdr tags, log:\n${npmLogLines(fx).join('\n')}`);
+  });
+});
+
+describe('release-verify npm propagation wait', () => {
+  // npm returns from a publish before the version is readable, so the pi
+  // series probe is a bounded wait. Both knobs are overridable so the wait
+  // costs milliseconds here instead of the production 8 x 15s.
+  const FAST = { RELEASE_NPM_PROBE_DELAY_SECONDS: '0' };
+
+  it('retries a not-yet-served version and passes once npm answers', (t) => {
+    const fx = setup(t);
+    const r = runVerify(fx, {
+      RELEASE_TAG: PI_TAG,
+      MOCK_VIEW: 'published',
+      MOCK_NPM_VIEW: '0.2.0',
+      MOCK_NPM_VIEW_FAIL_FIRST: '2',
+      ...FAST,
+    });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(r.stdout, /verified GitHub Release pi-v0\.2\.0/);
+    assert.match(r.stdout, /release-verify: npm version OK: herdr-gentle-shell@0\.2\.0/);
+    const waits = waitLines(r);
+    assert.equal(waits.length, 2, `one waiting line per retry, got stdout:\n${r.stdout}`);
+    for (const line of waits) {
+      assert.match(line, /^release-verify: npm does not serve herdr-gentle-shell@0\.2\.0 yet; waiting for registry propagation \(attempt \d+ of \d+, retrying in 0s\)$/);
+    }
+    assert.equal(npmViewLines(fx).length, 3, `expected three probes, log:\n${npmLogLines(fx).join('\n')}`);
+  });
+
+  it('fails closed with the documented message when the budget runs out', (t) => {
+    const fx = setup(t);
+    const r = runVerify(fx, {
+      RELEASE_TAG: PI_TAG,
+      MOCK_VIEW: 'published',
+      MOCK_NPM_VIEW_FAIL_FIRST: '99',
+      RELEASE_NPM_PROBE_ATTEMPTS: '3',
+      ...FAST,
+    });
+    assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(r.stderr, /release-verify: error: npm view herdr-gentle-shell@0\.2\.0 version failed/);
+    assert.ok(!r.stdout.includes('npm version OK'), `no npm version success line, got:\n${r.stdout}`);
+    assert.ok(!r.stdout.includes('verified GitHub Release'), `a missing publish must stay red, got:\n${r.stdout}`);
+    assert.equal(waitLines(r).length, 2, `no waiting line after the last probe, got:\n${r.stdout}`);
+    assert.equal(npmViewLines(fx).length, 3, `the budget caps the probes, log:\n${npmLogLines(fx).join('\n')}`);
+  });
+
+  it('probes with --prefer-online so a cached negative read cannot satisfy it', (t) => {
+    const fx = setup(t);
+    const r = runVerify(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'published', ...FAST });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    const views = npmViewLines(fx);
+    assert.equal(views.length, 1, `expected one probe, log:\n${views.join('\n')}`);
+    assert.ok(views[0].includes('--prefer-online'), `the probe must revalidate against the registry: ${views[0]}`);
+  });
+
+  it('an immediate answer keeps the previous byte-identical output', (t) => {
+    const fx = setup(t);
+    const r = runVerify(fx, { RELEASE_TAG: PI_TAG, MOCK_VIEW: 'published', MOCK_NPM_VIEW: '0.2.0', ...FAST });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.equal(r.stdout, [
+      '{"tagName":"pi-v0.2.0","isDraft":false,"isPrerelease":false}',
+      'release-verify: npm version OK: herdr-gentle-shell@0.2.0',
+      'release-verify: verified GitHub Release pi-v0.2.0',
+      '',
+    ].join('\n'), `the happy path must not gain output, got:\n${r.stdout}`);
+    assert.equal(npmViewLines(fx).length, 1, `the first probe must be enough, log:\n${npmLogLines(fx).join('\n')}`);
+  });
+
+  it('herdr series never calls npm view', (t) => {
+    const fx = setup(t);
+    const r = runVerify(fx, { RELEASE_TAG: HERDR_TAG, MOCK_VIEW: 'published', ...FAST });
+    assert.equal(r.status, 0, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.equal(npmLogLines(fx).length, 0, `npm must not run for herdr tags, log:\n${npmLogLines(fx).join('\n')}`);
+    assert.equal(waitLines(r).length, 0, `no waiting line for herdr tags, got:\n${r.stdout}`);
+  });
+
+  it('rejects a non-positive probe budget instead of looping forever', (t) => {
+    const fx = setup(t);
+    const r = runVerify(fx, {
+      RELEASE_TAG: PI_TAG,
+      MOCK_VIEW: 'published',
+      RELEASE_NPM_PROBE_ATTEMPTS: '0',
+      ...FAST,
+    });
+    assert.equal(r.status, 1, `stdout=${r.stdout}\nstderr=${r.stderr}`);
+    assert.match(r.stderr, /RELEASE_NPM_PROBE_ATTEMPTS/);
+    assert.equal(npmLogLines(fx).length, 0, `no probe may run with a bad budget, log:\n${npmLogLines(fx).join('\n')}`);
   });
 });
 
