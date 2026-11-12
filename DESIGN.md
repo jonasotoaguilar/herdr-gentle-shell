@@ -177,7 +177,8 @@ an explicit writer-ownership decision. Rationale follows each choice.
 ### O5. `done`/`idle` freshness vs pi-tree done-hold + idle grace → TTL WINS; SWEEP OWN TOKENS ONLY
 
 - **Chosen:** every gentle token carries an absolute `expiry <= now + 60000`
-  (same 60 s horizon as E4). The consumer treats missing or expired gentle
+  (same 60 s horizon as E4), except `gentle_done_v1`, which carries the unseen
+  cap (§4.3). The consumer treats missing or expired gentle
   tokens as `unknown → idle` fallback (never holds `done` past expiry).
   On handover (gentle disabled/uninstalled) the consumer sweeps only token
   names it wrote (`gentle_*`, `herdr:blocked` labels it set); it never deletes
@@ -206,7 +207,7 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 | Producer event (source) | Tokens written | v1 state contribution |
 |---|---|---|
 | `agent_start` / `isIdle=false` (main actively working, incl. 0 active subs) | `gentle_work_v1=<hash>:0:<exp>` + `gentle_principal_v1=<hash>:<exp>` (principal-only activity marker) + `gentle_orchestrating_v1=<hash>:<exp>` (root marker while main actively works) + clear `herdr:blocked` labels | the pink `gentle` (machine key `orchestrating`, with or without a fresh root marker) while the principal session actively works, even with zero subagents |
-| TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (running total of delegates — never a principal-working signal) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | the oldest running role word (known short word or unknown sanitized name) whenever the principal itself is not working; a working principal reads `gentle` instead; role labels show the total when two or more delegates run |
+| TaskStore `running` non-empty (G3; queued/waiting never execute) | `gentle_work_v1=<hash>:<count>:<exp>` (total delegates — snapshot-confirmed running records plus distinct in-flight `subagent_run`/`subagent_continue` calls, §4.2 — never a principal-working signal) + `gentle_roles_v1=<csv>` (roles from `TaskRecord.agent`, authoritative, oldest-first) + `gentle_names_v1=<csv>` (compat transport only, never rendered) + `gentle_orchestrating_v1=<hash>:<exp>` (root-only marker, §4.3) | the oldest running role word (known short word or unknown sanitized name) whenever the principal itself is not working; a working principal reads `gentle` instead; role labels show the total when two or more delegates run |
 | `ASK_USER_CHOICE_BLOCKED_EVENT` / `gentle-pi:ask-user-choice:blocked` (G4), incl. questionnaire + tool-gated `ui_prompt` dialog spans (`kind` other than `custom` — a panel or overlay such as the agents view, ODD viewer, changes view or design canvas never counts, because opening a panel is navigation, not a question), plus direct Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes for the exact tools `ask_user_question` and `ask_user_choice`, tracked by `toolCallId` in a call-id set (a `tool_call` proposal alone never opens; an abort/error end with no result still closes; overlapping calls correct; cleared on result/end/reset/shutdown; event legs and error > ask > review precedence unchanged; boundary: only what Pi emits as execution events is observable — a host ask UI that never emits one stays covered by the event legs only). `gentle_review` starts (any operation) never enter ask: the former consent-eligible pending signal fired before any outcome/UI and falsely blocked pre-granted sessions | `herdr:blocked` label `ask:<intentId>` + durable `gentle_ask_v1=<hash>:<intentId>:<exp>` on every beat while ask is active (null/clear when inactive — repairs a missed label edge; §4.3) | `ask` (existing machine key, user-facing `ask`, amber/orange, native `?`) |
 | Pi in-process `tool_execution_start` opens / `tool_execution_end` / `tool_result` closes (by `toolCallId`; a `tool_call` proposal alone never opens) for the exact tools `gentle_review_capture`, `gentle_review_capture_group` with `reviewerRunAcknowledged: true` in the runtime args; `correctionLines` (native planning, never a reviewer), forecast-only calls, `gentle_review` (any operation), `gentle_review_scope`, and all sidebar/hook signals never enter — unknown legacy shapes stay dark (conservative) | `herdr:blocked` label `review:<reviewId>` | `review` (machine key `review`) — during a capture-group run the single parent capture-group call stays in flight across the whole multi-reviewer span, so that one call alone holds the label. Bounded approximation: the acknowledged capture interval contains preparation and admission; no exact reviewer internal events exist today |
 | the agent run itself stops on an error (an assistant message whose `stopReason` is `error` — the same signal Pi derives `turn_end.outcome === "error"` from) | durable `gentle_error_v1=<hash>:run-failed:<exp>` on every beat while the leg stands (null/clear the beat it releases, §4.3) + `herdr:blocked` label `error:run-failed`; no native state is derived from it (the pane stays on its lifecycle state — `working` — while the leg stands, so the host raises no NeedsAttention toast or sound) | `error` (row word `blocked`) — never a native `blocked` |
@@ -218,9 +219,25 @@ Sidecar only: ships beside `herdr-agent-state.ts`, never modifies it.
 never counts as executing for the visible role + total (T2b): only `running`
 feeds `gentle_work_v1` and `gentle_roles_v1`. Liveness/marker coverage
 retains `running`/`queued`/pending (the root marker still covers a queued
-subagent or a pending launch). The count is a direct projection of the
-Gentle Shell TaskStore `running` records carried in
-`event.details.gentleAgents` — never a calculated pending-call estimate.
+subagent or a pending launch). The count is the UNION of two live sources:
+the Gentle Shell TaskStore `running` records carried in
+`event.details.gentleAgents`, narrowed on every beat to the ids the read
+presence snapshot lists running, and the DISTINCT
+`subagent_run`/`subagent_continue` calls still in flight that record set does
+not list yet, deduplicated by call id so one delegate is counted once. The
+in-flight leg is why a synchronous (task-mode) launch now counts at all: it
+creates no TaskStore record until it returns `tool_result`, so the records
+alone read two live synchronous delegates as zero, while the union renders
+`explorer (2)` for as long as both calls are in flight. It is not a
+pending-call estimate: a call is counted exactly while it is in flight and
+drops out on `tool_result`, cancellation, and settle, and a cancelled call
+keeps blocking the terminal state only through the separate pending-call leg.
+Names stay record-only (an in-flight call adds no name), and a record the
+upstream store no longer lists contributes no name, no role word
+and no count, even when the local map never received its final. When no
+snapshot is usable (stale heartbeat, mismatched generation, inconsistent
+counts) the local map stands in full, never at zero — a zero fallback would
+flip the `done` gate and hide genuinely running work.
 Background launches (`subagent_run` with `mode: background`) announce their
 lifecycle over `message_end` custom results instead of `tool_result`
 details: an ACTIVE status (running|queued) there promotes the background
@@ -244,20 +261,25 @@ the pink generic `gentle`, machine key `orchestrating`).
 The consumer displays the oldest role word (known short word or unknown
 sanitized name) whenever the principal itself is not working, regardless of
 how many delegates run; a working principal renders the pink `gentle` instead.
-Role labels carry the total running-delegate count in parentheses when greater
-than one. Role order is immutable first-seen (progress reads never reorder;
+Role labels carry that total count in parentheses when greater
+than one — the §4.2 union, so two in-flight synchronous delegates of one role
+render `explorer (2)` while the roles CSV still names `explorer` once. Role
+order is immutable first-seen (progress reads never reorder;
 sound same-session presence createdAt/startedAt may correct a late local
-first-sighting, otherwise the local firstSeen stands).
+first-sighting, otherwise the local firstSeen stands); the in-flight launches
+sort after the running records, both oldest-first, so the oldest-role choice
+is unchanged.
 Pending subagent tool calls are label correlation state for a later
 `gentleAgents.taskId` result and a role-only display hint while the call is
-in flight — never a count. WHY role-only: task-mode `subagent_run` stays in
+in flight; the marker itself carries no count. WHY the hint stays role-only:
+task-mode `subagent_run` stays in
 flight with no TaskStore record until it returns `tool_result`, so the exact
 agent name in the pending `tool_call` input is the only live role evidence;
-counting it would inflate the normative `gentle_work_v1` total with an
-estimate, while publishing its role slug as a bounded-CSV hint keeps the
+publishing its role slug as a bounded-CSV hint keeps the
 sidebar on the active role (`worker`, never the amber `working` cell —
-generic activity reads the pink `gentle`) with the count
-authoritative at 0. The hint merges with authoritative active TaskStore roles
+generic activity reads the pink `gentle`), while the total itself comes from
+the §4.2 union (one entry per in-flight call id), never from the hint. The
+hint merges with authoritative active TaskStore roles
 (oldest-first) and clears when the tool result arrives, the call is
 cancelled, or the agent settles. On a tool
 result the producer reads the pending record before deleting it and uses it
@@ -318,6 +340,8 @@ sessionHash = 43*[A-Za-z0-9_-]   ; base64url(sha256(agent_session path))
 expiry      = 1*15DIGIT           ; unix-ms, MUST satisfy expiry <= now+60000 at write
 count       = "0" / [1-9] 0*15DIGIT
 gentle_work_v1    = sessionHash ":" count ":" expiry
+                    ; count = the §4.2 union: snapshot-confirmed running
+                    ; records plus distinct in-flight launches, deduped
 gentle_changes_v1 = sessionHash ":" count ":" count ":" expiry
                     ; <hash>:<files>:<added+deleted>:<expiry> — LEGACY, see below
 gentle_changes_v2 = sessionHash ":" count ":" count ":" count ":" expiry
@@ -375,15 +399,28 @@ gentle_done_v1        = sessionHash ":" expiry
                     ; live background jobs, no ask/review/error leg), then
                     ; republished with the SAME expiry (never refreshed) until
                     ; it lapses; null (clear) whenever work reappears or the
-                    ; session resets. Its expiry IS the done hold: default
-                    ; 5 s (short on purpose — the hold only makes a finish
-                    ; visible, it never pins a settled row, so `idle` follows
-                    ; within seconds), overridden by
-                    ; GENTLE_HERDR_DONE_HOLD_MS clamped to [1000, 300000], and
-                    ; the consumer accepts no expiry beyond now+300000 at read
-                    ; (the only token whose ceiling is not the 60 s TTL). The
-                    ; daemon also caps its next sleep at that expiry (§8). A
-                    ; session that never worked never mints one.
+                    ; session resets. Its expiry IS the unseen cap: default
+                    ; 900000 ms (15 min, S8), overridden by
+                    ; GENTLE_DONE_UNSEEN_CAP_MS clamped to [100, 3600000], so a
+                    ; finish nobody looks at recedes at the cap. The consumer
+                    ; accepts no expiry beyond now+3600000 at read (the only
+                    ; token whose ceiling is not the 60 s TTL). A VIEWED finish
+                    ; recedes far sooner: the daemon starts one 5 s dwell
+                    ; (DONE_VIEW_DWELL_MS) at the first frame that observes the
+                    ; pane focused and then renders `idle` (§5.2). That ledger
+                    ; of views is keyed by the token's absolute expiry and is
+                    ; daemon memory only: a cleared token (reactivation,
+                    ; session reset) drops its view and a new mint starts a new
+                    ; episode, while a restart during a still-fresh token can
+                    ; show `done` once more for one dwell and never mints a
+                    ; second finish. The daemon also caps its next sleep at
+                    ; that expiry and at the
+                    ; pending dwell deadline (§8). The settle-edge hold that
+                    ; withholds the mint while an in-flight launch may still
+                    ; report back is a DIFFERENT bound:
+                    ; GENTLE_HERDR_DONE_HOLD_MS, default 5 s, clamped
+                    ; [1000, 300000]. A session that never worked never mints
+                    ; one.
 gentle_ask_v1         = sessionHash ":" intentId ":" expiry
                     ; durable ask signal, session-bound + TTL-fresh like
                     ; gentle_orchestrating_v1 — emitted on every beat while
@@ -420,8 +457,9 @@ left it.
 Validation: consumers MUST reject tokens failing the grammar (wrong hash
 length, `expiry` in the past or `> now+60000` at read, non-numeric counts)
 and treat the pane as `unknown → idle` for that signal (§7). `gentle_done_v1`
-is the one ceiling exception: it is validated against `now+300000` so an
-overridden hold stays readable, and it still fails closed on a past expiry.
+is the one ceiling exception: it is validated against `now+3600000` so an
+overridden unseen cap stays readable, and it still fails closed on a past
+expiry.
 
 ### 4.4 Examples
 
@@ -500,8 +538,10 @@ because delegates run.
   ordinary tool edge reaches the row through the host's own truth rather than
   by re-arming it. A settle recovered this way is not an observed turn, so it
   mints no `gentle_done_v1` and sends no finish notification.
-- The settle-time pending latch (`pendingCount`) is bounded by the finish hold
-  of the settle that raised it: past that hold a launch that never reports
+- The settle-time pending latch (`pendingCount`) is bounded by that settle's
+  finish hold (`GENTLE_HERDR_DONE_HOLD_MS`, default 5 s, clamped
+  [1000, 300000]) — the settle-edge bound, not the finish token's unseen cap:
+  past that hold a launch that never reports
   back stops counting, so it cannot pin the native report at `working`.
 - Session-change tokens are refreshed/cleared from the current Gentle Shell
   session model every beat and never carried across sessions: zero changed
@@ -531,8 +571,9 @@ gate for the working-vs-idle decision — never rendered as a count),
 `gentle_pending_v1` (blocking-delegate role marker + freshness gate for the
 in-flight synchronous launch — renders the child's role word while the
 principal's own turn is blocked on it),
-`gentle_done_v1` (synthesized finish signal + its own hold freshness gate
-for the reachable `done` display — the host never reports `done`, §4.3),
+`gentle_done_v1` (synthesized finish signal + its own unseen-cap freshness
+gate for the reachable `done` display, receded by the daemon after the viewed
+dwell — the host never reports `done`, §4.3),
 `gentle_error_v1` (durable run-error signal + freshness gate for the `error`
 display — repairs a missed `error:` label edge, §4.3),
 `gentle_roles_v1` (authoritative activity roles,
@@ -599,8 +640,10 @@ done          := (native done OR fresh gentle_done_v1) AND gentle_work_v1
                  marker still covers; a fresh marker, any roles, or a working
                  principal veto terminal (queued cover, pending-launch hint).
                  The producer's finish token is the reachable path (the host
-                 never emits done); its expiry is the hold, so `done` recedes
-                 to `idle` when it lapses and is never skipped in between
+                 never emits done); the daemon holds `done` until it first
+                 views the pane focused (one DONE_VIEW_DWELL_MS dwell) or the
+                 unseen cap lapses, so `done` recedes to `idle` then and is
+                 never skipped in between
 idle          := otherwise (native fallback; also all-gentle-tokens-missing-or-expired)
 ```
 
@@ -632,8 +675,8 @@ signal (it stays live while the principal is idle with queued or running
 delegates), so it never outranks a role word. An in-flight attention `review`
 (fresh `review:` label or durable `gentle_review_v1` token) overrides the
 role list; a settled session renders `done` even against a stale-fresh
-marker, and only after the minted finish hold lapses does it recede to
-`idle` (§4.3).
+marker, and only after the pane has been viewed for one dwell, or its unseen
+cap has lapsed, does it recede to `idle` (§4.3).
 
 ### 5.3 Publication (sidebar tokens)
 
@@ -1074,9 +1117,11 @@ exactly one mechanism writes each piece of state.
   marker, read from local git plus `agent.list` — plus the presence prefix,
   because Herdr emits no event for either. That is why the fast cycle is armed
   by a rendered non-idle display, and why polling is never removed.
-  The sleep is also capped at the nearest live `gentle_done_v1` expiry among
+  The sleep is also capped at the nearest live `gentle_done_v1` expiry AND the
+  nearest pending view-dwell deadline (`DONE_VIEW_DWELL_MS`) among
   the panes just rendered (never below the 250 ms floor), so a held `done`
-  row reaches `idle` when the hold lapses rather than up to one poll later.
+  row reaches `idle` when the cap or the dwell lapses rather than up to one
+  poll later.
   A pending expiry may only SHORTEN the delay: with no pending expiry the
   delay is exactly the adaptive value above, and an already-expired or
   unparseable value falls to the floor (fail closed, like every parser)

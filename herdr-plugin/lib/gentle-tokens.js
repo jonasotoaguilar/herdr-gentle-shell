@@ -86,13 +86,19 @@ const PENDING_RE = /^([A-Za-z0-9_-]{43}):([A-Za-z0-9_-]{1,32}):([1-9]\d{0,15})$/
 // session binding and absolute-expiry discipline as the presence markers,
 // minted by the producer ONCE at the settled-and-empty edge (principal
 // settled, no running/queued delegate, no pending launch, no live background
-// job). The consumer reduces a fresh token to `done`; the expiry IS the hold,
-// so once it passes the token is stale and the pane recedes to `idle` —
-// `done` is never skipped and never held past its hold. The hold defaults to
-// 60 s and is overridable by the producer; the ceiling below is the largest
-// expiry either side accepts (the producer clamps its override to it).
+// job). The consumer reduces a fresh token to `done`. Since T3 the expiry is
+// the UNSEEN cap, not the visible dwell: the row holds `done` until the human
+// views the pane, then one `DONE_VIEW_DWELL_MS` and `idle` (the daemon owns
+// that recede, because `focused` rides the snapshot it already reads), and a
+// pane nobody looks at recedes at the cap. The producer clamps its override to
+// the ceiling below; the consumer accepts no expiry beyond it.
 const DONE_TOKEN = 'gentle_done_v1';
-const FINISH_HOLD_MAX_MS = 300000;
+const FINISH_HOLD_MAX_MS = 3600000;
+// The dwell between the first `focused: true` observation of a finish and the
+// recede to `idle` (S6/S9). It is a consumer constant, deliberately separate
+// from the producer's unseen cap: the dwell starts at the observation the
+// daemon makes, the cap starts at the mint the producer stamps.
+const DONE_VIEW_DWELL_MS = 5000;
 // Presence-marker grammar shared by both markers above: `<hash>:<expiry>`,
 // no count.
 const MARKER_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
@@ -541,6 +547,42 @@ function parseDone(value, sessionHash, now) {
   if (!Number.isSafeInteger(expiry)) return null;
   if (expiry <= now || expiry > now + FINISH_HOLD_MAX_MS) return null;
   return { expiry };
+}
+
+// T3/S6-S9: the per-pane "done until viewed" ledger, kept by the daemon across
+// frames. `previous` is the record this pane carried on the last frame, or
+// undefined. The token's absolute expiry is the episode identity: the producer
+// republishes one mint unchanged, so a different expiry is a NEW finish, never
+// a refresh of the old one.
+//
+// The row holds `done` while no focus has been observed (up to the unseen cap
+// the producer stamped). The first snapshot with `focused: true` starts the
+// dwell; `recedeAt` is that deadline so the daemon can wake for it, and from it
+// on `receded` is true and a later look changes nothing. Returns undefined when
+// there is no fresh finish token to track: the caller drops the record, so a
+// reactivation (token cleared) or the cap (token expired) clears the episode.
+function observeDoneView(previous, entry, now = Date.now()) {
+  const tokens = isRecord(entry?.tokens) ? entry.tokens : {};
+  const done = parseDone(tokens[DONE_TOKEN], expectedSessionHash(entry), now);
+  if (done === null) return undefined;
+  if (previous === undefined || previous.expiry !== done.expiry) {
+    const focusedAt = entry?.focused === true ? now : undefined;
+    return {
+      expiry: done.expiry,
+      focusedAt,
+      receded: false,
+      recedeAt: focusedAt === undefined ? undefined : focusedAt + DONE_VIEW_DWELL_MS,
+    };
+  }
+  if (previous.receded === true) return previous;
+  let focusedAt = previous.focusedAt;
+  if (focusedAt === undefined && entry?.focused === true) focusedAt = now;
+  if (focusedAt === undefined) return previous;
+  const recedeAt = focusedAt + DONE_VIEW_DWELL_MS;
+  if (now >= recedeAt) {
+    return { expiry: done.expiry, focusedAt, receded: true, recedeAt: undefined };
+  }
+  return { expiry: done.expiry, focusedAt, receded: false, recedeAt };
 }
 
 // gentle_ask_v1 = <hash>:<intentId>:<expiry>. The durable ask signal:
@@ -1155,6 +1197,7 @@ module.exports = {
   ERROR_TOKEN,
   DONE_TOKEN,
   FINISH_HOLD_MAX_MS,
+  DONE_VIEW_DWELL_MS,
   STATE_TOKENS,
   TITLE_TOKENS,
   AGENT_TOKENS,
@@ -1187,6 +1230,7 @@ module.exports = {
   parseReview,
   parseError,
   parseDone,
+  observeDoneView,
   roleToDisplay,
   parseBlockedLabel,
   parseAgentName,

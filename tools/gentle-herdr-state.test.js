@@ -1129,6 +1129,185 @@ test('progress observation does not strand the delegate: absence still resolves'
   }
 });
 
+// The count, role words and names are the intersection of the local task map
+// with the ids a valid presence snapshot lists running. A record the upstream
+// store does not list is not running whatever the local map still says, so a
+// stranded record (epoch bumped after its last witnessed generation, final
+// never delivered) contributes no count, no role and no name and an idle
+// session reaches idle.
+test('T1 count source: a stranded running record contributes no count, role or name', async () => {
+  const { sockPath, received, waitForFrom, close } = await startWireServer();
+  const { factory, prevEnv } = await loadWireFactory(sockPath, 'test-pane-stranded');
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-wire-home-'));
+  const presenceRoot = wirePresenceRoot(agentHome);
+  const prevProfile = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  try {
+    const h = harness();
+    factory(h.pi);
+    const sessionId = 'sess-wire-stranded';
+    const sessionFile = '/tmp/gentle-wire-stranded-session';
+    h.fire(
+      'session_start',
+      {},
+      {
+        mode: 'tui',
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => sessionFile,
+          getEntries: () => [],
+        },
+        isIdle: () => false,
+      },
+    );
+    launchRunning(h, 'run-st1', 'st1', 'gentle-ai-worker');
+    launchRunning(h, 'run-st2', 'st2', 'gentle-ai-explore');
+    const { createHash } = require('node:crypto');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    writeWireSnapshot(presenceRoot, {
+      sessionId,
+      generation: 1,
+      heartbeat: Date.now(),
+      tasks: [
+        { id: 'st1', status: 'running' },
+        { id: 'st2', status: 'running' },
+      ],
+    });
+    h.fire('agent_start', {});
+    const both = await waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'both listed runs counted',
+    );
+    assert.equal(both.gentle_roles_v1, 'worker,explorer');
+    // The live trigger: a resume reuses the id and bumps its execution epoch
+    // after the last generation that witnessed it, while the upstream store
+    // stops listing the finished run and never delivers its final.
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-st2',
+      input: { task_id: 'st2', prompt: 'keep going' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-st2',
+      details: { gentleAgents: { taskId: 'st2', agent: 'gentle-ai-explore', status: 'running' } },
+    });
+    writeWireSnapshot(presenceRoot, {
+      sessionId,
+      generation: 2,
+      heartbeat: Date.now(),
+      tasks: [{ id: 'st1', status: 'running' }],
+    });
+    const before = received.length;
+    h.fire('agent_start', {});
+    const live = await waitForFrom(
+      before,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'only the run the snapshot lists stays counted',
+    );
+    assert.equal(live.gentle_roles_v1, 'worker', 'the stranded record contributes no role word');
+    assert.equal(live.gentle_names_v1, 'st1 work', 'the stranded record contributes no name');
+    // The stranded record finalizes locally so the last beat is a genuinely
+    // idle session: it must read idle, never a stale role or count.
+    h.fire('agent_settled', {}, { isIdle: () => true });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'st2', agent: 'gentle-ai-explore', status: 'completed' } },
+      },
+    });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'st1', agent: 'gentle-ai-worker', status: 'completed' } },
+      },
+    });
+    const idleBefore = received.length;
+    h.fire('agent_start', {});
+    const idle = await waitForFrom(
+      idleBefore,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      5000,
+      'count 0 with no roles once the runs finished',
+    );
+    assert.equal(idle.gentle_roles_v1, null, 'an idle session keeps no role word');
+    assert.equal(idle.gentle_names_v1, null, 'an idle session keeps no name');
+  } finally {
+    if (prevProfile === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+    else process.env.GENTLE_PI_AGENT_HOME = prevProfile;
+    process.env.HERDR_ENV = prevEnv.HERDR_ENV;
+    process.env.HERDR_SOCKET_PATH = prevEnv.HERDR_SOCKET_PATH;
+    process.env.HERDR_PANE_ID = prevEnv.HERDR_PANE_ID;
+    await close();
+  }
+});
+
+// The snapshot is the authoritative display source only while it is evidence:
+// a stale header yields no snapshot, and the local map then stands in full.
+// Never zero — a zero fallback would flip the consumer's done gate and hide
+// real running work.
+test('T1 count source: no valid snapshot falls back to the local map, never to zero', async () => {
+  const { sockPath, received, waitForFrom, close } = await startWireServer();
+  const { factory, prevEnv } = await loadWireFactory(sockPath, 'test-pane-stale-snapshot');
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-wire-home-'));
+  const presenceRoot = wirePresenceRoot(agentHome);
+  const prevProfile = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  try {
+    const h = harness();
+    factory(h.pi);
+    const sessionId = 'sess-wire-stale-snapshot';
+    const sessionFile = '/tmp/gentle-wire-stale-snapshot-session';
+    h.fire(
+      'session_start',
+      {},
+      {
+        mode: 'tui',
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => sessionFile,
+          getEntries: () => [],
+        },
+        isIdle: () => false,
+      },
+    );
+    launchRunning(h, 'run-fb1', 'fb1', 'gentle-ai-worker');
+    launchRunning(h, 'run-fb2', 'fb2', 'gentle-ai-explore');
+    // A heartbeat older than the freshness bound elects nothing, so the beat
+    // has no snapshot even though the run is genuinely live.
+    writeWireSnapshot(presenceRoot, {
+      sessionId,
+      generation: 1,
+      heartbeat: Date.now() - 60000,
+      tasks: [],
+    });
+    h.fire('agent_start', {});
+    const { createHash } = require('node:crypto');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    const beat = await waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'the local map still supplies the count without a valid snapshot',
+    );
+    assert.equal(beat.gentle_roles_v1, 'worker,explorer');
+    assert.equal(beat.gentle_names_v1, 'fb1 work,fb2 work');
+    assert.equal(received.length > 0, true);
+  } finally {
+    if (prevProfile === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+    else process.env.GENTLE_PI_AGENT_HOME = prevProfile;
+    process.env.HERDR_ENV = prevEnv.HERDR_ENV;
+    process.env.HERDR_SOCKET_PATH = prevEnv.HERDR_SOCKET_PATH;
+    process.env.HERDR_PANE_ID = prevEnv.HERDR_PANE_ID;
+    await close();
+  }
+});
+
 // --- T2 ask/review observation -------------------------------------------
 // The native questionnaire emits `gentle-pi:ask-user-question:blocked`
 // independently of the choice leg and the rpiv legacy leg (upstream
@@ -1594,7 +1773,8 @@ test('T2b RED: queued/waiting/pending never count; mixed completion keeps the su
       'three explorers counted',
     );
     assert.equal(three.gentle_roles_v1, 'explorer');
-    // Queued + waiting + pending hint must not inflate the running total.
+    // Queued + waiting never count; the in-flight launch counts once (T5/S11:
+    // the count is the union of running records and in-flight launches).
     h.fire('tool_result', {
       toolName: 'subagent_run',
       toolCallId: 'run-q1',
@@ -1613,13 +1793,13 @@ test('T2b RED: queued/waiting/pending never count; mixed completion keeps the su
     await new Promise((r) => setTimeout(r, 350));
     const before = wire.received.length;
     h.fire('agent_start', {});
-    const uninflated = await wire.waitForFrom(
+    const counted = await wire.waitForFrom(
       before,
-      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:3:`),
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:4:`),
       5000,
-      'queued/waiting/pending never inflate the running count',
+      'queued/waiting never count while the in-flight launch counts once',
     );
-    assert.equal(uninflated.gentle_roles_v1, 'explorer,worker', 'pending hint merges role-only without double count');
+    assert.equal(counted.gentle_roles_v1, 'explorer,worker', 'the pending hint merges its role, never a second entry');
     // Complete two explorers via background results; one explorer left: count 1, role only.
     h.fire('message_end', {
       message: {
@@ -2262,6 +2442,57 @@ test('T2: native owner has no opt-in flag; principal-gated states hold', async (
   assert.equal(mod.computeNativeState({ ...base, reviewActive: true }), 'working', 'review execution keeps working, never blocked/idle');
   assert.equal(mod.computeNativeState(base), 'idle', 'true empty settle is the only idle');
   assert.equal(mod.computeNativeState({ ...base, settled: false }), undefined, 'count0 alone without settle never idles');
+});
+
+// S4 of odd/tasks/sidebar-terminal-state.md narrows the `restore-done-idle.md`
+// S4 sentence for the NATIVE state only: the display already waited on a live
+// `bash_background` / `monitor` job while the native state reported `idle`, and
+// Herdr presents that `idle` as finished (check circle + notification) beside a
+// row still painted pink `gentle` (S2/S3/S5). The gate is the freshness-bounded,
+// session-owned count, so a stale or foreign snapshot reaches it as 0 and the
+// terminal state stays fail-OPEN (S4).
+test('S4: the native state is held non-terminal while a live job still runs', async () => {
+  const mod = await factoryPromise;
+  const base = {
+    agentActive: false,
+    settled: true,
+    activeCount: 0,
+    pendingCount: 0,
+    askActive: false,
+    reviewActive: false,
+    hasError: false,
+  };
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1 }),
+    'working',
+    'a settled principal with a live job never reports the terminal idle the host finishes on',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 2 }),
+    'working',
+    'any number of live jobs holds the same way',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 0 }),
+    'idle',
+    'zero live jobs (the stale/foreign snapshot case) is a true empty settle again',
+  );
+  assert.equal(mod.computeNativeState(base), 'idle', 'the absent input keeps the pre-existing default (fail open)');
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1, settled: false }),
+    'working',
+    'a live job never becomes the settle proof itself',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1, askActive: true }),
+    'blocked',
+    'a human-wait leg still wins over the live job',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1, activeCount: 1 }),
+    'working',
+    'a live job beside a running delegate stays non-terminal',
+  );
 });
 
 test('T2: opt-in settle with delegates stays working with seq + path binding', async () => {
@@ -4506,11 +4737,12 @@ test('a background launch ack and an unrecognized agent leave no lingering marke
     });
     const unknown = await wire.waitForFrom(
       beforeUnknown,
-      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
       5000,
-      'a beat after an unrecognized launch',
+      'a beat after an unrecognized launch (the running record plus the in-flight call)',
     );
     assert.equal(unknown.gentle_pending_v1, null);
+    assert.equal(unknown.gentle_roles_v1, 'verify', 'the unrecognized agent adds no role');
   } finally {
     await stopWire(wire);
   }
@@ -4566,8 +4798,8 @@ test('a resume launch resolves its role from the tracked task record', async () 
       'the resume pending marker carries the record agent role',
     );
     assert.ok(
-      typeof resumed.gentle_work_v1 === 'string' && resumed.gentle_work_v1.startsWith(`${paneHash}:0:`),
-      'the queued record never counts as running',
+      typeof resumed.gentle_work_v1 === 'string' && resumed.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      'the queued record never counts as running; the in-flight resume does (T5/S11)',
     );
     assert.equal(resumed.gentle_roles_v1, 'worker', 'the resume hint merges the record role');
     assert.equal(resumed.gentle_names_v1, null, 'the pending hint is role-only, never a name');
@@ -4595,9 +4827,9 @@ test('a resume launch with no record and no agent publishes no role hint', async
     h.fire('agent_start', {});
     const beat = await wire.waitForFrom(
       beforeResume,
-      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
       5000,
-      'a beat after an unresolvable resume',
+      'a beat after an unresolvable resume (the in-flight call still counts, T5/S11)',
     );
     assert.equal(beat.gentle_pending_v1, null, 'no agent means no pending role');
     assert.equal(beat.gentle_roles_v1, null, 'no role in the merged slice either');
@@ -4633,9 +4865,9 @@ test('the subagent sentinel is never published as a role word', async () => {
     h.fire('agent_start', {});
     const beat = await wire.waitForFrom(
       beforeSentinel,
-      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
       5000,
-      'a beat after a sentinel-agent launch',
+      'a beat after a sentinel-agent launch (the in-flight call counts, T5/S11)',
     );
     assert.equal(beat.gentle_pending_v1, null);
     assert.equal(beat.gentle_roles_v1, null);
@@ -4667,12 +4899,14 @@ test('an agent named gentle is never published as a role word', async () => {
     h.fire('agent_start', {});
     const pendingBeat = await wire.waitForFrom(
       beforePending,
-      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
       5000,
-      'a beat after a gentle-agent launch',
+      'a beat after a gentle-agent launch (the in-flight call counts, T5/S11)',
     );
     assert.equal(pendingBeat.gentle_pending_v1, null, 'the reserved word is never a pending role');
     assert.equal(pendingBeat.gentle_roles_v1, null, 'the reserved word is never a pending role entry');
+    // Resolve the launch so the count below is the running record alone.
+    h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'run-gentle-1', isError: true });
 
     const beforeRunning = wire.received.length;
     launchRunning(h, 'run-gentle-2', 'gnt1', 'gentle');
@@ -4958,6 +5192,438 @@ test('an observation without an agent keeps the previous record agent', async ()
     assert.equal(stable.gentle_roles_v1, 'worker', 'the recorded agent still supplies the role');
     assert.equal(stable.gentle_names_v1, 'ap1 work', 'the recorded label still supplies the name');
     assertNoPlaceholderNames(stable);
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+// --- T5/S11: the `(n)` count is the in-flight union ---------------------
+// S11 (odd/tasks/sidebar-terminal-state.md), user report verbatim: "ahí
+// ejecuto 2 subagentes pero no sale \"explorer (2)\" sino que solo explorer".
+// The count used to be `runningSubs()` alone, while a task-mode (synchronous)
+// `subagent_run` creates no TaskStore record until it returns its tool_result,
+// so two live delegates counted zero. Live evidence from `herdr pane list`
+// (pane `wHE:p1`, two synchronous launches through codemode):
+// `gentle_roles_v1: explorer`, `gentle_pending_v1: <ref>:explorer:<ts>`,
+// `gentle_work_v1: <ref>:0:<ts>`. The count is now the UNION of the running
+// records the presence snapshot confirms and the distinct in-flight
+// `subagent_run`/`subagent_continue` calls the store does not list yet,
+// deduplicated so one delegate is counted once. It decrements on a launch
+// result, on cancellation and on a settle, and it never weakens the S4
+// terminal gate (the pending-call leg is unchanged).
+
+// A synchronous (task-mode) launch: tool_call observed, tool_result not back.
+function launchInFlight(h, callId, agent, label = `${callId} work`) {
+  h.fire('tool_call', {
+    toolName: 'subagent_run',
+    toolCallId: callId,
+    input: { agent, label },
+  });
+}
+
+// Every count the pane published, oldest first.
+function countValues(received, paneHash) {
+  return received
+    .map((tokens) => tokens.gentle_work_v1)
+    .filter((value) => typeof value === 'string' && value.startsWith(`${paneHash}:`))
+    .map((value) => Number(value.split(':')[1]));
+}
+
+function pendingRoleOf(tokens) {
+  const value = tokens.gentle_pending_v1;
+  assert.equal(typeof value, 'string', 'a blocking launch marker must be published');
+  return value.split(':')[1];
+}
+
+test('T5/S11: two in-flight synchronous launches of one role count twice', async () => {
+  const wire = await startT2bWire('test-pane-t5-two-inflight');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('t5-two-inflight');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-t5-two-inflight', sessionFile);
+    launchInFlight(h, 't5-a1', 'gentle-ai-explore');
+    launchInFlight(h, 't5-a2', 'gentle-ai-explore');
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight explorers counted (the reported defect: this beat read 0)',
+    );
+    assert.equal(beat.gentle_roles_v1, 'explorer', 'one role word for two delegates of that role');
+    assert.equal(pendingRoleOf(beat), 'explorer', 'the oldest in-flight role still drives the marker');
+    assert.equal(beat.gentle_names_v1, null, 'an in-flight launch still publishes no name (record-only)');
+    assert.deepEqual(
+      countValues(wire.received, paneHash).filter((count) => count > 3),
+      [],
+      'two launches never count more than twice',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('T5/S11: the count deduplicates an in-flight resume of a listed run', async () => {
+  const wire = await startT2bWire('test-pane-t5-dedupe');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('t5-dedupe');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-t5-dedupe', sessionFile);
+    // One background delegate the store lists running, one synchronous launch
+    // still in flight, and a resume of the listed run. The resume is the SAME
+    // delegate as the running record, so two live delegates must read 2.
+    launchRunning(h, 't5-bg1', 'bg1', 'gentle-ai-verify');
+    launchInFlight(h, 't5-sync1', 'gentle-ai-explore');
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 't5-resume-bg1',
+      input: { task_id: 'bg1', prompt: 'keep going' },
+    });
+    h.fire('agent_start', {});
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'the union of one running record and one in-flight launch',
+    );
+    assert.equal(beat.gentle_roles_v1, 'verify,explorer', 'both delegates carry a role, oldest first');
+    assert.equal(beat.gentle_names_v1, 'bg1 work', 'names stay record-only');
+    assert.equal(pendingRoleOf(beat), 'explorer');
+    assert.deepEqual(
+      countValues(wire.received, paneHash).filter((count) => count > 2),
+      [],
+      'a resume of a listed run is never a third delegate',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('T5/S11: a launch result decrements the in-flight count', async () => {
+  const wire = await startT2bWire('test-pane-t5-result');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('t5-result');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-t5-result', sessionFile);
+    launchInFlight(h, 't5-r1', 'gentle-ai-explore');
+    launchInFlight(h, 't5-r2', 'gentle-ai-explore');
+    h.fire('agent_start', {});
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight explorers counted',
+    );
+    const from = wire.received.length;
+    // The failed launch carries no task record: its own resolution is the only
+    // evidence that it stopped executing, and it must decrement the count.
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 't5-r1',
+      isError: true,
+    });
+    const beat = await wire.waitForFrom(
+      from,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'the resolved launch decrements the count',
+    );
+    assert.equal(beat.gentle_roles_v1, 'explorer', 'the survivor still supplies the role');
+    assert.equal(pendingRoleOf(beat), 'explorer', 'and the survivor still drives the marker');
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('T5/S11: a settle clears the in-flight count contribution', async () => {
+  const wire = await startT2bWire('test-pane-t5-settle');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('t5-settle');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-t5-settle', sessionFile);
+    launchInFlight(h, 't5-s1', 'gentle-ai-explore');
+    launchInFlight(h, 't5-s2', 'gentle-ai-explore');
+    h.fire('agent_start', {});
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight explorers counted',
+    );
+    const from = wire.received.length;
+    h.fire('agent_settled', {}, { isIdle: () => true });
+    const beat = await wire.waitForFrom(
+      from,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      5000,
+      'the settle drops the in-flight count',
+    );
+    assert.equal(beat.gentle_roles_v1, null, 'no role survives the settle');
+    assert.equal(beat.gentle_pending_v1, null, 'no blocking marker survives the settle');
+    assert.equal(
+      typeof beat.gentle_orchestrating_v1,
+      'string',
+      'the settle-time hold still gates the terminal state (S4 untouched)',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('T5/S11: a cancelled launch is not counted', async () => {
+  const wire = await startT2bWire('test-pane-t5-cancel');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('t5-cancel');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-t5-cancel', sessionFile);
+    launchInFlight(h, 't5-c1', 'gentle-ai-explore');
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 't5-c2',
+      input: { agent: 'gentle-ai-verify', task_id: 't5-cancel-me', prompt: 'keep going' },
+    });
+    h.fire('agent_start', {});
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight launches counted before the cancel',
+    );
+    const from = wire.received.length;
+    // Cancelling the task the resume names ends that delegate; its call is no
+    // longer in flight for the count, while its pending evidence keeps gating
+    // the terminal state (S4 is never weakened).
+    h.fire('tool_call', {
+      toolName: 'subagent_cancel',
+      toolCallId: 't5-cancel',
+      input: { task_id: 't5-cancel-me' },
+    });
+    const beat = await wire.waitForFrom(
+      from,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'the cancelled launch stops counting',
+    );
+    assert.equal(beat.gentle_roles_v1, 'explorer', 'only the surviving delegate carries a role');
+    assert.equal(pendingRoleOf(beat), 'explorer');
+    assert.equal(
+      typeof beat.gentle_orchestrating_v1,
+      'string',
+      'the pending-call leg still holds the row non-terminal',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('T5/S11: a background delegate counts exactly as before', async () => {
+  const wire = await startT2bWire('test-pane-t5-background');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('t5-background');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 'sess-t5-background', sessionFile);
+    launchRunning(h, 't5-bo1', 'bo1', 'gentle-ai-worker');
+    launchRunning(h, 't5-bo2', 'bo2', 'gentle-ai-explore');
+    const beat = await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two background delegates counted from their records',
+    );
+    assert.equal(beat.gentle_roles_v1, 'worker,explorer');
+    assert.equal(beat.gentle_names_v1, 'bo1 work,bo2 work');
+    assert.equal(beat.gentle_pending_v1, null, 'a resolved background launch leaves no marker');
+    const from = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'bo1', agent: 'gentle-ai-worker', status: 'completed' } },
+      },
+    });
+    const after = await wire.waitForFrom(
+      from,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'background completion still decrements the count',
+    );
+    assert.equal(after.gentle_roles_v1, 'explorer');
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+// --- T5b/S11b: an announced record and its own launch are one delegate ---
+// S11b (odd/tasks/sidebar-terminal-state.md): a background launch is acked
+// synchronously while its START may announce the record on the lifecycle
+// channel BEFORE that ack lands, and the announcement carries no call id —
+// only the agent. The plain union then reported ONE delegate as
+// `explorer (2)`. Rule: per agent the count is
+// `max(running records, unbound in-flight launches)`, summed across agents; an
+// announced RUNNING record consumes one unbound in-flight launch of the same
+// agent (oldest first), and never a launch of another agent. Names stay
+// record-only, the oldest-role resolution and the suffix shape are unchanged,
+// and the S4 terminal gate still reads the pending-call leg.
+
+test('S11: a background START overlapping its launch counts once', async () => {
+  const wire = await startT2bWire('s11-start-overlap');
+  try {
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('s11-start-overlap');
+    startT2bSession(h, 's11-start-overlap', sessionFile);
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'launch',
+      input: { agent: 'gentle-ai-explore', mode: 'background' },
+    });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 'background-1', agent: 'gentle-ai-explore', status: 'running' },
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const beat = wire.received.at(-1);
+    assert.equal(beat.gentle_work_v1.split(':')[1], '1');
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('S11b: per agent the count is max(records, unbound launches)', async () => {
+  const wire = await startT2bWire('s11b-max');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('s11b-max');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 's11b-max', sessionFile);
+    // Two DISTINCT launches of one agent, both in flight: two delegates.
+    launchInFlight(h, 's11b-launch-1', 'gentle-ai-explore');
+    launchInFlight(h, 's11b-launch-2', 'gentle-ai-explore');
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight launches of one agent',
+    );
+    // One announced RUNNING record of that agent: it consumes ONE launch, so
+    // the count stays 2 (the union used to report 3).
+    const beforeFirstRecord = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 's11b-bg-1', agent: 'gentle-ai-explore', status: 'running' },
+        },
+      },
+    });
+    const oneRecord = await wire.waitForFrom(
+      beforeFirstRecord,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'one record beside two launches is two delegates, never three',
+    );
+    assert.equal(oneRecord.gentle_roles_v1, 'explorer', 'role words are unchanged');
+    // A second announced record of the same agent: two records and two
+    // launches are still two delegates.
+    const beforeSecondRecord = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 's11b-bg-2', agent: 'gentle-ai-explore', status: 'running' },
+        },
+      },
+    });
+    const twoRecords = await wire.waitForFrom(
+      beforeSecondRecord,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two records beside two launches are two delegates, never four',
+    );
+    assert.equal(twoRecords.gentle_roles_v1, 'explorer');
+    assert.deepEqual(
+      countValues(wire.received, paneHash).filter((count) => count > 2),
+      [],
+      'the overlapping evidence never inflates the count past two delegates',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('S11b: an announced record only consumes a launch of its own agent', async () => {
+  const wire = await startT2bWire('s11b-cross-agent');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('s11b-cross-agent');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 's11b-cross-agent', sessionFile);
+    launchInFlight(h, 's11b-cross-explore', 'gentle-ai-explore');
+    launchInFlight(h, 's11b-cross-worker', 'gentle-ai-worker');
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight launches of different agents',
+    );
+    // The announced record belongs to the worker launch: the explorer launch is
+    // untouched, so both delegates are still counted (two agents, never three).
+    const beforeRecord = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 's11b-bg-worker', agent: 'gentle-ai-worker', status: 'running' },
+        },
+      },
+    });
+    const beat = await wire.waitForFrom(
+      beforeRecord,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'a record for one agent consumes nothing of another agent',
+    );
+    assert.equal(
+      beat.gentle_roles_v1,
+      'explorer,worker',
+      'oldest-role resolution is unchanged (launches first, then the record)',
+    );
+    assert.equal(beat.gentle_names_v1, 'gentle-ai-worker', 'names stay record-only');
+    assert.deepEqual(
+      countValues(wire.received, paneHash).filter((count) => count > 2),
+      [],
+      'cross-agent evidence never inflates the count',
+    );
   } finally {
     await stopWire(wire);
   }

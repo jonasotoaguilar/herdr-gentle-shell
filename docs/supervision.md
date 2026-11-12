@@ -46,6 +46,15 @@ tokens carrying private data are added here.
   (`GENTLE_STATUS_POLL_MS`), 2 s fast cycle while recent ask activity or
   send/publish failures are observed, N quiet frames or a TTL-bounded
   window to recover, 250 ms floor, single dynamic `setTimeout` chain.
+- `done` is held until viewed. The producer stamps the unseen cap as the
+  finish token's expiry (`GENTLE_DONE_UNSEEN_CAP_MS`, producer-side, default
+  900000 ms = 15 min, clamped [100, 3600000]); the daemon owns the earlier
+  recede, because `focused` rides the same snapshot it already reads: the
+  first frame that sees the pane focused starts one 5 s dwell
+  (`DONE_VIEW_DWELL_MS`, a consumer constant, not an override) and the row
+  then renders `idle`. A second look changes nothing, and the per-pane view
+  ledger is daemon memory only, so a daemon restart while the token is still
+  fresh can show `done` once more for one dwell; it never mints a finish.
 - Failed snapshots are "no data", never "empty": nothing is published,
   swept, or recorded on a failed read. A failed pane list is
   distinguishable from an empty list (null vs `[]`): sweeps report
@@ -86,9 +95,14 @@ The daemon never writes the flag.
 
 ## Environment
 
-- `GENTLE_STATUS_STATE_DIR` (else `HERDR_PLUGIN_STATE_DIR`, else the
-  default plugins state dir) — pidfile, refresh request, ledger, err
-  log, sidebar flag. All fixtures in tests; never live global state.
+- `GENTLE_STATUS_STATE_DIR` (else `HERDR_PLUGIN_STATE_DIR` only when it is
+  the directory this package derives for that name under the resolved state
+  home — canonically compared, so a symlinked or relative spelling of it
+  still qualifies — else the default plugins state dir) — pidfile, refresh
+  request, ledger, err log, sidebar flag. All fixtures in tests; never live
+  global state. An install whose Herdr state home differs from the Pi/XDG
+  state home therefore ignores Herdr's injected path and uses the derived
+  stored directory, which is what keeps a single publisher.
 - `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH` — Herdr transport (socket with
   one CLI fallback each).
 - `GENTLE_STATUS_POLL_MS` / `GENTLE_STATUS_FAST_POLL_MS` /

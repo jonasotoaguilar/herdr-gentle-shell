@@ -13,7 +13,9 @@ sanitized name on the amber `working` cell `#f9e2af` — never the word
 `working`, never `gentle` — and a recognized gentle role keeps its
 abbreviation — `explorer`, `worker`,
 `verify`, `judge`, `rdd` — with the total running count in parentheses when
-two or more subagents run, for example `explorer (3)`). The principal's own
+two or more subagents run, for example `explorer (3)`, and a synchronous
+(task-mode) delegate counted while its launch is still in flight, so two
+in-flight explorers read `explorer (2)`). The principal's own
 activity marker (`gentle_principal_v1`, published while the principal session
 itself works and cleared when it settles) decides the row — never the
 delegate count, and never Herdr's aggregate native status (which reads
@@ -289,13 +291,26 @@ settled-plus-empty (principal settled with no running delegates and no
 pending launches; a settled principal with running delegates keeps the role
 word, never `done`). A role word is not a subagent label; it carries the
 total running delegate count in parentheses when that count exceeds one. The
-work total is a direct projection of the
+work total is the union of the
 Gentle Shell TaskStore `running` records (only `running` counts as
-executing; queued/waiting never count), never a calculated
-pending-call estimate: pending tool calls are role-only display hints (exact
+executing; queued/waiting never count), narrowed the same way to the ids the
+session's presence snapshot lists running, and the distinct in-flight
+`subagent_run`/`subagent_continue` calls the record set does not list yet,
+deduplicated by call id so one delegate counts once. The in-flight leg is
+what makes a synchronous (task-mode) launch count: it creates no TaskStore
+record until it returns its `tool_result`, so two in-flight synchronous
+delegates of one role render `explorer (2)` instead of a bare `explorer`,
+and a call drops out on `tool_result`, cancellation, and settle. A cancelled
+call is not counted, though it still blocks `done` through the pending-call
+leg, which is separate. Names stay record-only (an in-flight call adds no
+name), and the oldest-role order is unchanged: snapshot-confirmed running
+records first, then in-flight launches, both oldest-first by first sighting.
+A run that finished without a
+delivered final contributes no count, no role and no name; with no usable
+snapshot the local map stands in full, never at zero. Pending tool calls are
+otherwise role-only display hints (exact
 in-flight subagent agent -> role slug, resolved from the tool input or, for a
-resume, from the tracked task record, so task-mode launches show the active
-role even at count 0) plus label correlation, and
+resume, from the tracked task record) plus label correlation, and
 true concurrent tasks all count. A live `running` record is never regressed
 by a racy non-final status read (only the authoritative launch outcomes,
 completions, and presence terminals move it), so principal activity with
@@ -363,9 +378,20 @@ repaints for wakes the same single frame loop (bounded reconnect, floored at
 250 ms, no second loop, no per-event frame), and the producer requests that same
 coalesced refresh after every landed token beat, so a status change
 it publishes is drawn at once, and the daemon caps each sleep at the nearest
-live `done` expiry, so a settled row reaches `idle` when its short hold (5 s by
-default, `GENTLE_HERDR_DONE_HOLD_MS`-overridable) lapses instead of one poll
-later. The producer's own beat is 15 s by default and
+live `done` expiry and the nearest pending view-dwell deadline, so a row
+reaches `idle` on time instead of one poll later. `done` is held until viewed:
+a real finish stays `done` until the pane is first observed as the focused
+pane in the daemon's own snapshot, then one 5 s dwell (`DONE_VIEW_DWELL_MS`,
+consumer-side, not an override) and the recede to `idle`; a finish nobody
+looks at recedes at `GENTLE_DONE_UNSEEN_CAP_MS` (default 900000 ms = 15
+minutes, clamped [100, 3600000]), which is the finish token's expiry. A new
+turn that reactivates the producer and a session reset clear the held `done`,
+and a new mint is a new episode; the ledger of views is daemon memory only,
+so a daemon restart while the token is still fresh can show `done` once more
+for one dwell. `GENTLE_HERDR_DONE_HOLD_MS` no longer bounds this: it bounds
+only the settle-edge hold that withholds the terminal state while an in-flight
+launch may still report back (default 5 s, clamped [1000, 300000]). The
+producer's own beat is 15 s by default and
 `GENTLE_HERDR_BEAT_MS`-overridable for tests and debugging (clamped to
 [100, 300000]); the override changes the cadence only, never the 60 s token
 TTL. Reports in one window collapse into one frame, and refresh-driven frames

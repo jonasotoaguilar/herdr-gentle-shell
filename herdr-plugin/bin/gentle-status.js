@@ -301,15 +301,22 @@ function herdrStateDir() {
   return path.join(os.homedir(), '.local', 'state', 'herdr');
 }
 
-// Family of files proving a state dir is ours: when the Herdr-injected
-// dir (which changes with the plugin id) holds none of these while the
-// stored dir does, the stored dir wins so pre-rename flags stay readable.
-// Fresh installs with no stored files converge on the injected dir.
-// GENTLE_STATUS_STATE_DIR (explicit user override) is always used as-is.
-// This family is IDENTICAL in the sidebar, diagnostics, worktree-mode and
-// state-extension resolvers. The daemon also WRITES here (pidfile, mode,
-// ledger), so a file it cannot see is a file whose dir it splits off: the
-// stored ODD/Issues toggle then reads as missing, i.e. enabled.
+// Family of files proving a state dir is ours: the stored dir wins whenever it
+// holds one of these, so pre-rename flags stay readable and one stray known
+// file in the Herdr-injected dir (which changes with the plugin id) may never
+// outrank the stored state. Selection order: stored if it holds a known file,
+// else the active-id/injected dir if it holds one, else stored — the stored
+// canonical dir is the FINAL fallback, so a fresh install converges there and
+// every context that does not receive the injected variable names the same
+// directory as this daemon. An injected path is honoured only when it IS the
+// directory this package derives for that name under the resolved state home
+// (S1c); any other path — including an owned basename under another root — is
+// ignored and the derived active-id dir is used instead. GENTLE_STATUS_STATE_DIR (explicit user
+// override) is always used as-is. This family is IDENTICAL in the sidebar,
+// diagnostics, worktree-mode and state-extension resolvers. The daemon also
+// WRITES here (pidfile, mode, ledger), so a file it cannot see is a file whose
+// dir it splits off: the stored ODD/Issues toggle then reads as missing, i.e.
+// enabled.
 const STATE_KNOWN_FILES = [
   'gentle-sidebar-mode.json',
   'gentle-moshi.json',
@@ -320,6 +327,14 @@ const STATE_KNOWN_FILES = [
   'gentle-worktree-mode.json',
   'gentle-plugin-tools.json',
 ];
+// S1c: the only basenames an injected state dir may have to be honoured — the
+// active plugin id Herdr injects today and the stored canonical segment — and
+// the path must also BE the one this package derives for that name under the
+// resolved state home. Any other injected path belongs to another plugin (or a
+// stale/dev id) and is ignored, and so is an owned basename under another root,
+// because this daemon receives the variable and every producer does not:
+// honouring either is exactly what splits them.
+const OWNED_DIR_NAMES = [PLUGIN_ID, STATE_PLUGIN_ID];
 
 function dirHasKnownFiles(dir) {
   for (const name of STATE_KNOWN_FILES) {
@@ -336,6 +351,52 @@ function storedStateRoot() {
   return path.join(herdrStateDir(), 'plugins', STATE_PLUGIN_ID);
 }
 
+// Two spellings name the same directory when their canonical forms match.
+// realpath resolves symlinks but throws for a path that does not exist yet, so
+// walk up to the deepest existing ancestor and re-append the missing tail: that
+// keeps a symlinked or relative spelling of the derived dir from being rejected
+// as a different directory (S1c/T12 compares paths, never raw strings).
+function canonicalStateDir(dir) {
+  const absolute = path.resolve(dir);
+  const tail = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      // Prepended so the missing tail is re-appended in its original order.
+      tail.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+// The active-id dir: the Herdr-injected one only when it IS the directory this
+// package derives for that name under the resolved state home, else the same
+// sibling of the stored dir derived from the state home. S1c: Herdr injects a
+// path per plugin id, so a third id, a stale name or a dev checkout would
+// otherwise select a directory we do not own — and so does an owned basename
+// under another root, which is exactly the split (the daemon receives the
+// variable, the producer derives its own state home). Any other injected path is
+// ignored.
+function activeStateRoot() {
+  const pluginsDir = path.join(herdrStateDir(), 'plugins');
+  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected === 'string' && injected.length > 0) {
+    const name = path.basename(injected);
+    if (
+      OWNED_DIR_NAMES.includes(name) &&
+      canonicalStateDir(injected) === canonicalStateDir(path.join(pluginsDir, name))
+    ) {
+      return injected;
+    }
+  }
+  return path.join(pluginsDir, PLUGIN_ID);
+}
+
 function stateRoot() {
   const explicit = process.env.GENTLE_STATUS_STATE_DIR;
   if (typeof explicit === 'string' && explicit.length > 0) {
@@ -349,7 +410,7 @@ function stateRoot() {
   const stored = storedStateRoot();
   // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
   // value ignores every override and uses the stored default. Only an
-  // omitted (null/undefined) explicit falls through to the injected dir.
+  // omitted (null/undefined) explicit falls through to the active-id dir.
   if (explicit !== undefined && explicit !== null) {
     try {
       fs.mkdirSync(stored, { recursive: true });
@@ -358,15 +419,15 @@ function stateRoot() {
     }
     return stored;
   }
-  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  const active = activeStateRoot();
   let dir = stored;
-  if (typeof injected === 'string' && injected.length > 0 && injected !== stored) {
+  if (active !== stored) {
     try {
-      if (dirHasKnownFiles(injected)) dir = injected;
-      else if (dirHasKnownFiles(stored)) dir = stored;
-      else dir = injected;
+      if (dirHasKnownFiles(stored)) dir = stored;
+      else if (dirHasKnownFiles(active)) dir = active;
+      else dir = stored;
     } catch {
-      dir = injected;
+      dir = stored;
     }
   }
   try {
@@ -1143,13 +1204,38 @@ async function frame(state, opts = {}) {
     const paneId = entry?.pane_id;
     if (typeof paneId !== 'string') continue;
     live.add(paneId);
-    const reduced = contract.reducePane(entry, now);
+    let reduced = contract.reducePane(entry, now);
     if (!reduced.owned) {
+      if (state.doneViews instanceof Map) state.doneViews.delete(paneId);
       debug(`pane ${paneId}: pi-tree owns; yielding`);
       continue;
     }
+    // T3/S6-S9: done until viewed. The producer stamps the unseen cap as the
+    // finish token's expiry, so a fresh token alone would keep `done` for the
+    // whole cap. The recede belongs here because `focused` rides the same
+    // snapshot this frame already reads: the first observation of the pane as
+    // focused starts one dwell, and only then does the row move to `idle`.
+    // The ledger is per pane and keyed by the token's absolute expiry, so a
+    // cleared token (reactivation or cap) drops it and a new mint starts a new
+    // episode. A second look changes nothing: `receded` stays true.
+    if (!(state.doneViews instanceof Map)) state.doneViews = new Map();
+    const doneView = contract.observeDoneView(state.doneViews.get(paneId), entry, now);
+    if (doneView === undefined) state.doneViews.delete(paneId);
+    else state.doneViews.set(paneId, doneView);
+    if (doneView !== undefined && doneView.receded === true && reduced.display === 'done') {
+      reduced = { ...reduced, display: 'idle', label: 'idle' };
+    }
     const expiry = doneExpiryOf(entry, now);
     if (expiry !== null && (nearestExpiry === null || expiry < nearestExpiry)) nearestExpiry = expiry;
+    // The dwell deadline is a second wake the frame has to honour: without it
+    // the recede could wait a whole baseline after the 5 s elapsed.
+    if (
+      doneView !== undefined &&
+      doneView.recedeAt !== undefined &&
+      (nearestExpiry === null || doneView.recedeAt < nearestExpiry)
+    ) {
+      nearestExpiry = doneView.recedeAt;
+    }
     sightings[paneId] = { entry, reduced };
     if (!sidebar.enabled) {
       // Native sidebar selected (or malformed flag): never compose a
@@ -1222,6 +1308,7 @@ async function frame(state, opts = {}) {
   // clear the owned family under our own source (never foreign tokens).
   const departed = [...state.live].filter((id) => !live.has(id));
   for (const id of departed) {
+    if (state.doneViews instanceof Map) state.doneViews.delete(id);
     try {
       await clearOwnedFamily(id);
     } catch (error) {

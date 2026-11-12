@@ -17,9 +17,19 @@
 // Tokens (§4.3):
 //   gentle_work_v1    = <hash>:<count>:<expiry>
 //                       (normative running total — only `running` counts as
-//                       executing; queued/waiting/pending never count. The
-//                       consumer renders the oldest running role plus this
-//                       total in parentheses only when above one.)
+//                       executing; queued/waiting never count. The total is
+//                       the UNION of running TaskStore records and the
+//                       distinct in-flight `subagent_run`/`subagent_continue`
+//                       launches the store does not list yet, deduplicated so
+//                       one delegate counts once: a task-mode (synchronous)
+//                       launch has no record until it returns, so without it
+//                       two live delegates counted zero. Per agent the union
+//                       is a MAX (S11b): an announced running record and its
+//                       own in-flight launch are the same delegate and carry
+//                       no shared call id, so a record consumes one launch of
+//                       its own agent. The consumer renders the oldest
+//                       running role plus this total in parentheses only when
+//                       above one.)
 //   gentle_roles_v1   = CSV of canonical role slugs from TaskRecord.agent
 //                       (oldest-first by immutable firstSeen, e.g.
 //                       `worker,explorer` with worker oldest; null /
@@ -750,15 +760,29 @@ const QUIET_BEAT_LIMIT = 3;
 const LOST_SETTLE_BEATS = 2;
 // Synthesized finish signal (DESIGN §4.3, S2/D2). The host never reports
 // `done`, so the producer mints the finish itself: one session-bound
-// `<hash>:<expiry>` token per finish at the settled-and-empty edge, carrying
-// the hold as its absolute expiry. The sidebar reads it as `done` while it is
-// fresh and recedes to `idle` once it expires — the delay IS that expiry, so
-// no timer and no extra idle hold exists. The hold is short on purpose (5 s):
-// it exists to make a finish visible, never to pin a settled row, so `idle`
-// follows the finish within seconds. Overridden through
-// GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min]; the consumer rejects any
-// expiry beyond the same ceiling.
+// `<hash>:<expiry>` token per finish at the settled-and-empty edge. Since T3
+// the expiry is the UNSEEN cap, not the visible dwell: the row holds `done`
+// until the human views the pane, then the consumer's own 5 s dwell and
+// `idle`, and a pane nobody looks at recedes at the cap. The producer owns the
+// mint and the cap because it stamps the token; the consumer owns the recede
+// because `focused` rides the snapshot the daemon already reads. The finish
+// signal is never refreshed, so the cap can never be extended.
 const DONE_TOKEN = "gentle_done_v1";
+// Default unseen cap: 15 minutes (S8). It bounds how long a finish can read
+// `done` without the human ever looking at it, so the marker stays an answer
+// to "which finished panes have I not reviewed yet". Overridden through
+// GENTLE_DONE_UNSEEN_CAP_MS, clamped exactly like JOBS_SNAPSHOT_TTL_MS.
+const DONE_UNSEEN_CAP_MS = 900000;
+const DONE_UNSEEN_CAP_MIN_MS = 100;
+export const DONE_UNSEEN_CAP_MAX_MS = 3600000;
+const DONE_UNSEEN_CAP_ENV = "GENTLE_DONE_UNSEEN_CAP_MS";
+// Settle-time pending hold (T9/S12), NOT the finish token's life: one finish
+// spell in which a stranded `subagent_run` keeps the native state non-terminal
+// and the `done` mint withheld, after which the terminal state lands. Its 5 s
+// default is the time the latch waits on a launch result that may never come;
+// the 5 s dwell after the human views a finish lives consumer-side
+// (`DONE_VIEW_DWELL_MS` in herdr-plugin/lib/gentle-tokens.js). Overridden
+// through GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min].
 const DONE_HOLD_MS = 5000;
 const DONE_HOLD_MIN_MS = 1000;
 export const DONE_HOLD_MAX_MS = 300000;
@@ -946,6 +970,36 @@ export function doneHoldMs(raw = process.env[DONE_HOLD_ENV]) {
   const parsed = Number(text);
   if (!Number.isFinite(parsed)) return DONE_HOLD_MS;
   return Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(parsed)));
+}
+
+// S12/T9c: the deadline for one settle-time pending episode. A first raise
+// starts the episode at `now`. A re-settle that adds no launch id to the
+// retained union keeps the deadline exactly, so repeated settles can never
+// extend the latch. One that adds a new in-flight launch may extend it from
+// `now` (new work means the pane is not finished), but the whole episode never
+// runs past the hold ceiling measured from its first raise. `holdMs` is clamped
+// by the same band as doneHoldMs.
+export function settleHoldUntil({ now, held, startedAt, until, added, holdMs }) {
+  const raw = Number.isFinite(holdMs) ? holdMs : DONE_HOLD_MS;
+  const hold = Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(raw)));
+  if (!held) return { startedAt: now, until: now + hold };
+  if (!added) return { startedAt, until };
+  return {
+    startedAt,
+    until: Math.min(startedAt + DONE_HOLD_MAX_MS, Math.max(until, now + hold)),
+  };
+}
+
+// Unseen-cap override, the same discipline as jobsSnapshotTtlMs: an absent or
+// unparseable value keeps the 15 min default and anything outside the band is
+// clamped, so a debugging session (or a test that cannot wait 15 minutes) can
+// shorten the cap without ever making the finish token instantly stale.
+export function doneUnseenCapMs(raw = process.env[DONE_UNSEEN_CAP_ENV]) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0) return DONE_UNSEEN_CAP_MS;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return DONE_UNSEEN_CAP_MS;
+  return Math.min(DONE_UNSEEN_CAP_MAX_MS, Math.max(DONE_UNSEEN_CAP_MIN_MS, Math.round(parsed)));
 }
 
 // Beat cadence override, the same discipline as doneHoldMs: an absent or
@@ -1190,9 +1244,10 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // (ask/choice/question/questionnaire/permission — never
 // review/RDD execution, which stays working and silent); working while the
 // principal is active OR running/queued delegates exist OR pending launches
-// exist OR review execution holds; idle ONLY on authoritative principal
+// exist OR review execution holds OR a fresh session-owned background job
+// still runs; idle ONLY on authoritative principal
 // settled plus zero running+queued plus zero pending plus no human-wait
-// prompt and no review execution. The producer never sets `hasError`: native
+// prompt and no review execution and no live job. The producer never sets `hasError`: native
 // `blocked` is what fires the host's NeedsAttention toast and sound, so an
 // `error:` label stays sidebar-only and the pane reports `working` while it
 // stands. Never infer terminal from child
@@ -1205,6 +1260,14 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // host's own live truth (`ctx.isIdle()`), so a missed `agent_settled` cannot
 // leave this producer unable to reach `idle` — not when no turn was observed,
 // and not when a turn this producer saw start never delivered its settle edge.
+//
+// `liveJobCount` closes the disagreement that `restore-done-idle.md` S4 opened
+// (this document's L3/L4): the display already waited on a live
+// `bash_background` / `monitor` job while the native state reported `idle`, and
+// Herdr presents that `idle` as finished (check circle + notification) on a pane
+// whose row still read pink `gentle`. The input is the freshness-bounded,
+// session-owned count (`freshRunningJobCount`), so a stale or foreign snapshot
+// arrives here as 0 and can never block the terminal state (fail OPEN).
 export function computeNativeState({
   agentActive,
   settled,
@@ -1213,10 +1276,11 @@ export function computeNativeState({
   askActive,
   reviewActive,
   hasError,
+  liveJobCount = 0,
 }) {
   if (hasError) return "blocked";
   if (askActive) return "blocked";
-  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive) {
+  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive || liveJobCount > 0) {
     return "working";
   }
   if (settled && !agentActive && activeCount === 0 && pendingCount === 0 && !askActive && !reviewActive) {
@@ -1611,9 +1675,23 @@ export async function liveSummarizeRoots(roots) {
 
 // Producer state, resolved once for both flag files below. GENTLE_STATUS_STATE_DIR
 // (explicit user override) is used as-is; HERDR_PLUGIN_STATE_DIR is
-// Herdr-injected and changes with the plugin id, so when it holds none of our
-// files while the stored dir does, the stored dir wins. Fresh installs with no
-// stored files converge on the injected dir.
+// Herdr-injected and changes with the plugin id, so the stored dir wins
+// whenever it holds any of our files — one stray known file in the injected
+// dir may never outrank it, because the daemon writes its pidfile into the dir
+// it resolves and that made the split self-perpetuating.
+//
+// S1b: the stored canonical dir is the FINAL fallback. This process never
+// receives HERDR_PLUGIN_STATE_DIR, so resolving the injected dir on a fresh
+// install named a directory the daemon never created: the refresh write below
+// failed and the sidebar fell back to polling. The active-id dir is therefore a
+// candidate here too, derived from the state home when the variable is absent,
+// so a legacy install whose live flags sit only there is still found.
+// Selection order: stored if it holds a known file, else the active-id/injected
+// dir if it holds one, else stored. An injected path is honoured only when it IS
+// the directory this package derives for that name under the resolved state home
+// (S1c): any other basename, and an owned basename under another root, is
+// ignored, so the daemon and this helper can never be pointed at another
+// plugin's state or at a second root for the same name.
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1624,6 +1702,15 @@ export async function liveSummarizeRoots(roots) {
 // writes: an upgraded install still carries them, and a family that differs
 // between consumers splits the state across both dirs.
 const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
+const SIDEBAR_ACTIVE_PLUGIN_ID = "herdr-gentle-shell";
+// S1c: an injected path is honoured only when its basename names a directory
+// this package owns — the active plugin id (what Herdr injects today) or the
+// stored canonical segment — AND it is the path this package derives for that
+// name under the resolved state home. Any other path, e.g. a third plugin id or
+// an owned name under another root, is IGNORED: the daemon receives
+// HERDR_PLUGIN_STATE_DIR while no producer does, so honouring a directory we do
+// not own (or the same name under another root) is exactly what splits them.
+const SIDEBAR_OWNED_DIR_NAMES = [SIDEBAR_ACTIVE_PLUGIN_ID, SIDEBAR_STATE_SEGMENT];
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
   "gentle-moshi.json",
@@ -1635,12 +1722,71 @@ const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-plugin-tools.json",
 ];
 
-function sidebarStoredDir() {
+function sidebarStatePluginsDir() {
   const env = process.env;
   const base = env.XDG_STATE_HOME
     ? join(env.XDG_STATE_HOME, "herdr")
     : join(homedir(), ".local", "state", "herdr");
-  return join(base, "plugins", SIDEBAR_STATE_SEGMENT);
+  return join(base, "plugins");
+}
+
+function sidebarStoredDir() {
+  return join(sidebarStatePluginsDir(), SIDEBAR_STATE_SEGMENT);
+}
+
+// Two spellings name the same directory when their canonical forms match.
+// realpath resolves symlinks but throws for a path that does not exist yet, so
+// walk up to the deepest existing ancestor and re-append the missing tail: that
+// keeps a symlinked or relative spelling of the derived dir from being rejected
+// as a different directory (S1c/T12 compares paths, never raw strings).
+function sidebarCanonicalDir(dir) {
+  const absolute = resolvePath(dir);
+  const tail = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? join(real, ...tail) : real;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return absolute;
+      // Prepended so the missing tail is re-appended in its original order.
+      tail.unshift(pathBasename(current));
+      current = parent;
+    }
+  }
+}
+
+// The active plugin id dir: what Herdr injects as HERDR_PLUGIN_STATE_DIR for the
+// current plugin id, or — because this producer never receives that variable —
+// the same path derived from the state home. An injected path is only honoured
+// when it IS the directory this package derives for that name under the resolved
+// state home; any other basename (S1c) or an owned basename under another root —
+// the exact split, since the daemon receives the variable and this producer
+// derives its own — falls back to the derived path.
+function sidebarActiveDir() {
+  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected === "string" && injected.length > 0) {
+    const name = pathBasename(injected);
+    if (
+      SIDEBAR_OWNED_DIR_NAMES.includes(name) &&
+      sidebarCanonicalDir(injected) === sidebarCanonicalDir(join(sidebarStatePluginsDir(), name))
+    ) {
+      return injected;
+    }
+  }
+  return join(sidebarStatePluginsDir(), SIDEBAR_ACTIVE_PLUGIN_ID);
+}
+
+function sidebarDirHasKnownFile(dir) {
+  for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+    try {
+      if (fs.existsSync(join(dir, name))) return true;
+    } catch {
+      // A single unreadable entry never decides; keep scanning.
+    }
+  }
+  return false;
 }
 
 function sidebarEffectiveDir() {
@@ -1650,35 +1796,17 @@ function sidebarEffectiveDir() {
   const stored = sidebarStoredDir();
   // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
   // value ignores every override and uses the stored default. Only an
-  // omitted (null/undefined) explicit falls through to the injected dir.
+  // omitted (null/undefined) explicit falls through to the active-id dir.
   if (explicit !== undefined && explicit !== null) return stored;
-  const injected = env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected !== "string" || injected.length === 0) return stored;
-  if (injected === stored) return injected;
+  const active = sidebarActiveDir();
+  if (active === stored) return stored;
   try {
-    let injectedHas = false;
-    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
-      try {
-        if (fs.existsSync(join(injected, name))) {
-          injectedHas = true;
-          break;
-        }
-      } catch {
-        // A single unreadable entry never decides; keep scanning.
-      }
-    }
-    if (injectedHas) return injected;
-    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
-      try {
-        if (fs.existsSync(join(stored, name))) return stored;
-      } catch {
-        // A single unreadable entry never decides; keep scanning.
-      }
-    }
+    if (sidebarDirHasKnownFile(stored)) return stored;
+    if (sidebarDirHasKnownFile(active)) return active;
   } catch {
-    // Fall through to the injected dir on unexpected failure.
+    // Fall through to the stored canonical dir on unexpected failure.
   }
-  return injected;
+  return stored;
 }
 
 // Status-refresh request file, owned by the consumer daemon: a single
@@ -2633,16 +2761,18 @@ export default function (pi) {
   // exactly the entries whose status is running|queued. Gentle Shell owns
   // lifecycle/status truth: no local age/staleness timeout is applied.
   // pendingCalls holds label correlation state for a later
-  // gentleAgents.taskId result plus a role-only display hint (exact pending
-  // subagent agent -> gentle_roles_v1 slug) while the tool call is in
-  // flight; it never increments the count. Task-mode `subagent_run` stays
+  // gentleAgents.taskId result plus the in-flight launch evidence: its own
+  // contribution to the consolidated `(n)` count (a task-mode `subagent_run`
+  // stays in flight with no TaskStore record until tool_result, so the record
+  // set alone undercounts it) and a role-only display hint (exact pending
+  // subagent agent -> gentle_roles_v1 slug). Task-mode `subagent_run` stays
   // in flight with no TaskStore record until tool_result, so without the
   // hint the active role would be invisible and the sidebar would show
   // generic `working` during execution.
   // Finished/failed/cancelled/waiting entries may linger in the map but
   // never count; the map is cleared only on session reset (plus the
   // bounded-map guard) — never by a local staleness timeout.
-  const pendingCalls = new Map(); // toolCallId -> { agent, label, at }; agent/label are undefined when no agent is resolvable
+  const pendingCalls = new Map(); // toolCallId -> { agent, label, at, taskId?, cancelled? }; agent/label are undefined when no agent is resolvable
   const tasks = new Map(); // taskId -> { agent, label, status, at }
 
   // Blocker legs. ask combines choice + native questionnaire + legacy
@@ -2909,23 +3039,42 @@ export default function (pi) {
   // beat arriving mid-send is describing.
   let nativeSending = null;
   let nativeLastOk = undefined;
-  // T2 native-only terminal guard: agent_settled clears the metadata
-  // pending-launch hint below, but a settle that observes in-flight launches
-  // retains pending evidence here so native idle gating stays working until
-  // those launches resolve. Metadata/tasks untouched; the guard clears when a
-  // launch resolves, on agent_start, with the session, and — when a launch
-  // never reports back — at `nativeSettledPendingUntil`, the finish-hold
-  // deadline of the settle that raised it. Past that hold the evidence stops
-  // counting, so a lost launch result can never pin the native report at
-  // `working` for good (seq itself never resets).
+  // T2/S12 terminal guard: agent_settled clears the metadata pending-launch
+  // hint below, but a settle that observes in-flight launches retains pending
+  // evidence here so the terminal state stays held until those launches
+  // resolve. It gates BOTH sides — the native report (via `pendingCount`) and
+  // the display (`done` mint and the `orchestrating` marker) — so a stranded
+  // launch can never leave the row reading `done` beside a native `working`.
+  // Metadata/tasks untouched; the guard clears when the union of the episode's
+  // unresolved launches is empty, on agent_start, with the session, and — when
+  // a launch never reports back — at `nativeSettledPendingUntil`, the
+  // finish-hold deadline of the settle that raised it. Past that hold the
+  // evidence stops counting and the expiry beat below lands the terminal state,
+  // so a lost launch result can never pin the report at `working` for good
+  // (seq itself never resets).
   let nativeSettledPending = false;
   let nativeSettledPendingUntil = 0;
-  // Finish-hold episode (S2): minted once at the settled-and-empty edge so the
+  // When the episode's hold was first raised. The episode ceiling is measured
+  // from here, so repeated re-settles can extend up to it but never past it.
+  let nativeSettledPendingStartedAt = 0;
+  // The exact launches the settling turn left in flight. A result retires only
+  // its own id; a later settle ADDS to this union instead of replacing it, and
+  // the hold stands until the union is empty, so one early result can never
+  // release evidence another launch still owes.
+  let nativeSettledPendingCalls = new Set();
+  // One timer at that deadline, the same discipline as `armJobsExpiry`: the
+  // hold has no other edge behind it, so without this beat neither the native
+  // `idle` nor the `done` mint would ever land. One beat is enough — from that
+  // instant the evidence is zero, so the beat either reports the terminal
+  // state or the real activity that still holds it. Never a poll: a launch
+  // resolution, `agent_start`, and the session reset drop it.
+  let settledPendingExpiryTimer;
+  // Finish episode (S2/T3): minted once at the settled-and-empty edge so the
   // row reads `done`, then republished unchanged (never refreshed) until the
-  // hold expires. `donePending` carries the unannounced finish to the beat
-  // that actually delivers the token (S3), and `sawActivity` remembers that
-  // the session did work, so a session that never ran a turn stays idle. All
-  // three clear with the session and the moment any work reappears.
+  // unseen cap expires. `donePending` carries the unannounced finish to the
+  // beat that actually delivers the token (S3), and `sawActivity` remembers
+  // that the session did work, so a session that never ran a turn stays idle.
+  // All three clear with the session and the moment any work reappears.
   let doneExpiry;
   let donePending = false;
   let sawActivity = false;
@@ -2956,12 +3105,45 @@ export default function (pi) {
   function clearSettledPending() {
     nativeSettledPending = false;
     nativeSettledPendingUntil = 0;
+    nativeSettledPendingStartedAt = 0;
+    nativeSettledPendingCalls.clear();
+    clearSettledPendingExpiry();
+  }
+
+  function clearSettledPendingExpiry() {
+    if (settledPendingExpiryTimer === undefined) return;
+    clearTimeout(settledPendingExpiryTimer);
+    settledPendingExpiryTimer = undefined;
+  }
+
+  function armSettledPendingExpiry(at) {
+    clearSettledPendingExpiry();
+    const delay = Math.max(0, at - Date.now());
+    settledPendingExpiryTimer = setTimeout(() => {
+      settledPendingExpiryTimer = undefined;
+      if (!rootSession) return;
+      schedulePublish();
+    }, delay);
+    if (settledPendingExpiryTimer.unref) settledPendingExpiryTimer.unref();
   }
 
   // Past the finish hold of the settle that raised it, the retained pending
-  // evidence stops counting: the hold is the span it exists to cover.
+  // evidence stops counting: the hold is the span it exists to cover. This is
+  // the single condition the native report and the display both gate on.
   function settledPendingHeld() {
     return nativeSettledPending && Date.now() < nativeSettledPendingUntil;
+  }
+
+  // One launch result retires its own evidence. The hold releases — and the
+  // caller must publish on this edge — only when no launch the settle observed
+  // is still unresolved. An id outside the settling set (an earlier launch, or
+  // one started after the settle) never releases the hold.
+  function resolveSettledPending(callId) {
+    if (!settledPendingHeld()) return false;
+    if (typeof callId !== "string" || !nativeSettledPendingCalls.delete(callId)) return false;
+    if (nativeSettledPendingCalls.size > 0) return false;
+    clearSettledPending();
+    return true;
   }
 
   // The settle state `agent_settled` applies, shared with the reconcile below
@@ -3173,13 +3355,11 @@ export default function (pi) {
   // Authoritative TaskStore projection for liveness/marker coverage:
   // every entry whose status is running|queued is active here (T1
   // epochs/witness unchanged). Display count/roles use runningSubs()
-  // below (running only). Pending tool calls never count;
-  // finished/failed/cancelled/waiting entries never count.
-  // WHY pending calls stay out of the count: task-mode `subagent_run` stays
-  // in flight without a TaskStore record until it returns tool_result, so
-  // counting pending calls would inflate `gentle_work_v1` with estimates.
-  // The count is normative; role display below is the
-  // only consumer of the pending hint.
+  // below (running only). Finished/failed/cancelled/waiting entries never
+  // count. The consolidated `(n)` count adds the in-flight launch calls the
+  // record set does not list yet (countSubs below, S11): a task-mode
+  // `subagent_run` has no TaskStore record until it returns tool_result, so
+  // the record set alone counted live synchronous delegates as zero.
   // Order is oldest-first by immutable firstSeen (fallback at): progress
   // reads bump `at` but never move `firstSeen`, so they never reorder.
   function activeSubs() {
@@ -3202,6 +3382,8 @@ export default function (pi) {
   // T2b display projection: only `running` counts as executing.
   // Queued/waiting never count and never supply a role; the total here is
   // the consumer's `(n)` suffix source (suffix only when > 1).
+  // This map is the producer's own evidence, so it is authoritative only
+  // when no presence snapshot can be read: displaySubs() below narrows it.
   function runningSubs() {
     const out = [];
     for (const [id, task] of tasks) {
@@ -3219,18 +3401,108 @@ export default function (pi) {
     return out;
   }
 
+  // Authoritative display projection for the produced count, role words and
+  // names: the ids a VALID presence snapshot lists running. A local record
+  // the upstream store does not list is not running whatever this map still
+  // says, so a record stranded by an epoch bump after its last witnessed
+  // generation contributes no name, no role and no count, and an idle session
+  // reaches `idle` instead of a stale role word. Fallback (never zero): with
+  // no usable snapshot the local map is the only evidence and stands in full
+  // — zero would flip the consumer's `done` gate and hide real running work.
+  // Pending launch hints are deliberately not narrowed: they exist only while
+  // their own tool call is in flight, and their purpose is a record the store
+  // does not carry yet.
+  function displaySubs(snapshot) {
+    const local = runningSubs();
+    if (!isRecord(snapshot) || !Array.isArray(snapshot.tasks)) return local;
+    const listed = new Set();
+    for (const entry of snapshot.tasks) {
+      if (isRecord(entry) && typeof entry.id === "string" && entry.status === "running") {
+        listed.add(entry.id);
+      }
+    }
+    return local.filter((sub) => listed.has(sub.id));
+  }
+
+  // Distinct in-flight launch calls the running record set does not already
+  // list (S11): the second half of the `(n)` union. One delegate is one
+  // entry — the map is keyed by call id, so a call counts at most once, and a
+  // call that resumes a task the records already list running (its `taskId`)
+  // is the SAME delegate and adds nothing. A cancelled call is no longer an
+  // executing delegate; it keeps its pending evidence only for the terminal
+  // gate, which is a separate leg.
+  function inFlightLaunchSubs(listed) {
+    const out = [];
+    for (const pending of pendingCalls.values()) {
+      if (pending.cancelled === true) continue;
+      if (pending.taskId !== undefined && listed.has(pending.taskId)) continue;
+      out.push(pending);
+    }
+    out.sort((a, b) => a.at - b.at);
+    return out;
+  }
+
+  // The consolidated `(n)` source (S11/S11b): the UNION of the running
+  // records the presence snapshot confirms and the distinct in-flight launches
+  // the store does not list yet, deduplicated so one delegate is counted once.
+  // In-flight launches are never narrowed by the snapshot: like the role hint,
+  // they exist only while their own call is in flight, which is exactly the
+  // evidence the store cannot carry yet.
+  // S11b: an announced running record and its own in-flight launch are the SAME
+  // delegate and share no call id — a background launch is acked synchronously
+  // while its START may announce the record on the lifecycle channel before
+  // that ack lands, and the announcement carries only the agent. So per agent
+  // the count is max(running records, unbound in-flight launches): a record
+  // consumes one launch of its own agent (oldest first, which max() expresses
+  // without an arbitrary pairing) and never a launch of another agent, while
+  // two launches beside one record stay two delegates (real work is never
+  // hidden). Only KNOWN agents form a group; an entry with no agent is counted
+  // on its own, because identity is the only evidence that two entries are the
+  // same delegate.
+  function countSubs(snapshot) {
+    const running = displaySubs(snapshot);
+    const listed = new Set(running.map((sub) => sub.id));
+    const launches = inFlightLaunchSubs(listed);
+    const groups = new Map(); // known agent -> { records, launches }
+    let unknown = 0;
+    const groupOf = (agent) => {
+      if (typeof agent !== "string" || agent.length === 0) return undefined;
+      let group = groups.get(agent);
+      if (group === undefined) {
+        group = { records: 0, launches: 0 };
+        groups.set(agent, group);
+      }
+      return group;
+    };
+    for (const sub of running) {
+      const group = groupOf(sub.agent);
+      if (group === undefined) unknown += 1;
+      else group.records += 1;
+    }
+    for (const launch of launches) {
+      const group = groupOf(launch.agent);
+      if (group === undefined) unknown += 1;
+      else group.launches += 1;
+    }
+    let total = unknown;
+    for (const group of groups.values()) total += Math.max(group.records, group.launches);
+    return total;
+  }
+
   // Role-only hint from in-flight `subagent_run`/`subagent_continue` tool
   // calls: task-mode launches stay in flight (no tool_result yet, hence no
   // TaskStore record) even though `tool_call` input already carries the
   // exact agent name. Publishing that agent's role slug keeps the sidebar
-  // from showing generic `working` during execution. This is display-only:
-  // it never enters `gentle_work_v1` or any displayed count, and each hint
-  // is cleared when its tool_result arrives, the call is cancelled, or the
-  // agent settles. The hint carries the mapped word or the sanitized
-  // passthrough slug (unsalvageable names yield no hint and read gentle).
+  // from showing generic `working` during execution. The hint never adds a
+  // name; its count contribution comes from countSubs above, so the hint
+  // itself stays role-only. Each hint is cleared when its tool_result
+  // arrives, the call is cancelled, or the agent settles. The hint carries
+  // the mapped word or the sanitized passthrough slug (unsalvageable names
+  // yield no hint and read gentle).
   function pendingRoleSubs() {
     const out = [];
     for (const pending of pendingCalls.values()) {
+      if (pending.cancelled === true) continue;
       if (agentToRole(pending.agent) !== undefined) {
         out.push({ agent: pending.agent, label: pending.label, at: pending.at });
       }
@@ -3252,8 +3524,8 @@ export default function (pi) {
   // Merged role sources, oldest-first by first-seen: authoritative running
   // TaskStore subs plus pending role hints. Authoritative entries win on
   // duplicates via rolesCsv dedup (first wins = oldest wins).
-  function mergedRoleSubs() {
-    const merged = [...runningSubs(), ...pendingRoleSubs()];
+  function mergedRoleSubs(subs) {
+    const merged = [...subs, ...pendingRoleSubs()];
     merged.sort((a, b) => (a.firstSeen ?? a.at) - (b.firstSeen ?? b.at));
     return merged;
   }
@@ -3358,15 +3630,17 @@ export default function (pi) {
     return parts.join(",");
   }
 
-  function buildTokens() {
+  function buildTokens(snapshot) {
     if (!sessionHash) return {};
     const expiry = Date.now() + TTL_MS;
     // Liveness/marker coverage stays running|queued (T1); the visible
-    // count + roles are running-only (T2b executing set).
+    // count + roles are running-only (T2b executing set) narrowed to the ids
+    // the presence snapshot lists running (displaySubs), plus the distinct
+    // in-flight launches the store does not list yet (countSubs, S11/S11b).
     const subs = activeSubs();
-    const running = runningSubs();
+    const running = displaySubs(snapshot);
     const tokens = {};
-    const count = String(running.length);
+    const count = String(countSubs(snapshot));
     if (COUNT_RE.test(count)) tokens.gentle_work_v1 = `${sessionHash}:${count}:${expiry}`;
     const csv = namesCsv(running);
     // Clear (null) when the authoritative active TaskStore list has no
@@ -3379,11 +3653,12 @@ export default function (pi) {
     // §4.3), merged with the in-flight pending role hint: running TaskStore
     // roles (oldest-first) plus the exact pending subagent agent while its
     // tool call is in flight (task-mode launches have no TaskStore record
-    // yet). The hint is role-only — the count above stays running-only —
-    // and is cleared with the pending call. Null (clear) when no active
-    // recognized roles in either source — unrecognized agents degrade to
-    // the consumer's `working` display.
-    const roles = rolesCsv(mergedRoleSubs());
+    // yet). The hint is role-only — the count above adds the in-flight call
+    // itself in countSubs, grouped per agent (S11b) — and is cleared with the
+    // pending call. Null (clear) when no active recognized roles in either
+    // source — unrecognized agents degrade to the consumer's `working`
+    // display.
+    const roles = rolesCsv(mergedRoleSubs(running));
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;
     // Clear the retired disclosure token left by older producers.
@@ -3434,8 +3709,17 @@ export default function (pi) {
     // fresh marker to the
     // `orchestrating` display only when no recognized role is active (below
     // attention, terminal `done`, and recognized roles; ahead of main
-    // `working`).
-    if (rootSession && (agentActive || subs.length > 0 || pendingCalls.size > 0 || freshRunningJobCount() > 0)) {
+    // `working`). It answers the same held condition as the native report
+    // (S12): while the settle-time pending evidence stands, the row must read
+    // the pink generic wait, never `done` beside a native `working`.
+    if (
+      rootSession &&
+      (agentActive ||
+        subs.length > 0 ||
+        pendingCalls.size > 0 ||
+        freshRunningJobCount() > 0 ||
+        settledPendingHeld())
+    ) {
       tokens.gentle_orchestrating_v1 = `${sessionHash}:${expiry}`;
     } else {
       tokens.gentle_orchestrating_v1 = null;
@@ -3460,19 +3744,26 @@ export default function (pi) {
     const pending = pendingRole();
     if (pending !== undefined) tokens[PENDING_TOKEN] = `${sessionHash}:${pending}:${expiry}`;
     else tokens[PENDING_TOKEN] = null;
-    // Synthesized finish signal (S2/D2): minted once at the settled-and-empty
-    // edge — principal settled with no running/queued delegate, no pending
-    // launch, no live background job, and no human-wait, review, or error leg
-    // — then republished with the SAME expiry so the hold can never be
-    // extended. Any work appearing during the hold clears it on that beat, so
-    // the row moves straight back to the role state. A session that never
-    // worked never mints one. A live background job counts as activity: the
-    // finish waits while the session still waits on it.
+    // Synthesized finish signal (S2/D2/T3): minted once at the settled-and-
+    // empty edge — principal settled with no running/queued delegate, no
+    // pending launch, no live background job, and no human-wait, review, or
+    // error leg — then republished with the SAME expiry so the unseen cap can
+    // never be extended. The consumer holds `done` until the pane is viewed
+    // (its own 5 s dwell, then idle) and lets the token expire at the cap when
+    // nobody ever looks. Any work appearing during the episode clears it on
+    // that beat, so the row moves straight back to the role state. A session
+    // that never worked never mints one. A live background job counts as
+    // activity: the finish waits while the session still waits on it.
+    // A stranded settle-time launch is activity too (S12): the same held
+    // condition the native report uses blocks the `done` mint here, so the
+    // display and the native status agree at the settle edge. The settle
+    // hold's expiry releases it through the beat armed at that deadline.
     const activity =
       agentActive ||
       subs.length > 0 ||
       pendingCalls.size > 0 ||
       freshRunningJobCount() > 0 ||
+      settledPendingHeld() ||
       askActiveNow() ||
       reviewActive ||
       !!errorCode;
@@ -3482,7 +3773,7 @@ export default function (pi) {
       donePending = false;
     } else if (settled && turnSettled) {
       if (doneExpiry === undefined && sawActivity) {
-        doneExpiry = Date.now() + doneHoldMs();
+        doneExpiry = Date.now() + doneUnseenCapMs();
         donePending = true;
         sawActivity = false;
       }
@@ -3647,6 +3938,10 @@ export default function (pi) {
           pendingCount: pendingCalls.size + (settledPendingHeld() ? 1 : 0),
           askActive: askActiveNow(),
           reviewActive,
+          // S4/S5: the same freshness-bounded job count the display `done` mint
+          // waits on, so a live job can never leave a non-terminal row beside a
+          // terminal native status.
+          liveJobCount: freshRunningJobCount(),
         });
     if (!state) return undefined;
     if (state === "blocked") {
@@ -3862,9 +4157,10 @@ export default function (pi) {
     // Host truth first: a settle this producer missed must be visible to both
     // the native report and the tokens built below.
     reconcileSettled();
-    reconcilePresence();
+    const snapshot = readPresence();
+    reconcilePresence(snapshot);
     queueNative();
-    const tokens = buildTokens();
+    const tokens = buildTokens(snapshot);
     if (Object.keys(tokens).length === 0) {
       maybeStopBeat();
       return;
@@ -3907,6 +4203,17 @@ export default function (pi) {
     debug("beat", `tokens=${Object.keys(tokens).length} subs=${activeSubs().length}`);
   }
 
+  // One snapshot read per beat, shared by reconciliation and the display
+  // projection, so both legs decide on the same generation.
+  function readPresence() {
+    if (!sessionId) return undefined;
+    try {
+      return readPresenceSnapshot(sessionId, Date.now());
+    } catch {
+      return undefined;
+    }
+  }
+
   // T1 passive presence reconciliation: resolve explicit terminal task
   // statuses (and witnessed absence in a newer complete snapshot) from the
   // Gentle Shell presence files before building tokens, so delegate
@@ -3914,14 +4221,7 @@ export default function (pi) {
   // no timers, no writes, no imported upstream dependencies; any unreadable
   // or inapplicable snapshot leaves tasks untouched. Count, TTL, and
   // transport semantics below are unchanged.
-  function reconcilePresence() {
-    if (!sessionId) return;
-    let snapshot;
-    try {
-      snapshot = readPresenceSnapshot(sessionId, Date.now());
-    } catch {
-      return;
-    }
+  function reconcilePresence(snapshot) {
     if (!snapshot) return;
     let applied = [];
     try {
@@ -4197,6 +4497,9 @@ export default function (pi) {
   // role evidence at all — the pending call still covers the blocking/
   // orchestrating marker, but it contributes no role and no name, and it
   // must never publish the launch-correlation placeholder as a role word.
+  // The named `task_id` is retained for the count's dedupe (S11): a resume of
+  // a task the records already list running is the same delegate, and a
+  // cancel of that task ends it.
   function launchInput(input) {
     if (!isRecord(input)) return undefined;
     const taskId = typeof input.task_id === "string" ? input.task_id : undefined;
@@ -4207,7 +4510,11 @@ export default function (pi) {
     const labelSource =
       typeof input.label === "string" && input.label.length > 0 ? input.label : agent;
     const label = labelSource === undefined ? undefined : sanitizeLabel(labelSource, labelSource);
-    return { agent: agent === undefined ? undefined : truncateChars(agent, MAX_LABEL_CHARS), label };
+    return {
+      agent: agent === undefined ? undefined : truncateChars(agent, MAX_LABEL_CHARS),
+      label,
+      taskId,
+    };
   }
 
   pi.on("tool_call", (event) => {
@@ -4234,11 +4541,23 @@ export default function (pi) {
       const taskId = isRecord(event.input) ? event.input.task_id : undefined;
       if (typeof taskId !== "string") return;
       const known = tasks.get(taskId);
+      let changed = false;
+      // A cancelled task's own in-flight launch is no longer an executing
+      // delegate, so it stops counting on this beat (S11: the count
+      // decrements on cancellation). Its pending evidence is NOT dropped: the
+      // pending-call leg still gates the terminal state (S4) and the call's
+      // own result still arrives later.
+      for (const [callId, pending] of pendingCalls) {
+        if (pending.taskId !== taskId || pending.cancelled === true) continue;
+        pendingCalls.set(callId, { ...pending, cancelled: true });
+        changed = true;
+      }
       if (known) {
         // Progress/cancel bumps recency only; firstSeen never moves (T2b).
         tasks.set(taskId, { ...known, status: "cancelled", at: Date.now() });
-        schedulePublish();
+        changed = true;
       }
+      if (changed) schedulePublish();
     }
   });
 
@@ -4261,7 +4580,11 @@ export default function (pi) {
     // outcome is now covered by the task record (working via activeSubs),
     // the error latch (blocked), or genuine emptiness (idle on next beat).
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
-      clearSettledPending();
+      // A launch resolution retires only its own evidence. When it is the LAST
+      // one the settling turn owed, the hold releases and this edge publishes:
+      // a single result while another launch is still unresolved must keep the
+      // native state non-terminal and announce nothing.
+      if (resolveSettledPending(event.toolCallId)) schedulePublish();
     }
     if (typeof event.toolCallId === "string" ? reviewCalls.delete(event.toolCallId) : false) {
       // The ended id was a known acknowledged execution; remaining tracked
@@ -4473,13 +4796,40 @@ export default function (pi) {
     retainContext(ctx);
     // Retain settle-time pending evidence for native gating before the
     // metadata hint clears (see nativeSettledPending above), bounded by the
-    // finish hold this settle opens.
-    const pendingAtSettle = pendingCalls.size > 0;
+    // finish hold this settle opens. A redundant or later settle of the same
+    // episode must never drop an id an earlier settle still owes: evaluate the
+    // live episode before applySettled clears it, then merge.
+    const pendingAtSettle = [...pendingCalls.keys()];
     pendingCalls.clear();
+    const carriedHeld = settledPendingHeld();
+    const carried = carriedHeld ? [...nativeSettledPendingCalls] : [];
+    const carriedUntil = carriedHeld ? nativeSettledPendingUntil : 0;
+    const carriedStart = carriedHeld ? nativeSettledPendingStartedAt : 0;
     applySettled(true);
-    if (pendingAtSettle) {
+    const union = new Set(carried);
+    let added = false;
+    for (const id of pendingAtSettle) {
+      if (union.has(id)) continue;
+      union.add(id);
+      added = true;
+    }
+    if (union.size > 0) {
+      const next = settleHoldUntil({
+        now: Date.now(),
+        held: carriedHeld,
+        startedAt: carriedStart,
+        until: carriedUntil,
+        added,
+        holdMs: doneHoldMs(),
+      });
       nativeSettledPending = true;
-      nativeSettledPendingUntil = Date.now() + doneHoldMs();
+      nativeSettledPendingStartedAt = next.startedAt;
+      nativeSettledPendingUntil = next.until;
+      nativeSettledPendingCalls = union;
+      // Nothing else will publish when the last launch resolves or the hold
+      // expires: arm the one beat that lands native `idle` and the single
+      // `done` mint without waiting for an unrelated event.
+      armSettledPendingExpiry(nativeSettledPendingUntil);
     }
     // S62 turn-end: the working tree may have changed without transcript
     // evidence (external/untracked edits), so re-scan before publishing.

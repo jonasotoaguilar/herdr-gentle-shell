@@ -55,8 +55,10 @@ queued acceptance.
 
 ## Mode file
 
-Shared flag under the existing resolved state directory
-(`$GENTLE_STATUS_STATE_DIR`, else the Herdr plugin state dir):
+Shared flag under the resolved state directory — the stored canonical plugins
+dir, with `$GENTLE_STATUS_STATE_DIR` as the unconditional explicit override and
+`$HERDR_PLUGIN_STATE_DIR` honoured only when it is the directory this package
+derives for that name under the resolved state home (canonically compared):
 `gentle-sidebar-mode.json` containing exactly
 `{version:1,enabled:boolean}`. Missing means **enabled** (current
 installs keep working with no file). A malformed file is reported, never

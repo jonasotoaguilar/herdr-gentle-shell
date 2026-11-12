@@ -30,7 +30,9 @@ const PLUGIN_ID = STATE_PLUGIN_ID;
 // Family of files proving a state dir is ours: when the Herdr-injected
 // dir (which changes with the plugin id) holds none of these while the
 // stored dir does, the stored dir wins so pre-rename flags stay readable.
-// Fresh installs with no stored files converge on the injected dir.
+// The active plugin id dir is a candidate here too, so this resolver names the
+// same directory as the daemon without needing the injected variable, and the
+// stored canonical dir is the final fallback (fresh install).
 // This family is IDENTICAL in the sidebar, daemon, worktree-mode and state
 // extension resolvers: a file one of them cannot see is state it reports as
 // missing, and the plugin toggles default to enabled when missing.
@@ -44,6 +46,14 @@ const STATE_KNOWN_FILES = [
   'gentle-worktree-mode.json',
   'gentle-plugin-tools.json',
 ];
+// S1c: the only basenames an injected state dir may have to be honoured — the
+// active plugin id Herdr injects today and the stored canonical segment — and
+// the path must also BE the one this package derives for that name under the
+// resolved state home. Any other injected path belongs to another plugin (or a
+// stale/dev id) and is ignored, and so is an owned basename under another root,
+// because the daemon receives the variable while a reader here usually does
+// not: honouring either is exactly what splits their state.
+const OWNED_DIR_NAMES = [ACTIVE_PLUGIN_ID, STATE_PLUGIN_ID];
 const CLI_TIMEOUT_MS = 5000;
 const MAX_FILE_BYTES = 256 * 1024;
 const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -66,9 +76,16 @@ function herdrBinary() {
 // Existing state-directory precedence (mirrors bin/gentle-status.js) but
 // WITHOUT mkdir: readers fail closed to "absent" instead of creating.
 // S15 rename compat: GENTLE_STATUS_STATE_DIR (explicit user override) is
-// used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected and changes with
-// the plugin id, so an empty injected dir never orphans the stored
-// pre-rename flags (see STATE_KNOWN_FILES above).
+// used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected and changes with the
+// plugin id, so one stray known file there may never orphan the stored
+// pre-rename flags (see STATE_KNOWN_FILES above). Selection order: stored if it
+// holds a known file, else the active-id/injected dir if it holds one, else
+// stored — diagnostics must name the same directory as the daemon even when it
+// runs without the injected variable, and the stored canonical dir is the final
+// fallback so a fresh install converges there. An injected path is honoured
+// only when it IS the directory this package derives for that name under the
+// resolved state home (S1c); any other path — including an owned basename under
+// another root — is ignored and the derived active-id dir is used instead.
 function storedStateDir(env = process.env) {
   if (env?.XDG_STATE_HOME) return path.join(env.XDG_STATE_HOME, 'herdr', 'plugins', STATE_PLUGIN_ID);
   const base =
@@ -89,25 +106,67 @@ function dirHasKnownFiles(dir) {
   return false;
 }
 
+// Two spellings name the same directory when their canonical forms match.
+// realpath resolves symlinks but throws for a path that does not exist yet, so
+// walk up to the deepest existing ancestor and re-append the missing tail: that
+// keeps a symlinked or relative spelling of the derived dir from being rejected
+// as a different directory (S1c/T12 compares paths, never raw strings).
+function canonicalStateDir(dir) {
+  const absolute = path.resolve(dir);
+  const tail = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      // Prepended so the missing tail is re-appended in its original order.
+      tail.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+// The active-id dir: the Herdr-injected one only when it IS the directory this
+// package derives for that name under the resolved state home, else the same
+// sibling of the stored dir derived from the state home. S1c: an injected path
+// with any other basename (a third plugin id, a stale or dev id) — or an owned
+// basename under another root, which is exactly the split (the daemon receives
+// the variable, a reader here usually does not) — is ignored, not selected.
+function activeStateDir(env = process.env) {
+  const pluginsDir = path.dirname(storedStateDir(env));
+  const injected = env?.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected === 'string' && injected.length > 0) {
+    const name = path.basename(injected);
+    if (
+      OWNED_DIR_NAMES.includes(name) &&
+      canonicalStateDir(injected) === canonicalStateDir(path.join(pluginsDir, name))
+    ) {
+      return path.resolve(injected);
+    }
+  }
+  return path.join(pluginsDir, ACTIVE_PLUGIN_ID);
+}
+
 function resolveStateDir(env = process.env) {
   const explicit = env?.GENTLE_STATUS_STATE_DIR;
   if (typeof explicit === 'string' && explicit.length > 0) return path.resolve(explicit);
   const stored = storedStateDir(env);
   // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
   // value ignores every override and uses the stored default. Only an
-  // omitted (null/undefined) explicit falls through to the injected dir.
+  // omitted (null/undefined) explicit falls through to the active-id dir.
   if (explicit !== undefined && explicit !== null) return stored;
-  const injected = env?.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected !== 'string' || injected.length === 0) return stored;
-  const resolvedInjected = path.resolve(injected);
-  if (resolvedInjected === stored) return resolvedInjected;
+  const active = activeStateDir(env);
+  if (active === stored) return active;
   try {
-    if (dirHasKnownFiles(resolvedInjected)) return resolvedInjected;
     if (dirHasKnownFiles(stored)) return stored;
+    if (dirHasKnownFiles(active)) return active;
   } catch {
-    // Fall through to the injected dir on unexpected failure.
+    // Fall through to the stored canonical dir on unexpected failure.
   }
-  return resolvedInjected;
+  return stored;
 }
 
 function resolveConfigPath(env = process.env) {

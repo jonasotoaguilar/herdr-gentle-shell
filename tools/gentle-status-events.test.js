@@ -35,6 +35,7 @@ const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DAEMON = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
+const contract = require('../herdr-plugin/lib/gentle-tokens.js');
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for event-subscription and gs-label tests: logs each frame's agent
@@ -686,7 +687,19 @@ describe('gs label ladder for an isolated Gentle Shell pane (S5/S6)', () => {
     assert.ok(callsWith(sb, '---PROC---').length >= 1, 'the group was attempted first');
 
     await wait(800);
-    const noise = errLines(sb).filter((line) => /gs|process/i.test(line));
+    // Noise means the daemon's own bounded gs-ladder warnings, matched by the
+    // exact message text it writes for a failed report/process-group read. A
+    // `/gs|process/i` substring also matches the sandbox path itself (a TMPDIR
+    // may contain `gs`) and unrelated stack frames such as
+    // `process.processTicksAndRejections`, so a clean run would pass by luck.
+    const gsWarning = new RegExp(
+      'gentle-status: (?:'
+        + 'cannot (?:report|set|clear|release) the (?:reported )?gs (?:display )?label'
+        + '|pane list unavailable; gs labels unchanged'
+        + '|pane list over \\d+ panes; gs discovery stopped at the cap'
+        + ')',
+    );
+    const noise = errLines(sb).filter((line) => gsWarning.test(line));
     assert.ok(noise.length <= 1, `an unreadable group logs at most one bounded line, saw ${noise.length}`);
     assert.equal(daemonChild.exitCode, null, 'the daemon never crashes on an unreadable group');
   });
@@ -973,5 +986,327 @@ describe('gs label decisions (S5/S6)', () => {
     assert.equal(gs.processSignature(null), null, 'no process info has no signature');
     assert.equal(gs.processSignature({}), null, 'an empty payload has no signature');
     assert.equal(gs.processSignature({ foreground_processes: [{ pid: 'x' }] }), null, 'a malformed pid is ignored');
+  });
+});
+
+// T3 (S6-S9): `done` holds until the pane's own snapshot says the human looked
+// at it (`focused: true`, L5), then one 5 s dwell, then `idle`. The producer
+// stamps the unseen cap as the token expiry; the daemon owns the recede. These
+// tests drive the real `--run` daemon against the fake binary, so the observed
+// surface is the metadata call it actually publishes.
+function writeAgents(sb, agents) {
+  fs.writeFileSync(sb.agentsFile, `${JSON.stringify({ result: { agents } })}\n`);
+}
+
+const DONE_SESSION = '/tmp/gentle-done-view-session.jsonl';
+
+function doneAgent({ doneExpiry, workExpiry, focused = false }) {
+  const entry = {
+    pane_id: 'wD:p1',
+    agent: 'pi',
+    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: DONE_SESSION },
+    agent_status: 'idle',
+    cwd: PROJECT_CWD,
+    focused,
+    revision: 1,
+    tab_id: 'wD:t1',
+    workspace_id: 'wD',
+    tokens: {},
+  };
+  const hash = contract.expectedSessionHash(entry);
+  entry.tokens.gentle_work_v1 = `${hash}:0:${workExpiry}`;
+  entry.tokens.gentle_done_v1 = `${hash}:${doneExpiry}`;
+  return entry;
+}
+
+// The display each published frame rendered, in order: the one state token the
+// daemon carried with `--token` on that call.
+function publishedDisplays(sb) {
+  let text = '';
+  try {
+    text = fs.readFileSync(sb.metaLog, 'utf8');
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('---META---')) continue;
+    for (const [display, name] of Object.entries(contract.STATE_TOKENS)) {
+      if (line.includes(`--token ${name}=${display}`)) {
+        out.push(display);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+describe('done until viewed (S6-S9/T3)', () => {
+  it('a finish nobody viewed stays done well past the old 5 s hold', async () => {
+    const sb = sandbox;
+    const now = Date.now();
+    writeAgents(sb, [doneAgent({ doneExpiry: now + 900000, workExpiry: now + 30000 })]);
+    startDaemon(sb, { GENTLE_STATUS_POLL_MS: '250', GENTLE_STATUS_FAST_POLL_MS: '250' });
+
+    await waitFor('the planted finish to render done', () => publishedDisplays(sb).includes('done'), 8000);
+    await wait(6000);
+    assert.equal(publishedDisplays(sb).includes('idle'), false, 'never focused: the row never recedes');
+    assert.equal(publishedDisplays(sb).at(-1), 'done', 'the row still reads done past the old 5 s hold');
+  });
+
+  it('the first focused snapshot starts the 5 s dwell, then the row recedes to idle', async () => {
+    const sb = sandbox;
+    const now = Date.now();
+    const doneExpiry = now + 900000;
+    const workExpiry = now + 30000;
+    writeAgents(sb, [doneAgent({ doneExpiry, workExpiry })]);
+    startDaemon(sb, { GENTLE_STATUS_POLL_MS: '250', GENTLE_STATUS_FAST_POLL_MS: '250' });
+
+    await waitFor('the planted finish to render done', () => publishedDisplays(sb).includes('done'), 8000);
+    await wait(700);
+    assert.equal(publishedDisplays(sb).includes('idle'), false, 'an unfocused finish never recedes');
+
+    const focusedAt = Date.now();
+    writeAgents(sb, [doneAgent({ doneExpiry, workExpiry, focused: true })]);
+    await waitFor('the row to recede after the dwell', () => publishedDisplays(sb).includes('idle'), 10000);
+    const elapsed = Date.now() - focusedAt;
+    assert.ok(elapsed >= 4800, `the recede waits the 5 s dwell (saw ${elapsed}ms)`);
+    assert.ok(elapsed <= 9000, `the recede is bounded by the dwell (saw ${elapsed}ms)`);
+    assert.equal(publishedDisplays(sb).at(-1), 'idle', 'the row ends on idle');
+  });
+});
+
+// T10 (S9/S10): the view ledger is per pane, and the row it renders is the row
+// the human sees. These tests drive the real `--run` daemon with TWO owned panes
+// and with the cap/live-job/reactivation edges, so a shared ledger, a focus on
+// one pane receding another, a repeated focus restarting a dwell, or a display
+// paired with the opposite kind of native status fails here instead of in
+// manual review.
+const PANE_A = 'wV:p1';
+const PANE_B = 'wV:p2';
+const VIEW_POLL = { GENTLE_STATUS_POLL_MS: '250', GENTLE_STATUS_FAST_POLL_MS: '250' };
+
+// S4: a native `done` (or the native idle Herdr presents as finished) is
+// terminal; every other native status is not. The display is terminal for
+// `done`/`idle` only, so the two must agree at every edge.
+const TERMINAL_NATIVE = new Set(['done', 'idle']);
+const TERMINAL_DISPLAY = new Set(['done', 'idle']);
+
+function assertDisplayMatchesNative(display, nativeStatus, why) {
+  assert.ok(display, `a display was published for ${why}`);
+  assert.equal(
+    TERMINAL_DISPLAY.has(display),
+    TERMINAL_NATIVE.has(nativeStatus),
+    `${why}: display ${display} beside native ${nativeStatus}`,
+  );
+}
+
+function viewAgent(paneId, options = {}) {
+  const {
+    doneExpiry,
+    workExpiry = Date.now() + 30000,
+    focused = false,
+    status = 'idle',
+    orchExpiry,
+    principalExpiry,
+  } = options;
+  const entry = {
+    pane_id: paneId,
+    agent: 'pi',
+    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: DONE_SESSION },
+    agent_status: status,
+    cwd: PROJECT_CWD,
+    focused,
+    revision: 1,
+    tab_id: 'wV:t1',
+    workspace_id: 'wV',
+    tokens: {},
+  };
+  const hash = contract.expectedSessionHash(entry);
+  entry.tokens.gentle_work_v1 = `${hash}:0:${workExpiry}`;
+  if (doneExpiry !== undefined) entry.tokens[contract.DONE_TOKEN] = `${hash}:${doneExpiry}`;
+  if (orchExpiry !== undefined) entry.tokens[contract.ORCH_TOKEN] = `${hash}:${orchExpiry}`;
+  if (principalExpiry !== undefined) entry.tokens[contract.PRINCIPAL_TOKEN] = `${hash}:${principalExpiry}`;
+  return entry;
+}
+
+const DISPLAY_OF_STATE_TOKEN = new Map(Object.entries(contract.STATE_TOKENS).map(([display, name]) => [name, display]));
+
+// The display each published frame rendered, per pane: one state token per
+// metadata call, so a dual publish would surface as two entries.
+function publishedByPane(sb) {
+  const byPane = new Map();
+  let text = '';
+  try {
+    text = fs.readFileSync(sb.metaLog, 'utf8');
+  } catch {
+    return byPane;
+  }
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('---META---')) continue;
+    const parts = line.split(' ');
+    const paneId = parts[3];
+    if (!paneId) continue;
+    if (!byPane.has(paneId)) byPane.set(paneId, []);
+    for (let at = 0; at < parts.length - 1; at += 1) {
+      if (parts[at] !== '--token') continue;
+      const pair = parts[at + 1];
+      const eq = pair.indexOf('=');
+      if (eq < 0) continue;
+      const display = DISPLAY_OF_STATE_TOKEN.get(pair.slice(0, eq));
+      if (display) byPane.get(paneId).push(display);
+    }
+  }
+  return byPane;
+}
+
+function displaysOf(sb, paneId) {
+  return publishedByPane(sb).get(paneId) ?? [];
+}
+
+function lastDisplayOf(sb, paneId) {
+  return displaysOf(sb, paneId).at(-1);
+}
+
+describe('two-pane view ledger through the daemon (S9/S10/T10)', () => {
+  it('pane A recedes on its own dwell, pane B keeps done, a repeated focus is inert, and the token clear drops the entry', async () => {
+    const sb = sandbox;
+    const now = Date.now();
+    const capExpiry = now + 900000;
+    const workExpiry = now + 30000;
+    const aDone = viewAgent(PANE_A, { doneExpiry: capExpiry, workExpiry });
+    const bDone = viewAgent(PANE_B, { doneExpiry: capExpiry, workExpiry });
+    writeAgents(sb, [aDone, bDone]);
+    startDaemon(sb, VIEW_POLL);
+
+    await waitFor(
+      'both owned panes to render done',
+      () => lastDisplayOf(sb, PANE_A) === 'done' && lastDisplayOf(sb, PANE_B) === 'done',
+      8000,
+    );
+    assertDisplayMatchesNative('done', aDone.agent_status, 'the mint on pane A');
+    assertDisplayMatchesNative('done', bDone.agent_status, 'the mint on pane B');
+
+    // The first focused snapshot of A starts A's own dwell.
+    const focusedAt = Date.now();
+    const aFocused = viewAgent(PANE_A, { doneExpiry: capExpiry, workExpiry, focused: true });
+    writeAgents(sb, [aFocused, bDone]);
+    await wait(1000);
+    assert.equal(lastDisplayOf(sb, PANE_A), 'done', 'the dwell keeps the row done until it elapses');
+    // A repeated focus observation one second in must not restart the dwell.
+    writeAgents(sb, [aFocused, bDone]);
+    await waitFor('pane A to recede after one dwell', () => lastDisplayOf(sb, PANE_A) === 'idle', 12000);
+    const elapsed = Date.now() - focusedAt;
+    assert.ok(elapsed >= 4800, `pane A waits one 5 s dwell (saw ${elapsed}ms)`);
+    assert.ok(elapsed <= 9500, `the repeated focus does not restart the dwell (saw ${elapsed}ms)`);
+    assertDisplayMatchesNative('idle', aFocused.agent_status, 'the dwell boundary on pane A');
+
+    // Pane B was never focused: its own ledger never receded.
+    const bDisplays = displaysOf(sb, PANE_B);
+    assert.equal(bDisplays.includes('idle'), false, 'viewing pane A never recedes pane B');
+    assert.equal(bDisplays.at(-1), 'done', 'pane B stays done until its own focus or its cap');
+
+    // A repeated focus AFTER the recede changes nothing.
+    const beforeRepeat = displaysOf(sb, PANE_A).length;
+    writeAgents(sb, [aFocused, bDone]);
+    await wait(1200);
+    assert.deepEqual(displaysOf(sb, PANE_A).slice(beforeRepeat), [], 'a later focus on a receded pane publishes nothing');
+
+    // The token clear removes the ledger entry. The cleared beat drops the
+    // finish token while the pane stays focused (a reactivation), so the row
+    // leaves done without any recede; re-minting the IDENTICAL finish expiry
+    // then starts a NEW dwell. A surviving receded entry would key that same
+    // expiry, force idle, and publish nothing here.
+    const cleared = viewAgent(PANE_A, {
+      workExpiry: Date.now() + 30000,
+      focused: true,
+      status: 'working',
+      orchExpiry: Date.now() + 30000,
+    });
+    writeAgents(sb, [cleared, bDone]);
+    await waitFor('the token clear to leave done', () => lastDisplayOf(sb, PANE_A) === 'orchestrating', 6000);
+    assertDisplayMatchesNative('orchestrating', cleared.agent_status, 'the focus-without-a-finish edge');
+    const beforeReMint = displaysOf(sb, PANE_A).length;
+    const reMint = viewAgent(PANE_A, { doneExpiry: capExpiry, workExpiry: Date.now() + 30000, focused: true });
+    writeAgents(sb, [reMint, bDone]);
+    await waitFor('the re-minted finish to start a fresh dwell', () => lastDisplayOf(sb, PANE_A) === 'done', 4000);
+    assert.deepEqual(displaysOf(sb, PANE_A).slice(beforeReMint).at(-1), 'done', 'a new episode shows done again');
+    assert.equal(displaysOf(sb, PANE_B).includes('idle'), false, 'pane B still never receded');
+  });
+
+  it('the pink gentle, the held done and the native status agree at the job, cap and reactivation edges (S10)', async () => {
+    const sb = sandbox;
+    const now = Date.now();
+    const workExpiry = now + 45000;
+    const mint = viewAgent(PANE_A, { doneExpiry: now + 30000, workExpiry });
+    writeAgents(sb, [mint]);
+    startDaemon(sb, VIEW_POLL);
+
+    await waitFor('the mint to render done', () => lastDisplayOf(sb, PANE_A) === 'done', 8000);
+    assertDisplayMatchesNative('done', mint.agent_status, 'the mint');
+
+    // A live job holds the terminal state: the producer keeps the native status
+    // non-terminal while the root marker is fresh, and the row keeps the pink
+    // generic gentle instead of the held done.
+    const beforeJob = displaysOf(sb, PANE_A).length;
+    const markerExpiry = Date.now() + 1800;
+    const jobHeld = viewAgent(PANE_A, {
+      doneExpiry: now + 30000,
+      workExpiry,
+      status: 'working',
+      orchExpiry: markerExpiry,
+    });
+    writeAgents(sb, [jobHeld]);
+    await waitFor('the live-job row to read the pink gentle', () => lastDisplayOf(sb, PANE_A) === 'orchestrating', 6000);
+    assertDisplayMatchesNative('orchestrating', jobHeld.agent_status, 'the live-job edge');
+    assert.deepEqual(
+      displaysOf(sb, PANE_A).slice(beforeJob),
+      ['orchestrating'],
+      'the live-job marker holds the pink gentle and never renders done',
+    );
+
+    // The marker clearing (the job set empty) is what makes the still-fresh
+    // finish token reachable again.
+    const markerCleared = viewAgent(PANE_A, { doneExpiry: now + 30000, workExpiry });
+    writeAgents(sb, [markerCleared]);
+    await waitFor('done to return once the job marker clears', () => lastDisplayOf(sb, PANE_A) === 'done', 8000);
+    assertDisplayMatchesNative('done', markerCleared.agent_status, 'the marker-cleared edge');
+
+    // The cap boundary: the finish token expires with no focus, so the row
+    // recedes to idle on its own (the unseen cap, at daemon scale).
+    const expiring = viewAgent(PANE_A, { doneExpiry: Date.now() + 1500, workExpiry: Date.now() + 30000 });
+    writeAgents(sb, [expiring]);
+    await waitFor('the cap to recede the row', () => lastDisplayOf(sb, PANE_A) === 'idle', 8000);
+    assertDisplayMatchesNative('idle', expiring.agent_status, 'the cap boundary');
+
+    // The reactivation edge: a new turn (fresh beat + live principal marker, the
+    // producer reporting working) renders the pink generic gentle, never done
+    // beside a non-terminal native status and never the amber `working`.
+    const beforeReactivation = displaysOf(sb, PANE_A).length;
+    const reactivationWork = Date.now() + 60000;
+    const reactivated = viewAgent(PANE_A, {
+      workExpiry: reactivationWork,
+      status: 'working',
+      principalExpiry: reactivationWork,
+    });
+    writeAgents(sb, [reactivated]);
+    await waitFor('the reactivated row to read gentle', () => lastDisplayOf(sb, PANE_A) === 'orchestrating', 6000);
+    assertDisplayMatchesNative('orchestrating', reactivated.agent_status, 'the reactivation edge');
+    const reactivationTail = displaysOf(sb, PANE_A).slice(beforeReactivation);
+    assert.equal(reactivationTail.includes('done'), false, 'no done beside a live principal');
+    assert.equal(reactivationTail.includes('working'), false, 'a no-delegation working beat stays the pink gentle');
+
+    // S10: one state token per published frame — no dual publishers.
+    const lines = fs.readFileSync(sb.metaLog, 'utf8').split('\n').filter((line) => line.startsWith('---META---'));
+    for (const line of lines) {
+      let stateTokens = 0;
+      const parts = line.split(' ');
+      for (let at = 0; at < parts.length - 1; at += 1) {
+        if (parts[at] !== '--token') continue;
+        const name = parts[at + 1].slice(0, Math.max(0, parts[at + 1].indexOf('=')));
+        if (DISPLAY_OF_STATE_TOKEN.has(name)) stateTokens += 1;
+      }
+      assert.ok(stateTokens <= 1, `one state token per frame, saw ${stateTokens}: ${line}`);
+    }
   });
 });

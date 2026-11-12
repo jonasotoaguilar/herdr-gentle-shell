@@ -892,12 +892,17 @@ describe('daemon resolver on explicit empty GENTLE (S15)', () => {
     }
   });
 
-  it('still honors an injected dir holding flags when GENTLE is omitted', () => {
+  it('still honors an injected dir that IS the derived active-id dir when GENTLE is omitted', () => {
     const status = require('../herdr-plugin/bin/gentle-status.js');
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-omit-'));
-    const injected = path.join(sandbox, 'injected-shell');
+    // S1c/T12: an injected path is honoured only when it IS the directory this
+    // package derives for that name under the resolved state home. “injected-shell”
+    // would be ignored, and the stored dir it then falls back to reads as enabled
+    // (missing means enabled), hiding which directory was used. A disabled flag in
+    // the derived injected dir is therefore the observable.
+    const injected = path.join(sandbox, 'herdr', 'plugins', 'herdr-gentle-shell');
     fs.mkdirSync(injected, { recursive: true });
-    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
+    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
     const saved = {
       GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
       HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
@@ -907,7 +912,38 @@ describe('daemon resolver on explicit empty GENTLE (S15)', () => {
     process.env.HERDR_PLUGIN_STATE_DIR = injected;
     process.env.XDG_STATE_HOME = sandbox;
     try {
+      assert.deepEqual(status.readSidebarMode(), { enabled: false, malformed: false, raw: null });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores an owned-basename injected dir under a different root', () => {
+    const status = require('../herdr-plugin/bin/gentle-status.js');
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-foreign-root-'));
+    // S1c/T12: an owned basename under another root used to select there, which
+    // split the daemon (it receives the variable) from every producer (which
+    // derives its own state home). One known file there is what made it win.
+    const injected = path.join(sandbox, 'other-herdr', 'herdr-gentle-shell');
+    fs.mkdirSync(injected, { recursive: true });
+    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
+    const saved = {
+      GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
+      HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+    };
+    delete process.env.GENTLE_STATUS_STATE_DIR;
+    process.env.HERDR_PLUGIN_STATE_DIR = injected;
+    process.env.XDG_STATE_HOME = sandbox;
+    try {
+      // The foreign flag is invisible: the daemon resolves the stored dir, where
+      // the missing mode default means enabled.
       assert.deepEqual(status.readSidebarMode(), { enabled: true, malformed: false, raw: null });
+      assert.ok(!fs.existsSync(path.join(injected, 'gentle-status.pid')), 'nothing is written into the foreign dir');
     } finally {
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[key];
@@ -946,10 +982,38 @@ describe('diagnostics resolver known-file family', () => {
     }
   });
 
-  it('a fresh install still converges on the injected dir', () => {
+  it('a fresh install converges on the stored canonical dir in both contexts', () => {
     const fixture = resolverSandbox('fresh');
     try {
-      assert.equal(diag.resolveStateDir(fixture.env), fixture.injected);
+      assert.equal(diag.resolveStateDir(fixture.env), fixture.stored, 'the injected variable does not pick the final dir');
+      assert.equal(diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg }), fixture.stored, 'nor does its absence');
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('a legacy install holding its flags only in the active-id dir is found without the injected variable', () => {
+    const fixture = resolverSandbox('legacy');
+    try {
+      const activeId = path.join(fixture.xdg, 'herdr', 'plugins', 'herdr-gentle-shell');
+      fs.mkdirSync(activeId, { recursive: true });
+      fs.writeFileSync(path.join(activeId, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+      assert.equal(diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg }), activeId);
+      assert.equal(
+        diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: activeId }),
+        activeId,
+        'the injected context names the same active-id dir',
+      );
+      assert.equal(
+        diag.resolveStateDir(fixture.env),
+        activeId,
+        'an unrelated injected dir (S1c) is ignored, so the active-id dir is found exactly as without the variable',
+      );
+      assert.equal(
+        diag.resolveStateDir(fixture.env),
+        diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg }),
+        'the unrelated injected dir changes nothing',
+      );
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
