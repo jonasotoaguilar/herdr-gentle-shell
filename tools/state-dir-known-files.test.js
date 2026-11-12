@@ -795,3 +795,131 @@ describe('state-dir known-file family', () => {
     }
   });
 });
+
+// The five canonicalisation functions are run in isolation below, read from
+// source so a sixth resolver cannot silently escape the boundaries.
+const vm = require('node:vm');
+
+// S1/S1c end to end: a foreign-root owned basename is ignored by every reader
+// (and the producer writes no refresh there), the same-root spellings of the
+// derived dir are honoured, and each canonicalisation function survives the
+// path edges the rule compares paths with.
+test('independent foreign root, same root, refresh and canonical boundaries', async () => {
+  const root = track(fs.mkdtempSync(path.join(os.tmpdir(), 'state-known-independent-')));
+  const xdg = path.join(root, 'xdg');
+  const stored = path.join(xdg, STORED_SEGMENT);
+  const active = path.join(xdg, ACTIVE_ID_SEGMENT);
+  const foreign = path.join(root, 'foreign', 'herdr-gentle-shell');
+  const base = { XDG_STATE_HOME: xdg };
+  const readers = (env) => [
+    SIDEBAR.stateDir(env),
+    DIAGNOSTICS.resolveStateDir(env),
+    path.dirname(TRACE.tracePath(env)),
+  ];
+  touch(foreign, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}');
+  fs.mkdirSync(stored, { recursive: true });
+  const injected = { ...base, HERDR_PLUGIN_STATE_DIR: foreign };
+
+  // The owned basename under a foreign root is not ours: no reader moves to it,
+  // so the daemon reads the absent stored mode as enabled instead of the
+  // foreign disabled one.
+  assert.deepEqual(readers(injected), Array(3).fill(stored), 'every reader ignores the foreign-root owned basename');
+  try {
+    applyEnv(injected);
+    assert.equal(
+      STATUS.readSidebarMode().enabled,
+      true,
+      'the daemon ignores the foreign-root owned basename (missing mode means enabled)',
+    );
+  } finally {
+    applyEnv({});
+  }
+
+  // The producer's only verdict is where its refresh flag lands: the stored dir,
+  // never the foreign dir the variable names.
+  let ext = await extensionResolvedDir(injected, [stored, active, foreign], 3000);
+  assert.deepEqual(ext.dirs, [stored], 'the producer writes its refresh in the stored dir, never the foreign one');
+
+  // An absent owned basename under a foreign root is never created either.
+  const absent = path.join(root, 'absent', 'herdr-gentle-shell');
+  readers({ ...base, HERDR_PLUGIN_STATE_DIR: absent });
+  try {
+    applyEnv({ ...base, HERDR_PLUGIN_STATE_DIR: absent });
+    STATUS.readSidebarMode();
+  } finally {
+    applyEnv({});
+  }
+  assert.equal(fs.existsSync(absent), false, 'no consumer creates an absent foreign-root dir');
+
+  // The rule must not over-tighten: exact, symlinked and relative spellings of
+  // the DERIVED dir all name that directory, so all five consumers use it.
+  fs.rmSync(foreign, { recursive: true, force: true });
+  touch(active, 'gentle-plugin-tools.json', '{}');
+  const link = path.join(root, 'link');
+  fs.symlinkSync(path.dirname(active), link, 'dir');
+  const previous = process.cwd();
+  process.chdir(root);
+  try {
+    for (const spelling of [active, path.join(link, 'herdr-gentle-shell'), path.relative(root, active)]) {
+      const env = { ...base, HERDR_PLUGIN_STATE_DIR: spelling };
+      const got = readers(env);
+      assert.equal(path.resolve(got[0]), path.resolve(spelling), `the sidebar honours the ${spelling} spelling`);
+      assert.equal(path.resolve(got[1]), path.resolve(spelling), `diagnostics honours the ${spelling} spelling`);
+      assert.equal(path.resolve(got[2]), path.resolve(spelling), `trace honours the ${spelling} spelling`);
+      try {
+        applyEnv(env);
+        assert.equal(
+          STATUS.readSidebarMode().enabled,
+          true,
+          `the daemon resolves through the ${spelling} spelling (the tools toggle is not a mode flag)`,
+        );
+      } finally {
+        applyEnv({});
+      }
+      ext = await extensionResolvedDir(env, [stored, active], 3000);
+      assert.deepEqual(ext.dirs, [active], `the producer writes its refresh in the derived dir for ${spelling}`);
+    }
+  } finally {
+    process.chdir(previous);
+  }
+
+  // Every canonicalisation function must survive the edges the path comparison
+  // faces: a missing tail under an existing ancestor reached through a symlink,
+  // a broken symlink, and a tail with no ancestor at all. Each pair names one
+  // directory, so the canonical forms must be equal (and must not throw).
+  const real = path.join(root, 'real');
+  fs.mkdirSync(real, { recursive: true });
+  const alias = path.join(root, 'alias');
+  if (!fs.existsSync(alias)) fs.symlinkSync(real, alias, 'dir');
+  const broken = path.join(root, 'broken');
+  if (!fs.existsSync(broken)) {
+    try {
+      fs.symlinkSync(path.join(root, 'missing-target'), broken, 'dir');
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+  for (const file of RESOLVER_SOURCES) {
+    const text = fs.readFileSync(path.resolve(__dirname, '..', file), 'utf8');
+    const match = text.match(/function (?:sidebarCanonicalDir|canonicalStateDir)\(dir\) \{[\s\S]*?\n\}/);
+    assert.ok(match, `${file} declares its canonicalisation function`);
+    const fn = vm.runInNewContext(`(${match[0]})`, {
+      fs,
+      path,
+      resolvePath: path.resolve,
+      dirname: path.dirname,
+      join: path.join,
+      pathBasename: path.basename,
+    });
+    for (const [a, b] of [
+      [path.join(alias, 'missing', 'herdr-gentle-shell'), path.join(real, 'missing', 'herdr-gentle-shell')],
+      [path.join(broken, 'missing', 'herdr-gentle-shell'), path.join(broken, 'missing', 'herdr-gentle-shell')],
+      [
+        path.join(root, 'no-ancestor', 'deep', 'herdr-gentle-shell'),
+        path.join(root, 'no-ancestor', 'deep', 'herdr-gentle-shell'),
+      ],
+    ]) {
+      assert.equal(fn(a), fn(b), `${file} canonicalises ${a} and ${b} identically`);
+    }
+  }
+});
