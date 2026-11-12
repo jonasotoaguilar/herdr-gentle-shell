@@ -1633,7 +1633,9 @@ export async function liveSummarizeRoots(roots) {
 // candidate here too, derived from the state home when the variable is absent,
 // so a legacy install whose live flags sit only there is still found.
 // Selection order: stored if it holds a known file, else the active-id/injected
-// dir if it holds one, else stored.
+// dir if it holds one, else stored. An injected path is honoured only when its
+// basename names a directory this package owns (S1c), so the daemon and this
+// helper can never be pointed at another plugin's state.
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1645,6 +1647,13 @@ export async function liveSummarizeRoots(roots) {
 // between consumers splits the state across both dirs.
 const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
 const SIDEBAR_ACTIVE_PLUGIN_ID = "herdr-gentle-shell";
+// S1c: an injected path is honoured only when its basename names a directory
+// this package owns — the active plugin id (what Herdr injects today) or the
+// stored canonical segment (a stale or dev checkout may still name it from
+// another parent). Any other path, e.g. a third plugin id, is IGNORED: the
+// daemon receives HERDR_PLUGIN_STATE_DIR while no producer does, so honouring
+// a directory we do not own is exactly what splits them.
+const SIDEBAR_OWNED_DIR_NAMES = [SIDEBAR_ACTIVE_PLUGIN_ID, SIDEBAR_STATE_SEGMENT];
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
   "gentle-moshi.json",
@@ -1670,10 +1679,15 @@ function sidebarStoredDir() {
 
 // The active plugin id dir: what Herdr injects as HERDR_PLUGIN_STATE_DIR for the
 // current plugin id, or — because this producer never receives that variable —
-// the same path derived from the state home.
+// the same path derived from the state home. An injected path is only honoured
+// when its basename is a name this package owns (S1c); anything else falls back
+// to the derived path, so the producer and the daemon cannot end up naming a
+// directory that belongs to another plugin.
 function sidebarActiveDir() {
   const injected = process.env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected === "string" && injected.length > 0) return injected;
+  if (typeof injected === "string" && injected.length > 0 && SIDEBAR_OWNED_DIR_NAMES.includes(pathBasename(injected))) {
+    return injected;
+  }
   return join(sidebarStatePluginsDir(), SIDEBAR_ACTIVE_PLUGIN_ID);
 }
 

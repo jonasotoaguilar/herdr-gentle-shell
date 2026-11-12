@@ -892,12 +892,17 @@ describe('daemon resolver on explicit empty GENTLE (S15)', () => {
     }
   });
 
-  it('still honors an injected dir holding flags when GENTLE is omitted', () => {
+  it('still honors an injected dir holding flags when GENTLE is omitted (owned basename)', () => {
     const status = require('../herdr-plugin/bin/gentle-status.js');
     const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-daemon-omit-'));
-    const injected = path.join(sandbox, 'injected-shell');
+    // S1c: only an injected basename this package owns (the active plugin id or
+    // the stored segment) is honoured; “injected-shell” would be ignored, and
+    // the stored dir it then falls back to reads as enabled (missing means
+    // enabled), hiding which directory was used. A disabled flag in the injected
+    // dir is therefore the observable.
+    const injected = path.join(sandbox, 'elsewhere', 'herdr-gentle-shell');
     fs.mkdirSync(injected, { recursive: true });
-    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: true }));
+    fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), JSON.stringify({ version: 1, enabled: false }));
     const saved = {
       GENTLE_STATUS_STATE_DIR: process.env.GENTLE_STATUS_STATE_DIR,
       HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
@@ -907,7 +912,7 @@ describe('daemon resolver on explicit empty GENTLE (S15)', () => {
     process.env.HERDR_PLUGIN_STATE_DIR = injected;
     process.env.XDG_STATE_HOME = sandbox;
     try {
-      assert.deepEqual(status.readSidebarMode(), { enabled: true, malformed: false, raw: null });
+      assert.deepEqual(status.readSidebarMode(), { enabled: false, malformed: false, raw: null });
     } finally {
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[key];
@@ -970,8 +975,13 @@ describe('diagnostics resolver known-file family', () => {
       );
       assert.equal(
         diag.resolveStateDir(fixture.env),
-        fixture.stored,
-        'an unrelated injected dir holding nothing never wins over the stored canonical dir',
+        activeId,
+        'an unrelated injected dir (S1c) is ignored, so the active-id dir is found exactly as without the variable',
+      );
+      assert.equal(
+        diag.resolveStateDir(fixture.env),
+        diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg }),
+        'the unrelated injected dir changes nothing',
       );
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
