@@ -43,9 +43,10 @@ distinct from an empty-but-successful view.
 ## Environment
 
 - `HERDR_BIN_PATH` — Herdr binary (default `herdr`).
-- `GENTLE_STATUS_STATE_DIR` (else `HERDR_PLUGIN_STATE_DIR`, else the
-  default plugins state dir) — read for `gentle-status.pid` and the
-  `gentle-sidebar-mode.json` (`{version:1,enabled:boolean}`; missing defaults
+- `GENTLE_STATUS_STATE_DIR` (else `HERDR_PLUGIN_STATE_DIR` only when it is
+  the directory this package derives for that name under the resolved state
+  home, else the default plugins state dir) — read for `gentle-status.pid`,
+  the `gentle-sidebar-mode.json` (`{version:1,enabled:boolean}`; missing defaults
   to Gentle mode), and the `gentle-interruptions.json` ledger
   (`{version:1,panes:{...}}` with only
   identity hash, whitelisted unfinished displays, finite timestamps, and
