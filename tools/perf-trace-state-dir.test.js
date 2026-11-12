@@ -76,14 +76,79 @@ describe('perf trace state dir compatibility', { concurrency: false }, () => {
     assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), stored);
   });
 
-  test('an injected dir whose basename is the active plugin id wins when only it holds a file of ours (preserved)', () => {
-    const { root, xdg } = sandbox('injected');
-    // Owned basename, unrelated parent: the name is what makes it ours, not the
-    // state home it sits under (S1c).
-    const injected = path.join(root, 'elsewhere', 'herdr-gentle-shell');
+  // The same precedence must hold when the injected variable names exactly the
+  // derived active-id dir: a stray file there still loses to the stored family.
+  test('a stray known file in the derived active-id dir never outranks the stored family', () => {
+    const { xdg, stored, activeId } = sandbox('derived-trapped');
+    fs.mkdirSync(activeId, { recursive: true });
+    fs.writeFileSync(path.join(activeId, 'gentle-interruptions.json'), '{"version":1,"panes":{}}\n');
+    fs.writeFileSync(path.join(stored, 'gentle-status.pid'), '1\n');
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: activeId }), stored);
+  });
+
+  // S1c (T12): an owned basename is not enough. The injected path must BE the
+  // directory this package derives for that name under the resolved state home,
+  // or an owned name under another root selects there while a context without
+  // the variable derives its own — the split L12 recorded.
+  test('an owned-basename injected dir under a different root is ignored (cross-context)', () => {
+    const { root, xdg, stored } = sandbox('owned-foreign');
+    for (const owned of ['herdr-gentle-shell', 'herdr-gentle-agents']) {
+      const injected = path.join(root, 'other-herdr', owned);
+      fs.mkdirSync(injected, { recursive: true });
+      fs.writeFileSync(path.join(injected, 'gentle-moshi.json'), '{"enabled":true}\n');
+      const withVariable = dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected });
+      assert.equal(withVariable, stored, `${owned} under a foreign root is ignored`);
+      assert.equal(withVariable, dirOf({ XDG_STATE_HOME: xdg }), `the injected variable changes nothing for ${owned}`);
+      fs.rmSync(path.join(root, 'other-herdr'), { recursive: true, force: true });
+    }
+  });
+
+  // The same rule may not over-tighten: a symlinked or relative spelling of the
+  // derived dir is still that dir, so it is honoured as given.
+  test('an owned-basename injected dir under the same root is honoured (symlinked and relative spellings)', () => {
+    const { root, xdg, activeId } = sandbox('owned-same-root');
+    fs.mkdirSync(activeId, { recursive: true });
+    fs.writeFileSync(path.join(activeId, 'gentle-moshi.json'), '{"enabled":true}\n');
+    const link = path.join(root, 'plugins-link');
+    fs.symlinkSync(path.join(xdg, 'herdr', 'plugins'), link, 'dir');
+    const symlinked = path.join(link, 'herdr-gentle-shell');
+    assert.equal(
+      dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: symlinked }),
+      symlinked,
+      'the symlinked spelling is used as given',
+    );
+    const previous = process.cwd();
+    try {
+      process.chdir(root);
+      const relative = path.join('xdg', 'herdr', 'plugins', 'herdr-gentle-shell');
+      assert.equal(
+        dirOf({ XDG_STATE_HOME: 'xdg', HERDR_PLUGIN_STATE_DIR: relative }),
+        relative,
+        'the relative spelling is used as given',
+      );
+    } finally {
+      process.chdir(previous);
+    }
+  });
+
+  test('an injected dir named for the stored segment under a different root is ignored', () => {
+    const { root, xdg, stored } = sandbox('segment-foreign');
+    const injected = path.join(root, 'other-herdr', 'herdr-gentle-agents');
     fs.mkdirSync(injected, { recursive: true });
-    fs.writeFileSync(path.join(injected, 'gentle-moshi.json'), '{"enabled":true}\n');
-    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), injected);
+    fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '1\n');
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), stored);
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), dirOf({ XDG_STATE_HOME: xdg }));
+  });
+
+  test('an injected dir named for the stored segment under the same root resolves that dir (owner name)', () => {
+    const { xdg, stored } = sandbox('segment-same-root');
+    fs.writeFileSync(path.join(stored, 'gentle-status.pid'), '1\n');
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: stored }), stored);
+    const link = path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents-link');
+    fs.symlinkSync(stored, link, 'dir');
+    // The link's basename is not an owned name, so it is ignored; the derived
+    // segment dir is the same directory and still resolves there.
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: link }), stored);
   });
 
   // S1c: an injected path is honoured only when its basename is the active
@@ -94,14 +159,6 @@ describe('perf trace state dir compatibility', { concurrency: false }, () => {
     const { xdg, stored, injected } = sandbox('unowned');
     fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '1\n');
     assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), stored);
-  });
-
-  test('an injected dir named for the stored segment is honoured (owner name)', () => {
-    const { root, xdg } = sandbox('segment');
-    const injected = path.join(root, 'elsewhere', 'herdr-gentle-agents');
-    fs.mkdirSync(injected, { recursive: true });
-    fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '1\n');
-    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), injected);
   });
 
   test('the active-id dir wins when only it holds a file of ours (legacy install)', () => {

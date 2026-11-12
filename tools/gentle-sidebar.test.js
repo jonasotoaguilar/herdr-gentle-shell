@@ -69,4 +69,77 @@ describe('sidebar state-dir resolution', () => {
     fs.writeFileSync(path.join(fixture.stored, 'installer-state'), 'installed\n');
     assert.equal(sidebar.stateDir(fixture.env), fixture.stored);
   });
+
+  // S1c (T12): an owned basename is not enough — the injected path must BE the
+  // directory this package derives for that name under the resolved state home.
+  // An owned name under another root is exactly the case that splits the daemon
+  // (which receives the variable) from every producer (which does not).
+  test('an owned-basename injected dir under a different root is ignored', () => {
+    const fixture = sandbox('owned-foreign');
+    for (const owned of ['herdr-gentle-shell', 'herdr-gentle-agents']) {
+      const injected = path.join(fixture.root, 'other-herdr', owned);
+      fs.mkdirSync(injected, { recursive: true });
+      fs.writeFileSync(path.join(injected, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+      const env = { XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: injected };
+      assert.equal(sidebar.stateDir(env), fixture.stored, `${owned} under a foreign root is ignored`);
+      assert.equal(sidebar.stateDir(env), sidebar.stateDir({ XDG_STATE_HOME: fixture.xdg }));
+      sidebar.writeMode(true, env);
+      assert.equal(
+        fs.readFileSync(path.join(fixture.stored, 'gentle-sidebar-mode.json'), 'utf8'),
+        '{"version":1,"enabled":true}\n',
+        'the write lands in the stored dir',
+      );
+      assert.equal(
+        fs.readFileSync(path.join(injected, 'gentle-sidebar-mode.json'), 'utf8'),
+        '{"version":1,"enabled":false}\n',
+        'the foreign-root flag is never touched',
+      );
+      fs.rmSync(path.join(fixture.root, 'other-herdr'), { recursive: true, force: true });
+    }
+  });
+
+  // A spelling of the derived dir that only differs by a symlink or by being
+  // relative still names that dir, so it is honoured as given.
+  test('an owned-basename injected dir under the same root is honoured (symlinked and relative spellings)', () => {
+    const fixture = sandbox('owned-same-root');
+    const activeId = path.join(fixture.xdg, 'herdr', 'plugins', 'herdr-gentle-shell');
+    fs.mkdirSync(activeId, { recursive: true });
+    fs.writeFileSync(path.join(activeId, 'gentle-plugin-tools.json'), '{"version":1,"odd":false,"issues":false}\n');
+    const link = path.join(fixture.root, 'plugins-link');
+    fs.symlinkSync(path.join(fixture.xdg, 'herdr', 'plugins'), link, 'dir');
+    const symlinked = path.join(link, 'herdr-gentle-shell');
+    assert.equal(
+      sidebar.stateDir({ XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: symlinked }),
+      symlinked,
+      'the symlinked spelling is used as given',
+    );
+    const previous = process.cwd();
+    try {
+      process.chdir(fixture.root);
+      const relative = path.join('xdg', 'herdr', 'plugins', 'herdr-gentle-shell');
+      assert.equal(
+        sidebar.stateDir({ XDG_STATE_HOME: 'xdg', HERDR_PLUGIN_STATE_DIR: relative }),
+        relative,
+        'the relative spelling is used as given',
+      );
+    } finally {
+      process.chdir(previous);
+    }
+  });
+
+  test('the explicit override wins over an owned injected dir (preserved)', () => {
+    const fixture = sandbox('explicit');
+    const activeId = path.join(fixture.xdg, 'herdr', 'plugins', 'herdr-gentle-shell');
+    const explicit = track(fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-sidebar-explicit-')));
+    assert.equal(
+      sidebar.stateDir({ XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: activeId, GENTLE_STATUS_STATE_DIR: explicit }),
+      explicit,
+      'an explicit override still wins unconditionally',
+    );
+    assert.equal(
+      sidebar.stateDir({ XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: activeId, GENTLE_STATUS_STATE_DIR: '' }),
+      fixture.stored,
+      'an explicit-but-empty override still keeps the stored default',
+    );
+  });
 });

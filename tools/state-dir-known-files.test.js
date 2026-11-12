@@ -142,6 +142,17 @@ function touch(dir, name, body) {
   fs.writeFileSync(path.join(dir, name), body ?? 'placeholder\n');
 }
 
+// Two spellings name the same directory when their canonical forms match: the
+// T12 rule compares paths, not strings, so a symlinked or relative spelling of
+// the derived dir is never rejected as a different directory.
+function canonical(dir) {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
 // The producer extension resolves this same dir for the two flags it reads.
 // Its only remaining observable is the sidebar-mode gate: with
 // `gentle-sidebar-mode.json` saying enabled:false it publishes nothing at all,
@@ -357,6 +368,19 @@ describe('state-dir known-file family', () => {
     assert.equal(await extensionRun(fixture.env, 1200), 0, 'the stored disabled mode gates the producer');
   });
 
+  // The same precedence for the producer when the injected variable names
+  // exactly the derived active-id dir: the stored family still wins.
+  test('the producer extension prefers the stored family over a stray file in the derived active-id dir', async () => {
+    const fixture = crossSandbox('ext-derived-trapped');
+    touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
+    touch(fixture.activeId, 'gentle-interruptions.json', '{"version":1,"panes":{}}\n');
+    assert.equal(
+      await extensionRun({ XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: fixture.activeId }, 1200),
+      0,
+      'the stored disabled mode gates the producer',
+    );
+  });
+
   test('an explicit-but-empty override keeps the stored default on every resolver (preserved)', () => {
     const fixture = sandbox('explicit-empty');
     touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
@@ -534,38 +558,119 @@ describe('state-dir known-file family', () => {
     assert.deepEqual(withVariable.dirs, withoutVariable.dirs, 'the unrelated injected dir changes nothing');
   });
 
-  // The two owned names: the active plugin id (what Herdr injects today) and
-  // the stored canonical segment (a stale or dev checkout may still name it
-  // from another parent). Both are honoured; a third name is not.
-  test('an injected path whose basename is an owned name still wins when the stored dir holds no known file', () => {
-    const fixture = crossSandbox('owned-injected');
+  // S1c (T12): an owned BASENAME is not enough — the injected path must BE the
+  // directory this package derives for that name under the resolved state home.
+  // An owned name under ANOTHER root is the case the basename-only rule let
+  // through: the daemon (which receives the variable) selected there while a
+  // context without it derived its own state home, so the state split exactly
+  // as in L12. One known file there is what made it look like ours.
+  test('an owned-basename injected dir under a different root is ignored (cross-context)', () => {
+    const fixture = crossSandbox('owned-foreign-root');
+    const onlyXdg = { XDG_STATE_HOME: fixture.xdg };
     for (const owned of ['herdr-gentle-shell', 'herdr-gentle-agents']) {
-      const injected = path.join(fixture.root, 'elsewhere', owned);
+      const foreignRoot = path.join(fixture.root, 'other-herdr');
+      const injected = path.join(foreignRoot, owned);
       touch(injected, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
       const env = { XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: injected };
       for (const [label, resolve] of resolvers) {
-        assert.equal(resolve(env), injected, `${label} honours an injected dir named ${owned}`);
+        assert.equal(resolve(env), fixture.stored, `${label} ignores ${owned} under a foreign root`);
+        assert.equal(resolve(env), resolve(onlyXdg), `${label} resolves the same dir in both contexts for ${owned}`);
       }
       try {
         applyEnv(env);
         assert.deepEqual(
           STATUS.readSidebarMode(),
-          { enabled: false, malformed: false, raw: null },
-          `the daemon reads the mode flag from the injected ${owned} dir`,
+          { enabled: true, malformed: false, raw: null },
+          `the daemon ignores ${owned} under a foreign root (missing mode means enabled)`,
         );
       } finally {
         applyEnv({});
       }
-      removePath(injected);
+      assert.ok(
+        !fs.existsSync(path.join(injected, 'gentle-status.pid')),
+        `the daemon writes nothing into the foreign-root ${owned} dir`,
+      );
+      // Cleanup covers the injected dir too: `foreignRoot` is its parent, so one
+      // guarded removal of the whole foreign root replaces the per-candidate one.
+      removePath(foreignRoot);
     }
   });
 
-  test('the stored family still outranks a stray known file in the active-id dir', () => {
+  test('an owned-basename injected dir under a different root changes nothing for the producer extension (cross-context)', async () => {
+    const fixture = crossSandbox('owned-foreign-root-ext');
+    const foreign = path.join(fixture.root, 'other-herdr', 'herdr-gentle-shell');
+    touch(foreign, 'gentle-interruptions.json', '{"version":1,"panes":{}}\n');
+    // The producer's only observable verdict is the refresh flag it writes into
+    // the dir it resolved, so the stored dir must exist to receive it.
+    fs.mkdirSync(fixture.stored, { recursive: true });
+    const candidates = [fixture.stored, fixture.activeId, foreign];
+    const withoutVariable = await extensionResolvedDir({ XDG_STATE_HOME: fixture.xdg }, candidates, 3000);
+    assert.deepEqual(withoutVariable.dirs, [fixture.stored], 'the producer writes its refresh in the stored dir');
+    const withVariable = await extensionResolvedDir(
+      { XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: foreign },
+      candidates,
+      3000,
+    );
+    assert.deepEqual(withVariable.dirs, withoutVariable.dirs, 'the foreign-root owned name changes nothing');
+  });
+
+  // The same rule must not over-tighten: a spelling of the DERIVED dir that only
+  // differs by a symlink or by being relative still names that directory, so it
+  // is honoured (used as given) instead of being rejected as foreign.
+  test('an owned-basename injected dir under the same root is honoured (symlinked and relative spellings)', async () => {
+    const fixture = crossSandbox('owned-same-root');
+    const realPlugins = path.join(fixture.xdg, 'herdr', 'plugins');
+    touch(fixture.activeId, 'gentle-plugin-tools.json', '{"version":1,"odd":false,"issues":false}\n');
+    const link = path.join(fixture.root, 'plugins-link');
+    fs.symlinkSync(realPlugins, link, 'dir');
+    const symlinked = path.join(link, 'herdr-gentle-shell');
+    assert.equal(canonical(symlinked), canonical(fixture.activeId), 'the fixture really is a spelling of the derived dir');
+    const env = { XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: symlinked };
+    assert.equal(SIDEBAR.stateDir(env), symlinked, 'the sidebar uses the injected symlinked spelling as given');
+    assert.equal(
+      DIAGNOSTICS.resolveStateDir(env),
+      path.resolve(symlinked),
+      'diagnostics honours the same symlinked spelling',
+    );
+    try {
+      applyEnv(env);
+      assert.deepEqual(
+        STATUS.readSidebarMode(),
+        { enabled: true, malformed: false, raw: null },
+        'the daemon resolves through the symlinked spelling (the tools toggle is not a mode flag)',
+      );
+      assert.ok(!fs.existsSync(path.join(fixture.activeId, 'gentle-status.pid')), 'the reader creates nothing');
+    } finally {
+      applyEnv({});
+    }
+    // The extension's verdict is the refresh flag: it must land in that same
+    // directory, whether reached by the injected spelling or derived.
+    const resolved = await extensionResolvedDir(env, [fixture.stored, fixture.activeId], 3000);
+    assert.deepEqual(resolved.dirs, [fixture.activeId], 'the producer writes its refresh in the derived dir');
+
+    const previous = process.cwd();
+    try {
+      process.chdir(fixture.root);
+      const relative = path.join('xdg', 'herdr', 'plugins', 'herdr-gentle-shell');
+      const relativeEnv = { XDG_STATE_HOME: 'xdg', HERDR_PLUGIN_STATE_DIR: relative };
+      assert.equal(SIDEBAR.stateDir(relativeEnv), relative, 'the sidebar uses the relative spelling as given');
+      assert.equal(
+        DIAGNOSTICS.resolveStateDir(relativeEnv),
+        fixture.activeId,
+        'diagnostics resolves the relative spelling to the same dir',
+      );
+    } finally {
+      process.chdir(previous);
+    }
+  });
+
+  test('the stored family still outranks a stray known file in the derived active-id dir', () => {
     const fixture = crossSandbox('owned-trapped');
-    const injected = path.join(fixture.root, 'elsewhere', 'herdr-gentle-shell');
-    touch(injected, 'gentle-interruptions.json', '{"version":1,"panes":{}}\n');
+    // The injected variable names exactly the derived dir, and that dir holds
+    // one stray known file; the stored dir holds the family.
+    touch(fixture.activeId, 'gentle-interruptions.json', '{"version":1,"panes":{}}\n');
     touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
-    const env = { XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: injected };
+    const env = { XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: fixture.activeId };
     for (const [label, resolve] of resolvers) {
       assert.equal(resolve(env), fixture.stored, `${label} keeps the stored dir over the stray active-id file`);
     }
