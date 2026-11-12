@@ -308,9 +308,10 @@ function herdrStateDir() {
 // else the active-id/injected dir if it holds one, else stored — the stored
 // canonical dir is the FINAL fallback, so a fresh install converges there and
 // every context that does not receive the injected variable names the same
-// directory as this daemon. An injected path is honoured only when its basename
-// names a directory this package owns (S1c); any other path is ignored and the
-// derived active-id dir is used instead. GENTLE_STATUS_STATE_DIR (explicit user
+// directory as this daemon. An injected path is honoured only when it IS the
+// directory this package derives for that name under the resolved state home
+// (S1c); any other path — including an owned basename under another root — is
+// ignored and the derived active-id dir is used instead. GENTLE_STATUS_STATE_DIR (explicit user
 // override) is always used as-is. This family is IDENTICAL in the sidebar,
 // diagnostics, worktree-mode and state-extension resolvers. The daemon also
 // WRITES here (pidfile, mode, ledger), so a file it cannot see is a file whose
@@ -327,10 +328,12 @@ const STATE_KNOWN_FILES = [
   'gentle-plugin-tools.json',
 ];
 // S1c: the only basenames an injected state dir may have to be honoured — the
-// active plugin id Herdr injects today and the stored canonical segment. Any
-// other injected path belongs to another plugin (or a stale/dev id) and is
-// ignored, because this daemon receives the variable and every producer does
-// not: honouring it is exactly what splits them.
+// active plugin id Herdr injects today and the stored canonical segment — and
+// the path must also BE the one this package derives for that name under the
+// resolved state home. Any other injected path belongs to another plugin (or a
+// stale/dev id) and is ignored, and so is an owned basename under another root,
+// because this daemon receives the variable and every producer does not:
+// honouring either is exactly what splits them.
 const OWNED_DIR_NAMES = [PLUGIN_ID, STATE_PLUGIN_ID];
 
 function dirHasKnownFiles(dir) {
@@ -348,22 +351,50 @@ function storedStateRoot() {
   return path.join(herdrStateDir(), 'plugins', STATE_PLUGIN_ID);
 }
 
-// The active-id dir: the Herdr-injected one when this process has it and its
-// basename is a directory this package owns, else the same sibling of the stored
-// dir derived from the state home. S1c: Herdr injects a path per plugin id, so a
-// third id, a stale name or a dev checkout would otherwise select a directory we
-// do not own — and the producer, which never receives the variable, would keep
-// resolving stored. Any other injected path is ignored.
-function activeStateRoot() {
-  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
-  if (
-    typeof injected === 'string' &&
-    injected.length > 0 &&
-    OWNED_DIR_NAMES.includes(path.basename(injected))
-  ) {
-    return injected;
+// Two spellings name the same directory when their canonical forms match.
+// realpath resolves symlinks but throws for a path that does not exist yet, so
+// walk up to the deepest existing ancestor and re-append the missing tail: that
+// keeps a symlinked or relative spelling of the derived dir from being rejected
+// as a different directory (S1c/T12 compares paths, never raw strings).
+function canonicalStateDir(dir) {
+  const absolute = path.resolve(dir);
+  const tail = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return absolute;
+      // Prepended so the missing tail is re-appended in its original order.
+      tail.unshift(path.basename(current));
+      current = parent;
+    }
   }
-  return path.join(herdrStateDir(), 'plugins', PLUGIN_ID);
+}
+
+// The active-id dir: the Herdr-injected one only when it IS the directory this
+// package derives for that name under the resolved state home, else the same
+// sibling of the stored dir derived from the state home. S1c: Herdr injects a
+// path per plugin id, so a third id, a stale name or a dev checkout would
+// otherwise select a directory we do not own — and so does an owned basename
+// under another root, which is exactly the split (the daemon receives the
+// variable, the producer derives its own state home). Any other injected path is
+// ignored.
+function activeStateRoot() {
+  const pluginsDir = path.join(herdrStateDir(), 'plugins');
+  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected === 'string' && injected.length > 0) {
+    const name = path.basename(injected);
+    if (
+      OWNED_DIR_NAMES.includes(name) &&
+      canonicalStateDir(injected) === canonicalStateDir(path.join(pluginsDir, name))
+    ) {
+      return injected;
+    }
+  }
+  return path.join(pluginsDir, PLUGIN_ID);
 }
 
 function stateRoot() {

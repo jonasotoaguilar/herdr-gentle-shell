@@ -1687,9 +1687,11 @@ export async function liveSummarizeRoots(roots) {
 // candidate here too, derived from the state home when the variable is absent,
 // so a legacy install whose live flags sit only there is still found.
 // Selection order: stored if it holds a known file, else the active-id/injected
-// dir if it holds one, else stored. An injected path is honoured only when its
-// basename names a directory this package owns (S1c), so the daemon and this
-// helper can never be pointed at another plugin's state.
+// dir if it holds one, else stored. An injected path is honoured only when it IS
+// the directory this package derives for that name under the resolved state home
+// (S1c): any other basename, and an owned basename under another root, is
+// ignored, so the daemon and this helper can never be pointed at another
+// plugin's state or at a second root for the same name.
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1703,10 +1705,11 @@ const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
 const SIDEBAR_ACTIVE_PLUGIN_ID = "herdr-gentle-shell";
 // S1c: an injected path is honoured only when its basename names a directory
 // this package owns — the active plugin id (what Herdr injects today) or the
-// stored canonical segment (a stale or dev checkout may still name it from
-// another parent). Any other path, e.g. a third plugin id, is IGNORED: the
-// daemon receives HERDR_PLUGIN_STATE_DIR while no producer does, so honouring
-// a directory we do not own is exactly what splits them.
+// stored canonical segment — AND it is the path this package derives for that
+// name under the resolved state home. Any other path, e.g. a third plugin id or
+// an owned name under another root, is IGNORED: the daemon receives
+// HERDR_PLUGIN_STATE_DIR while no producer does, so honouring a directory we do
+// not own (or the same name under another root) is exactly what splits them.
 const SIDEBAR_OWNED_DIR_NAMES = [SIDEBAR_ACTIVE_PLUGIN_ID, SIDEBAR_STATE_SEGMENT];
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
@@ -1731,16 +1734,46 @@ function sidebarStoredDir() {
   return join(sidebarStatePluginsDir(), SIDEBAR_STATE_SEGMENT);
 }
 
+// Two spellings name the same directory when their canonical forms match.
+// realpath resolves symlinks but throws for a path that does not exist yet, so
+// walk up to the deepest existing ancestor and re-append the missing tail: that
+// keeps a symlinked or relative spelling of the derived dir from being rejected
+// as a different directory (S1c/T12 compares paths, never raw strings).
+function sidebarCanonicalDir(dir) {
+  const absolute = resolvePath(dir);
+  const tail = [];
+  let current = absolute;
+  for (;;) {
+    try {
+      const real = fs.realpathSync(current);
+      return tail.length ? join(real, ...tail) : real;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return absolute;
+      // Prepended so the missing tail is re-appended in its original order.
+      tail.unshift(pathBasename(current));
+      current = parent;
+    }
+  }
+}
+
 // The active plugin id dir: what Herdr injects as HERDR_PLUGIN_STATE_DIR for the
 // current plugin id, or — because this producer never receives that variable —
 // the same path derived from the state home. An injected path is only honoured
-// when its basename is a name this package owns (S1c); anything else falls back
-// to the derived path, so the producer and the daemon cannot end up naming a
-// directory that belongs to another plugin.
+// when it IS the directory this package derives for that name under the resolved
+// state home; any other basename (S1c) or an owned basename under another root —
+// the exact split, since the daemon receives the variable and this producer
+// derives its own — falls back to the derived path.
 function sidebarActiveDir() {
   const injected = process.env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected === "string" && injected.length > 0 && SIDEBAR_OWNED_DIR_NAMES.includes(pathBasename(injected))) {
-    return injected;
+  if (typeof injected === "string" && injected.length > 0) {
+    const name = pathBasename(injected);
+    if (
+      SIDEBAR_OWNED_DIR_NAMES.includes(name) &&
+      sidebarCanonicalDir(injected) === sidebarCanonicalDir(join(sidebarStatePluginsDir(), name))
+    ) {
+      return injected;
+    }
   }
   return join(sidebarStatePluginsDir(), SIDEBAR_ACTIVE_PLUGIN_ID);
 }
