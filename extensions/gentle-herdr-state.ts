@@ -23,9 +23,13 @@
 //                       launches the store does not list yet, deduplicated so
 //                       one delegate counts once: a task-mode (synchronous)
 //                       launch has no record until it returns, so without it
-//                       two live delegates counted zero. The consumer renders
-//                       the oldest running role plus this total in
-//                       parentheses only when above one.)
+//                       two live delegates counted zero. Per agent the union
+//                       is a MAX (S11b): an announced running record and its
+//                       own in-flight launch are the same delegate and carry
+//                       no shared call id, so a record consumes one launch of
+//                       its own agent. The consumer renders the oldest
+//                       running role plus this total in parentheses only when
+//                       above one.)
 //   gentle_roles_v1   = CSV of canonical role slugs from TaskRecord.agent
 //                       (oldest-first by immutable firstSeen, e.g.
 //                       `worker,explorer` with worker oldest; null /
@@ -3405,18 +3409,51 @@ export default function (pi) {
     return out;
   }
 
-  // The consolidated `(n)` source (S11): the UNION of the running records the
-  // presence snapshot confirms and the distinct in-flight launches the store
-  // does not list yet, deduplicated so one delegate is counted once. Records
-  // first (oldest-first), then the in-flight launches (oldest-first), so the
-  // consumer's oldest-role resolution is unchanged. In-flight launches are
-  // never narrowed by the snapshot: like the role hint, they exist only while
-  // their own call is in flight, which is exactly the evidence the store
-  // cannot carry yet.
+  // The consolidated `(n)` source (S11/S11b): the UNION of the running
+  // records the presence snapshot confirms and the distinct in-flight launches
+  // the store does not list yet, deduplicated so one delegate is counted once.
+  // In-flight launches are never narrowed by the snapshot: like the role hint,
+  // they exist only while their own call is in flight, which is exactly the
+  // evidence the store cannot carry yet.
+  // S11b: an announced running record and its own in-flight launch are the SAME
+  // delegate and share no call id — a background launch is acked synchronously
+  // while its START may announce the record on the lifecycle channel before
+  // that ack lands, and the announcement carries only the agent. So per agent
+  // the count is max(running records, unbound in-flight launches): a record
+  // consumes one launch of its own agent (oldest first, which max() expresses
+  // without an arbitrary pairing) and never a launch of another agent, while
+  // two launches beside one record stay two delegates (real work is never
+  // hidden). Only KNOWN agents form a group; an entry with no agent is counted
+  // on its own, because identity is the only evidence that two entries are the
+  // same delegate.
   function countSubs(snapshot) {
     const running = displaySubs(snapshot);
     const listed = new Set(running.map((sub) => sub.id));
-    return [...running, ...inFlightLaunchSubs(listed)];
+    const launches = inFlightLaunchSubs(listed);
+    const groups = new Map(); // known agent -> { records, launches }
+    let unknown = 0;
+    const groupOf = (agent) => {
+      if (typeof agent !== "string" || agent.length === 0) return undefined;
+      let group = groups.get(agent);
+      if (group === undefined) {
+        group = { records: 0, launches: 0 };
+        groups.set(agent, group);
+      }
+      return group;
+    };
+    for (const sub of running) {
+      const group = groupOf(sub.agent);
+      if (group === undefined) unknown += 1;
+      else group.records += 1;
+    }
+    for (const launch of launches) {
+      const group = groupOf(launch.agent);
+      if (group === undefined) unknown += 1;
+      else group.launches += 1;
+    }
+    let total = unknown;
+    for (const group of groups.values()) total += Math.max(group.records, group.launches);
+    return total;
   }
 
   // Role-only hint from in-flight `subagent_run`/`subagent_continue` tool
@@ -3566,12 +3603,11 @@ export default function (pi) {
     // Liveness/marker coverage stays running|queued (T1); the visible
     // count + roles are running-only (T2b executing set) narrowed to the ids
     // the presence snapshot lists running (displaySubs), plus the distinct
-    // in-flight launches the store does not list yet (countSubs, S11).
+    // in-flight launches the store does not list yet (countSubs, S11/S11b).
     const subs = activeSubs();
     const running = displaySubs(snapshot);
-    const counted = countSubs(snapshot);
     const tokens = {};
-    const count = String(counted.length);
+    const count = String(countSubs(snapshot));
     if (COUNT_RE.test(count)) tokens.gentle_work_v1 = `${sessionHash}:${count}:${expiry}`;
     const csv = namesCsv(running);
     // Clear (null) when the authoritative active TaskStore list has no
@@ -3585,9 +3621,10 @@ export default function (pi) {
     // roles (oldest-first) plus the exact pending subagent agent while its
     // tool call is in flight (task-mode launches have no TaskStore record
     // yet). The hint is role-only — the count above adds the in-flight call
-    // itself in countSubs — and is cleared with the pending call. Null
-    // (clear) when no active recognized roles in either source —
-    // unrecognized agents degrade to the consumer's `working` display.
+    // itself in countSubs, grouped per agent (S11b) — and is cleared with the
+    // pending call. Null (clear) when no active recognized roles in either
+    // source — unrecognized agents degrade to the consumer's `working`
+    // display.
     const roles = rolesCsv(mergedRoleSubs(running));
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;

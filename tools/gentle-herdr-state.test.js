@@ -5470,3 +5470,161 @@ test('T5/S11: a background delegate counts exactly as before', async () => {
     await stopWire(wire);
   }
 });
+
+// --- T5b/S11b: an announced record and its own launch are one delegate ---
+// S11b (odd/tasks/sidebar-terminal-state.md): a background launch is acked
+// synchronously while its START may announce the record on the lifecycle
+// channel BEFORE that ack lands, and the announcement carries no call id —
+// only the agent. The plain union then reported ONE delegate as
+// `explorer (2)`. Rule: per agent the count is
+// `max(running records, unbound in-flight launches)`, summed across agents; an
+// announced RUNNING record consumes one unbound in-flight launch of the same
+// agent (oldest first), and never a launch of another agent. Names stay
+// record-only, the oldest-role resolution and the suffix shape are unchanged,
+// and the S4 terminal gate still reads the pending-call leg.
+
+test('S11: a background START overlapping its launch counts once', async () => {
+  const wire = await startT2bWire('s11-start-overlap');
+  try {
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('s11-start-overlap');
+    startT2bSession(h, 's11-start-overlap', sessionFile);
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'launch',
+      input: { agent: 'gentle-ai-explore', mode: 'background' },
+    });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 'background-1', agent: 'gentle-ai-explore', status: 'running' },
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const beat = wire.received.at(-1);
+    assert.equal(beat.gentle_work_v1.split(':')[1], '1');
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('S11b: per agent the count is max(records, unbound launches)', async () => {
+  const wire = await startT2bWire('s11b-max');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('s11b-max');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 's11b-max', sessionFile);
+    // Two DISTINCT launches of one agent, both in flight: two delegates.
+    launchInFlight(h, 's11b-launch-1', 'gentle-ai-explore');
+    launchInFlight(h, 's11b-launch-2', 'gentle-ai-explore');
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight launches of one agent',
+    );
+    // One announced RUNNING record of that agent: it consumes ONE launch, so
+    // the count stays 2 (the union used to report 3).
+    const beforeFirstRecord = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 's11b-bg-1', agent: 'gentle-ai-explore', status: 'running' },
+        },
+      },
+    });
+    const oneRecord = await wire.waitForFrom(
+      beforeFirstRecord,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'one record beside two launches is two delegates, never three',
+    );
+    assert.equal(oneRecord.gentle_roles_v1, 'explorer', 'role words are unchanged');
+    // A second announced record of the same agent: two records and two
+    // launches are still two delegates.
+    const beforeSecondRecord = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 's11b-bg-2', agent: 'gentle-ai-explore', status: 'running' },
+        },
+      },
+    });
+    const twoRecords = await wire.waitForFrom(
+      beforeSecondRecord,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two records beside two launches are two delegates, never four',
+    );
+    assert.equal(twoRecords.gentle_roles_v1, 'explorer');
+    assert.deepEqual(
+      countValues(wire.received, paneHash).filter((count) => count > 2),
+      [],
+      'the overlapping evidence never inflates the count past two delegates',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
+
+test('S11b: an announced record only consumes a launch of its own agent', async () => {
+  const wire = await startT2bWire('s11b-cross-agent');
+  try {
+    const { createHash } = require('node:crypto');
+    const h = harness();
+    wire.factory(h.pi);
+    const sessionFile = t2bSessionFile('s11b-cross-agent');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    startT2bSession(h, 's11b-cross-agent', sessionFile);
+    launchInFlight(h, 's11b-cross-explore', 'gentle-ai-explore');
+    launchInFlight(h, 's11b-cross-worker', 'gentle-ai-worker');
+    await wire.waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'two in-flight launches of different agents',
+    );
+    // The announced record belongs to the worker launch: the explorer launch is
+    // untouched, so both delegates are still counted (two agents, never three).
+    const beforeRecord = wire.received.length;
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: {
+          gentleAgents: { taskId: 's11b-bg-worker', agent: 'gentle-ai-worker', status: 'running' },
+        },
+      },
+    });
+    const beat = await wire.waitForFrom(
+      beforeRecord,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'a record for one agent consumes nothing of another agent',
+    );
+    assert.equal(
+      beat.gentle_roles_v1,
+      'explorer,worker',
+      'oldest-role resolution is unchanged (launches first, then the record)',
+    );
+    assert.equal(beat.gentle_names_v1, 'gentle-ai-worker', 'names stay record-only');
+    assert.deepEqual(
+      countValues(wire.received, paneHash).filter((count) => count > 2),
+      [],
+      'cross-agent evidence never inflates the count',
+    );
+  } finally {
+    await stopWire(wire);
+  }
+});
