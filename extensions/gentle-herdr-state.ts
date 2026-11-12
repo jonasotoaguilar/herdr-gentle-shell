@@ -17,9 +17,15 @@
 // Tokens (§4.3):
 //   gentle_work_v1    = <hash>:<count>:<expiry>
 //                       (normative running total — only `running` counts as
-//                       executing; queued/waiting/pending never count. The
-//                       consumer renders the oldest running role plus this
-//                       total in parentheses only when above one.)
+//                       executing; queued/waiting never count. The total is
+//                       the UNION of running TaskStore records and the
+//                       distinct in-flight `subagent_run`/`subagent_continue`
+//                       launches the store does not list yet, deduplicated so
+//                       one delegate counts once: a task-mode (synchronous)
+//                       launch has no record until it returns, so without it
+//                       two live delegates counted zero. The consumer renders
+//                       the oldest running role plus this total in
+//                       parentheses only when above one.)
 //   gentle_roles_v1   = CSV of canonical role slugs from TaskRecord.agent
 //                       (oldest-first by immutable firstSeen, e.g.
 //                       `worker,explorer` with worker oldest; null /
@@ -2718,16 +2724,18 @@ export default function (pi) {
   // exactly the entries whose status is running|queued. Gentle Shell owns
   // lifecycle/status truth: no local age/staleness timeout is applied.
   // pendingCalls holds label correlation state for a later
-  // gentleAgents.taskId result plus a role-only display hint (exact pending
-  // subagent agent -> gentle_roles_v1 slug) while the tool call is in
-  // flight; it never increments the count. Task-mode `subagent_run` stays
+  // gentleAgents.taskId result plus the in-flight launch evidence: its own
+  // contribution to the consolidated `(n)` count (a task-mode `subagent_run`
+  // stays in flight with no TaskStore record until tool_result, so the record
+  // set alone undercounts it) and a role-only display hint (exact pending
+  // subagent agent -> gentle_roles_v1 slug). Task-mode `subagent_run` stays
   // in flight with no TaskStore record until tool_result, so without the
   // hint the active role would be invisible and the sidebar would show
   // generic `working` during execution.
   // Finished/failed/cancelled/waiting entries may linger in the map but
   // never count; the map is cleared only on session reset (plus the
   // bounded-map guard) — never by a local staleness timeout.
-  const pendingCalls = new Map(); // toolCallId -> { agent, label, at }; agent/label are undefined when no agent is resolvable
+  const pendingCalls = new Map(); // toolCallId -> { agent, label, at, taskId?, cancelled? }; agent/label are undefined when no agent is resolvable
   const tasks = new Map(); // taskId -> { agent, label, status, at }
 
   // Blocker legs. ask combines choice + native questionnaire + legacy
@@ -3310,13 +3318,11 @@ export default function (pi) {
   // Authoritative TaskStore projection for liveness/marker coverage:
   // every entry whose status is running|queued is active here (T1
   // epochs/witness unchanged). Display count/roles use runningSubs()
-  // below (running only). Pending tool calls never count;
-  // finished/failed/cancelled/waiting entries never count.
-  // WHY pending calls stay out of the count: task-mode `subagent_run` stays
-  // in flight without a TaskStore record until it returns tool_result, so
-  // counting pending calls would inflate `gentle_work_v1` with estimates.
-  // The count is normative; role display below is the
-  // only consumer of the pending hint.
+  // below (running only). Finished/failed/cancelled/waiting entries never
+  // count. The consolidated `(n)` count adds the in-flight launch calls the
+  // record set does not list yet (countSubs below, S11): a task-mode
+  // `subagent_run` has no TaskStore record until it returns tool_result, so
+  // the record set alone counted live synchronous delegates as zero.
   // Order is oldest-first by immutable firstSeen (fallback at): progress
   // reads bump `at` but never move `firstSeen`, so they never reorder.
   function activeSubs() {
@@ -3381,18 +3387,52 @@ export default function (pi) {
     return local.filter((sub) => listed.has(sub.id));
   }
 
+  // Distinct in-flight launch calls the running record set does not already
+  // list (S11): the second half of the `(n)` union. One delegate is one
+  // entry — the map is keyed by call id, so a call counts at most once, and a
+  // call that resumes a task the records already list running (its `taskId`)
+  // is the SAME delegate and adds nothing. A cancelled call is no longer an
+  // executing delegate; it keeps its pending evidence only for the terminal
+  // gate, which is a separate leg.
+  function inFlightLaunchSubs(listed) {
+    const out = [];
+    for (const pending of pendingCalls.values()) {
+      if (pending.cancelled === true) continue;
+      if (pending.taskId !== undefined && listed.has(pending.taskId)) continue;
+      out.push(pending);
+    }
+    out.sort((a, b) => a.at - b.at);
+    return out;
+  }
+
+  // The consolidated `(n)` source (S11): the UNION of the running records the
+  // presence snapshot confirms and the distinct in-flight launches the store
+  // does not list yet, deduplicated so one delegate is counted once. Records
+  // first (oldest-first), then the in-flight launches (oldest-first), so the
+  // consumer's oldest-role resolution is unchanged. In-flight launches are
+  // never narrowed by the snapshot: like the role hint, they exist only while
+  // their own call is in flight, which is exactly the evidence the store
+  // cannot carry yet.
+  function countSubs(snapshot) {
+    const running = displaySubs(snapshot);
+    const listed = new Set(running.map((sub) => sub.id));
+    return [...running, ...inFlightLaunchSubs(listed)];
+  }
+
   // Role-only hint from in-flight `subagent_run`/`subagent_continue` tool
   // calls: task-mode launches stay in flight (no tool_result yet, hence no
   // TaskStore record) even though `tool_call` input already carries the
   // exact agent name. Publishing that agent's role slug keeps the sidebar
-  // from showing generic `working` during execution. This is display-only:
-  // it never enters `gentle_work_v1` or any displayed count, and each hint
-  // is cleared when its tool_result arrives, the call is cancelled, or the
-  // agent settles. The hint carries the mapped word or the sanitized
-  // passthrough slug (unsalvageable names yield no hint and read gentle).
+  // from showing generic `working` during execution. The hint never adds a
+  // name; its count contribution comes from countSubs above, so the hint
+  // itself stays role-only. Each hint is cleared when its tool_result
+  // arrives, the call is cancelled, or the agent settles. The hint carries
+  // the mapped word or the sanitized passthrough slug (unsalvageable names
+  // yield no hint and read gentle).
   function pendingRoleSubs() {
     const out = [];
     for (const pending of pendingCalls.values()) {
+      if (pending.cancelled === true) continue;
       if (agentToRole(pending.agent) !== undefined) {
         out.push({ agent: pending.agent, label: pending.label, at: pending.at });
       }
@@ -3524,12 +3564,14 @@ export default function (pi) {
     if (!sessionHash) return {};
     const expiry = Date.now() + TTL_MS;
     // Liveness/marker coverage stays running|queued (T1); the visible
-    // count + roles are running-only (T2b executing set) and narrowed to the
-    // ids the presence snapshot lists running (displaySubs).
+    // count + roles are running-only (T2b executing set) narrowed to the ids
+    // the presence snapshot lists running (displaySubs), plus the distinct
+    // in-flight launches the store does not list yet (countSubs, S11).
     const subs = activeSubs();
     const running = displaySubs(snapshot);
+    const counted = countSubs(snapshot);
     const tokens = {};
-    const count = String(running.length);
+    const count = String(counted.length);
     if (COUNT_RE.test(count)) tokens.gentle_work_v1 = `${sessionHash}:${count}:${expiry}`;
     const csv = namesCsv(running);
     // Clear (null) when the authoritative active TaskStore list has no
@@ -3542,10 +3584,10 @@ export default function (pi) {
     // §4.3), merged with the in-flight pending role hint: running TaskStore
     // roles (oldest-first) plus the exact pending subagent agent while its
     // tool call is in flight (task-mode launches have no TaskStore record
-    // yet). The hint is role-only — the count above stays running-only —
-    // and is cleared with the pending call. Null (clear) when no active
-    // recognized roles in either source — unrecognized agents degrade to
-    // the consumer's `working` display.
+    // yet). The hint is role-only — the count above adds the in-flight call
+    // itself in countSubs — and is cleared with the pending call. Null
+    // (clear) when no active recognized roles in either source —
+    // unrecognized agents degrade to the consumer's `working` display.
     const roles = rolesCsv(mergedRoleSubs(running));
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;
@@ -4385,6 +4427,9 @@ export default function (pi) {
   // role evidence at all — the pending call still covers the blocking/
   // orchestrating marker, but it contributes no role and no name, and it
   // must never publish the launch-correlation placeholder as a role word.
+  // The named `task_id` is retained for the count's dedupe (S11): a resume of
+  // a task the records already list running is the same delegate, and a
+  // cancel of that task ends it.
   function launchInput(input) {
     if (!isRecord(input)) return undefined;
     const taskId = typeof input.task_id === "string" ? input.task_id : undefined;
@@ -4395,7 +4440,11 @@ export default function (pi) {
     const labelSource =
       typeof input.label === "string" && input.label.length > 0 ? input.label : agent;
     const label = labelSource === undefined ? undefined : sanitizeLabel(labelSource, labelSource);
-    return { agent: agent === undefined ? undefined : truncateChars(agent, MAX_LABEL_CHARS), label };
+    return {
+      agent: agent === undefined ? undefined : truncateChars(agent, MAX_LABEL_CHARS),
+      label,
+      taskId,
+    };
   }
 
   pi.on("tool_call", (event) => {
@@ -4422,11 +4471,23 @@ export default function (pi) {
       const taskId = isRecord(event.input) ? event.input.task_id : undefined;
       if (typeof taskId !== "string") return;
       const known = tasks.get(taskId);
+      let changed = false;
+      // A cancelled task's own in-flight launch is no longer an executing
+      // delegate, so it stops counting on this beat (S11: the count
+      // decrements on cancellation). Its pending evidence is NOT dropped: the
+      // pending-call leg still gates the terminal state (S4) and the call's
+      // own result still arrives later.
+      for (const [callId, pending] of pendingCalls) {
+        if (pending.taskId !== taskId || pending.cancelled === true) continue;
+        pendingCalls.set(callId, { ...pending, cancelled: true });
+        changed = true;
+      }
       if (known) {
         // Progress/cancel bumps recency only; firstSeen never moves (T2b).
         tasks.set(taskId, { ...known, status: "cancelled", at: Date.now() });
-        schedulePublish();
+        changed = true;
       }
+      if (changed) schedulePublish();
     }
   });
 
