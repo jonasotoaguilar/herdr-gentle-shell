@@ -2195,3 +2195,34 @@ test('independent S12: new continue extends original deadline but old run still 
   assert.equal(finishesFrom(phone).length,1);
   h.fire('session_shutdown', {}, ctx()); delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
 });
+
+test('live job and two settled launches retain independent gates', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(200);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(200);
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('independent')]));
+  for (const id of ['x', 'y']) {
+    h.fire('tool_call', { toolName: 'subagent_run', toolCallId: id, input: { agent: 'gentle-ai-explore' } });
+  }
+  await settle(200);
+  const from = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(200);
+  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'x', isError: true });
+  await settle(400);
+  assert.deepEqual(nativeStatesFrom(paneId, from).filter(s => s === 'idle'), []);
+  assert.deepEqual(doneValuesFrom(paneId, from), []);
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', []));
+  await settle(400);
+  assert.deepEqual(nativeStatesFrom(paneId, from).filter(s => s === 'idle'), []);
+  assert.deepEqual(doneValuesFrom(paneId, from), []);
+  h.fire('tool_result', { toolName: 'subagent_run', toolCallId: 'y', isError: true });
+  assert.ok(await waitFrom(paneId, from, f => f?.method === 'pane.report_agent' && f.params?.state === 'idle', 2500));
+  assert.ok(await waitFrom(paneId, from, f => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string', 2500));
+  h.fire('session_shutdown', {}, ctx());
+});

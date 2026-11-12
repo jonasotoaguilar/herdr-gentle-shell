@@ -687,7 +687,19 @@ describe('gs label ladder for an isolated Gentle Shell pane (S5/S6)', () => {
     assert.ok(callsWith(sb, '---PROC---').length >= 1, 'the group was attempted first');
 
     await wait(800);
-    const noise = errLines(sb).filter((line) => /gs|process/i.test(line));
+    // Noise means the daemon's own bounded gs-ladder warnings, matched by the
+    // exact message text it writes for a failed report/process-group read. A
+    // `/gs|process/i` substring also matches the sandbox path itself (a TMPDIR
+    // may contain `gs`) and unrelated stack frames such as
+    // `process.processTicksAndRejections`, so a clean run would pass by luck.
+    const gsWarning = new RegExp(
+      'gentle-status: (?:'
+        + 'cannot (?:report|set|clear|release) the (?:reported )?gs (?:display )?label'
+        + '|pane list unavailable; gs labels unchanged'
+        + '|pane list over \\d+ panes; gs discovery stopped at the cap'
+        + ')',
+    );
+    const noise = errLines(sb).filter((line) => gsWarning.test(line));
     assert.ok(noise.length <= 1, `an unreadable group logs at most one bounded line, saw ${noise.length}`);
     assert.equal(daemonChild.exitCode, null, 'the daemon never crashes on an unreadable group');
   });
