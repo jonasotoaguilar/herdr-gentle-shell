@@ -1087,6 +1087,75 @@ test('S3/S4/S5: a stranded delegate cannot mint done at settle', async () => {
   h.fire('session_shutdown', {}, ctx());
 });
 
+// S11/T5 (odd/tasks/sidebar-terminal-state.md): the count that renders the
+// `(n)` suffix is now the union of running records and in-flight launches, so
+// two synchronous delegates are two pending-work entries. The S4/S12 terminal
+// gate must hold exactly as before: a settle beside those two launches is
+// never terminal, mints no `done`, and sends no finish envelope — while the
+// sidebar row renders the user's own `explorer (2)` (the consumer's suffix
+// comes from the same count).
+test('S11: two in-flight launches gate the terminal state and render `explorer (2)`', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  const moshiBefore = moshiFrames.length;
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(300);
+  h.fire('tool_call', {
+    toolName: 'subagent_run',
+    toolCallId: 't5-gate-1',
+    input: { agent: 'gentle-ai-explore', label: 'first explore' },
+  });
+  h.fire('tool_call', {
+    toolName: 'subagent_run',
+    toolCallId: 't5-gate-2',
+    input: { agent: 'gentle-ai-explore', label: 'second explore' },
+  });
+  await settle(250);
+
+  // The count the row consumes: two in-flight delegates, one role word. It is
+  // published on the launch beat (a settle clears the in-flight evidence on
+  // its own beat, which is the decrement S11 requires).
+  const beat = await waitFrom(
+    paneId,
+    0,
+    (f) => {
+      const tokens = f?.params?.tokens ?? {};
+      return typeof tokens.gentle_work_v1 === 'string' && tokens.gentle_work_v1.split(':')[1] === '2';
+    },
+    2000,
+  );
+  assert.ok(beat, 'the launch beat carries the in-flight count');
+  const tokens = beat.params.tokens;
+  assert.equal(tokens.gentle_roles_v1, 'explorer');
+  assert.equal(tokens.gentle_pending_v1.split(':')[1], 'explorer');
+  assert.equal(
+    contract.reducePane({
+      agent_session: { agent: 'pi', kind: 'path', value: sessionFile },
+      agent_status: 'working',
+      group: 'myproj',
+      state_labels: {},
+      tokens,
+    }).label,
+    'explorer (2)',
+    'the sidebar renders the reported `explorer (2)` row',
+  );
+
+  // S4/S12 untouched: the same two launches still gate the terminal state.
+  const from = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(500);
+  assert.equal(nativeStatesFrom(paneId, 0).at(-1), 'working', 'never a terminal native status');
+  assert.deepEqual(doneValuesFrom(paneId, from), [], 'never a done mint');
+  assert.equal(finishesFrom(moshiBefore).length, 0, 'never a finish envelope');
+  // Drop the hold's expiry beat with the session: a live timer would publish
+  // into a later test.
+  h.fire('session_shutdown', {}, ctx());
+});
+
 // The release path the hold must not break: when the stranded launch never
 // reports back, the bounded hold expires and nothing else has to happen for
 // the terminal state to land. One beat at that instant carries native `idle`,
