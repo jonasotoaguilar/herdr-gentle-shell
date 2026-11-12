@@ -962,6 +962,24 @@ export function doneHoldMs(raw = process.env[DONE_HOLD_ENV]) {
   return Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(parsed)));
 }
 
+// S12/T9c: the deadline for one settle-time pending episode. A first raise
+// starts the episode at `now`. A re-settle that adds no launch id to the
+// retained union keeps the deadline exactly, so repeated settles can never
+// extend the latch. One that adds a new in-flight launch may extend it from
+// `now` (new work means the pane is not finished), but the whole episode never
+// runs past the hold ceiling measured from its first raise. `holdMs` is clamped
+// by the same band as doneHoldMs.
+export function settleHoldUntil({ now, held, startedAt, until, added, holdMs }) {
+  const raw = Number.isFinite(holdMs) ? holdMs : DONE_HOLD_MS;
+  const hold = Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(raw)));
+  if (!held) return { startedAt: now, until: now + hold };
+  if (!added) return { startedAt, until };
+  return {
+    startedAt,
+    until: Math.min(startedAt + DONE_HOLD_MAX_MS, Math.max(until, now + hold)),
+  };
+}
+
 // Unseen-cap override, the same discipline as jobsSnapshotTtlMs: an absent or
 // unparseable value keeps the 15 min default and anything outside the band is
 // clamped, so a debugging session (or a test that cannot wait 15 minutes) can
@@ -2982,14 +3000,23 @@ export default function (pi) {
   // resolve. It gates BOTH sides — the native report (via `pendingCount`) and
   // the display (`done` mint and the `orchestrating` marker) — so a stranded
   // launch can never leave the row reading `done` beside a native `working`.
-  // Metadata/tasks untouched; the guard clears when a launch resolves, on
-  // agent_start, with the session, and — when a launch never reports back — at
-  // `nativeSettledPendingUntil`, the finish-hold deadline of the settle that
-  // raised it. Past that hold the evidence stops counting and the expiry beat
-  // below lands the terminal state, so a lost launch result can never pin the
-  // report at `working` for good (seq itself never resets).
+  // Metadata/tasks untouched; the guard clears when the union of the episode's
+  // unresolved launches is empty, on agent_start, with the session, and — when
+  // a launch never reports back — at `nativeSettledPendingUntil`, the
+  // finish-hold deadline of the settle that raised it. Past that hold the
+  // evidence stops counting and the expiry beat below lands the terminal state,
+  // so a lost launch result can never pin the report at `working` for good
+  // (seq itself never resets).
   let nativeSettledPending = false;
   let nativeSettledPendingUntil = 0;
+  // When the episode's hold was first raised. The episode ceiling is measured
+  // from here, so repeated re-settles can extend up to it but never past it.
+  let nativeSettledPendingStartedAt = 0;
+  // The exact launches the settling turn left in flight. A result retires only
+  // its own id; a later settle ADDS to this union instead of replacing it, and
+  // the hold stands until the union is empty, so one early result can never
+  // release evidence another launch still owes.
+  let nativeSettledPendingCalls = new Set();
   // One timer at that deadline, the same discipline as `armJobsExpiry`: the
   // hold has no other edge behind it, so without this beat neither the native
   // `idle` nor the `done` mint would ever land. One beat is enough — from that
@@ -3031,11 +3058,11 @@ export default function (pi) {
   }
 
   function clearSettledPending() {
-    const held = settledPendingHeld();
     nativeSettledPending = false;
     nativeSettledPendingUntil = 0;
+    nativeSettledPendingStartedAt = 0;
+    nativeSettledPendingCalls.clear();
     clearSettledPendingExpiry();
-    return held;
   }
 
   function clearSettledPendingExpiry() {
@@ -3060,6 +3087,18 @@ export default function (pi) {
   // the single condition the native report and the display both gate on.
   function settledPendingHeld() {
     return nativeSettledPending && Date.now() < nativeSettledPendingUntil;
+  }
+
+  // One launch result retires its own evidence. The hold releases — and the
+  // caller must publish on this edge — only when no launch the settle observed
+  // is still unresolved. An id outside the settling set (an earlier launch, or
+  // one started after the settle) never releases the hold.
+  function resolveSettledPending(callId) {
+    if (!settledPendingHeld()) return false;
+    if (typeof callId !== "string" || !nativeSettledPendingCalls.delete(callId)) return false;
+    if (nativeSettledPendingCalls.size > 0) return false;
+    clearSettledPending();
+    return true;
   }
 
   // The settle state `agent_settled` applies, shared with the reconcile below
@@ -4410,10 +4449,11 @@ export default function (pi) {
     // outcome is now covered by the task record (working via activeSubs),
     // the error latch (blocked), or genuine emptiness (idle on next beat).
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
-      // A result that finally arrives inside the hold releases it: publish on
-      // this edge, because the expiry beat was cancelled with the hold and no
-      // other beat is guaranteed to follow.
-      if (clearSettledPending()) schedulePublish();
+      // A launch resolution retires only its own evidence. When it is the LAST
+      // one the settling turn owed, the hold releases and this edge publishes:
+      // a single result while another launch is still unresolved must keep the
+      // native state non-terminal and announce nothing.
+      if (resolveSettledPending(event.toolCallId)) schedulePublish();
     }
     if (typeof event.toolCallId === "string" ? reviewCalls.delete(event.toolCallId) : false) {
       // The ended id was a known acknowledged execution; remaining tracked
@@ -4625,16 +4665,39 @@ export default function (pi) {
     retainContext(ctx);
     // Retain settle-time pending evidence for native gating before the
     // metadata hint clears (see nativeSettledPending above), bounded by the
-    // finish hold this settle opens.
-    const pendingAtSettle = pendingCalls.size > 0;
+    // finish hold this settle opens. A redundant or later settle of the same
+    // episode must never drop an id an earlier settle still owes: evaluate the
+    // live episode before applySettled clears it, then merge.
+    const pendingAtSettle = [...pendingCalls.keys()];
     pendingCalls.clear();
+    const carriedHeld = settledPendingHeld();
+    const carried = carriedHeld ? [...nativeSettledPendingCalls] : [];
+    const carriedUntil = carriedHeld ? nativeSettledPendingUntil : 0;
+    const carriedStart = carriedHeld ? nativeSettledPendingStartedAt : 0;
     applySettled(true);
-    if (pendingAtSettle) {
+    const union = new Set(carried);
+    let added = false;
+    for (const id of pendingAtSettle) {
+      if (union.has(id)) continue;
+      union.add(id);
+      added = true;
+    }
+    if (union.size > 0) {
+      const next = settleHoldUntil({
+        now: Date.now(),
+        held: carriedHeld,
+        startedAt: carriedStart,
+        until: carriedUntil,
+        added,
+        holdMs: doneHoldMs(),
+      });
       nativeSettledPending = true;
-      nativeSettledPendingUntil = Date.now() + doneHoldMs();
-      // Nothing else will publish when the hold expires: arm the one beat that
-      // lands native `idle` and the single `done` mint without waiting for an
-      // unrelated event.
+      nativeSettledPendingStartedAt = next.startedAt;
+      nativeSettledPendingUntil = next.until;
+      nativeSettledPendingCalls = union;
+      // Nothing else will publish when the last launch resolves or the hold
+      // expires: arm the one beat that lands native `idle` and the single
+      // `done` mint without waiting for an unrelated event.
       armSettledPendingExpiry(nativeSettledPendingUntil);
     }
     // S62 turn-end: the working tree may have changed without transcript
