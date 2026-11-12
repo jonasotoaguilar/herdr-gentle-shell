@@ -54,9 +54,14 @@ describe('sidebar state-dir resolution', () => {
     assert.deepEqual(fs.readdirSync(fixture.injected), [], 'the injected dir stays empty');
   });
 
-  test('a fresh install still converges on the injected dir (preserved)', () => {
+  test('a fresh install converges on the stored canonical dir, and on the active-id dir when only it holds a flag', () => {
     const fixture = sandbox('fresh');
-    assert.equal(sidebar.stateDir(fixture.env), fixture.injected);
+    assert.equal(sidebar.stateDir(fixture.env), fixture.stored, 'the stored canonical dir is the final fallback');
+    assert.equal(sidebar.stateDir({ XDG_STATE_HOME: fixture.xdg }), fixture.stored, 'the injected variable changes nothing');
+    const activeId = path.join(fixture.xdg, 'herdr', 'plugins', 'herdr-gentle-shell');
+    fs.mkdirSync(activeId, { recursive: true });
+    fs.writeFileSync(path.join(activeId, 'gentle-plugin-tools.json'), '{"version":1,"odd":false,"issues":false}\n');
+    assert.equal(sidebar.stateDir({ XDG_STATE_HOME: fixture.xdg }), activeId, 'a legacy active-id flag is found without the variable');
   });
 
   test('an empty injected dir never orphans a stored pre-rename flag (preserved)', () => {

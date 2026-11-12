@@ -946,10 +946,33 @@ describe('diagnostics resolver known-file family', () => {
     }
   });
 
-  it('a fresh install still converges on the injected dir', () => {
+  it('a fresh install converges on the stored canonical dir in both contexts', () => {
     const fixture = resolverSandbox('fresh');
     try {
-      assert.equal(diag.resolveStateDir(fixture.env), fixture.injected);
+      assert.equal(diag.resolveStateDir(fixture.env), fixture.stored, 'the injected variable does not pick the final dir');
+      assert.equal(diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg }), fixture.stored, 'nor does its absence');
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it('a legacy install holding its flags only in the active-id dir is found without the injected variable', () => {
+    const fixture = resolverSandbox('legacy');
+    try {
+      const activeId = path.join(fixture.xdg, 'herdr', 'plugins', 'herdr-gentle-shell');
+      fs.mkdirSync(activeId, { recursive: true });
+      fs.writeFileSync(path.join(activeId, 'gentle-sidebar-mode.json'), '{"version":1,"enabled":false}\n');
+      assert.equal(diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg }), activeId);
+      assert.equal(
+        diag.resolveStateDir({ XDG_STATE_HOME: fixture.xdg, HERDR_PLUGIN_STATE_DIR: activeId }),
+        activeId,
+        'the injected context names the same active-id dir',
+      );
+      assert.equal(
+        diag.resolveStateDir(fixture.env),
+        fixture.stored,
+        'an unrelated injected dir holding nothing never wins over the stored canonical dir',
+      );
     } finally {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
