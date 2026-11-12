@@ -46,6 +46,15 @@ tokens carrying private data are added here.
   (`GENTLE_STATUS_POLL_MS`), 2 s fast cycle while recent ask activity or
   send/publish failures are observed, N quiet frames or a TTL-bounded
   window to recover, 250 ms floor, single dynamic `setTimeout` chain.
+- `done` is held until viewed. The producer stamps the unseen cap as the
+  finish token's expiry (`GENTLE_DONE_UNSEEN_CAP_MS`, producer-side, default
+  900000 ms = 15 min, clamped [100, 3600000]); the daemon owns the earlier
+  recede, because `focused` rides the same snapshot it already reads: the
+  first frame that sees the pane focused starts one 5 s dwell
+  (`DONE_VIEW_DWELL_MS`, a consumer constant, not an override) and the row
+  then renders `idle`. A second look changes nothing, and the per-pane view
+  ledger is daemon memory only, so a daemon restart while the token is still
+  fresh can show `done` once more for one dwell; it never mints a finish.
 - Failed snapshots are "no data", never "empty": nothing is published,
   swept, or recorded on a failed read. A failed pane list is
   distinguishable from an empty list (null vs `[]`): sweeps report
