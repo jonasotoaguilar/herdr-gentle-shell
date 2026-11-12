@@ -76,9 +76,31 @@ describe('perf trace state dir compatibility', { concurrency: false }, () => {
     assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), stored);
   });
 
-  test('the injected dir wins when only it holds a file of ours (preserved)', () => {
-    const { xdg, injected } = sandbox('injected');
+  test('an injected dir whose basename is the active plugin id wins when only it holds a file of ours (preserved)', () => {
+    const { root, xdg } = sandbox('injected');
+    // Owned basename, unrelated parent: the name is what makes it ours, not the
+    // state home it sits under (S1c).
+    const injected = path.join(root, 'elsewhere', 'herdr-gentle-shell');
+    fs.mkdirSync(injected, { recursive: true });
     fs.writeFileSync(path.join(injected, 'gentle-moshi.json'), '{"enabled":true}\n');
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), injected);
+  });
+
+  // S1c: an injected path is honoured only when its basename is the active
+  // plugin id or the stored canonical segment. A third plugin id holding our
+  // files must not select the directory: the daemon receives the variable and
+  // the producer never does, so honouring it splits the state.
+  test('an unrelated populated injected dir is ignored', () => {
+    const { xdg, stored, injected } = sandbox('unowned');
+    fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '1\n');
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), stored);
+  });
+
+  test('an injected dir named for the stored segment is honoured (owner name)', () => {
+    const { root, xdg } = sandbox('segment');
+    const injected = path.join(root, 'elsewhere', 'herdr-gentle-agents');
+    fs.mkdirSync(injected, { recursive: true });
+    fs.writeFileSync(path.join(injected, 'gentle-status.pid'), '1\n');
     assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), injected);
   });
 

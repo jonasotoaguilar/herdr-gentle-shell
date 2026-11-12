@@ -750,15 +750,29 @@ const QUIET_BEAT_LIMIT = 3;
 const LOST_SETTLE_BEATS = 2;
 // Synthesized finish signal (DESIGN §4.3, S2/D2). The host never reports
 // `done`, so the producer mints the finish itself: one session-bound
-// `<hash>:<expiry>` token per finish at the settled-and-empty edge, carrying
-// the hold as its absolute expiry. The sidebar reads it as `done` while it is
-// fresh and recedes to `idle` once it expires — the delay IS that expiry, so
-// no timer and no extra idle hold exists. The hold is short on purpose (5 s):
-// it exists to make a finish visible, never to pin a settled row, so `idle`
-// follows the finish within seconds. Overridden through
-// GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min]; the consumer rejects any
-// expiry beyond the same ceiling.
+// `<hash>:<expiry>` token per finish at the settled-and-empty edge. Since T3
+// the expiry is the UNSEEN cap, not the visible dwell: the row holds `done`
+// until the human views the pane, then the consumer's own 5 s dwell and
+// `idle`, and a pane nobody looks at recedes at the cap. The producer owns the
+// mint and the cap because it stamps the token; the consumer owns the recede
+// because `focused` rides the snapshot the daemon already reads. The finish
+// signal is never refreshed, so the cap can never be extended.
 const DONE_TOKEN = "gentle_done_v1";
+// Default unseen cap: 15 minutes (S8). It bounds how long a finish can read
+// `done` without the human ever looking at it, so the marker stays an answer
+// to "which finished panes have I not reviewed yet". Overridden through
+// GENTLE_DONE_UNSEEN_CAP_MS, clamped exactly like JOBS_SNAPSHOT_TTL_MS.
+const DONE_UNSEEN_CAP_MS = 900000;
+const DONE_UNSEEN_CAP_MIN_MS = 100;
+export const DONE_UNSEEN_CAP_MAX_MS = 3600000;
+const DONE_UNSEEN_CAP_ENV = "GENTLE_DONE_UNSEEN_CAP_MS";
+// Settle-time pending hold (T9/S12), NOT the finish token's life: one finish
+// spell in which a stranded `subagent_run` keeps the native state non-terminal
+// and the `done` mint withheld, after which the terminal state lands. Its 5 s
+// default is the time the latch waits on a launch result that may never come;
+// the 5 s dwell after the human views a finish lives consumer-side
+// (`DONE_VIEW_DWELL_MS` in herdr-plugin/lib/gentle-tokens.js). Overridden
+// through GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min].
 const DONE_HOLD_MS = 5000;
 const DONE_HOLD_MIN_MS = 1000;
 export const DONE_HOLD_MAX_MS = 300000;
@@ -946,6 +960,18 @@ export function doneHoldMs(raw = process.env[DONE_HOLD_ENV]) {
   const parsed = Number(text);
   if (!Number.isFinite(parsed)) return DONE_HOLD_MS;
   return Math.min(DONE_HOLD_MAX_MS, Math.max(DONE_HOLD_MIN_MS, Math.round(parsed)));
+}
+
+// Unseen-cap override, the same discipline as jobsSnapshotTtlMs: an absent or
+// unparseable value keeps the 15 min default and anything outside the band is
+// clamped, so a debugging session (or a test that cannot wait 15 minutes) can
+// shorten the cap without ever making the finish token instantly stale.
+export function doneUnseenCapMs(raw = process.env[DONE_UNSEEN_CAP_ENV]) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (text.length === 0) return DONE_UNSEEN_CAP_MS;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return DONE_UNSEEN_CAP_MS;
+  return Math.min(DONE_UNSEEN_CAP_MAX_MS, Math.max(DONE_UNSEEN_CAP_MIN_MS, Math.round(parsed)));
 }
 
 // Beat cadence override, the same discipline as doneHoldMs: an absent or
@@ -1633,7 +1659,9 @@ export async function liveSummarizeRoots(roots) {
 // candidate here too, derived from the state home when the variable is absent,
 // so a legacy install whose live flags sit only there is still found.
 // Selection order: stored if it holds a known file, else the active-id/injected
-// dir if it holds one, else stored.
+// dir if it holds one, else stored. An injected path is honoured only when its
+// basename names a directory this package owns (S1c), so the daemon and this
+// helper can never be pointed at another plugin's state.
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1645,6 +1673,13 @@ export async function liveSummarizeRoots(roots) {
 // between consumers splits the state across both dirs.
 const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
 const SIDEBAR_ACTIVE_PLUGIN_ID = "herdr-gentle-shell";
+// S1c: an injected path is honoured only when its basename names a directory
+// this package owns — the active plugin id (what Herdr injects today) or the
+// stored canonical segment (a stale or dev checkout may still name it from
+// another parent). Any other path, e.g. a third plugin id, is IGNORED: the
+// daemon receives HERDR_PLUGIN_STATE_DIR while no producer does, so honouring
+// a directory we do not own is exactly what splits them.
+const SIDEBAR_OWNED_DIR_NAMES = [SIDEBAR_ACTIVE_PLUGIN_ID, SIDEBAR_STATE_SEGMENT];
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
   "gentle-moshi.json",
@@ -1670,10 +1705,15 @@ function sidebarStoredDir() {
 
 // The active plugin id dir: what Herdr injects as HERDR_PLUGIN_STATE_DIR for the
 // current plugin id, or — because this producer never receives that variable —
-// the same path derived from the state home.
+// the same path derived from the state home. An injected path is only honoured
+// when its basename is a name this package owns (S1c); anything else falls back
+// to the derived path, so the producer and the daemon cannot end up naming a
+// directory that belongs to another plugin.
 function sidebarActiveDir() {
   const injected = process.env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected === "string" && injected.length > 0) return injected;
+  if (typeof injected === "string" && injected.length > 0 && SIDEBAR_OWNED_DIR_NAMES.includes(pathBasename(injected))) {
+    return injected;
+  }
   return join(sidebarStatePluginsDir(), SIDEBAR_ACTIVE_PLUGIN_ID);
 }
 
@@ -2957,12 +2997,12 @@ export default function (pi) {
   // state or the real activity that still holds it. Never a poll: a launch
   // resolution, `agent_start`, and the session reset drop it.
   let settledPendingExpiryTimer;
-  // Finish-hold episode (S2): minted once at the settled-and-empty edge so the
+  // Finish episode (S2/T3): minted once at the settled-and-empty edge so the
   // row reads `done`, then republished unchanged (never refreshed) until the
-  // hold expires. `donePending` carries the unannounced finish to the beat
-  // that actually delivers the token (S3), and `sawActivity` remembers that
-  // the session did work, so a session that never ran a turn stays idle. All
-  // three clear with the session and the moment any work reappears.
+  // unseen cap expires. `donePending` carries the unannounced finish to the
+  // beat that actually delivers the token (S3), and `sawActivity` remembers
+  // that the session did work, so a session that never ran a turn stays idle.
+  // All three clear with the session and the moment any work reappears.
   let doneExpiry;
   let donePending = false;
   let sawActivity = false;
@@ -3553,18 +3593,20 @@ export default function (pi) {
     const pending = pendingRole();
     if (pending !== undefined) tokens[PENDING_TOKEN] = `${sessionHash}:${pending}:${expiry}`;
     else tokens[PENDING_TOKEN] = null;
-    // Synthesized finish signal (S2/D2): minted once at the settled-and-empty
-    // edge — principal settled with no running/queued delegate, no pending
-    // launch, no live background job, and no human-wait, review, or error leg
-    // — then republished with the SAME expiry so the hold can never be
-    // extended. Any work appearing during the hold clears it on that beat, so
-    // the row moves straight back to the role state. A session that never
-    // worked never mints one. A live background job counts as activity: the
-    // finish waits while the session still waits on it.
+    // Synthesized finish signal (S2/D2/T3): minted once at the settled-and-
+    // empty edge — principal settled with no running/queued delegate, no
+    // pending launch, no live background job, and no human-wait, review, or
+    // error leg — then republished with the SAME expiry so the unseen cap can
+    // never be extended. The consumer holds `done` until the pane is viewed
+    // (its own 5 s dwell, then idle) and lets the token expire at the cap when
+    // nobody ever looks. Any work appearing during the episode clears it on
+    // that beat, so the row moves straight back to the role state. A session
+    // that never worked never mints one. A live background job counts as
+    // activity: the finish waits while the session still waits on it.
     // A stranded settle-time launch is activity too (S12): the same held
     // condition the native report uses blocks the `done` mint here, so the
-    // display and the native status agree at the settle edge. The hold's
-    // expiry releases it through the beat armed at that deadline.
+    // display and the native status agree at the settle edge. The settle
+    // hold's expiry releases it through the beat armed at that deadline.
     const activity =
       agentActive ||
       subs.length > 0 ||
@@ -3580,7 +3622,7 @@ export default function (pi) {
       donePending = false;
     } else if (settled && turnSettled) {
       if (doneExpiry === undefined && sawActivity) {
-        doneExpiry = Date.now() + doneHoldMs();
+        doneExpiry = Date.now() + doneUnseenCapMs();
         donePending = true;
         sawActivity = false;
       }

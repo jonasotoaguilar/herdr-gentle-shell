@@ -1406,7 +1406,8 @@ test('the settle edge mints the finish token and notifies exactly once', async (
   assert.match(value, /^[A-Za-z0-9_-]{43}:\d+$/, 'the finish token is session-bound with an expiry');
   const expiry = Number(value.split(':')[1]);
   assert.ok(expiry > Date.now(), 'the finish hold is still in the future');
-  assert.ok(expiry <= Date.now() + 5000 + 1000, 'the hold defaults to 5 s');
+  assert.ok(expiry > Date.now() + 5000, 'the finish outlives the old 5 s hold');
+  assert.ok(expiry <= Date.now() + 900000 + 1000, 'the hold defaults to the 15 min unseen cap');
 
   await settle(700);
   assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification for one finish');
@@ -1425,39 +1426,167 @@ test('the settle edge mints the finish token and notifies exactly once', async (
   assert.equal(finishesFrom(moshiBefore).length, 1, 'a settled session never re-notifies');
 });
 
-test('the finish hold is overridable and its expiry clears the token', async () => {
+test('the settle-time hold is overridable and its own clock never moves', async () => {
   await listening;
-  const { module, paneId } = await loadRuntime();
+  const { module } = await loadRuntime();
+  // The settle-edge latch (T9/S12) keeps its own 5 s clock: it is what holds
+  // the terminal state for one finish after a stranded launch, and this task
+  // never changes it. The finish token's expiry is the unseen cap below.
   assert.equal(typeof module.doneHoldMs, 'function');
   assert.equal(module.doneHoldMs(undefined), 5000, 'default hold is 5 s');
   assert.equal(module.doneHoldMs('1500'), 1500, 'the hold is overridable');
   assert.equal(module.doneHoldMs('nonsense'), 5000, 'an unparseable override keeps the default');
   assert.equal(module.doneHoldMs('0'), 1000, 'clamped up to the floor');
   assert.equal(module.doneHoldMs('99999999'), module.DONE_HOLD_MAX_MS, 'clamped down to the ceiling');
+});
 
-  const h = harness();
-  module.default(h.pi);
-  const moshiBefore = moshiFrames.length;
+// T3/S8: the finish token's absolute expiry is the UNSEEN cap (15 min by
+// default), not the settle hold, because the row must stay `done` until the
+// human looks at it. The env var is clamped exactly like the jobs snapshot TTL.
+test('the unseen cap is the finish token expiry, env-overridable and clamped', async () => {
+  await listening;
+  const { module } = await loadRuntime();
+  assert.equal(typeof module.doneUnseenCapMs, 'function');
+  assert.equal(module.doneUnseenCapMs(undefined), 900000, 'default unseen cap is 15 min');
+  assert.equal(module.doneUnseenCapMs('1500'), 1500, 'the cap is overridable');
+  assert.equal(module.doneUnseenCapMs('nonsense'), 900000, 'an unparseable override keeps the default');
+  assert.equal(module.doneUnseenCapMs('0'), 100, 'clamped up to the floor');
+  assert.equal(module.doneUnseenCapMs('99999999'), module.DONE_UNSEEN_CAP_MAX_MS, 'clamped down to the ceiling');
+});
 
-  const previous = process.env.GENTLE_HERDR_DONE_HOLD_MS;
-  process.env.GENTLE_HERDR_DONE_HOLD_MS = '1500';
+test('a never-viewed finish recedes at the unseen cap, not at the old 5 s hold', async () => {
+  await listening;
+  const previousBeat = process.env.GENTLE_HERDR_BEAT_MS;
+  const previousCap = process.env.GENTLE_DONE_UNSEEN_CAP_MS;
+  process.env.GENTLE_HERDR_BEAT_MS = '300';
+  process.env.GENTLE_DONE_UNSEEN_CAP_MS = '1500';
   try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+
     const from = await startAndSettle(h, paneId);
     const minted = await waitFrom(paneId, from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
-    assert.ok(minted, 'the settle edge publishes a finish token');
+    assert.ok(minted, 'the settle edge publishes the finish token');
     const expiry = Number(minted.params.tokens[DONE_TOKEN].split(':')[1]);
-    assert.ok(expiry - Date.now() <= 1500, 'the override shortens the hold');
+    assert.ok(expiry - Date.now() <= 1500, 'the small cap is the minted expiry');
 
+    const mintedAt = cursor(paneId);
     await settle(1800);
-    const clearedFrom = cursor(paneId);
-    h.fire('agent_settled', {}, ctx({ idle: true }));
-    const cleared = await waitFrom(paneId, clearedFrom, (f) => (f?.params?.tokens ?? {})[DONE_TOKEN] === null);
-    assert.ok(cleared, 'an expired hold republishes a clear instead of a stale done');
-    assert.equal(doneValuesFrom(paneId, clearedFrom).length, 0, 'no live finish token is republished after the hold');
-    assert.equal(finishesFrom(moshiBefore).length, 1, 'an expired hold never re-notifies');
+    const after = paneFrames(paneId).slice(mintedAt);
+    assert.equal(
+      doneValuesFrom(paneId, mintedAt).every((value) => Number(value.split(':')[1]) === expiry),
+      true,
+      'every republish before the cap carries the one stamped expiry',
+    );
+    assert.ok(
+      after.some((f) => (f?.params?.tokens ?? {})[DONE_TOKEN] === null),
+      'the cap expiry republishes a clear instead of a stale done',
+    );
+    assert.equal(finishesFrom(moshiBefore).length, 1, 'the cap never re-notifies the finish');
+    h.fire('session_shutdown', {}, ctx());
   } finally {
-    if (previous === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
-    else process.env.GENTLE_HERDR_DONE_HOLD_MS = previous;
+    if (previousBeat === undefined) delete process.env.GENTLE_HERDR_BEAT_MS;
+    else process.env.GENTLE_HERDR_BEAT_MS = previousBeat;
+    if (previousCap === undefined) delete process.env.GENTLE_DONE_UNSEEN_CAP_MS;
+    else process.env.GENTLE_DONE_UNSEEN_CAP_MS = previousCap;
+  }
+});
+
+// T3/S6/S9: a real finish holds `done` far past the old 5 s hold (the expiry is
+// the unseen cap), the expiry is never refreshed, and the finish envelope is
+// emitted exactly once. A second beat must never create a second notification.
+test('a held finish stays done past the old 5 s hold with exactly one notification', async () => {
+  await listening;
+  const previousBeat = process.env.GENTLE_HERDR_BEAT_MS;
+  process.env.GENTLE_HERDR_BEAT_MS = '300';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+
+    const from = await startAndSettle(h, paneId);
+    const minted = await waitFrom(paneId, from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
+    assert.ok(minted, 'the settle edge publishes the finish token');
+    const expiry = Number(minted.params.tokens[DONE_TOKEN].split(':')[1]);
+    assert.ok(expiry - Date.now() > 60000, 'the minted expiry is the unseen cap, not the 5 s hold');
+
+    await settle(6200);
+    const values = doneValuesFrom(paneId, from);
+    assert.ok(values.length >= 2, 'the finish token is republished while the row holds done');
+    assert.ok(
+      values.every((value) => Number(value.split(':')[1]) === expiry),
+      'the expiry never moves: the hold is never refreshed',
+    );
+    assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish envelope, no second notification');
+    h.fire('session_shutdown', {}, ctx());
+  } finally {
+    if (previousBeat === undefined) delete process.env.GENTLE_HERDR_BEAT_MS;
+    else process.env.GENTLE_HERDR_BEAT_MS = previousBeat;
+  }
+});
+
+// T3/S9: a new turn reactivates the producer, so the held finish is cleared on
+// that beat instead of waiting for the cap.
+test('a reactivation clears the held done immediately', async () => {
+  await listening;
+  const previousBeat = process.env.GENTLE_HERDR_BEAT_MS;
+  process.env.GENTLE_HERDR_BEAT_MS = '300';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+
+    const from = await startAndSettle(h, paneId);
+    const minted = await waitFrom(paneId, from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
+    assert.ok(minted, 'the finish is held');
+
+    const reactFrom = cursor(paneId);
+    h.fire('agent_start', {}, ctx({ idle: false }));
+    const cleared = await waitFrom(
+      paneId,
+      reactFrom,
+      (f) => (f?.params?.tokens ?? {})[DONE_TOKEN] === null,
+    );
+    assert.ok(cleared, 'a fresh turn clears the held done at once');
+    h.fire('session_shutdown', {}, ctx());
+  } finally {
+    if (previousBeat === undefined) delete process.env.GENTLE_HERDR_BEAT_MS;
+    else process.env.GENTLE_HERDR_BEAT_MS = previousBeat;
+  }
+});
+
+// T3/S9: done state is per session. The session reset drops the held finish,
+// so the next session's first beat republishes a cleared token.
+test('resetSessionState clears the held done', async () => {
+  await listening;
+  const previousBeat = process.env.GENTLE_HERDR_BEAT_MS;
+  process.env.GENTLE_HERDR_BEAT_MS = '300';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+
+    const from = await startAndSettle(h, paneId);
+    const minted = await waitFrom(paneId, from, (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string');
+    assert.ok(minted, 'the finish is held');
+
+    h.fire('session_shutdown', {}, ctx());
+    await settle(200);
+    const resetFrom = cursor(paneId);
+    h.fire('session_start', { reason: 'startup' }, ctx());
+    const cleared = await waitFrom(
+      paneId,
+      resetFrom,
+      (f) => f?.method === 'pane.report_metadata' && (f?.params?.tokens ?? {})[DONE_TOKEN] === null,
+    );
+    assert.ok(cleared, 'the reset session never republishes the old finish');
+    h.fire('session_shutdown', {}, ctx());
+  } finally {
+    if (previousBeat === undefined) delete process.env.GENTLE_HERDR_BEAT_MS;
+    else process.env.GENTLE_HERDR_BEAT_MS = previousBeat;
   }
 });
 
@@ -1493,9 +1622,9 @@ test('a landed beat requests the daemon coalesced refresh, never a second writer
   );
 });
 
-test('the producer hold ceiling and the consumer freshness ceiling agree', async () => {
+test('the producer cap ceiling and the consumer freshness ceiling agree', async () => {
   const { module } = await loadRuntime();
-  assert.equal(module.DONE_HOLD_MAX_MS, 300000);
+  assert.equal(module.DONE_UNSEEN_CAP_MAX_MS, 3600000);
   const consumer = fs.readFileSync(path.resolve(__dirname, '../herdr-plugin/lib/gentle-tokens.js'), 'utf8');
-  assert.match(consumer, /FINISH_HOLD_MAX_MS = 300000/, 'both sides pin the same ceiling');
+  assert.match(consumer, /FINISH_HOLD_MAX_MS = 3600000/, 'both sides pin the same ceiling');
 });

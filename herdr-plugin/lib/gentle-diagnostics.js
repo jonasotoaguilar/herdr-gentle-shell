@@ -46,6 +46,12 @@ const STATE_KNOWN_FILES = [
   'gentle-worktree-mode.json',
   'gentle-plugin-tools.json',
 ];
+// S1c: the only basenames an injected state dir may have to be honoured — the
+// active plugin id Herdr injects today and the stored canonical segment. Any
+// other injected path belongs to another plugin (or a stale/dev id) and is
+// ignored, because the daemon receives the variable while a reader here usually
+// does not: honouring it is exactly what splits their state.
+const OWNED_DIR_NAMES = [ACTIVE_PLUGIN_ID, STATE_PLUGIN_ID];
 const CLI_TIMEOUT_MS = 5000;
 const MAX_FILE_BYTES = 256 * 1024;
 const HASH_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -74,7 +80,9 @@ function herdrBinary() {
 // holds a known file, else the active-id/injected dir if it holds one, else
 // stored — diagnostics must name the same directory as the daemon even when it
 // runs without the injected variable, and the stored canonical dir is the final
-// fallback so a fresh install converges there.
+// fallback so a fresh install converges there. An injected path is honoured
+// only when its basename names a directory this package owns (S1c); any other
+// path is ignored and the derived active-id dir is used instead.
 function storedStateDir(env = process.env) {
   if (env?.XDG_STATE_HOME) return path.join(env.XDG_STATE_HOME, 'herdr', 'plugins', STATE_PLUGIN_ID);
   const base =
@@ -95,12 +103,20 @@ function dirHasKnownFiles(dir) {
   return false;
 }
 
-// The active-id dir: the Herdr-injected one when this process has it, else the
-// same sibling of the stored dir derived from the state home (the segment is the
-// only difference, so the parent of the stored dir is the plugins dir).
+// The active-id dir: the Herdr-injected one when this process has it and its
+// basename is a directory this package owns, else the same sibling of the stored
+// dir derived from the state home (the segment is the only difference, so the
+// parent of the stored dir is the plugins dir). S1c: an injected path with any
+// other basename (a third plugin id, a stale or dev id) is ignored, not selected.
 function activeStateDir(env = process.env) {
   const injected = env?.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected === 'string' && injected.length > 0) return path.resolve(injected);
+  if (
+    typeof injected === 'string' &&
+    injected.length > 0 &&
+    OWNED_DIR_NAMES.includes(path.basename(injected))
+  ) {
+    return path.resolve(injected);
+  }
   return path.join(path.dirname(storedStateDir(env)), ACTIVE_PLUGIN_ID);
 }
 
