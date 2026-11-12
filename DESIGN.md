@@ -220,7 +220,13 @@ feeds `gentle_work_v1` and `gentle_roles_v1`. Liveness/marker coverage
 retains `running`/`queued`/pending (the root marker still covers a queued
 subagent or a pending launch). The count is a direct projection of the
 Gentle Shell TaskStore `running` records carried in
-`event.details.gentleAgents` — never a calculated pending-call estimate.
+`event.details.gentleAgents` — never a calculated pending-call estimate —
+narrowed on every beat to the ids the read presence snapshot lists running:
+a record the upstream store no longer lists contributes no name, no role word
+and no count, even when the local map never received its final. When no
+snapshot is usable (stale heartbeat, mismatched generation, inconsistent
+counts) the local map stands in full, never at zero — a zero fallback would
+flip the `done` gate and hide genuinely running work.
 Background launches (`subagent_run` with `mode: background`) announce their
 lifecycle over `message_end` custom results instead of `tool_result`
 details: an ACTIVE status (running|queued) there promotes the background

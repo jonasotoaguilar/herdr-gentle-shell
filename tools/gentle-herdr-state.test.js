@@ -1129,6 +1129,185 @@ test('progress observation does not strand the delegate: absence still resolves'
   }
 });
 
+// The count, role words and names are the intersection of the local task map
+// with the ids a valid presence snapshot lists running. A record the upstream
+// store does not list is not running whatever the local map still says, so a
+// stranded record (epoch bumped after its last witnessed generation, final
+// never delivered) contributes no count, no role and no name and an idle
+// session reaches idle.
+test('T1 count source: a stranded running record contributes no count, role or name', async () => {
+  const { sockPath, received, waitForFrom, close } = await startWireServer();
+  const { factory, prevEnv } = await loadWireFactory(sockPath, 'test-pane-stranded');
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-wire-home-'));
+  const presenceRoot = wirePresenceRoot(agentHome);
+  const prevProfile = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  try {
+    const h = harness();
+    factory(h.pi);
+    const sessionId = 'sess-wire-stranded';
+    const sessionFile = '/tmp/gentle-wire-stranded-session';
+    h.fire(
+      'session_start',
+      {},
+      {
+        mode: 'tui',
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => sessionFile,
+          getEntries: () => [],
+        },
+        isIdle: () => false,
+      },
+    );
+    launchRunning(h, 'run-st1', 'st1', 'gentle-ai-worker');
+    launchRunning(h, 'run-st2', 'st2', 'gentle-ai-explore');
+    const { createHash } = require('node:crypto');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    writeWireSnapshot(presenceRoot, {
+      sessionId,
+      generation: 1,
+      heartbeat: Date.now(),
+      tasks: [
+        { id: 'st1', status: 'running' },
+        { id: 'st2', status: 'running' },
+      ],
+    });
+    h.fire('agent_start', {});
+    const both = await waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'both listed runs counted',
+    );
+    assert.equal(both.gentle_roles_v1, 'worker,explorer');
+    // The live trigger: a resume reuses the id and bumps its execution epoch
+    // after the last generation that witnessed it, while the upstream store
+    // stops listing the finished run and never delivers its final.
+    h.fire('tool_call', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-st2',
+      input: { task_id: 'st2', prompt: 'keep going' },
+    });
+    h.fire('tool_result', {
+      toolName: 'subagent_continue',
+      toolCallId: 'resume-st2',
+      details: { gentleAgents: { taskId: 'st2', agent: 'gentle-ai-explore', status: 'running' } },
+    });
+    writeWireSnapshot(presenceRoot, {
+      sessionId,
+      generation: 2,
+      heartbeat: Date.now(),
+      tasks: [{ id: 'st1', status: 'running' }],
+    });
+    const before = received.length;
+    h.fire('agent_start', {});
+    const live = await waitForFrom(
+      before,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:1:`),
+      5000,
+      'only the run the snapshot lists stays counted',
+    );
+    assert.equal(live.gentle_roles_v1, 'worker', 'the stranded record contributes no role word');
+    assert.equal(live.gentle_names_v1, 'st1 work', 'the stranded record contributes no name');
+    // The stranded record finalizes locally so the last beat is a genuinely
+    // idle session: it must read idle, never a stale role or count.
+    h.fire('agent_settled', {}, { isIdle: () => true });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'st2', agent: 'gentle-ai-explore', status: 'completed' } },
+      },
+    });
+    h.fire('message_end', {
+      message: {
+        role: 'custom',
+        customType: 'gentle-agents.result',
+        details: { gentleAgents: { taskId: 'st1', agent: 'gentle-ai-worker', status: 'completed' } },
+      },
+    });
+    const idleBefore = received.length;
+    h.fire('agent_start', {});
+    const idle = await waitForFrom(
+      idleBefore,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:0:`),
+      5000,
+      'count 0 with no roles once the runs finished',
+    );
+    assert.equal(idle.gentle_roles_v1, null, 'an idle session keeps no role word');
+    assert.equal(idle.gentle_names_v1, null, 'an idle session keeps no name');
+  } finally {
+    if (prevProfile === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+    else process.env.GENTLE_PI_AGENT_HOME = prevProfile;
+    process.env.HERDR_ENV = prevEnv.HERDR_ENV;
+    process.env.HERDR_SOCKET_PATH = prevEnv.HERDR_SOCKET_PATH;
+    process.env.HERDR_PANE_ID = prevEnv.HERDR_PANE_ID;
+    await close();
+  }
+});
+
+// The snapshot is the authoritative display source only while it is evidence:
+// a stale header yields no snapshot, and the local map then stands in full.
+// Never zero — a zero fallback would flip the consumer's done gate and hide
+// real running work.
+test('T1 count source: no valid snapshot falls back to the local map, never to zero', async () => {
+  const { sockPath, received, waitForFrom, close } = await startWireServer();
+  const { factory, prevEnv } = await loadWireFactory(sockPath, 'test-pane-stale-snapshot');
+  const agentHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-wire-home-'));
+  const presenceRoot = wirePresenceRoot(agentHome);
+  const prevProfile = process.env.GENTLE_PI_AGENT_HOME;
+  process.env.GENTLE_PI_AGENT_HOME = agentHome;
+  try {
+    const h = harness();
+    factory(h.pi);
+    const sessionId = 'sess-wire-stale-snapshot';
+    const sessionFile = '/tmp/gentle-wire-stale-snapshot-session';
+    h.fire(
+      'session_start',
+      {},
+      {
+        mode: 'tui',
+        sessionManager: {
+          getSessionId: () => sessionId,
+          getSessionFile: () => sessionFile,
+          getEntries: () => [],
+        },
+        isIdle: () => false,
+      },
+    );
+    launchRunning(h, 'run-fb1', 'fb1', 'gentle-ai-worker');
+    launchRunning(h, 'run-fb2', 'fb2', 'gentle-ai-explore');
+    // A heartbeat older than the freshness bound elects nothing, so the beat
+    // has no snapshot even though the run is genuinely live.
+    writeWireSnapshot(presenceRoot, {
+      sessionId,
+      generation: 1,
+      heartbeat: Date.now() - 60000,
+      tasks: [],
+    });
+    h.fire('agent_start', {});
+    const { createHash } = require('node:crypto');
+    const paneHash = createHash('sha256').update(sessionFile, 'utf8').digest('base64url');
+    const beat = await waitForFrom(
+      0,
+      (p) => typeof p.gentle_work_v1 === 'string' && p.gentle_work_v1.startsWith(`${paneHash}:2:`),
+      5000,
+      'the local map still supplies the count without a valid snapshot',
+    );
+    assert.equal(beat.gentle_roles_v1, 'worker,explorer');
+    assert.equal(beat.gentle_names_v1, 'fb1 work,fb2 work');
+    assert.equal(received.length > 0, true);
+  } finally {
+    if (prevProfile === undefined) delete process.env.GENTLE_PI_AGENT_HOME;
+    else process.env.GENTLE_PI_AGENT_HOME = prevProfile;
+    process.env.HERDR_ENV = prevEnv.HERDR_ENV;
+    process.env.HERDR_SOCKET_PATH = prevEnv.HERDR_SOCKET_PATH;
+    process.env.HERDR_PANE_ID = prevEnv.HERDR_PANE_ID;
+    await close();
+  }
+});
+
 // --- T2 ask/review observation -------------------------------------------
 // The native questionnaire emits `gentle-pi:ask-user-question:blocked`
 // independently of the choice leg and the rpiv legacy leg (upstream
