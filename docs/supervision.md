@@ -95,9 +95,14 @@ The daemon never writes the flag.
 
 ## Environment
 
-- `GENTLE_STATUS_STATE_DIR` (else `HERDR_PLUGIN_STATE_DIR`, else the
-  default plugins state dir) — pidfile, refresh request, ledger, err
-  log, sidebar flag. All fixtures in tests; never live global state.
+- `GENTLE_STATUS_STATE_DIR` (else `HERDR_PLUGIN_STATE_DIR` only when it is
+  the directory this package derives for that name under the resolved state
+  home — canonically compared, so a symlinked or relative spelling of it
+  still qualifies — else the default plugins state dir) — pidfile, refresh
+  request, ledger, err log, sidebar flag. All fixtures in tests; never live
+  global state. An install whose Herdr state home differs from the Pi/XDG
+  state home therefore ignores Herdr's injected path and uses the derived
+  stored directory, which is what keeps a single publisher.
 - `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH` — Herdr transport (socket with
   one CLI fallback each).
 - `GENTLE_STATUS_POLL_MS` / `GENTLE_STATUS_FAST_POLL_MS` /

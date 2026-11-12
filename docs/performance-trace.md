@@ -216,7 +216,8 @@ hook for it.
 
 Both live in the plugin state directory, the same one the other Gentle flags
 use (`GENTLE_STATUS_STATE_DIR`, else the Herdr-injected
-`HERDR_PLUGIN_STATE_DIR` when it already holds our files, else
+`HERDR_PLUGIN_STATE_DIR` when it is the directory this package derives for
+that name under the resolved state home and already holds our files, else
 `$XDG_STATE_HOME/herdr/plugins/herdr-gentle-agents`, else
 `~/.local/state/herdr/plugins/herdr-gentle-agents`):
 
