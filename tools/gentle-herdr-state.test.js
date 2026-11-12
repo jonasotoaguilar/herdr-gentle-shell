@@ -2443,6 +2443,57 @@ test('T2: native owner has no opt-in flag; principal-gated states hold', async (
   assert.equal(mod.computeNativeState({ ...base, settled: false }), undefined, 'count0 alone without settle never idles');
 });
 
+// S4 of odd/tasks/sidebar-terminal-state.md narrows the `restore-done-idle.md`
+// S4 sentence for the NATIVE state only: the display already waited on a live
+// `bash_background` / `monitor` job while the native state reported `idle`, and
+// Herdr presents that `idle` as finished (check circle + notification) beside a
+// row still painted pink `gentle` (S2/S3/S5). The gate is the freshness-bounded,
+// session-owned count, so a stale or foreign snapshot reaches it as 0 and the
+// terminal state stays fail-OPEN (S4).
+test('S4: the native state is held non-terminal while a live job still runs', async () => {
+  const mod = await factoryPromise;
+  const base = {
+    agentActive: false,
+    settled: true,
+    activeCount: 0,
+    pendingCount: 0,
+    askActive: false,
+    reviewActive: false,
+    hasError: false,
+  };
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1 }),
+    'working',
+    'a settled principal with a live job never reports the terminal idle the host finishes on',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 2 }),
+    'working',
+    'any number of live jobs holds the same way',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 0 }),
+    'idle',
+    'zero live jobs (the stale/foreign snapshot case) is a true empty settle again',
+  );
+  assert.equal(mod.computeNativeState(base), 'idle', 'the absent input keeps the pre-existing default (fail open)');
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1, settled: false }),
+    'working',
+    'a live job never becomes the settle proof itself',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1, askActive: true }),
+    'blocked',
+    'a human-wait leg still wins over the live job',
+  );
+  assert.equal(
+    mod.computeNativeState({ ...base, liveJobCount: 1, activeCount: 1 }),
+    'working',
+    'a live job beside a running delegate stays non-terminal',
+  );
+});
+
 test('T2: opt-in settle with delegates stays working with seq + path binding', async () => {
   const wire = await startNativeWire();
   const { factory, prevEnv } = await loadNativeFactory(wire.sockPath, 'pane-native-working', '1');

@@ -1190,9 +1190,10 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // (ask/choice/question/questionnaire/permission — never
 // review/RDD execution, which stays working and silent); working while the
 // principal is active OR running/queued delegates exist OR pending launches
-// exist OR review execution holds; idle ONLY on authoritative principal
+// exist OR review execution holds OR a fresh session-owned background job
+// still runs; idle ONLY on authoritative principal
 // settled plus zero running+queued plus zero pending plus no human-wait
-// prompt and no review execution. The producer never sets `hasError`: native
+// prompt and no review execution and no live job. The producer never sets `hasError`: native
 // `blocked` is what fires the host's NeedsAttention toast and sound, so an
 // `error:` label stays sidebar-only and the pane reports `working` while it
 // stands. Never infer terminal from child
@@ -1205,6 +1206,14 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // host's own live truth (`ctx.isIdle()`), so a missed `agent_settled` cannot
 // leave this producer unable to reach `idle` — not when no turn was observed,
 // and not when a turn this producer saw start never delivered its settle edge.
+//
+// `liveJobCount` closes the disagreement that `restore-done-idle.md` S4 opened
+// (this document's L3/L4): the display already waited on a live
+// `bash_background` / `monitor` job while the native state reported `idle`, and
+// Herdr presents that `idle` as finished (check circle + notification) on a pane
+// whose row still read pink `gentle`. The input is the freshness-bounded,
+// session-owned count (`freshRunningJobCount`), so a stale or foreign snapshot
+// arrives here as 0 and can never block the terminal state (fail OPEN).
 export function computeNativeState({
   agentActive,
   settled,
@@ -1213,10 +1222,11 @@ export function computeNativeState({
   askActive,
   reviewActive,
   hasError,
+  liveJobCount = 0,
 }) {
   if (hasError) return "blocked";
   if (askActive) return "blocked";
-  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive) {
+  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive || liveJobCount > 0) {
     return "working";
   }
   if (settled && !agentActive && activeCount === 0 && pendingCount === 0 && !askActive && !reviewActive) {
@@ -3690,6 +3700,10 @@ export default function (pi) {
           pendingCount: pendingCalls.size + (settledPendingHeld() ? 1 : 0),
           askActive: askActiveNow(),
           reviewActive,
+          // S4/S5: the same freshness-bounded job count the display `done` mint
+          // waits on, so a live job can never leave a non-terminal row beside a
+          // terminal native status.
+          liveJobCount: freshRunningJobCount(),
         });
     if (!state) return undefined;
     if (state === "blocked") {

@@ -651,7 +651,14 @@ test('PRESERVE: an ask still reports native blocked with its label', async () =>
   );
 });
 
-test('computeNativeState takes no job input', async () => {
+// S4 (odd/tasks/sidebar-terminal-state.md) narrows `restore-done-idle.md` S4
+// for the NATIVE state only. The sentence it supersedes was written against the
+// unversioned snapshot; that document's own S6/T5 replaced it with the
+// freshness-bounded, session-owned count, and that same count now gates the
+// terminal native report the way it already gated the display `done` mint.
+// A stale or foreign snapshot arrives here as 0, so the terminal state stays
+// fail-OPEN.
+test('computeNativeState gates the terminal native report on the live job count', async () => {
   const { module } = await loadRuntime();
   const base = {
     agentActive: false,
@@ -664,9 +671,14 @@ test('computeNativeState takes no job input', async () => {
   };
   assert.equal(module.computeNativeState(base), 'idle', 'true empty settle is idle');
   assert.equal(
-    module.computeNativeState({ ...base, jobCount: 1 }),
+    module.computeNativeState({ ...base, liveJobCount: 1 }),
+    'working',
+    'a live job is pending work: the terminal report waits on it',
+  );
+  assert.equal(
+    module.computeNativeState({ ...base, liveJobCount: 0 }),
     'idle',
-    'a job count is not an input: a caller cannot keep the native state non-terminal',
+    'a stale or foreign snapshot reaches this input as zero and never blocks',
   );
   assert.equal(module.computeNativeState({ ...base, activeCount: 1 }), 'working');
 });
@@ -691,7 +703,15 @@ test('a fresh job snapshot keeps the settled row on gentle and holds the finish'
   await settle(700);
   assert.deepEqual(doneValuesFrom(paneId, from), [], 'the finish never appears while the job waits');
   assert.equal(finishesFrom(moshiBefore).length, 0, 'no finish notification while the job waits');
-  assert.ok(nativeStatesFrom(paneId, from).includes('idle'), 'the native state stays job-free');
+  assert.deepEqual(
+    nativeStatesFrom(paneId, 0).filter((state) => state === 'idle'),
+    [],
+    'the native state waits on the job too: no terminal report beside a non-terminal row',
+  );
+  assert.ok(
+    nativeStatesFrom(paneId, 0).includes('working'),
+    'the pane reports the non-terminal working state while the job waits',
+  );
 });
 
 test('no job token name is ever published, not even a clear', async () => {
@@ -850,6 +870,178 @@ test('a live job next to a finished tail holds the row, then releases it', async
   assert.equal(minted.params.tokens[ORCHESTRATING_TOKEN], null, 'and clears the gentle wait');
   await settle(400);
   assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification');
+});
+
+// --- S2/S3/S4/S5: the reported defect --------------------------------------
+// "cuando terminaba subagentes pero habia job en espera seguia en status gentle
+// pero como que mandaba a herdr status (done) el circulo salia como ticket, lo
+// cual tiraba notificacion": the display waited on the live job while the
+// native report said `idle`, which Herdr presents as finished. Both sides now
+// wait on the same freshness-bounded, session-owned count, so the terminal
+// state (and the host check circle + notification that ride it) happens only on
+// the real finish.
+test('S2/S4: a live job holds the native terminal report, then both settle once', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  const moshiBefore = moshiFrames.length;
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+  const from = await startAndSettle(h, paneId);
+  await settle(450);
+  const states = nativeStatesFrom(paneId, 0);
+  assert.ok(states.includes('working'), 'the pane reports the non-terminal working state');
+  assert.deepEqual(
+    states.filter((state) => state === 'idle'),
+    [],
+    'no terminal native report while the display still reads non-terminal',
+  );
+  for (const state of states) {
+    assert.ok(
+      ['working', 'blocked', 'idle'].includes(state),
+      `${state} must stay in working|blocked|idle (never done/finished)`,
+    );
+  }
+  assert.deepEqual(doneValuesFrom(paneId, from), [], 'and no done mint while the job runs');
+  assert.equal(finishesFrom(moshiBefore).length, 0, 'hence no finish notification');
+
+  // The job exits: the display and the native state reach the terminal edge
+  // together, exactly once.
+  const freedFrom = cursor(paneId);
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [finishedJob('job-1')]));
+  const idle = await waitFrom(
+    paneId,
+    freedFrom,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(idle, 'the real finish releases the native terminal report');
+  const minted = await waitFrom(
+    paneId,
+    freedFrom,
+    (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+  );
+  assert.ok(minted, 'and the done mint rides the same edge');
+  await settle(700);
+  assert.equal(
+    nativeStatesFrom(paneId, freedFrom).filter((state) => state === 'idle').length,
+    1,
+    'the native terminal report lands exactly once',
+  );
+  const expiries = new Set(doneValuesFrom(paneId, freedFrom).map((token) => token.split(':')[1]));
+  assert.equal(expiries.size, 1, 'one real finish, one minted hold');
+  assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification');
+});
+
+// S4 fail-OPEN: the snapshot is an edge-emitted hint, so a stale one counts as
+// zero jobs and may never keep the pane off its terminal state.
+test('S4: a stale job snapshot never holds the native terminal report', async () => {
+  await listening;
+  const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
+  process.env.GENTLE_HERDR_JOBS_TTL_MS = '2000';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+
+    const from = await startAndSettle(h, paneId);
+    await settle(250);
+    assert.deepEqual(
+      nativeStatesFrom(paneId, from).filter((state) => state === 'idle'),
+      [],
+      'a fresh snapshot holds the terminal report across the settle edge',
+    );
+
+    // No bus event ever refreshes it: past the bound it is zero jobs, and the
+    // expiry beat lands the real finish on its own.
+    const releasedFrom = cursor(paneId);
+    const idle = await waitFrom(
+      paneId,
+      releasedFrom,
+      (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+    );
+    assert.ok(idle, 'a stale snapshot settles normally');
+    const minted = await waitFrom(
+      paneId,
+      releasedFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+    );
+    assert.ok(minted, 'and mints done on the same beat');
+    await settle(400);
+    assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish notification');
+  } finally {
+    if (previousTtl === undefined) delete process.env.GENTLE_HERDR_JOBS_TTL_MS;
+    else process.env.GENTLE_HERDR_JOBS_TTL_MS = previousTtl;
+  }
+});
+
+// S4 fail-OPEN: another session's job set is zero jobs for this pane.
+test('S4: a snapshot owned by another session never holds the native terminal report', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fireBus(JOBS_EVENT, jobsSnapshot('other-session', [job('job-x')]));
+
+  const from = await startAndSettle(h, paneId);
+  const idle = await waitFrom(
+    paneId,
+    from,
+    (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+  );
+  assert.ok(idle, 'a foreign job set never holds this pane terminal state');
+});
+
+// S4/S11: a live job beside a running delegate is still one pending-work set:
+// neither leg alone may release the terminal report.
+test('S4: a live job beside a running delegate stays non-terminal', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fireBus(JOBS_EVENT, jobsSnapshot('sess-1', [job('job-1')]));
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(300);
+  h.fire('tool_call', {
+    toolName: 'subagent_run',
+    toolCallId: 'run-d1',
+    input: { agent: 'gentle-ai-worker', label: 'delegate work' },
+  });
+  h.fire('tool_result', {
+    toolName: 'subagent_run',
+    toolCallId: 'run-d1',
+    details: { gentleAgents: { taskId: 'd1', agent: 'gentle-ai-worker', status: 'running' } },
+  });
+  await settle(300);
+
+  const from = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(500);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, 0).filter((state) => state === 'idle'),
+    [],
+    'a live job plus a running delegate never reports the terminal state',
+  );
+  assert.deepEqual(doneValuesFrom(paneId, from), [], 'and never mints done');
+
+  // The delegate completes; the live job keeps holding on its own.
+  h.fire('message_end', {
+    message: {
+      role: 'custom',
+      customType: 'gentle-agents.result',
+      details: { gentleAgents: { taskId: 'd1', agent: 'gentle-ai-worker', status: 'completed' } },
+    },
+  });
+  await settle(450);
+  assert.deepEqual(
+    nativeStatesFrom(paneId, 0).filter((state) => state === 'idle'),
+    [],
+    'the live job alone still holds the terminal report',
+  );
 });
 
 test('a job whose exit snapshot never arrives still releases the finish at the TTL', async () => {
