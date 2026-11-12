@@ -1611,9 +1611,11 @@ export async function liveSummarizeRoots(roots) {
 
 // Producer state, resolved once for both flag files below. GENTLE_STATUS_STATE_DIR
 // (explicit user override) is used as-is; HERDR_PLUGIN_STATE_DIR is
-// Herdr-injected and changes with the plugin id, so when it holds none of our
-// files while the stored dir does, the stored dir wins. Fresh installs with no
-// stored files converge on the injected dir.
+// Herdr-injected and changes with the plugin id, so the stored dir wins
+// whenever it holds any of our files — one stray known file in the injected
+// dir may never outrank it, because the daemon writes its pidfile into the dir
+// it resolves and that made the split self-perpetuating. The injected dir is
+// used only when neither holds a known file (fresh install).
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1656,6 +1658,13 @@ function sidebarEffectiveDir() {
   if (typeof injected !== "string" || injected.length === 0) return stored;
   if (injected === stored) return injected;
   try {
+    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+      try {
+        if (fs.existsSync(join(stored, name))) return stored;
+      } catch {
+        // A single unreadable entry never decides; keep scanning.
+      }
+    }
     let injectedHas = false;
     for (const name of SIDEBAR_STATE_KNOWN_FILES) {
       try {
@@ -1668,13 +1677,6 @@ function sidebarEffectiveDir() {
       }
     }
     if (injectedHas) return injected;
-    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
-      try {
-        if (fs.existsSync(join(stored, name))) return stored;
-      } catch {
-        // A single unreadable entry never decides; keep scanning.
-      }
-    }
   } catch {
     // Fall through to the injected dir on unexpected failure.
   }
@@ -3202,6 +3204,8 @@ export default function (pi) {
   // T2b display projection: only `running` counts as executing.
   // Queued/waiting never count and never supply a role; the total here is
   // the consumer's `(n)` suffix source (suffix only when > 1).
+  // This map is the producer's own evidence, so it is authoritative only
+  // when no presence snapshot can be read: displaySubs() below narrows it.
   function runningSubs() {
     const out = [];
     for (const [id, task] of tasks) {
@@ -3217,6 +3221,29 @@ export default function (pi) {
     }
     out.sort((a, b) => a.firstSeen - b.firstSeen);
     return out;
+  }
+
+  // Authoritative display projection for the produced count, role words and
+  // names: the ids a VALID presence snapshot lists running. A local record
+  // the upstream store does not list is not running whatever this map still
+  // says, so a record stranded by an epoch bump after its last witnessed
+  // generation contributes no name, no role and no count, and an idle session
+  // reaches `idle` instead of a stale role word. Fallback (never zero): with
+  // no usable snapshot the local map is the only evidence and stands in full
+  // — zero would flip the consumer's `done` gate and hide real running work.
+  // Pending launch hints are deliberately not narrowed: they exist only while
+  // their own tool call is in flight, and their purpose is a record the store
+  // does not carry yet.
+  function displaySubs(snapshot) {
+    const local = runningSubs();
+    if (!isRecord(snapshot) || !Array.isArray(snapshot.tasks)) return local;
+    const listed = new Set();
+    for (const entry of snapshot.tasks) {
+      if (isRecord(entry) && typeof entry.id === "string" && entry.status === "running") {
+        listed.add(entry.id);
+      }
+    }
+    return local.filter((sub) => listed.has(sub.id));
   }
 
   // Role-only hint from in-flight `subagent_run`/`subagent_continue` tool
@@ -3252,8 +3279,8 @@ export default function (pi) {
   // Merged role sources, oldest-first by first-seen: authoritative running
   // TaskStore subs plus pending role hints. Authoritative entries win on
   // duplicates via rolesCsv dedup (first wins = oldest wins).
-  function mergedRoleSubs() {
-    const merged = [...runningSubs(), ...pendingRoleSubs()];
+  function mergedRoleSubs(subs) {
+    const merged = [...subs, ...pendingRoleSubs()];
     merged.sort((a, b) => (a.firstSeen ?? a.at) - (b.firstSeen ?? b.at));
     return merged;
   }
@@ -3358,13 +3385,14 @@ export default function (pi) {
     return parts.join(",");
   }
 
-  function buildTokens() {
+  function buildTokens(snapshot) {
     if (!sessionHash) return {};
     const expiry = Date.now() + TTL_MS;
     // Liveness/marker coverage stays running|queued (T1); the visible
-    // count + roles are running-only (T2b executing set).
+    // count + roles are running-only (T2b executing set) and narrowed to the
+    // ids the presence snapshot lists running (displaySubs).
     const subs = activeSubs();
-    const running = runningSubs();
+    const running = displaySubs(snapshot);
     const tokens = {};
     const count = String(running.length);
     if (COUNT_RE.test(count)) tokens.gentle_work_v1 = `${sessionHash}:${count}:${expiry}`;
@@ -3383,7 +3411,7 @@ export default function (pi) {
     // and is cleared with the pending call. Null (clear) when no active
     // recognized roles in either source — unrecognized agents degrade to
     // the consumer's `working` display.
-    const roles = rolesCsv(mergedRoleSubs());
+    const roles = rolesCsv(mergedRoleSubs(running));
     if (roles.length > 0) tokens.gentle_roles_v1 = roles;
     else tokens.gentle_roles_v1 = null;
     // Clear the retired disclosure token left by older producers.
@@ -3862,9 +3890,10 @@ export default function (pi) {
     // Host truth first: a settle this producer missed must be visible to both
     // the native report and the tokens built below.
     reconcileSettled();
-    reconcilePresence();
+    const snapshot = readPresence();
+    reconcilePresence(snapshot);
     queueNative();
-    const tokens = buildTokens();
+    const tokens = buildTokens(snapshot);
     if (Object.keys(tokens).length === 0) {
       maybeStopBeat();
       return;
@@ -3907,6 +3936,17 @@ export default function (pi) {
     debug("beat", `tokens=${Object.keys(tokens).length} subs=${activeSubs().length}`);
   }
 
+  // One snapshot read per beat, shared by reconciliation and the display
+  // projection, so both legs decide on the same generation.
+  function readPresence() {
+    if (!sessionId) return undefined;
+    try {
+      return readPresenceSnapshot(sessionId, Date.now());
+    } catch {
+      return undefined;
+    }
+  }
+
   // T1 passive presence reconciliation: resolve explicit terminal task
   // statuses (and witnessed absence in a newer complete snapshot) from the
   // Gentle Shell presence files before building tokens, so delegate
@@ -3914,14 +3954,7 @@ export default function (pi) {
   // no timers, no writes, no imported upstream dependencies; any unreadable
   // or inapplicable snapshot leaves tasks untouched. Count, TTL, and
   // transport semantics below are unchanged.
-  function reconcilePresence() {
-    if (!sessionId) return;
-    let snapshot;
-    try {
-      snapshot = readPresenceSnapshot(sessionId, Date.now());
-    } catch {
-      return;
-    }
+  function reconcilePresence(snapshot) {
     if (!snapshot) return;
     let applied = [];
     try {

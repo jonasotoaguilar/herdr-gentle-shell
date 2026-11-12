@@ -7,9 +7,10 @@
 // flags, or an upgrade silently moves (and abandons) the existing log. These
 // assertions are the compatibility contract for that resolution, observed only
 // through `tracePath(env)`: the explicit override, the stored-default quirk for
-// an empty or non-string override, the Herdr-injected dir when it already holds
-// a file of ours, the stored dir when only it holds one, and the never-writes
-// promise of a pure path resolution.
+// an empty or non-string override, the stored dir whenever it holds a file of
+// ours (even when a stray known file sits in the Herdr-injected dir), the
+// injected dir only when neither holds one, and the never-writes promise of a
+// pure path resolution.
 
 const { describe, test, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -64,10 +65,16 @@ describe('perf trace state dir compatibility', { concurrency: false }, () => {
     assert.equal(dirOf({ XDG_STATE_HOME: xdg }), path.join(xdg, 'herdr', 'plugins', 'herdr-gentle-agents'));
   });
 
-  test('the injected dir wins only when it already holds a file of ours', () => {
-    const { xdg, stored, injected } = sandbox('injected');
-    fs.writeFileSync(path.join(injected, 'gentle-moshi.json'), '{"enabled":true}\n');
+  test('a stray injected file never outranks the stored family', () => {
+    const { xdg, stored, injected } = sandbox('trapped');
+    fs.writeFileSync(path.join(injected, 'gentle-interruptions.json'), '{"version":1,"panes":{}}\n');
     fs.writeFileSync(path.join(stored, 'gentle-status.pid'), '1\n');
+    assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), stored);
+  });
+
+  test('the injected dir wins when only it holds a file of ours (preserved)', () => {
+    const { xdg, injected } = sandbox('injected');
+    fs.writeFileSync(path.join(injected, 'gentle-moshi.json'), '{"enabled":true}\n');
     assert.equal(dirOf({ XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: injected }), injected);
   });
 

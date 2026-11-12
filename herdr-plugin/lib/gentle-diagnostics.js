@@ -66,9 +66,10 @@ function herdrBinary() {
 // Existing state-directory precedence (mirrors bin/gentle-status.js) but
 // WITHOUT mkdir: readers fail closed to "absent" instead of creating.
 // S15 rename compat: GENTLE_STATUS_STATE_DIR (explicit user override) is
-// used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected and changes with
-// the plugin id, so an empty injected dir never orphans the stored
-// pre-rename flags (see STATE_KNOWN_FILES above).
+// used as-is; HERDR_PLUGIN_STATE_DIR is Herdr-injected and changes with the
+// plugin id, so one stray known file there may never orphan the stored
+// pre-rename flags (see STATE_KNOWN_FILES above). The injected dir is used only
+// when neither dir holds a known file (fresh install).
 function storedStateDir(env = process.env) {
   if (env?.XDG_STATE_HOME) return path.join(env.XDG_STATE_HOME, 'herdr', 'plugins', STATE_PLUGIN_ID);
   const base =
@@ -102,8 +103,8 @@ function resolveStateDir(env = process.env) {
   const resolvedInjected = path.resolve(injected);
   if (resolvedInjected === stored) return resolvedInjected;
   try {
-    if (dirHasKnownFiles(resolvedInjected)) return resolvedInjected;
     if (dirHasKnownFiles(stored)) return stored;
+    if (dirHasKnownFiles(resolvedInjected)) return resolvedInjected;
   } catch {
     // Fall through to the injected dir on unexpected failure.
   }

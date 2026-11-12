@@ -24,6 +24,9 @@ const { pathToFileURL } = require('node:url');
 
 const SIDEBAR = require('../lib/gentle-sidebar.js');
 const DIAGNOSTICS = require('../herdr-plugin/lib/gentle-diagnostics.js');
+// The daemon's `stateRoot` is not exported; `readSidebarMode()` reads the mode
+// file through it, so it is the daemon's state-dir observable.
+const STATUS = require('../herdr-plugin/bin/gentle-status.js');
 
 const STORED_SEGMENT = path.join('herdr', 'plugins', 'herdr-gentle-agents');
 
@@ -215,6 +218,53 @@ describe('state-dir known-file family', () => {
     assert.equal(SIDEBAR.modePath(fixture.env), path.join(fixture.stored, 'gentle-sidebar-mode.json'));
     assert.ok(!fs.existsSync(path.join(fixture.injected, 'gentle-sidebar-mode.json')), 'nothing lands in the injected dir');
     assert.equal(SIDEBAR.stateDir(fixture.env), fixture.stored, 'resolution stays on the stored dir after the write');
+  });
+
+  // The reported split (L2): one stray family file in the injected dir made
+  // every resolver keep choosing it, so the daemon's pidfile landed there and
+  // the choice became self-perpetuating. A stray injected file may never
+  // outrank the stored family — not for the readers, and not for the daemon
+  // that wrote the stray file.
+  test('a stray known file in the injected dir never outranks the stored family', () => {
+    const fixture = sandbox('trapped');
+    touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
+    touch(fixture.injected, 'gentle-interruptions.json', '{"version":1,"panes":{}}\n');
+    for (const [label, resolve] of resolvers) {
+      assert.equal(resolve(fixture.env), fixture.stored, `${label} ignores the stray injected file`);
+    }
+    try {
+      applyEnv(fixture.env);
+      assert.deepEqual(
+        STATUS.readSidebarMode(),
+        { enabled: false, malformed: false, raw: null },
+        'the daemon resolves the stored dir instead of the dir holding the stray file',
+      );
+    } finally {
+      applyEnv({});
+    }
+  });
+
+  test('the producer extension prefers the stored dir over a stray injected file', async () => {
+    const fixture = sandbox('ext-trapped');
+    touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
+    touch(fixture.injected, 'gentle-interruptions.json', '{"version":1,"panes":{}}\n');
+    assert.equal(await extensionReportCount(fixture, 1200), 0, 'the stored disabled mode gates the producer');
+  });
+
+  test('an explicit-but-empty override keeps the stored default on every resolver (preserved)', () => {
+    const fixture = sandbox('explicit-empty');
+    touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
+    touch(fixture.injected, 'gentle-status.pid', '123\n');
+    const env = { ...fixture.env, GENTLE_STATUS_STATE_DIR: '' };
+    for (const [label, resolve] of resolvers) {
+      assert.equal(resolve(env), fixture.stored, `${label} ignores every override for an empty explicit value`);
+    }
+    try {
+      applyEnv(env);
+      assert.equal(STATUS.readSidebarMode().enabled, false, 'the daemon uses the stored default too');
+    } finally {
+      applyEnv({});
+    }
   });
 
   test('a fresh install converges on the injected dir on every resolver (preserved)', () => {
