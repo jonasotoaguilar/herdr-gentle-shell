@@ -1190,9 +1190,10 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // (ask/choice/question/questionnaire/permission — never
 // review/RDD execution, which stays working and silent); working while the
 // principal is active OR running/queued delegates exist OR pending launches
-// exist OR review execution holds; idle ONLY on authoritative principal
+// exist OR review execution holds OR a fresh session-owned background job
+// still runs; idle ONLY on authoritative principal
 // settled plus zero running+queued plus zero pending plus no human-wait
-// prompt and no review execution. The producer never sets `hasError`: native
+// prompt and no review execution and no live job. The producer never sets `hasError`: native
 // `blocked` is what fires the host's NeedsAttention toast and sound, so an
 // `error:` label stays sidebar-only and the pane reports `working` while it
 // stands. Never infer terminal from child
@@ -1205,6 +1206,14 @@ const NATIVE_MAX_ATTEMPTS = 2;
 // host's own live truth (`ctx.isIdle()`), so a missed `agent_settled` cannot
 // leave this producer unable to reach `idle` — not when no turn was observed,
 // and not when a turn this producer saw start never delivered its settle edge.
+//
+// `liveJobCount` closes the disagreement that `restore-done-idle.md` S4 opened
+// (this document's L3/L4): the display already waited on a live
+// `bash_background` / `monitor` job while the native state reported `idle`, and
+// Herdr presents that `idle` as finished (check circle + notification) on a pane
+// whose row still read pink `gentle`. The input is the freshness-bounded,
+// session-owned count (`freshRunningJobCount`), so a stale or foreign snapshot
+// arrives here as 0 and can never block the terminal state (fail OPEN).
 export function computeNativeState({
   agentActive,
   settled,
@@ -1213,10 +1222,11 @@ export function computeNativeState({
   askActive,
   reviewActive,
   hasError,
+  liveJobCount = 0,
 }) {
   if (hasError) return "blocked";
   if (askActive) return "blocked";
-  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive) {
+  if (agentActive || activeCount > 0 || pendingCount > 0 || reviewActive || liveJobCount > 0) {
     return "working";
   }
   if (settled && !agentActive && activeCount === 0 && pendingCount === 0 && !askActive && !reviewActive) {
@@ -2926,17 +2936,27 @@ export default function (pi) {
   // beat arriving mid-send is describing.
   let nativeSending = null;
   let nativeLastOk = undefined;
-  // T2 native-only terminal guard: agent_settled clears the metadata
-  // pending-launch hint below, but a settle that observes in-flight launches
-  // retains pending evidence here so native idle gating stays working until
-  // those launches resolve. Metadata/tasks untouched; the guard clears when a
-  // launch resolves, on agent_start, with the session, and — when a launch
-  // never reports back — at `nativeSettledPendingUntil`, the finish-hold
-  // deadline of the settle that raised it. Past that hold the evidence stops
-  // counting, so a lost launch result can never pin the native report at
-  // `working` for good (seq itself never resets).
+  // T2/S12 terminal guard: agent_settled clears the metadata pending-launch
+  // hint below, but a settle that observes in-flight launches retains pending
+  // evidence here so the terminal state stays held until those launches
+  // resolve. It gates BOTH sides — the native report (via `pendingCount`) and
+  // the display (`done` mint and the `orchestrating` marker) — so a stranded
+  // launch can never leave the row reading `done` beside a native `working`.
+  // Metadata/tasks untouched; the guard clears when a launch resolves, on
+  // agent_start, with the session, and — when a launch never reports back — at
+  // `nativeSettledPendingUntil`, the finish-hold deadline of the settle that
+  // raised it. Past that hold the evidence stops counting and the expiry beat
+  // below lands the terminal state, so a lost launch result can never pin the
+  // report at `working` for good (seq itself never resets).
   let nativeSettledPending = false;
   let nativeSettledPendingUntil = 0;
+  // One timer at that deadline, the same discipline as `armJobsExpiry`: the
+  // hold has no other edge behind it, so without this beat neither the native
+  // `idle` nor the `done` mint would ever land. One beat is enough — from that
+  // instant the evidence is zero, so the beat either reports the terminal
+  // state or the real activity that still holds it. Never a poll: a launch
+  // resolution, `agent_start`, and the session reset drop it.
+  let settledPendingExpiryTimer;
   // Finish-hold episode (S2): minted once at the settled-and-empty edge so the
   // row reads `done`, then republished unchanged (never refreshed) until the
   // hold expires. `donePending` carries the unannounced finish to the beat
@@ -2971,12 +2991,33 @@ export default function (pi) {
   }
 
   function clearSettledPending() {
+    const held = settledPendingHeld();
     nativeSettledPending = false;
     nativeSettledPendingUntil = 0;
+    clearSettledPendingExpiry();
+    return held;
+  }
+
+  function clearSettledPendingExpiry() {
+    if (settledPendingExpiryTimer === undefined) return;
+    clearTimeout(settledPendingExpiryTimer);
+    settledPendingExpiryTimer = undefined;
+  }
+
+  function armSettledPendingExpiry(at) {
+    clearSettledPendingExpiry();
+    const delay = Math.max(0, at - Date.now());
+    settledPendingExpiryTimer = setTimeout(() => {
+      settledPendingExpiryTimer = undefined;
+      if (!rootSession) return;
+      schedulePublish();
+    }, delay);
+    if (settledPendingExpiryTimer.unref) settledPendingExpiryTimer.unref();
   }
 
   // Past the finish hold of the settle that raised it, the retained pending
-  // evidence stops counting: the hold is the span it exists to cover.
+  // evidence stops counting: the hold is the span it exists to cover. This is
+  // the single condition the native report and the display both gate on.
   function settledPendingHeld() {
     return nativeSettledPending && Date.now() < nativeSettledPendingUntil;
   }
@@ -3477,8 +3518,17 @@ export default function (pi) {
     // fresh marker to the
     // `orchestrating` display only when no recognized role is active (below
     // attention, terminal `done`, and recognized roles; ahead of main
-    // `working`).
-    if (rootSession && (agentActive || subs.length > 0 || pendingCalls.size > 0 || freshRunningJobCount() > 0)) {
+    // `working`). It answers the same held condition as the native report
+    // (S12): while the settle-time pending evidence stands, the row must read
+    // the pink generic wait, never `done` beside a native `working`.
+    if (
+      rootSession &&
+      (agentActive ||
+        subs.length > 0 ||
+        pendingCalls.size > 0 ||
+        freshRunningJobCount() > 0 ||
+        settledPendingHeld())
+    ) {
       tokens.gentle_orchestrating_v1 = `${sessionHash}:${expiry}`;
     } else {
       tokens.gentle_orchestrating_v1 = null;
@@ -3511,11 +3561,16 @@ export default function (pi) {
     // the row moves straight back to the role state. A session that never
     // worked never mints one. A live background job counts as activity: the
     // finish waits while the session still waits on it.
+    // A stranded settle-time launch is activity too (S12): the same held
+    // condition the native report uses blocks the `done` mint here, so the
+    // display and the native status agree at the settle edge. The hold's
+    // expiry releases it through the beat armed at that deadline.
     const activity =
       agentActive ||
       subs.length > 0 ||
       pendingCalls.size > 0 ||
       freshRunningJobCount() > 0 ||
+      settledPendingHeld() ||
       askActiveNow() ||
       reviewActive ||
       !!errorCode;
@@ -3690,6 +3745,10 @@ export default function (pi) {
           pendingCount: pendingCalls.size + (settledPendingHeld() ? 1 : 0),
           askActive: askActiveNow(),
           reviewActive,
+          // S4/S5: the same freshness-bounded job count the display `done` mint
+          // waits on, so a live job can never leave a non-terminal row beside a
+          // terminal native status.
+          liveJobCount: freshRunningJobCount(),
         });
     if (!state) return undefined;
     if (state === "blocked") {
@@ -4309,7 +4368,10 @@ export default function (pi) {
     // outcome is now covered by the task record (working via activeSubs),
     // the error latch (blocked), or genuine emptiness (idle on next beat).
     if (event.toolName === "subagent_run" || event.toolName === "subagent_continue") {
-      clearSettledPending();
+      // A result that finally arrives inside the hold releases it: publish on
+      // this edge, because the expiry beat was cancelled with the hold and no
+      // other beat is guaranteed to follow.
+      if (clearSettledPending()) schedulePublish();
     }
     if (typeof event.toolCallId === "string" ? reviewCalls.delete(event.toolCallId) : false) {
       // The ended id was a known acknowledged execution; remaining tracked
@@ -4528,6 +4590,10 @@ export default function (pi) {
     if (pendingAtSettle) {
       nativeSettledPending = true;
       nativeSettledPendingUntil = Date.now() + doneHoldMs();
+      // Nothing else will publish when the hold expires: arm the one beat that
+      // lands native `idle` and the single `done` mint without waiting for an
+      // unrelated event.
+      armSettledPendingExpiry(nativeSettledPendingUntil);
     }
     // S62 turn-end: the working tree may have changed without transcript
     // evidence (external/untracked edits), so re-scan before publishing.
