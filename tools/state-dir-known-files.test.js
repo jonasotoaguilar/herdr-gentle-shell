@@ -31,11 +31,30 @@ const { pathToFileURL } = require('node:url');
 
 const SIDEBAR = require('../lib/gentle-sidebar.js');
 const DIAGNOSTICS = require('../herdr-plugin/lib/gentle-diagnostics.js');
+const TRACE = require('../lib/perf-trace.js');
 // The daemon's `stateRoot` is not exported; `readSidebarMode()` reads the mode
 // file through it, so it is the daemon's state-dir observable.
 const STATUS = require('../herdr-plugin/bin/gentle-status.js');
 
 const STORED_SEGMENT = path.join('herdr', 'plugins', 'herdr-gentle-agents');
+
+// The five resolvers that must agree on the state dir (S1) and the array name
+// each one declares the family under. The names are read from source below, so
+// drift between them fails a test instead of a manual review.
+const RESOLVER_SOURCES = [
+  'extensions/gentle-herdr-state.ts',
+  'lib/perf-trace.js',
+  'lib/gentle-sidebar.js',
+  'herdr-plugin/bin/gentle-status.js',
+  'herdr-plugin/lib/gentle-diagnostics.js',
+];
+
+function knownFileFamilyOf(relativePath) {
+  const source = fs.readFileSync(path.resolve(__dirname, '..', relativePath), 'utf8');
+  const match = /STATE_KNOWN_FILES\s*=\s*\[([\s\S]*?)\]/.exec(source);
+  assert.ok(match, `${relativePath} declares a STATE_KNOWN_FILES family`);
+  return [...match[1].matchAll(/'([^']+)'|"([^"]+)"/g)].map((entry) => entry[1] ?? entry[2]);
+}
 
 // Every file the family must contain. The two retired flag names stay in it
 // because an upgraded install still carries them, and a family that differs
@@ -245,6 +264,22 @@ after(() => {
 });
 
 describe('state-dir known-file family', () => {
+  // S1: the five resolvers keep byte-identical known-file families, in the same
+  // order. A family that differs between consumers splits the state across both
+  // dirs, and a flag stored disabled then reads as missing (missing means
+  // enabled), so equality is the contract — not "each list is plausible".
+  test('every resolver declares the identical eight-file family in the same order', () => {
+    const families = RESOLVER_SOURCES.map((relativePath) => [relativePath, knownFileFamilyOf(relativePath)]);
+    for (const [relativePath, family] of families) {
+      assert.deepEqual(family, KNOWN_FILES, `${relativePath} declares the eight known files in the pinned order`);
+      assert.equal(new Set(family).size, family.length, `${relativePath} declares no duplicate`);
+    }
+    const [referencePath, reference] = families[0];
+    for (const [relativePath, family] of families.slice(1)) {
+      assert.deepEqual(family, reference, `${relativePath} matches ${referencePath} entry for entry`);
+    }
+  });
+
   // The three resolvers whose verdict is directly observable.
   const resolvers = [
     ['sidebar', (env) => SIDEBAR.stateDir(env)],
@@ -529,6 +564,104 @@ describe('state-dir known-file family', () => {
     } finally {
       applyEnv({});
     }
+  });
+
+  // S1c path edges: every consumer must degrade the same way when the state home
+  // is relative, symlinked, or unusable. The three readers are pure path
+  // resolutions; the daemon CREATES the dir it resolves and the producer's only
+  // observable verdict is the refresh flag it writes into that dir, so all five
+  // are asserted against one expected directory.
+  function readerDirs(env) {
+    return {
+      sidebar: SIDEBAR.stateDir(env),
+      diagnostics: DIAGNOSTICS.resolveStateDir(env),
+      trace: path.dirname(TRACE.tracePath(env)),
+    };
+  }
+
+  function assertReadersAgree(env, expected, why) {
+    for (const [label, dir] of Object.entries(readerDirs(env))) {
+      assert.equal(dir, expected, `${label} ${why}`);
+    }
+  }
+
+  test('a relative XDG_STATE_HOME resolves the same relative stored dir on every consumer', async () => {
+    const cwd = track(fs.mkdtempSync(path.join(os.tmpdir(), 'state-known-relative-')));
+    const env = { XDG_STATE_HOME: 'rel-state' };
+    const expected = path.join('rel-state', STORED_SEGMENT);
+    assertReadersAgree(env, expected, 'resolves the relative stored dir');
+    const previous = process.cwd();
+    try {
+      process.chdir(cwd);
+      assert.deepEqual(daemonResolvedDir(env, [expected]), [expected], 'the daemon creates the same relative dir');
+      const resolved = await extensionResolvedDir(env, [expected], 4000);
+      assert.ok(resolved.reports > 0, 'the producer still publishes its beat');
+      assert.deepEqual(resolved.dirs, [expected], 'the producer writes its refresh in the same relative dir');
+    } finally {
+      process.chdir(previous);
+    }
+  });
+
+  test('a symlinked state home resolves through the link on every consumer', async () => {
+    const root = track(fs.mkdtempSync(path.join(os.tmpdir(), 'state-known-symlink-')));
+    const real = path.join(root, 'state-real');
+    fs.mkdirSync(real, { recursive: true });
+    const link = path.join(root, 'state-link');
+    fs.symlinkSync(real, link, 'dir');
+    const env = { XDG_STATE_HOME: link };
+    const stored = path.join(link, STORED_SEGMENT);
+    assertReadersAgree(env, stored, 'resolves through the symlinked state home');
+    assert.deepEqual(daemonResolvedDir(env, [stored]), [stored], 'the daemon creates the dir through the link');
+    const resolved = await extensionResolvedDir(env, [stored], 4000);
+    assert.ok(resolved.reports > 0, 'the producer still publishes its beat');
+    assert.deepEqual(resolved.dirs, [stored], 'the producer writes its refresh through the link');
+    assert.ok(
+      fs.existsSync(path.join(real, STORED_SEGMENT, REFRESH_FILE)),
+      'one real directory behind the link, not a second copy beside it',
+    );
+  });
+
+  test('a state home that is a regular file degrades without throwing on every consumer', async () => {
+    const root = track(fs.mkdtempSync(path.join(os.tmpdir(), 'state-known-fileval-')));
+    const stateHome = path.join(root, 'state-home');
+    fs.writeFileSync(stateHome, 'not a directory\n');
+    const env = { XDG_STATE_HOME: stateHome };
+    const expected = path.join(stateHome, STORED_SEGMENT);
+    assertReadersAgree(env, expected, 'still names the stored dir under the unusable state home');
+    assert.deepEqual(daemonResolvedDir(env, [expected]), [], 'the daemon creates nothing and never throws');
+    try {
+      applyEnv(env);
+      assert.deepEqual(
+        STATUS.readSidebarMode(),
+        { enabled: true, malformed: false, raw: null },
+        'the daemon degrades to the missing-mode default',
+      );
+    } finally {
+      applyEnv({});
+    }
+    const reports = await extensionRun(env, 3000);
+    // An unreadable mode flag fails CLOSED in the producer (a malformed flag
+    // never publishes), while the daemon defaults to enabled; both degrade
+    // without throwing and neither creates anything. The dir-resolution
+    // verdict above is what S1c pins — the policy difference is the existing
+    // malformed-flag rule, not a second directory.
+    assert.equal(reports, 0, 'the producer fails closed on the unreadable mode flag instead of throwing');
+    assert.deepEqual(fs.readdirSync(root), ['state-home'], 'no consumer created anything under the file');
+  });
+
+  test('an absent foreign injected dir changes nothing on every consumer', async () => {
+    const root = track(fs.mkdtempSync(path.join(os.tmpdir(), 'state-known-foreign-absent-')));
+    const xdg = path.join(root, 'xdg');
+    const stored = path.join(xdg, STORED_SEGMENT);
+    fs.mkdirSync(stored, { recursive: true });
+    const foreign = path.join(root, 'plugins', 'third-plugin');
+    const env = { XDG_STATE_HOME: xdg, HERDR_PLUGIN_STATE_DIR: foreign };
+    assertReadersAgree(env, stored, 'ignores the absent unrelated injected dir');
+    assert.deepEqual(daemonResolvedDir(env, [stored]), [stored], 'the daemon resolves the stored dir');
+    const resolved = await extensionResolvedDir(env, [stored], 4000);
+    assert.ok(resolved.reports > 0, 'the producer still publishes its beat');
+    assert.deepEqual(resolved.dirs, [stored], 'the producer writes its refresh in the stored dir');
+    assert.equal(fs.existsSync(foreign), false, 'nothing creates a dir this package does not own');
   });
 
   test('the explicit override wins over stored and injected dirs (preserved)', () => {
