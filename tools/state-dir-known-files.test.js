@@ -72,8 +72,23 @@ const KNOWN_FILES = [
 
 const roots = [];
 after(() => {
-  for (const dir of roots) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of roots) removePath(dir);
 });
+
+// Cleanup must never throw on a path the test only pretended to use. A
+// candidate below an unusable state home (a regular file) has a non-directory
+// ancestor, so its removal fails with ENOTDIR — `force` suppresses ENOENT only,
+// and Node 22's recursive implementation surfaces ENOTDIR (Node 26 tolerates
+// it). Nothing can exist below a regular file, so an unreachable target is
+// already clean; everything the harness actually created is still removed.
+function removePath(target) {
+  try {
+    fs.rmSync(target, { recursive: true, force: true });
+  } catch (error) {
+    if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return;
+    throw error;
+  }
+}
 
 function track(dir) {
   roots.push(dir);
@@ -221,7 +236,7 @@ async function extensionRun(env, waitMs) {
 // Run one beat in the given env from a clean slate, and report both the number
 // of landed reports and which candidate dirs received the refresh flag.
 async function extensionResolvedDir(env, candidates, waitMs) {
-  for (const dir of candidates) fs.rmSync(path.join(dir, REFRESH_FILE), { force: true });
+  for (const dir of candidates) removePath(path.join(dir, REFRESH_FILE));
   const reports = await extensionRun(env, waitMs);
   return { reports, dirs: candidates.filter((dir) => fs.existsSync(path.join(dir, REFRESH_FILE))) };
 }
@@ -229,7 +244,7 @@ async function extensionResolvedDir(env, candidates, waitMs) {
 // The daemon's `stateRoot()` is not exported and it CREATES the dir it resolves,
 // so the created candidate dir is the resolution.
 function daemonResolvedDir(env, candidates) {
-  for (const dir of candidates) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of candidates) removePath(dir);
   try {
     applyEnv(env);
     STATUS.readSidebarMode();
@@ -468,7 +483,7 @@ describe('state-dir known-file family', () => {
     // enabled, so a beat would arrive.
     touch(fixture.stored, 'gentle-sidebar-mode.json', '{"version":1,"enabled":false}\n');
     assert.equal(await extensionRun(fixture.env, 1200), 0, 'a stored disabled mode stops the producer');
-    fs.rmSync(path.join(fixture.stored, 'gentle-sidebar-mode.json'));
+    removePath(path.join(fixture.stored, 'gentle-sidebar-mode.json'));
     assert.ok(await extensionRun(fixture.env, 3000) > 0, 'without the flag the producer publishes (missing means enabled)');
   });
 
@@ -541,7 +556,7 @@ describe('state-dir known-file family', () => {
       } finally {
         applyEnv({});
       }
-      fs.rmSync(injected, { recursive: true, force: true });
+      removePath(injected);
     }
   });
 
