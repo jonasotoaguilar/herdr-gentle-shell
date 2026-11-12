@@ -1614,8 +1614,16 @@ export async function liveSummarizeRoots(roots) {
 // Herdr-injected and changes with the plugin id, so the stored dir wins
 // whenever it holds any of our files — one stray known file in the injected
 // dir may never outrank it, because the daemon writes its pidfile into the dir
-// it resolves and that made the split self-perpetuating. The injected dir is
-// used only when neither holds a known file (fresh install).
+// it resolves and that made the split self-perpetuating.
+//
+// S1b: the stored canonical dir is the FINAL fallback. This process never
+// receives HERDR_PLUGIN_STATE_DIR, so resolving the injected dir on a fresh
+// install named a directory the daemon never created: the refresh write below
+// failed and the sidebar fell back to polling. The active-id dir is therefore a
+// candidate here too, derived from the state home when the variable is absent,
+// so a legacy install whose live flags sit only there is still found.
+// Selection order: stored if it holds a known file, else the active-id/injected
+// dir if it holds one, else stored.
 //
 // S15 identity rename: the active plugin lookup id is herdr-gentle-shell, but
 // every stored state path keeps the herdr-gentle-agents segment (no migration
@@ -1626,6 +1634,7 @@ export async function liveSummarizeRoots(roots) {
 // writes: an upgraded install still carries them, and a family that differs
 // between consumers splits the state across both dirs.
 const SIDEBAR_STATE_SEGMENT = "herdr-gentle-agents";
+const SIDEBAR_ACTIVE_PLUGIN_ID = "herdr-gentle-shell";
 const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-sidebar-mode.json",
   "gentle-moshi.json",
@@ -1637,12 +1646,36 @@ const SIDEBAR_STATE_KNOWN_FILES = [
   "gentle-plugin-tools.json",
 ];
 
-function sidebarStoredDir() {
+function sidebarStatePluginsDir() {
   const env = process.env;
   const base = env.XDG_STATE_HOME
     ? join(env.XDG_STATE_HOME, "herdr")
     : join(homedir(), ".local", "state", "herdr");
-  return join(base, "plugins", SIDEBAR_STATE_SEGMENT);
+  return join(base, "plugins");
+}
+
+function sidebarStoredDir() {
+  return join(sidebarStatePluginsDir(), SIDEBAR_STATE_SEGMENT);
+}
+
+// The active plugin id dir: what Herdr injects as HERDR_PLUGIN_STATE_DIR for the
+// current plugin id, or — because this producer never receives that variable —
+// the same path derived from the state home.
+function sidebarActiveDir() {
+  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected === "string" && injected.length > 0) return injected;
+  return join(sidebarStatePluginsDir(), SIDEBAR_ACTIVE_PLUGIN_ID);
+}
+
+function sidebarDirHasKnownFile(dir) {
+  for (const name of SIDEBAR_STATE_KNOWN_FILES) {
+    try {
+      if (fs.existsSync(join(dir, name))) return true;
+    } catch {
+      // A single unreadable entry never decides; keep scanning.
+    }
+  }
+  return false;
 }
 
 function sidebarEffectiveDir() {
@@ -1652,35 +1685,17 @@ function sidebarEffectiveDir() {
   const stored = sidebarStoredDir();
   // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
   // value ignores every override and uses the stored default. Only an
-  // omitted (null/undefined) explicit falls through to the injected dir.
+  // omitted (null/undefined) explicit falls through to the active-id dir.
   if (explicit !== undefined && explicit !== null) return stored;
-  const injected = env.HERDR_PLUGIN_STATE_DIR;
-  if (typeof injected !== "string" || injected.length === 0) return stored;
-  if (injected === stored) return injected;
+  const active = sidebarActiveDir();
+  if (active === stored) return stored;
   try {
-    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
-      try {
-        if (fs.existsSync(join(stored, name))) return stored;
-      } catch {
-        // A single unreadable entry never decides; keep scanning.
-      }
-    }
-    let injectedHas = false;
-    for (const name of SIDEBAR_STATE_KNOWN_FILES) {
-      try {
-        if (fs.existsSync(join(injected, name))) {
-          injectedHas = true;
-          break;
-        }
-      } catch {
-        // A single unreadable entry never decides; keep scanning.
-      }
-    }
-    if (injectedHas) return injected;
+    if (sidebarDirHasKnownFile(stored)) return stored;
+    if (sidebarDirHasKnownFile(active)) return active;
   } catch {
-    // Fall through to the injected dir on unexpected failure.
+    // Fall through to the stored canonical dir on unexpected failure.
   }
-  return injected;
+  return stored;
 }
 
 // Status-refresh request file, owned by the consumer daemon: a single

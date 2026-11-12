@@ -304,12 +304,15 @@ function herdrStateDir() {
 // Family of files proving a state dir is ours: the stored dir wins whenever it
 // holds one of these, so pre-rename flags stay readable and one stray known
 // file in the Herdr-injected dir (which changes with the plugin id) may never
-// outrank the stored state. Fresh installs with no stored files converge on the
-// injected dir. GENTLE_STATUS_STATE_DIR (explicit user override) is always used
-// as-is. This family is IDENTICAL in the sidebar, diagnostics, worktree-mode and
-// state-extension resolvers. The daemon also WRITES here (pidfile, mode,
-// ledger), so a file it cannot see is a file whose dir it splits off: the
-// stored ODD/Issues toggle then reads as missing, i.e. enabled.
+// outrank the stored state. Selection order: stored if it holds a known file,
+// else the active-id/injected dir if it holds one, else stored — the stored
+// canonical dir is the FINAL fallback, so a fresh install converges there and
+// every context that does not receive the injected variable names the same
+// directory as this daemon. GENTLE_STATUS_STATE_DIR (explicit user override) is
+// always used as-is. This family is IDENTICAL in the sidebar, diagnostics,
+// worktree-mode and state-extension resolvers. The daemon also WRITES here
+// (pidfile, mode, ledger), so a file it cannot see is a file whose dir it
+// splits off: the stored ODD/Issues toggle then reads as missing, i.e. enabled.
 const STATE_KNOWN_FILES = [
   'gentle-sidebar-mode.json',
   'gentle-moshi.json',
@@ -336,6 +339,14 @@ function storedStateRoot() {
   return path.join(herdrStateDir(), 'plugins', STATE_PLUGIN_ID);
 }
 
+// The active-id dir: the Herdr-injected one when this process has it, else the
+// same sibling of the stored dir derived from the state home.
+function activeStateRoot() {
+  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  if (typeof injected === 'string' && injected.length > 0) return injected;
+  return path.join(herdrStateDir(), 'plugins', PLUGIN_ID);
+}
+
 function stateRoot() {
   const explicit = process.env.GENTLE_STATUS_STATE_DIR;
   if (typeof explicit === 'string' && explicit.length > 0) {
@@ -349,7 +360,7 @@ function stateRoot() {
   const stored = storedStateRoot();
   // HEAD parity: an explicit-but-empty (or otherwise invalid non-nullish)
   // value ignores every override and uses the stored default. Only an
-  // omitted (null/undefined) explicit falls through to the injected dir.
+  // omitted (null/undefined) explicit falls through to the active-id dir.
   if (explicit !== undefined && explicit !== null) {
     try {
       fs.mkdirSync(stored, { recursive: true });
@@ -358,15 +369,15 @@ function stateRoot() {
     }
     return stored;
   }
-  const injected = process.env.HERDR_PLUGIN_STATE_DIR;
+  const active = activeStateRoot();
   let dir = stored;
-  if (typeof injected === 'string' && injected.length > 0 && injected !== stored) {
+  if (active !== stored) {
     try {
       if (dirHasKnownFiles(stored)) dir = stored;
-      else if (dirHasKnownFiles(injected)) dir = injected;
-      else dir = injected;
+      else if (dirHasKnownFiles(active)) dir = active;
+      else dir = stored;
     } catch {
-      dir = injected;
+      dir = stored;
     }
   }
   try {
