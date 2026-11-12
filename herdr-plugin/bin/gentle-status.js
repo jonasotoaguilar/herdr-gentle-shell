@@ -1173,13 +1173,38 @@ async function frame(state, opts = {}) {
     const paneId = entry?.pane_id;
     if (typeof paneId !== 'string') continue;
     live.add(paneId);
-    const reduced = contract.reducePane(entry, now);
+    let reduced = contract.reducePane(entry, now);
     if (!reduced.owned) {
+      if (state.doneViews instanceof Map) state.doneViews.delete(paneId);
       debug(`pane ${paneId}: pi-tree owns; yielding`);
       continue;
     }
+    // T3/S6-S9: done until viewed. The producer stamps the unseen cap as the
+    // finish token's expiry, so a fresh token alone would keep `done` for the
+    // whole cap. The recede belongs here because `focused` rides the same
+    // snapshot this frame already reads: the first observation of the pane as
+    // focused starts one dwell, and only then does the row move to `idle`.
+    // The ledger is per pane and keyed by the token's absolute expiry, so a
+    // cleared token (reactivation or cap) drops it and a new mint starts a new
+    // episode. A second look changes nothing: `receded` stays true.
+    if (!(state.doneViews instanceof Map)) state.doneViews = new Map();
+    const doneView = contract.observeDoneView(state.doneViews.get(paneId), entry, now);
+    if (doneView === undefined) state.doneViews.delete(paneId);
+    else state.doneViews.set(paneId, doneView);
+    if (doneView !== undefined && doneView.receded === true && reduced.display === 'done') {
+      reduced = { ...reduced, display: 'idle', label: 'idle' };
+    }
     const expiry = doneExpiryOf(entry, now);
     if (expiry !== null && (nearestExpiry === null || expiry < nearestExpiry)) nearestExpiry = expiry;
+    // The dwell deadline is a second wake the frame has to honour: without it
+    // the recede could wait a whole baseline after the 5 s elapsed.
+    if (
+      doneView !== undefined &&
+      doneView.recedeAt !== undefined &&
+      (nearestExpiry === null || doneView.recedeAt < nearestExpiry)
+    ) {
+      nearestExpiry = doneView.recedeAt;
+    }
     sightings[paneId] = { entry, reduced };
     if (!sidebar.enabled) {
       // Native sidebar selected (or malformed flag): never compose a
@@ -1252,6 +1277,7 @@ async function frame(state, opts = {}) {
   // clear the owned family under our own source (never foreign tokens).
   const departed = [...state.live].filter((id) => !live.has(id));
   for (const id of departed) {
+    if (state.doneViews instanceof Map) state.doneViews.delete(id);
     try {
       await clearOwnedFamily(id);
     } catch (error) {

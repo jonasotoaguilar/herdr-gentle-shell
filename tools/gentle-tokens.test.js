@@ -1690,6 +1690,109 @@ describe('synthesized finish signal (gentle_done_v1): done then idle', () => {
   });
 });
 
+// T3 (S6-S9): after a real finish the row HOLDS `done` until the human looks
+// at the pane. The producer stamps the unseen cap as the token's absolute
+// expiry, so the reducer alone keeps `done` visible long past the old 5 s
+// hold. The daemon owns the recede: the first snapshot that reports
+// `focused: true` for that finish starts the 5 s dwell, and only then does the
+// row move to `idle`. A second look changes nothing, and a new finish token is
+// a new episode.
+describe('done until viewed (S6-S9/T3)', () => {
+  const CAP = 900000; // 15 min: the producer's default unseen cap
+  const DWELL = 5000;
+
+  function finishEpisode({ doneExpiry = NOW + CAP, focused = false, workExpiry = EXPIRY } = {}) {
+    const { entry, hash } = roleEntry('', { count: 0, agent_status: 'idle' });
+    entry.tokens[tokens.DONE_TOKEN] = `${hash}:${doneExpiry}`;
+    entry.tokens.gentle_work_v1 = `${hash}:0:${workExpiry}`;
+    entry.focused = focused;
+    return { entry, hash };
+  }
+
+  it('pins the dwell and the accepted cap ceiling', () => {
+    assert.equal(tokens.DONE_VIEW_DWELL_MS, DWELL);
+    assert.equal(tokens.FINISH_HOLD_MAX_MS, 3600000, 'the 15 min cap fits under the consumer ceiling');
+  });
+
+  it('a finish token minted with the unseen cap is fresh and reduces to done', () => {
+    const { entry, hash } = finishEpisode();
+    assert.notEqual(tokens.parseDone(entry.tokens[tokens.DONE_TOKEN], hash, NOW), null);
+    assert.equal(tokens.reducePane(entry, NOW).display, 'done');
+  });
+
+  it('holds done while the pane is never focused, well past the old 5 s hold', () => {
+    const { entry } = finishEpisode();
+    let view = tokens.observeDoneView(undefined, entry, NOW);
+    assert.equal(view.receded, false);
+    assert.equal(view.focusedAt, undefined, 'no focus, so no dwell started');
+    assert.equal(view.recedeAt, undefined);
+
+    for (const after of [6000, 30000, CAP - 1]) {
+      const at = NOW + after;
+      // The producer republishes the unchanged finish expiry on every beat but
+      // keeps the count-0 work token fresh, so the row stays renderable.
+      const fresh = finishEpisode({ doneExpiry: NOW + CAP, workExpiry: at + 10000 }).entry;
+      view = tokens.observeDoneView(view, fresh, at);
+      assert.equal(view.receded, false, `${after}ms after the mint and still done`);
+      assert.equal(tokens.reducePane(fresh, at).display, 'done', `${after}ms`);
+    }
+  });
+
+  it('starts the dwell at the first focused observation, then recedes to idle', () => {
+    const { entry } = finishEpisode();
+    const focused = finishEpisode({ focused: true }).entry;
+    let view = tokens.observeDoneView(undefined, entry, NOW);
+    view = tokens.observeDoneView(view, entry, NOW + 30000);
+    assert.equal(view.receded, false, 'unfocused panes never recede on their own');
+
+    view = tokens.observeDoneView(view, focused, NOW + 30000);
+    assert.equal(view.focusedAt, NOW + 30000, 'the dwell starts at the observation');
+    assert.equal(view.recedeAt, NOW + 30000 + DWELL);
+    assert.equal(tokens.observeDoneView(view, focused, NOW + 30000 + DWELL - 1).receded, false);
+    const receded = tokens.observeDoneView(view, focused, NOW + 30000 + DWELL);
+    assert.equal(receded.receded, true);
+    assert.equal(receded.recedeAt, undefined);
+  });
+
+  it('a pane focused at the first sight of the mint recedes after the dwell', () => {
+    const { entry } = finishEpisode({ focused: true });
+    let view = tokens.observeDoneView(undefined, entry, NOW);
+    assert.equal(view.focusedAt, NOW);
+    assert.equal(view.recedeAt, NOW + DWELL);
+    assert.equal(tokens.observeDoneView(view, entry, NOW + DWELL - 1).receded, false);
+    view = tokens.observeDoneView(view, entry, NOW + DWELL);
+    assert.equal(view.receded, true);
+  });
+
+  it('a second look after the recede changes nothing', () => {
+    const { entry } = finishEpisode({ focused: true });
+    let view = tokens.observeDoneView(undefined, entry, NOW);
+    view = tokens.observeDoneView(view, entry, NOW + DWELL);
+    assert.equal(view.receded, true);
+    const later = tokens.observeDoneView(view, entry, NOW + DWELL + 60000);
+    assert.equal(later.receded, true, 'the row stays idle once the finish was viewed');
+    assert.equal(later.recedeAt, undefined);
+  });
+
+  it('a new finish token is a new episode and shows done again', () => {
+    const { entry } = finishEpisode({ focused: true });
+    let view = tokens.observeDoneView(undefined, entry, NOW);
+    view = tokens.observeDoneView(view, entry, NOW + DWELL);
+    assert.equal(view.receded, true);
+
+    const next = finishEpisode({ doneExpiry: NOW + 2 * CAP, focused: true }).entry;
+    const fresh = tokens.observeDoneView(view, next, NOW + 60000);
+    assert.equal(fresh.receded, false, 'a fresh mint is a fresh finish episode');
+    assert.notEqual(fresh.expiry, view.expiry);
+  });
+
+  it('an absent or stale finish token leaves nothing to track', () => {
+    assert.equal(tokens.observeDoneView(undefined, baseEntry(), NOW), undefined);
+    const { entry } = finishEpisode({ doneExpiry: NOW });
+    assert.equal(tokens.observeDoneView(undefined, entry, NOW), undefined, 'expired tokens are no evidence');
+  });
+});
+
 // The settled background-job wait has no row state of its own
 // (odd/tasks/restore-done-idle.md): the producer keeps the root marker live
 // while a job runs, so the row reads the pink generic `gentle` until the job
@@ -1758,7 +1861,7 @@ describe('blocking pending delegate call decides the row', () => {
   // (the principal is inside a blocking tool call, so its own agent is
   // active), count 0 (task-mode launches have no TaskStore record yet) and
   // the pending role marker.
-  function pendingEntry({ role = 'worker', pending = null, count = 0, principal = true, status = 'working' } = {}) {
+  function pendingEntry({ pending = null, count = 0, principal = true, status = 'working' } = {}) {
     const built = roleEntry('', { count });
     if (principal) built.entry.tokens[tokens.PRINCIPAL_TOKEN] = principalToken(built.hash);
     built.entry.tokens[tokens.PENDING_TOKEN] = pending === null ? null : pendingToken(built.hash, pending);

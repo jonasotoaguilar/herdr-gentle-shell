@@ -35,6 +35,7 @@ const path = require('node:path');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DAEMON = path.join(REPO_ROOT, 'herdr-plugin', 'bin', 'gentle-status.js');
+const contract = require('../herdr-plugin/lib/gentle-tokens.js');
 
 const FAKE_HERDR = `#!/bin/sh
 # Fake herdr for event-subscription and gs-label tests: logs each frame's agent
@@ -973,5 +974,92 @@ describe('gs label decisions (S5/S6)', () => {
     assert.equal(gs.processSignature(null), null, 'no process info has no signature');
     assert.equal(gs.processSignature({}), null, 'an empty payload has no signature');
     assert.equal(gs.processSignature({ foreground_processes: [{ pid: 'x' }] }), null, 'a malformed pid is ignored');
+  });
+});
+
+// T3 (S6-S9): `done` holds until the pane's own snapshot says the human looked
+// at it (`focused: true`, L5), then one 5 s dwell, then `idle`. The producer
+// stamps the unseen cap as the token expiry; the daemon owns the recede. These
+// tests drive the real `--run` daemon against the fake binary, so the observed
+// surface is the metadata call it actually publishes.
+function writeAgents(sb, agents) {
+  fs.writeFileSync(sb.agentsFile, `${JSON.stringify({ result: { agents } })}\n`);
+}
+
+const DONE_SESSION = '/tmp/gentle-done-view-session.jsonl';
+
+function doneAgent({ doneExpiry, workExpiry, focused = false }) {
+  const entry = {
+    pane_id: 'wD:p1',
+    agent: 'pi',
+    agent_session: { agent: 'pi', kind: 'path', source: 'herdr:pi', value: DONE_SESSION },
+    agent_status: 'idle',
+    cwd: PROJECT_CWD,
+    focused,
+    revision: 1,
+    tab_id: 'wD:t1',
+    workspace_id: 'wD',
+    tokens: {},
+  };
+  const hash = contract.expectedSessionHash(entry);
+  entry.tokens.gentle_work_v1 = `${hash}:0:${workExpiry}`;
+  entry.tokens.gentle_done_v1 = `${hash}:${doneExpiry}`;
+  return entry;
+}
+
+// The display each published frame rendered, in order: the one state token the
+// daemon carried with `--token` on that call.
+function publishedDisplays(sb) {
+  let text = '';
+  try {
+    text = fs.readFileSync(sb.metaLog, 'utf8');
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('---META---')) continue;
+    for (const [display, name] of Object.entries(contract.STATE_TOKENS)) {
+      if (line.includes(`--token ${name}=${display}`)) {
+        out.push(display);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+describe('done until viewed (S6-S9/T3)', () => {
+  it('a finish nobody viewed stays done well past the old 5 s hold', async () => {
+    const sb = sandbox;
+    const now = Date.now();
+    writeAgents(sb, [doneAgent({ doneExpiry: now + 900000, workExpiry: now + 30000 })]);
+    startDaemon(sb, { GENTLE_STATUS_POLL_MS: '250', GENTLE_STATUS_FAST_POLL_MS: '250' });
+
+    await waitFor('the planted finish to render done', () => publishedDisplays(sb).includes('done'), 8000);
+    await wait(6000);
+    assert.equal(publishedDisplays(sb).includes('idle'), false, 'never focused: the row never recedes');
+    assert.equal(publishedDisplays(sb).at(-1), 'done', 'the row still reads done past the old 5 s hold');
+  });
+
+  it('the first focused snapshot starts the 5 s dwell, then the row recedes to idle', async () => {
+    const sb = sandbox;
+    const now = Date.now();
+    const doneExpiry = now + 900000;
+    const workExpiry = now + 30000;
+    writeAgents(sb, [doneAgent({ doneExpiry, workExpiry })]);
+    startDaemon(sb, { GENTLE_STATUS_POLL_MS: '250', GENTLE_STATUS_FAST_POLL_MS: '250' });
+
+    await waitFor('the planted finish to render done', () => publishedDisplays(sb).includes('done'), 8000);
+    await wait(700);
+    assert.equal(publishedDisplays(sb).includes('idle'), false, 'an unfocused finish never recedes');
+
+    const focusedAt = Date.now();
+    writeAgents(sb, [doneAgent({ doneExpiry, workExpiry, focused: true })]);
+    await waitFor('the row to recede after the dwell', () => publishedDisplays(sb).includes('idle'), 10000);
+    const elapsed = Date.now() - focusedAt;
+    assert.ok(elapsed >= 4800, `the recede waits the 5 s dwell (saw ${elapsed}ms)`);
+    assert.ok(elapsed <= 9000, `the recede is bounded by the dwell (saw ${elapsed}ms)`);
+    assert.equal(publishedDisplays(sb).at(-1), 'idle', 'the row ends on idle');
   });
 });
