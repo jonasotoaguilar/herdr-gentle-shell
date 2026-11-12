@@ -2080,3 +2080,49 @@ test('the producer cap ceiling and the consumer freshness ceiling agree', async 
   const consumer = fs.readFileSync(path.resolve(__dirname, '../herdr-plugin/lib/gentle-tokens.js'), 'utf8');
   assert.match(consumer, /FINISH_HOLD_MAX_MS = 3600000/, 'both sides pin the same ceiling');
 });
+
+test('independent S12: duplicate does not extend deadline, continue launch', async () => {
+  await listening;
+  process.env.GENTLE_HERDR_DONE_HOLD_MS = '1200';
+  const { module, paneId } = await loadRuntime();
+  const h = harness(); module.default(h.pi);
+  h.fire('session_start', {}, ctx()); await settle(200);
+  h.fire('agent_start', {}, ctx({idle:false})); await settle(200);
+  h.fire('tool_call', {toolName:'subagent_continue', toolCallId:'a', input:{task_id:'t'}}); await settle(200);
+  const from = cursor(paneId), phone = moshiFrames.length, start = Date.now();
+  h.fire('agent_settled', {}, ctx()); await settle(600);
+  h.fire('agent_settled', {}, ctx());
+  const idle = await waitFrom(paneId, from, f => f?.method === 'pane.report_agent' && f.params?.state === 'idle', 850);
+  assert.ok(idle, 'original 1200ms deadline must win over duplicate at 600ms');
+  assert.ok(Date.now()-start < 1700, 'deadline did not move to 1800ms');
+  await settle(100);
+  assert.equal(new Set(doneValuesFrom(paneId,from)).size,1);
+  assert.equal(finishesFrom(phone).length,1);
+  h.fire('session_shutdown', {}, ctx()); delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+});
+
+test('independent S12: new continue extends original deadline but old run still holds', async () => {
+  await listening;
+  process.env.GENTLE_HERDR_DONE_HOLD_MS = '1200';
+  const { module, paneId } = await loadRuntime();
+  const h = harness(); module.default(h.pi);
+  h.fire('session_start', {}, ctx()); await settle(200);
+  h.fire('agent_start', {}, ctx({idle:false})); await settle(200);
+  h.fire('tool_call', {toolName:'subagent_run', toolCallId:'a', input:{agent:'gentle-ai-worker'}}); await settle(200);
+  const from = cursor(paneId), phone = moshiFrames.length;
+  h.fire('agent_settled', {}, ctx()); await settle(700);
+  h.fire('tool_call', {toolName:'subagent_continue', toolCallId:'b', input:{task_id:'t'}});
+  h.fire('agent_settled', {}, ctx());
+  h.fire('tool_result', {toolName:'subagent_continue', toolCallId:'b', isError:true});
+  await settle(650);
+  assert.deepEqual(nativeStatesFrom(paneId,from).filter(s=>s==='idle'), []);
+  assert.deepEqual(doneValuesFrom(paneId,from), []);
+  assert.equal(finishesFrom(phone).length,0);
+  h.fire('tool_result', {toolName:'subagent_run', toolCallId:'a', isError:true});
+  const idle = await waitFrom(paneId,from,f=>f?.method==='pane.report_agent' && f.params?.state==='idle', 1000);
+  assert.ok(idle); await settle(150);
+  assert.equal(nativeStatesFrom(paneId,from).filter(s=>s==='idle').length,1);
+  assert.equal(new Set(doneValuesFrom(paneId,from)).size,1);
+  assert.equal(finishesFrom(phone).length,1);
+  h.fire('session_shutdown', {}, ctx()); delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+});
