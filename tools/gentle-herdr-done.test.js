@@ -1044,6 +1044,184 @@ test('S4: a live job beside a running delegate stays non-terminal', async () => 
   );
 });
 
+// --- T9/S12: the settle edge may not disagree ------------------------------
+// A `subagent_run` still in flight when the principal settles, whose result
+// never arrives, used to leave the native state held non-terminal for one
+// finish hold while the display minted `done` on the same beat: the row read
+// `done` beside a native `working`. That is a premature finish (S3) and a
+// display/native disagreement (S5). The same held condition now gates the
+// display `done` mint and the `orchestrating` marker, and the hold's expiry
+// arms one beat so the terminal state still lands on its own.
+test('S3/S4/S5: a stranded delegate cannot mint done at settle', async () => {
+  await listening;
+  const { module, paneId } = await loadRuntime();
+  const h = harness();
+  module.default(h.pi);
+  h.fire('session_start', { reason: 'startup' }, ctx());
+  await settle(250);
+  h.fire('agent_start', {}, ctx({ idle: false }));
+  await settle(300);
+  h.fire('tool_call', {
+    toolName: 'subagent_run',
+    toolCallId: 'stranded',
+    input: { agent: 'gentle-ai-worker' },
+  });
+  await settle(250);
+  const from = cursor(paneId);
+  h.fire('agent_settled', {}, ctx({ idle: true }));
+  await settle(500);
+  assert.equal(nativeStatesFrom(paneId, 0).at(-1), 'working');
+  assert.deepEqual(doneValuesFrom(paneId, from), []);
+  // The same held condition gates the display marker: the row keeps the pink
+  // generic wait on the settle beat instead of reading `done`.
+  const held = await waitFrom(
+    paneId,
+    from,
+    (f) => typeof (f?.params?.tokens ?? {})[ORCHESTRATING_TOKEN] === 'string',
+    1000,
+  );
+  assert.ok(held, 'the held settle keeps the orchestrating marker');
+  assert.equal(held.params.tokens[DONE_TOKEN], null, 'and never mints done on that beat');
+  // Drop the hold's expiry beat with the session: this test asserts the
+  // settle edge only, and a live timer would publish into a later test.
+  h.fire('session_shutdown', {}, ctx());
+});
+
+// The release path the hold must not break: when the stranded launch never
+// reports back, the bounded hold expires and nothing else has to happen for
+// the terminal state to land. One beat at that instant carries native `idle`,
+// exactly one `done` mint, and exactly one finish envelope (no double
+// notification).
+test('S12: the settle-time hold expiry lands native idle and exactly one done', async () => {
+  await listening;
+  const previous = process.env.GENTLE_HERDR_DONE_HOLD_MS;
+  process.env.GENTLE_HERDR_DONE_HOLD_MS = '1200';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fire('session_start', { reason: 'startup' }, ctx());
+    await settle(250);
+    h.fire('agent_start', {}, ctx({ idle: false }));
+    await settle(300);
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'stranded-release',
+      input: { agent: 'gentle-ai-worker' },
+    });
+    await settle(250);
+    const from = cursor(paneId);
+    h.fire('agent_settled', {}, ctx({ idle: true }));
+    await settle(400);
+    assert.deepEqual(doneValuesFrom(paneId, from), [], 'no done mint inside the hold');
+    assert.deepEqual(
+      nativeStatesFrom(paneId, from).filter((state) => state === 'idle'),
+      [],
+      'the native terminal state waits on the same hold',
+    );
+
+    // Nothing else fires: the hold's own expiry must land the terminal state.
+    const idle = await waitFrom(
+      paneId,
+      from,
+      (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+      4000,
+    );
+    assert.ok(idle, 'the hold expiry arms the beat that lands native idle');
+    const minted = await waitFrom(
+      paneId,
+      from,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+      4000,
+    );
+    assert.ok(minted, 'and mints done on that same expiry beat');
+    assert.equal(
+      minted.params.tokens[ORCHESTRATING_TOKEN],
+      null,
+      'the expiry beat drops the gentle wait, so the row reads done',
+    );
+    await settle(500);
+    assert.equal(
+      nativeStatesFrom(paneId, from).filter((state) => state === 'idle').length,
+      1,
+      'native idle lands exactly once',
+    );
+    const expiries = new Set(doneValuesFrom(paneId, from).map((token) => token.split(':')[1]));
+    assert.equal(expiries.size, 1, 'exactly one done mint');
+    assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish envelope, no double notification');
+    h.fire('session_shutdown', {}, ctx());
+  } finally {
+    if (previous === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+    else process.env.GENTLE_HERDR_DONE_HOLD_MS = previous;
+  }
+});
+
+// A result that finally arrives inside the hold is the other way out: the hold
+// is released on that edge, so the cancelled expiry beat can never leave the
+// terminal state waiting for an unrelated event. A failed launch carries no
+// task record and no pending call any more (the settle cleared it), which is
+// exactly the path that used to publish nothing at all.
+test('S12: a launch result inside the hold releases it on its own beat', async () => {
+  await listening;
+  const previous = process.env.GENTLE_HERDR_DONE_HOLD_MS;
+  process.env.GENTLE_HERDR_DONE_HOLD_MS = '1200';
+  try {
+    const { module, paneId } = await loadRuntime();
+    const h = harness();
+    module.default(h.pi);
+    const moshiBefore = moshiFrames.length;
+    h.fire('session_start', { reason: 'startup' }, ctx());
+    await settle(250);
+    h.fire('agent_start', {}, ctx({ idle: false }));
+    await settle(300);
+    h.fire('tool_call', {
+      toolName: 'subagent_run',
+      toolCallId: 'stranded-late-result',
+      input: { agent: 'gentle-ai-worker' },
+    });
+    await settle(250);
+    const from = cursor(paneId);
+    h.fire('agent_settled', {}, ctx({ idle: true }));
+    await settle(300);
+    assert.deepEqual(doneValuesFrom(paneId, from), [], 'the hold blocks done before the result');
+
+    const releaseFrom = cursor(paneId);
+    h.fire('tool_result', {
+      toolName: 'subagent_run',
+      toolCallId: 'stranded-late-result',
+      isError: true,
+    });
+    const idle = await waitFrom(
+      paneId,
+      releaseFrom,
+      (f) => f?.method === 'pane.report_agent' && f.params?.state === 'idle',
+      2500,
+    );
+    assert.ok(idle, 'the released hold still lands native idle on its own beat');
+    const minted = await waitFrom(
+      paneId,
+      releaseFrom,
+      (f) => typeof (f?.params?.tokens ?? {})[DONE_TOKEN] === 'string',
+      2500,
+    );
+    assert.ok(minted, 'and mints done; the cancelled expiry is not a lost finish');
+    await settle(400);
+    assert.equal(
+      nativeStatesFrom(paneId, releaseFrom).filter((state) => state === 'idle').length,
+      1,
+      'native idle lands exactly once',
+    );
+    const expiries = new Set(doneValuesFrom(paneId, releaseFrom).map((token) => token.split(':')[1]));
+    assert.equal(expiries.size, 1, 'exactly one done mint');
+    assert.equal(finishesFrom(moshiBefore).length, 1, 'exactly one finish envelope');
+    h.fire('session_shutdown', {}, ctx());
+  } finally {
+    if (previous === undefined) delete process.env.GENTLE_HERDR_DONE_HOLD_MS;
+    else process.env.GENTLE_HERDR_DONE_HOLD_MS = previous;
+  }
+});
+
 test('a job whose exit snapshot never arrives still releases the finish at the TTL', async () => {
   await listening;
   const previousTtl = process.env.GENTLE_HERDR_JOBS_TTL_MS;
