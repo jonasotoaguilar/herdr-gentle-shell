@@ -50,7 +50,7 @@ tokens carrying private data are added here.
   finish token's expiry (`GENTLE_DONE_UNSEEN_CAP_MS`, producer-side, default
   900000 ms = 15 min, clamped [100, 3600000]); the daemon owns the earlier
   recede, because `focused` rides the same snapshot it already reads: the
-  first frame that sees the pane focused starts one 5 s dwell
+  first frame that sees the pane focused starts one 3 s dwell
   (`DONE_VIEW_DWELL_MS`, a consumer constant, not an override) and the row
   then renders `idle`. A second look changes nothing, and the per-pane view
   ledger is daemon memory only, so a daemon restart while the token is still

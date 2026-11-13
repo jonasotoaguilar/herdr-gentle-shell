@@ -762,7 +762,7 @@ const LOST_SETTLE_BEATS = 2;
 // `done`, so the producer mints the finish itself: one session-bound
 // `<hash>:<expiry>` token per finish at the settled-and-empty edge. Since T3
 // the expiry is the UNSEEN cap, not the visible dwell: the row holds `done`
-// until the human views the pane, then the consumer's own 5 s dwell and
+// until the human views the pane, then the consumer's own 3 s dwell and
 // `idle`, and a pane nobody looks at recedes at the cap. The producer owns the
 // mint and the cap because it stamps the token; the consumer owns the recede
 // because `focused` rides the snapshot the daemon already reads. The finish
@@ -780,7 +780,7 @@ const DONE_UNSEEN_CAP_ENV = "GENTLE_DONE_UNSEEN_CAP_MS";
 // spell in which a stranded `subagent_run` keeps the native state non-terminal
 // and the `done` mint withheld, after which the terminal state lands. Its 5 s
 // default is the time the latch waits on a launch result that may never come;
-// the 5 s dwell after the human views a finish lives consumer-side
+// the 3 s dwell after the human views a finish lives consumer-side
 // (`DONE_VIEW_DWELL_MS` in herdr-plugin/lib/gentle-tokens.js). Overridden
 // through GENTLE_HERDR_DONE_HOLD_MS, clamped to [1 s, 5 min].
 const DONE_HOLD_MS = 5000;
@@ -3749,7 +3749,7 @@ export default function (pi) {
     // pending launch, no live background job, and no human-wait, review, or
     // error leg — then republished with the SAME expiry so the unseen cap can
     // never be extended. The consumer holds `done` until the pane is viewed
-    // (its own 5 s dwell, then idle) and lets the token expire at the cap when
+    // (its own 3 s dwell, then idle) and lets the token expire at the cap when
     // nobody ever looks. Any work appearing during the episode clears it on
     // that beat, so the row moves straight back to the role state. A session
     // that never worked never mints one. A live background job counts as

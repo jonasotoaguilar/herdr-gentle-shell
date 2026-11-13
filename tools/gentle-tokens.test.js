@@ -1692,14 +1692,14 @@ describe('synthesized finish signal (gentle_done_v1): done then idle', () => {
 
 // T3 (S6-S9): after a real finish the row HOLDS `done` until the human looks
 // at the pane. The producer stamps the unseen cap as the token's absolute
-// expiry, so the reducer alone keeps `done` visible long past the old 5 s
-// hold. The daemon owns the recede: the first snapshot that reports
-// `focused: true` for that finish starts the 5 s dwell, and only then does the
+// expiry, so the reducer alone keeps `done` visible long past the dwell.
+// The daemon owns the recede: the first snapshot that reports
+// `focused: true` for that finish starts the 3 s dwell, and only then does the
 // row move to `idle`. A second look changes nothing, and a new finish token is
 // a new episode.
 describe('done until viewed (S6-S9/T3)', () => {
   const CAP = 900000; // 15 min: the producer's default unseen cap
-  const DWELL = 5000;
+  const DWELL = 3000;
 
   function finishEpisode({ doneExpiry = NOW + CAP, focused = false, workExpiry = EXPIRY } = {}) {
     const { entry, hash } = roleEntry('', { count: 0, agent_status: 'idle' });
@@ -1720,7 +1720,7 @@ describe('done until viewed (S6-S9/T3)', () => {
     assert.equal(tokens.reducePane(entry, NOW).display, 'done');
   });
 
-  it('holds done while the pane is never focused, well past the old 5 s hold', () => {
+  it('holds done while the pane is never focused, well past the dwell', () => {
     const { entry } = finishEpisode();
     let view = tokens.observeDoneView(undefined, entry, NOW);
     assert.equal(view.receded, false);

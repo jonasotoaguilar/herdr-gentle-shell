@@ -990,7 +990,7 @@ describe('gs label decisions (S5/S6)', () => {
 });
 
 // T3 (S6-S9): `done` holds until the pane's own snapshot says the human looked
-// at it (`focused: true`, L5), then one 5 s dwell, then `idle`. The producer
+// at it (`focused: true`, L5), then one 3 s dwell, then `idle`. The producer
 // stamps the unseen cap as the token expiry; the daemon owns the recede. These
 // tests drive the real `--run` daemon against the fake binary, so the observed
 // surface is the metadata call it actually publishes.
@@ -1054,7 +1054,7 @@ describe('done until viewed (S6-S9/T3)', () => {
     assert.equal(publishedDisplays(sb).at(-1), 'done', 'the row still reads done past the old 5 s hold');
   });
 
-  it('the first focused snapshot starts the 5 s dwell, then the row recedes to idle', async () => {
+  it('the first focused snapshot starts the 3 s dwell, then the row recedes to idle', async () => {
     const sb = sandbox;
     const now = Date.now();
     const doneExpiry = now + 900000;
@@ -1070,7 +1070,7 @@ describe('done until viewed (S6-S9/T3)', () => {
     writeAgents(sb, [doneAgent({ doneExpiry, workExpiry, focused: true })]);
     await waitFor('the row to recede after the dwell', () => publishedDisplays(sb).includes('idle'), 10000);
     const elapsed = Date.now() - focusedAt;
-    assert.ok(elapsed >= 4800, `the recede waits the 5 s dwell (saw ${elapsed}ms)`);
+    assert.ok(elapsed >= 2800, `the recede waits the 3 s dwell (saw ${elapsed}ms)`);
     assert.ok(elapsed <= 9000, `the recede is bounded by the dwell (saw ${elapsed}ms)`);
     assert.equal(publishedDisplays(sb).at(-1), 'idle', 'the row ends on idle');
   });
@@ -1197,7 +1197,7 @@ describe('two-pane view ledger through the daemon (S9/S10/T10)', () => {
     writeAgents(sb, [aFocused, bDone]);
     await waitFor('pane A to recede after one dwell', () => lastDisplayOf(sb, PANE_A) === 'idle', 12000);
     const elapsed = Date.now() - focusedAt;
-    assert.ok(elapsed >= 4800, `pane A waits one 5 s dwell (saw ${elapsed}ms)`);
+    assert.ok(elapsed >= 2800, `pane A waits one 3 s dwell (saw ${elapsed}ms)`);
     assert.ok(elapsed <= 9500, `the repeated focus does not restart the dwell (saw ${elapsed}ms)`);
     assertDisplayMatchesNative('idle', aFocused.agent_status, 'the dwell boundary on pane A');
 

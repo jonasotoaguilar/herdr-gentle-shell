@@ -405,7 +405,7 @@ gentle_done_v1        = sessionHash ":" expiry
                     ; finish nobody looks at recedes at the cap. The consumer
                     ; accepts no expiry beyond now+3600000 at read (the only
                     ; token whose ceiling is not the 60 s TTL). A VIEWED finish
-                    ; recedes far sooner: the daemon starts one 5 s dwell
+                    ; recedes far sooner: the daemon starts one 3 s dwell
                     ; (DONE_VIEW_DWELL_MS) at the first frame that observes the
                     ; pane focused and then renders `idle` (§5.2). That ledger
                     ; of views is keyed by the token's absolute expiry and is
