@@ -118,6 +118,7 @@ function makeHerdrStub() {
       'if [ "$1" = "worktree" ] && [ "$2" = "open" ]; then',
       '  if [ "${HERDR_SHIM_OPEN_EXIT:-0}" != "0" ]; then',
       '    if [ -n "${HERDR_STUB_WORKTREE_OPEN_REMOVE:-}" ]; then git -C "$HERDR_STUB_WORKTREE_OPEN_REMOVE_REPO" worktree remove --force "$HERDR_STUB_WORKTREE_OPEN_REMOVE" >/dev/null 2>&1 || true; fi',
+      '    if [ -n "${HERDR_STUB_WORKTREE_OPEN_RECREATE:-}" ]; then mkdir -p "$HERDR_STUB_WORKTREE_OPEN_RECREATE" >/dev/null 2>&1 || true; fi',
       '    if [ -n "${HERDR_STUB_WORKTREE_OPEN_ERROR:-}" ]; then cat "$HERDR_STUB_WORKTREE_OPEN_ERROR" >&2; else echo "shim worktree open failure" >&2; fi',
       '    exit 1',
       '  fi',
@@ -716,6 +717,59 @@ describe('herdr_session_open worktrees of another repository', () => {
       assert.equal(
         resultText(result),
         `herdr session open failed: 'herdr worktree open' exited 1 (${JSON.stringify(errorDoc)}) for ${target}; no session was opened`,
+      );
+      assert.deepEqual(Object.keys(result.details), ['path', 'kind', 'branch']);
+      assert.equal(result.details.kind, 'worktree');
+      assert.equal('fallback' in result.details, false, 'a non-worktree path never reports a fallback');
+      const argv = shimArgv(herdr.log);
+      assert.equal(argv.filter((line) => line.startsWith('workspace create')).length, 0, 'no fallback panel');
+      assert.equal(argv.filter((line) => line.startsWith('agent start')).length, 0, 'nothing started');
+    } finally {
+      restoreEnv();
+    }
+  });
+
+  test('worktree_not_found for a recreated directory inside a linked worktree still aborts', async () => {
+    // The fallback is scoped to the path being the CHECKOUT ROOT of a linked
+    // worktree (S3), not merely inside one. Nested linked worktrees make that
+    // distinction real: the target is worktree B inside worktree A, both
+    // linked. The failed open removes B and recreates the bare directory, so
+    // git resolves B's containing repository to A — still a linked worktree,
+    // but no longer B's checkout. The same `worktree_not_found` code must
+    // abort, never open a panel.
+    const focused = makeRepo('cross-recreated-focused');
+    const other = makeRepo('cross-recreated-other');
+    const outer = addWorktree(other, 'feat/recreated-outer');
+    const target = track(path.join(outer, 'inner'));
+    git(outer, ['worktree', 'add', '-b', 'feat/recreated-inner', target, 'HEAD']);
+    const inner = fs.realpathSync(target);
+    const errorDoc = { error: { code: 'worktree_not_found', message: 'worktree path not found' } };
+    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
+    const herdr = makeHerdrStub();
+    setEnv(worldEnv({
+      herdr,
+      seq,
+      worktreeList: worktreeListDoc([{ path: inner, branch: 'feat/recreated-inner' }]),
+      worktreeOpenError: errorDoc,
+      workspaceCreate: openReplyDoc('w2', 'w2:p1', inner),
+      extra: {
+        HERDR_SHIM_OPEN_EXIT: '1',
+        HERDR_STUB_WORKTREE_OPEN_REMOVE_REPO: other,
+        HERDR_STUB_WORKTREE_OPEN_REMOVE: inner,
+        HERDR_STUB_WORKTREE_OPEN_RECREATE: inner,
+      },
+    }));
+    try {
+      const { tools } = await loadExtension();
+      const result = await callOpen(tools, { path: inner, notify: false }, makeCtx(focused));
+      // Fixture: the directory exists again but is no longer a checkout — git
+      // resolves it to the ENCLOSING linked worktree, which is the trap.
+      assert.equal(fs.existsSync(inner), true, 'fixture: the directory was recreated');
+      assert.equal(git(inner, ['rev-parse', '--show-toplevel']), outer, 'fixture: the target is inside another worktree');
+      assert.equal(result.isError, true);
+      assert.equal(
+        resultText(result),
+        `herdr session open failed: 'herdr worktree open' exited 1 (${JSON.stringify(errorDoc)}) for ${inner}; no session was opened`,
       );
       assert.deepEqual(Object.keys(result.details), ['path', 'kind', 'branch']);
       assert.equal(result.details.kind, 'worktree');
