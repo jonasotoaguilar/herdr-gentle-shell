@@ -381,7 +381,7 @@ it publishes is drawn at once, and the daemon caps each sleep at the nearest
 live `done` expiry and the nearest pending view-dwell deadline, so a row
 reaches `idle` on time instead of one poll later. `done` is held until viewed:
 a real finish stays `done` until the pane is first observed as the focused
-pane in the daemon's own snapshot, then one 5 s dwell (`DONE_VIEW_DWELL_MS`,
+pane in the daemon's own snapshot, then one 3 s dwell (`DONE_VIEW_DWELL_MS`,
 consumer-side, not an override) and the recede to `idle`; a finish nobody
 looks at recedes at `GENTLE_DONE_UNSEEN_CAP_MS` (default 900000 ms = 15
 minutes, clamped [100, 3600000]), which is the finish token's expiry. A new

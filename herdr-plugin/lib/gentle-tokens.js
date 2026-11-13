@@ -97,8 +97,10 @@ const FINISH_HOLD_MAX_MS = 3600000;
 // The dwell between the first `focused: true` observation of a finish and the
 // recede to `idle` (S6/S9). It is a consumer constant, deliberately separate
 // from the producer's unseen cap: the dwell starts at the observation the
-// daemon makes, the cap starts at the mint the producer stamps.
-const DONE_VIEW_DWELL_MS = 5000;
+// daemon makes, the cap starts at the mint the producer stamps. The
+// producer's separate settle-edge hold (`GENTLE_HERDR_DONE_HOLD_MS`) is a
+// different bound and keeps its own 5 s default.
+const DONE_VIEW_DWELL_MS = 3000;
 // Presence-marker grammar shared by both markers above: `<hash>:<expiry>`,
 // no count.
 const MARKER_RE = /^([A-Za-z0-9_-]{43}):([1-9]\d{0,15})$/;
