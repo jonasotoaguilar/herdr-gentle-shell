@@ -73,10 +73,13 @@ function makeRepo(tag) {
   return fs.realpathSync(dir);
 }
 
-// A LINKED worktree of that repository.
-function addWorktree(root, branch) {
+// A LINKED worktree of that repository, placed beside `root`. `into` puts it
+// INSIDE another worktree instead, for the nested-worktree case.
+function addWorktree(root, branch, into) {
   const slug = String(branch).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  const target = track(path.join(path.dirname(root), `${path.basename(root)}-wt-${slug}`));
+  const base = into || path.dirname(root);
+  const name = into ? `nested-${slug}` : `${path.basename(root)}-wt-${slug}`;
+  const target = track(path.join(base, name));
   git(root, ['worktree', 'add', '-b', branch, target, 'HEAD']);
   return fs.realpathSync(target);
 }
@@ -1212,5 +1215,37 @@ describe('herdr_session_open safety seams', () => {
     for (const value of ['', '-x', 'UPPER', 'a'.repeat(33), 'bad name', 'x.y']) {
       assert.equal(lib.validAgentName(value), false, value);
     }
+  });
+});
+
+describe('herdr_session_open fallback guard', () => {
+  // The fallback guard re-probes git when a failed worktree open would fall
+  // back, and only a path that IS a linked worktree's ROOT keeps the abort. A
+  // directory inside a linked worktree resolves upward to the ENCLOSING
+  // checkout, so its kind says nothing about the path itself.
+  test('fallback guard distinguishes linked roots from their descendants', async () => {
+    const lib = require('../lib/herdr-session-open.js');
+    const root = makeRepo('guard');
+    const outer = addWorktree(root, 'feat/guard-outer');
+    const inner = addWorktree(outer, 'feat/guard-inner', outer);
+    const aliasDir = tmp('hs-path-alias-');
+    const alias = path.join(aliasDir, 'outer-alias');
+    fs.symlinkSync(outer, alias, 'dir');
+
+    // A primary checkout is not a linked worktree.
+    assert.equal(await lib.isLinkedWorktreePath(root), false);
+    assert.equal(await lib.isLinkedWorktreePath(outer), true);
+    // A symlink alias of a linked root resolves to that same root.
+    assert.equal(await lib.isLinkedWorktreePath(alias), true);
+    // While it exists, the nested worktree is a linked root of its own.
+    assert.equal(await lib.isLinkedWorktreePath(inner), true);
+
+    // Drop the inner worktree and recreate a plain directory in its place: git
+    // now resolves that directory UPWARD to the enclosing checkout.
+    git(root, ['worktree', 'remove', '--force', inner]);
+    fs.mkdirSync(inner);
+    assert.equal(fs.realpathSync(git(inner, ['rev-parse', '--show-toplevel'])), outer);
+    assert.equal(await lib.isLinkedWorktreePath(inner), false);
+    assert.equal(await lib.isLinkedWorktreePath(outer), true);
   });
 });
