@@ -4,8 +4,14 @@
 //
 // It opens a Herdr panel running a Pi session AT A PATH:
 //   * the path is a linked Git worktree  -> a WORKTREE panel
-//     (`herdr worktree open --path …`), reusing the workspace Herdr already
-//     has for that checkout when there is one;
+//     (`herdr worktree open --path … --cwd …`), reusing the workspace Herdr
+//     already has for that checkout when there is one. The target is passed as
+//     `--cwd` as well because herdr resolves a worktree against the
+//     repository of the FOCUSED workspace, not against the process cwd, so a
+//     worktree of ANOTHER repository resolves instead of answering
+//     `worktree_not_found`. When herdr still answers `worktree_not_found` for
+//     a path git proves is a linked worktree, the panel falls back to a NORMAL
+//     one at the same path and the result says so;
 //   * the path is a repository's primary checkout, any other directory, or a
 //     subdirectory of a checkout -> a NORMAL panel
 //     (`herdr workspace create --cwd …`).
@@ -181,12 +187,23 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
   let paneId = null;
   let openedHere = false;
   const openCall = isWorktree ? "herdr worktree open" : "herdr workspace create";
+  // The panel kind that was really OPENED. A worktree panel can degrade to a
+  // normal panel on the one documented fallback, and both the rows and the
+  // details state the kind that was opened, never the one that was classified.
+  let openedKind = kind;
+  // The herdr error code that forced that fallback, or null. It is present
+  // only when a fallback really happened, so every existing result keeps its
+  // exact key order.
+  let fallbackCode = null;
 
   // One pane choice, used by the reuse path and by the create-then-list path.
   // Each refusal carries the details object the caller publishes, so every
   // refusal of this tool has the same key order: path, kind, branch, then the
   // pane before the workspace it belongs to.
-  const paneRefusalBase = () => ({ path: target, kind, branch });
+  const paneRefusalBase = () => ({
+    path: target, kind: openedKind, branch,
+    ...(fallbackCode === null ? {} : { fallback: fallbackCode }),
+  });
   const choosePane = async (note) => {
     const panes = await runHerdr("pane-list", { workspace: workspaceId }, 60000);
     if (panes.status !== 0) {
@@ -214,22 +231,24 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
   // Verify the pair a successful open/create reply names, before anything is
   // started in it: the pane belongs to the workspace, the pane's own workspace
   // (when reported) agrees, and its cwd is the requested path or inside it.
-  const verifyOpenedPair = (pair) => {
+  // `call` names the call that really produced the panel, so a fallback reply
+  // is reported as the `herdr workspace create` it was.
+  const verifyOpenedPair = (pair, call = openCall) => {
     if (pair.workspaceId === null || pair.paneId === null) {
-      return `herdr session open failed: '${openCall}' for ${target} succeeded but its output named no workspace/pane; no session was started`;
+      return `herdr session open failed: '${call}' for ${target} succeeded but its output named no workspace/pane; no session was started`;
     }
     if (!pair.paneId.startsWith(`${pair.workspaceId}:`)) {
-      return `herdr session open failed: '${openCall}' named workspace '${pair.workspaceId}' but pane '${pair.paneId}', which does not belong to it; no session was started`;
+      return `herdr session open failed: '${call}' named workspace '${pair.workspaceId}' but pane '${pair.paneId}', which does not belong to it; no session was started`;
     }
     if (pair.paneWorkspace !== null && pair.paneWorkspace !== pair.workspaceId) {
-      return `herdr session open failed: '${openCall}' named workspace '${pair.workspaceId}' but its root pane reports workspace '${pair.paneWorkspace}'; no session was started`;
+      return `herdr session open failed: '${call}' named workspace '${pair.workspaceId}' but its root pane reports workspace '${pair.paneWorkspace}'; no session was started`;
     }
     if (pair.paneCwd !== null) {
       const openedState = lib.checkoutState(pair.paneCwd, target);
       const openedReal = openedState.real !== null ? openedState.real : openedState.absolute;
       const inside = openedReal !== null && (openedReal === target || openedReal.startsWith(target + path.sep));
       if (!inside) {
-        return `herdr session open failed: the pane '${pair.paneId}' '${openCall}' opened for ${target} has cwd ${pair.paneCwd}, outside ${target}; no session was started`;
+        return `herdr session open failed: the pane '${pair.paneId}' '${call}' opened for ${target} has cwd ${pair.paneCwd}, outside ${target}; no session was started`;
       }
     }
     return null;
@@ -271,10 +290,16 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
     // it fails, one fresh list decides whether the workspace appeared anyway.
     // A worktree panel opens at the canonical checkout; a normal panel keeps the
     // spelling the caller asked for, which is what their shell will show.
-    const opened = isWorktree
-      ? await runHerdr("open", { path: target, noFocus: true }, 60000)
+    //
+    // The target travels as BOTH `--path` and `--cwd`: herdr resolves a
+    // worktree against the repository of the FOCUSED workspace unless `--cwd`
+    // names the resolution base, so only a target passed as `--cwd` can be
+    // resolved when its repository is not the focused one.
+    let reply = isWorktree
+      ? await runHerdr("open", { path: target, cwd: target, noFocus: true }, 60000)
       : await runHerdr("workspace-create", { cwd: requested, noFocus: true }, 60000);
-    if (opened.status !== 0) {
+    let call = openCall;
+    if (reply.status !== 0) {
       if (isWorktree) {
         const relisted = await runHerdr("list", { cwd: target }, 60000);
         const retry = relisted.status === 0
@@ -283,17 +308,38 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
         if (retry.id !== null) workspaceId = retry.id;
       }
       if (workspaceId === null) {
-        return errorResult(
-          `herdr session open failed: ${lib.herdrFailureText(openCall, opened.status, opened.stderr || opened.error)} for ${target}; no session was opened`,
-          { path: target, kind, branch },
-        );
+        // The ONE fallback (S3): herdr answered `worktree_not_found` for a path
+        // git still proves is a linked worktree, i.e. it could not resolve that
+        // worktree's repository. A normal panel at the same path still opens.
+        // Every other failure — and this code for a path that is no longer a
+        // linked worktree — keeps the abort below, so an unrelated error is
+        // never masked by a panel.
+        const code = isWorktree ? lib.herdrErrorCode(reply) : null;
+        if (code !== "worktree_not_found" || !(await lib.isLinkedWorktreePath(target))) {
+          return errorResult(
+            `herdr session open failed: ${lib.herdrFailureText(call, reply.status, reply.stderr || reply.error)} for ${target}; no session was opened`,
+            { path: target, kind, branch },
+          );
+        }
+        const fallback = await runHerdr("workspace-create", { cwd: target, noFocus: true }, 60000);
+        if (fallback.status !== 0) {
+          return errorResult(
+            `herdr session open failed: ${lib.herdrFailureText("herdr workspace create", fallback.status, fallback.stderr || fallback.error)} for ${target} after 'herdr worktree open' reported ${code}; no session was opened`,
+            { path: target, kind: "normal", branch, fallback: code },
+          );
+        }
+        reply = fallback;
+        call = "herdr workspace create";
+        openedKind = "normal";
+        fallbackCode = code;
       }
-    } else {
-      const pair = lib.openedWorkspace(opened.stdout);
-      const refusal = verifyOpenedPair(pair);
+    }
+    if (reply.status === 0 && workspaceId === null) {
+      const pair = lib.openedWorkspace(reply.stdout);
+      const refusal = verifyOpenedPair(pair, call);
       if (refusal) {
         return errorResult(refusal, {
-          path: target, kind, branch,
+          ...paneRefusalBase(),
           paneId: pair.paneId, workspaceId: pair.workspaceId,
         });
       }
@@ -303,7 +349,7 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
     }
     if (paneId === null && workspaceId !== null) {
       const chosen = await choosePane(
-        isWorktree
+        openedKind === "worktree"
           ? `; the workspace '${workspaceId}' was opened by this call and no session was started in it`
           : `; the workspace '${workspaceId}' was created by this call and no session was started in it`,
       );
@@ -320,7 +366,8 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
     timeout: String(AGENT_START_TIMEOUT_MS), agentArgs: piArgs,
   }, AGENT_START_TIMEOUT_MS + 60000);
   const details = {
-    path: target, kind, branch,
+    path: target, kind: openedKind, branch,
+    ...(fallbackCode === null ? {} : { fallback: fallbackCode }),
     paneId, workspaceId, sessionId, resumed, agentName, notify,
   };
   if (started.status !== 0) {
@@ -341,7 +388,7 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
     try {
       notifications.startAgentSessionWatcher(
         {
-          paneId, path: target, kind, branch, sessionId,
+          paneId, path: target, kind: openedKind, branch, sessionId,
           agentName, workspaceId, repoRoot: target,
         },
         watcherOptions,

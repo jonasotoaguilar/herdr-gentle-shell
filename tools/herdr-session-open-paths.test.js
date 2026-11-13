@@ -202,6 +202,15 @@ function openReplyDoc(workspaceId, paneId, cwd) {
   return { result: { workspace: { workspace_id: workspaceId }, root_pane: { pane_id: paneId, cwd } } };
 }
 
+// The argv a worktree panel is opened with: the target travels as BOTH
+// `--path` and `--cwd`, because herdr resolves the owning repository from
+// `--cwd`, not from the process cwd (odd/tasks/session-open-cross-repo.md S1).
+// Both name the REAL checkout, even when the caller spelled it through a
+// symlink: resolution still lands on the same directory it always did.
+function worktreeOpenArgv(realTarget) {
+  return `worktree open --path ${realTarget} --cwd ${realTarget} --no-focus`;
+}
+
 describe('herdr_session_open symlinked paths', () => {
   test('a symlinked directory opens ONE normal panel at the requested spelling', async () => {
     const real = makeDir('real target');
@@ -269,7 +278,10 @@ describe('herdr_session_open symlinked paths', () => {
       assert.equal(result.details.workspaceId, 'w3');
       const argv = shimArgv(herdr.log);
       assert.equal(argv[0], `worktree list --cwd ${target}`);
-      assert.equal(argv[1], `worktree open --path ${target} --no-focus`);
+      assert.equal(argv[1], worktreeOpenArgv(target), 'the panel opens at the real checkout, resolved by --cwd');
+      for (const line of argv) {
+        assert.ok(!line.includes(link), `the symlink spelling never reaches herdr: ${line}`);
+      }
     } finally {
       restoreEnv();
     }
@@ -333,7 +345,7 @@ describe('herdr_session_open separate-git-dir checkouts', () => {
       const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.kind, 'worktree');
-      assert.equal(shimArgv(herdr.log)[1], `worktree open --path ${target} --no-focus`);
+      assert.equal(shimArgv(herdr.log)[1], worktreeOpenArgv(target));
     } finally {
       restoreEnv();
     }

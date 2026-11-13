@@ -5,7 +5,7 @@ The panel kind follows the path:
 
 | The path is | The panel opened |
 | --- | --- |
-| a linked Git worktree (a checkout whose `git rev-parse --git-dir` differs from its `--git-common-dir`) | **worktree panel** — `herdr worktree open --path <path>` |
+| a linked Git worktree (a checkout whose `git rev-parse --git-dir` differs from its `--git-common-dir`) | **worktree panel** — `herdr worktree open --path <path> --cwd <path>` |
 | a repository's primary checkout, including `git init --separate-git-dir` | **normal panel** — `herdr workspace create --cwd <path>` |
 | any other existing directory, including a subdirectory of a checkout | **normal panel** — `herdr workspace create --cwd <path>` |
 
@@ -52,8 +52,15 @@ reply parsers), `lib/herdr-session-notifications.js` (finish subscription)
    - Worktree panel: `herdr worktree list --cwd <path>` first. A workspace
      already open for that checkout is reused; two different workspace ids
      claiming it fail closed. Otherwise `herdr worktree open --path <path>
-     --no-focus`, and a failed open is re-checked against one fresh list rather
-     than assumed to have done nothing.
+     --cwd <path> --no-focus`: the path travels twice because Herdr resolves
+     the owning repository from `--cwd`, not from the process directory, so a
+     worktree of another repository resolves instead of answering
+     `worktree_not_found`. A failed open is re-checked against one fresh list
+     rather than assumed to have done nothing, and only that
+     `worktree_not_found` code for a path git *still* proves is a linked
+     worktree falls back to a **normal panel** at the same path (`herdr
+     workspace create --cwd <path> --no-focus`), with the result saying so;
+     every other failure aborts and opens nothing.
    - Normal panel: `herdr workspace create --cwd <requested> --no-focus`, where
      `<requested>` is the caller's own spelling of the path.
 4. **Verify the pane before starting anything.** The pane Herdr names must
@@ -68,9 +75,12 @@ reply parsers), `lib/herdr-session-notifications.js` (finish subscription)
 6. **Subscribe to the finish** unless `notify: false` was passed.
 
 The result is compact, ordered `label: value` rows — `outcome`, `path`,
-`panel` (`worktree` or `normal`), `branch` (only for a Git checkout), `session`,
+`panel` (`worktree` or `normal`, naming the kind really opened), `fallback`
+(only when a worktree open fell back: `normal panel after herdr reported
+worktree_not_found`), `branch` (only for a Git checkout), `session`,
 `workspace`, `pane`, `agent` — and the same facts ride in `details` as `path`,
-`kind` (`worktree` / `primary` / `generic`), `branch`, `paneId`, `workspaceId`,
+`kind` (`worktree` / `primary` / `generic` / `normal` after a fallback),
+`branch`, `fallback` (only when it happened), `paneId`, `workspaceId`,
 `sessionId`, `resumed`, `agentName`, `notify`.
 
 ## Parameters
