@@ -2,7 +2,7 @@ id = "herdr-gentle-shell"
 name = "Herdr Gentle Shell"
 version = "1.6.2"
 min_herdr_version = "0.9.4"
-description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments and ↑N behind-upstream marker."
+description = "Herdr sidebar states for Pi + Gentle Shell agents: oldest running role (explorer, worker, verify, judge) with total count in parentheses only when above one, ask, review, blocked, done, idle, plus exact +N/-N SessionChanges segments."
 platforms = ["linux"]
 
 # Task 5 scaffold: identity metadata only.
@@ -70,8 +70,7 @@ command = ["node", "bin/gentle-status.js", "--refresh"]
 
 # Sidebar wiring (DESIGN.md §5.3 install configuration): the daemon publishes
 # presence-encoded gentle_title_* labels plus the exact +N/-N SessionChanges
-# segments ($gentle_changes_added/$gentle_changes_deleted) and the ↑N
-# behind-upstream marker ($gentle_changes_pull), and
+# segments ($gentle_changes_added/$gentle_changes_deleted), and
 # bin/configure.js appends exactly one marked pi-only
 # [ui.sidebar.agents.rows_by_agent] override for canonical agent `pi`. The
 # parent [ui.sidebar.agents] table stays user-owned; --apply refuses when an
@@ -89,7 +88,7 @@ command = ["node", "bin/gentle-status.js", "--refresh"]
 [[actions]]
 id = "configure"
 command = ["node", "bin/configure.js", "--apply", "--reload"]
-description = "Append (or repair) the managed pi-only [ui.sidebar.agents.rows_by_agent] override (gentle_title_* + exact +N/-N SessionChanges segments + ↑N behind-upstream marker) without touching the user [ui.sidebar.agents] table, then reload."
+description = "Append (or repair) the managed pi-only [ui.sidebar.agents.rows_by_agent] override (gentle_title_* + exact +N/-N SessionChanges segments) without touching the user [ui.sidebar.agents] table, then reload."
 platforms = ["linux"]
 title = "Configure: install the pi-only sidebar override"
 

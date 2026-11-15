@@ -270,7 +270,7 @@ const HEADING_TOKENS = {
 // Presence-encoded combined row tokens (compat, DESIGN §5.3): agent
 // identity + state in one value, one current token only. Superseded by the
 // current structural row-2 wiring (eleven `gentle_title_*` state cells plus
-// three change-segment cells, no agent cell, no rules — native separators
+// two change-segment cells, no agent cell, no rules — native separators
 // on row 2 are acceptable): the combined value needed a substring rule to
 // recolor the state word, which cannot color identity vs state
 // structurally. These stay published for compatibility but are wired into
@@ -351,31 +351,31 @@ const DISPLAY_LABELS = {
 const PROJECT_TOKEN = 'gentle_project';
 
 // Change tokens for the two-row sidebar layout (DESIGN §5.3):
-// exact added/deleted line counts from SessionChanges evidence plus the
-// behind-upstream pull marker. Each renders a compact symbol or null
-// (absent) so empty segments collapse instead of showing stale counts.
-// The three segment tokens are published and wired as the visible row-2
-// color cells after the eleven title cells (added green `+N`, deleted red
-// `-N`, pull blue `↑N`, each its own cell, no rules, never swapped).
+// exact added/deleted line counts from SessionChanges evidence. Each
+// renders a compact symbol or null (absent) so empty segments collapse
+// instead of showing stale counts. The two segment tokens are published
+// and wired as the visible row-2 color cells after the eleven title cells
+// (added green `+N`, deleted red `-N`, each its own cell, no rules, never
+// swapped). The changes row carries no ahead/behind marker relative to the
+// branch: only these exact line counts.
 const CHANGES_ADDED_TOKEN = 'gentle_changes_added'; // "+N" or null
 const CHANGES_DELETED_TOKEN = 'gentle_changes_deleted'; // "-N" or null
-const CHANGES_PULL_TOKEN = 'gentle_changes_pull'; // "↑N" behind/upstream or null
 // Compact changes-summary value (compat, DESIGN §5.3): the nonempty
-// `+N`/`-N`/`↑N` segments joined with single spaces (`+N -N ↑N`), or null
-// when all are absent so the value collapses. Still published and owned
+// `+N`/`-N` segments joined with single spaces (`+N -N`), or null
+// when both are absent so the value collapses. Still published and owned
 // but wired into no visible row: the visible row-2 change cells carry the
-// same segments structurally (added/deleted/pull tokens). Inputs are
+// same segments structurally (added/deleted tokens). Inputs are
 // already-validated segment strings (or empty); anything else fails closed
 // to null, never a guessed count.
 const CHANGES_SUMMARY_TOKEN = 'gentle_changes_summary';
 
 // Every token name this daemon may write: 11 state + 11 title + 11 agent +
-// 11 icon + 11 heading + 11 row + 1 current-agent + 1 project + 3 changes
-// segments + 1 changes summary = 72, published
+// 11 icon + 11 heading + 11 row + 1 current-agent + 1 project + 2 changes
+// segments + 1 changes summary = 71, published
 // chunked <= 16 per report by the daemon (DESIGN §8). The state/agent/icon/
 // row/project/change-summary names stay published for compatibility; the
 // visible sidebar rows wire the eleven `gentle_title_*` state tokens plus the
-// three change-segment tokens (row 2: 11 state + 3 changes = 14 cells,
+// two change-segment tokens (row 2: 11 state + 2 changes = 13 cells,
 // each color structural with no rules); row 1 is native `state_icon` +
 // `workspace` + `agent` (3 cells, no custom wiring, no plugin colors),
 // each within Herdr's 16-token-per-row ceiling
@@ -392,7 +392,6 @@ const OWNED_TOKENS = [
   PROJECT_TOKEN,
   CHANGES_ADDED_TOKEN,
   CHANGES_DELETED_TOKEN,
-  CHANGES_PULL_TOKEN,
   CHANGES_SUMMARY_TOKEN,
 ];
 // Retired names a previous install may have left behind. Cleared on sweep,
@@ -400,9 +399,13 @@ const OWNED_TOKENS = [
 // fail-closed (absent) rather than rendering a stale "~N". The retired
 // `*_working_subs` family held the old `working (n)` count display; the role
 // model (explorer/worker/verify/judge + `working`) supersedes it, so those names
-// are swept to leave no orphan count row behind.
+// are swept to leave no orphan count row behind. The retired
+// `gentle_changes_pull` name carried the behind-upstream `↑N` marker, which
+// mismatched the real branch state, so it was removed on request: swept,
+// never written.
 const LEGACY_TOKENS = [
   BADGE_TOKEN,
+  'gentle_changes_pull',
   'gentle_state_working_subs',
   'gentle_title_working_subs',
   'gentle_agent_working_subs',
@@ -845,7 +848,7 @@ function reducePane(entry, now = Date.now()) {
   const sessionHash = expectedSessionHash(entry);
   const agent = parseAgentName(entry);
   const workspace = parseWorkspaceName(entry);
-  const idle = { display: 'idle', label: 'idle', agent, workspace, added: '', deleted: '', pull: '', notify: null };
+  const idle = { display: 'idle', label: 'idle', agent, workspace, added: '', deleted: '', notify: null };
 
   if (piTreeOwnsPane(tokens, sessionHash, now)) return { ...idle, owned: false };
 
@@ -890,7 +893,6 @@ function reducePane(entry, now = Date.now()) {
       workspace,
       added,
       deleted,
-      pull: '', // filled by the daemon from branch-ab status (DESIGN §5.3)
       notify,
       owned: true,
     };
@@ -912,7 +914,6 @@ function reducePane(entry, now = Date.now()) {
       workspace,
       added,
       deleted,
-      pull: '',
       notify,
       owned: true,
     };
@@ -1094,13 +1095,13 @@ function projectValueFor(workspace) {
   return typeof workspace === 'string' && workspace.length > 0 ? workspace : 'workspace';
 }
 
-// Compact changes-summary value: the nonempty `+N`/`-N`/`↑N` segments
-// joined with single spaces (`+N -N ↑N`), or null when all are absent so
-// the cell collapses. One token means one Herdr cell. Inputs are already-validated segment strings
+// Compact changes-summary value: the nonempty `+N`/`-N` segments joined
+// with single spaces (`+N -N`), or null when both are absent so the cell
+// collapses. One token means one Herdr cell. Inputs are already-validated segment strings
 // (or empty); anything else fails closed to null, never a guessed count.
-function changesSummaryValue(added, deleted, pull) {
+function changesSummaryValue(added, deleted) {
   const parts = [];
-  for (const part of [added, deleted, pull]) {
+  for (const part of [added, deleted]) {
     if (typeof part === 'string' && part.length > 0) parts.push(part);
   }
   return parts.length > 0 ? parts.join(' ') : null;
@@ -1147,16 +1148,16 @@ function rowValueFor(display, agent, label) {
 // no agent cell) and the combined gentle_row_* token for
 // the current display carries `<agent> · <label>` (compat output, wired
 // into no visible row — only the eleven `gentle_title_*` state cells plus the
-// three change-segment cells are visibly wired, DESIGN §5.3);
+// two change-segment cells are visibly wired, DESIGN §5.3);
 // the change segment tokens ride as the visible row-2 color cells after
 // the eleven title cells (green
-// `+N`, red `-N`, blue `↑N`, each its own cell with no rules, never
+// `+N`, red `-N`, each its own cell with no rules, never
 // swapped) and the
 // `gentle_changes_summary` token carries the space-joined nonempty
 // segments (compat output, wired into no visible row),
 // so state and session changes stay independently observable (DESIGN §3
-// O4 — never ↳, never merged, never the combined v1 badge). `result.pull`
-// is the daemon-resolved behind-upstream marker ("↑N" or empty);
+// O4 — never ↳, never merged, never the combined v1 badge). The row carries
+// no ahead/behind marker relative to the branch;
 // stale/invalid input yields nulls (fail-closed), never held values.
 function displayTokens(result) {
   const patch = {};
@@ -1167,8 +1168,7 @@ function displayTokens(result) {
   }
   patch[CHANGES_ADDED_TOKEN] = result.added || null;
   patch[CHANGES_DELETED_TOKEN] = result.deleted || null;
-  patch[CHANGES_PULL_TOKEN] = result.pull || null;
-  patch[CHANGES_SUMMARY_TOKEN] = changesSummaryValue(result.added, result.deleted, result.pull);
+  patch[CHANGES_SUMMARY_TOKEN] = changesSummaryValue(result.added, result.deleted);
   for (const display of DISPLAYS) {
     patch[ICON_TOKENS[display]] =
       display === result.display ? iconValueFor(display) : null;
@@ -1214,7 +1214,6 @@ module.exports = {
   BADGE_TOKEN,
   CHANGES_ADDED_TOKEN,
   CHANGES_DELETED_TOKEN,
-  CHANGES_PULL_TOKEN,
   CHANGES_SUMMARY_TOKEN,
   OWNED_TOKENS,
   LEGACY_TOKENS,

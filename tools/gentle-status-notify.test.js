@@ -370,8 +370,8 @@ describe('adaptive poll (P1)', () => {
   });
 
   // S4: the row data this daemon derives by itself (the `+N/-N` changes
-  // summary and the `↑N` pull marker) is read from local git plus
-  // `agent.list`, so no producer report can drive it. Any display other than
+  // summary) is read from the local snapshot plus `agent.list`, so no
+  // producer report can drive it. Any display other than
   // the settled `idle` therefore keeps the fast cycle armed on its own.
   it('an active display arms the fast cycle', () => {
     const config = daemon.resolvePollConfig({});

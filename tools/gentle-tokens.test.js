@@ -113,12 +113,9 @@ describe('native icons', () => {
   });
 
   it('heading uses the workspace and ignores change args (white structural cell, no rules)', () => {
-    assert.equal(
-      tokens.headingValueFor('worker', 'myproj', '+110', '-22', '↑3'),
-      '● myproj',
-    );
-    assert.equal(tokens.headingValueFor('worker', 'myproj', '+110', '', ''), '● myproj');
-    assert.equal(tokens.headingValueFor('worker', 'myproj', '', '', ''), '● myproj');
+    assert.equal(tokens.headingValueFor('worker', 'myproj', '+110', '-22'), '● myproj');
+    assert.equal(tokens.headingValueFor('worker', 'myproj', '+110', ''), '● myproj');
+    assert.equal(tokens.headingValueFor('worker', 'myproj', '', ''), '● myproj');
     assert.equal(tokens.headingValueFor('worker', ''), '● workspace');
     assert.equal(tokens.headingValueFor('unknown', 'myproj'), null);
   });
@@ -132,7 +129,6 @@ describe('native icons', () => {
       workspace: 'my-proj',
       added: '+1',
       deleted: '-2',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.HEADING_TOKENS.worker], '● my-proj');
@@ -420,7 +416,6 @@ describe('orchestrating display family', () => {
       workspace: 'myproj',
       added: '',
       deleted: '',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.STATE_TOKENS.orchestrating], 'orchestrating');
@@ -440,8 +435,8 @@ describe('orchestrating display family', () => {
     }
   });
 
-  it('owned and sweep lists include judge (66 + 6 = 72)', () => {
-    assert.equal(tokens.OWNED_TOKENS.length, 72);
+  it('owned and sweep lists include judge (66 + 5 = 71)', () => {
+    assert.equal(tokens.OWNED_TOKENS.length, 71);
     const names = [
       'gentle_state_orchestrating',
       'gentle_title_orchestrating',
@@ -459,16 +454,22 @@ describe('orchestrating display family', () => {
     assert.ok(tokens.SWEEP_TOKENS.includes('gentle_project'));
     assert.ok(tokens.SWEEP_TOKENS.includes('gentle_changes_summary'));
   });
+
+  it('retires the behind-upstream pull marker: swept, never owned or written', () => {
+    assert.equal(tokens.CHANGES_PULL_TOKEN, undefined);
+    assert.ok(!tokens.OWNED_TOKENS.includes('gentle_changes_pull'));
+    assert.ok(tokens.LEGACY_TOKENS.includes('gentle_changes_pull'));
+    assert.ok(tokens.SWEEP_TOKENS.includes('gentle_changes_pull'));
+  });
 });
 
 describe('changes summary cell', () => {
   it('joins nonempty segments with spaces; null when all absent', () => {
-    assert.equal(tokens.changesSummaryValue('+110', '-22', ''), '+110 -22');
-    assert.equal(tokens.changesSummaryValue('+110', '', '↑3'), '+110 ↑3');
-    assert.equal(tokens.changesSummaryValue('', '', '↑3'), '↑3');
-    assert.equal(tokens.changesSummaryValue('+1', '-2', '↑3'), '+1 -2 ↑3');
-    assert.equal(tokens.changesSummaryValue('', '', ''), null);
-    assert.equal(tokens.changesSummaryValue(null, undefined, ''), null);
+    assert.equal(tokens.changesSummaryValue('+110', '-22'), '+110 -22');
+    assert.equal(tokens.changesSummaryValue('+110', ''), '+110');
+    assert.equal(tokens.changesSummaryValue('', '-2'), '-2');
+    assert.equal(tokens.changesSummaryValue('', ''), null);
+    assert.equal(tokens.changesSummaryValue(null, undefined), null);
   });
 
   it('displayTokens publishes segments as structural row-2 cells while the heading stays `<icon> <project>`', () => {
@@ -479,20 +480,19 @@ describe('changes summary cell', () => {
       workspace: 'myproj',
       added: '+110',
       deleted: '-22',
-      pull: '↑3',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.CHANGES_ADDED_TOKEN], '+110');
     assert.equal(patch[tokens.CHANGES_DELETED_TOKEN], '-22');
-    assert.equal(patch[tokens.CHANGES_PULL_TOKEN], '↑3');
-    assert.equal(patch[tokens.CHANGES_SUMMARY_TOKEN], '+110 -22 ↑3');
+    assert.equal(patch['gentle_changes_pull'], undefined);
+    assert.equal(patch[tokens.CHANGES_SUMMARY_TOKEN], '+110 -22');
     assert.doesNotMatch(patch[tokens.CHANGES_SUMMARY_TOKEN], /·/);
     assert.equal(patch[tokens.HEADING_TOKENS.worker], '● myproj');
     assert.equal(patch[tokens.PROJECT_TOKEN], 'myproj');
     assert.doesNotMatch(patch[tokens.HEADING_TOKENS.worker], /·/);
     assert.ok(!patch[tokens.HEADING_TOKENS.worker].includes('+110'));
     assert.ok(!patch[tokens.HEADING_TOKENS.worker].includes('-22'));
-    assert.ok(!patch[tokens.HEADING_TOKENS.worker].includes('↑3'));
+    assert.ok(!patch[tokens.HEADING_TOKENS.worker].includes('↑'));
   });
 
   it('row 1 presence-encoding leaves exactly one nonempty `<icon> <project>` heading', () => {
@@ -503,7 +503,6 @@ describe('changes summary cell', () => {
       workspace: 'myproj',
       added: '+1',
       deleted: '',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     const nonempty = tokens.DISPLAYS.filter((display) => patch[tokens.HEADING_TOKENS[display]] !== null);
@@ -522,7 +521,6 @@ describe('changes summary cell', () => {
       workspace: 'myproj',
       added: '+7',
       deleted: '-3',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.CHANGES_ADDED_TOKEN], '+7');
@@ -537,7 +535,6 @@ describe('changes summary cell', () => {
       workspace: 'myproj',
       added: '',
       deleted: '',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.CHANGES_SUMMARY_TOKEN], null);
@@ -558,7 +555,6 @@ describe('row value identity', () => {
       workspace: 'myproj',
       added: '',
       deleted: '',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.ROW_TOKENS.worker], 'pi · worker');
@@ -610,7 +606,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
     assert.ok(!row1.includes('sidebarCell'));
   });
 
-  it('row 2 is state word + added + deleted + pull in exact order, no rules', () => {
+  it('row 2 is state word + added + deleted in exact order, no rules', () => {
     const order = [
       '$gentle_title_working',
       '$gentle_title_orchestrating',
@@ -625,7 +621,6 @@ describe('sidebar row layout (bin/configure.js)', () => {
       '$gentle_title_idle',
       '$gentle_changes_added',
       '$gentle_changes_deleted',
-      '$gentle_changes_pull',
     ];
     let prev = -1;
     for (const token of order) {
@@ -633,7 +628,8 @@ describe('sidebar row layout (bin/configure.js)', () => {
       assert.ok(idx > prev, token + ' in order on row 2');
       prev = idx;
     }
-    assert.equal(cells(row2), 14);
+    assert.equal(cells(row2), 13);
+    assert.ok(!row2.includes('$gentle_changes_pull'));
     assert.ok(!row2.includes('rules'));
     assert.ok(!row2.includes('$gentle_heading_'));
     assert.ok(!row2.includes('$gentle_project'));
@@ -641,7 +637,7 @@ describe('sidebar row layout (bin/configure.js)', () => {
     assert.ok(!row2.includes('$gentle_changes_summary'));
   });
 
-  it('row 2 keeps agent off; state colors preserved; added green, deleted red, pull blue', () => {
+  it('row 2 keeps agent off; state colors preserved; added green, deleted red', () => {
     assert.ok(!row2.includes("'$gentle_agent'"));
     const expected = [
       ['$gentle_title_working', 'SIDEBAR_AMBER'],
@@ -657,7 +653,6 @@ describe('sidebar row layout (bin/configure.js)', () => {
       ['$gentle_title_idle', 'SIDEBAR_GREY'],
       ['$gentle_changes_added', 'SIDEBAR_GREEN'],
       ['$gentle_changes_deleted', 'SIDEBAR_RED'],
-      ['$gentle_changes_pull', 'SIDEBAR_BLUE'],
     ];
     for (const [token, color] of expected) {
       assert.ok(row2.includes("sidebarCell('" + token + "', " + color + ')'), token + ' ' + color);
@@ -1200,7 +1195,6 @@ describe('T2b role words and running delegate count', () => {
       workspace: 'myproj',
       added: '',
       deleted: '',
-      pull: '',
     };
     const patch = tokens.displayTokens(reduced);
     assert.equal(patch[tokens.TITLE_TOKENS.worker], 'worker');
@@ -1228,9 +1222,9 @@ describe('T2b role words and running delegate count', () => {
     assert.equal(reduced.label, 'idle');
   });
 
-  it('owned/sweep families include judge (72 total) and row 2 holds 14 cells', () => {
+  it('owned/sweep families include judge (71 total) and row 2 holds 13 cells', () => {
     assert.equal(tokens.DISPLAYS.length, 11);
-    assert.equal(tokens.OWNED_TOKENS.length, 72);
+    assert.equal(tokens.OWNED_TOKENS.length, 71);
     assert.ok(tokens.OWNED_TOKENS.includes('gentle_state_judge'));
     assert.ok(tokens.OWNED_TOKENS.includes('gentle_title_judge'));
     assert.ok(tokens.SWEEP_TOKENS.includes('gentle_title_judge'));
