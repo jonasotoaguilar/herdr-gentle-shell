@@ -179,7 +179,21 @@
 //                       ask only when it opens while at least one tool
 //                       execution is active, so commands/widgets that prompt
 //                       while idle never become ask; nested/duplicate
-//                       lifecycle coalesces into one boolean leg.
+//                       lifecycle coalesces into one boolean leg. A command
+//                       menu (`/rdd`, `/warp` list, the `customize` fallback)
+//                       renders through `ctx.ui.select` -> `kind: "select"`,
+//                       the same kind a real question uses, and the host
+//                       gives no origin signal — so the span withdraws the
+//                       moment the agent proves it was never waiting on it:
+//                       a top-level `tool_execution_start` (never a nested
+//                       `codemode` call, which starts while a sibling dialog
+//                       is still awaited) or an assistant-role `message_end`
+//                       while the span is open, and only then
+//                       (`tool_execution_update` never withdraws: live
+//                       background jobs emit it while a real ask may be
+//                       open). Entry stays immediate so a real ask is never
+//                       missed; `ui_prompt_end` clears both flags, so the
+//                       next span starts fresh.
 //                       Boundary: this leg observes only what Pi emits as a
 //                       `tool_execution_start` event in this root extension.
 //                       A host-side ask UI that emits no execution for those names
@@ -2799,8 +2813,26 @@ export default function (pi) {
   // and a false ask on every panel open is worse than missing one dialog.
   // Nested or duplicate prompt lifecycle coalesces into one boolean leg,
   // cleared on the matching `ui_prompt_end`, session reset, and shutdown.
+  // Withdrawal (odd/tasks/ui-prompt-ask-origin): the host emits no origin
+  // signal, so a Gentle Shell slash command rendering its option menu through
+  // `ctx.ui.select` (`/rdd`, `/warp` list, the `customize` fallback — all
+  // `kind: "select"`) is indistinguishable from a real question at entry.
+  // Entry therefore stays immediate (a real ask is never missed), and the leg
+  // withdraws on the asymmetry a run genuinely blocked on its own dialog
+  // cannot produce: starting new TOP-LEVEL tool executions, or finishing
+  // assistant messages. A top-level `tool_execution_start` or an
+  // assistant-role `message_end` proves the span was never waited on, so
+  // `uiPromptWithdrawn` stands for the rest of that span and only
+  // `ui_prompt_end` clears it. A nested call (`parentToolCallId`) never
+  // withdraws: codemode's `ctx.executeTool` starts a sibling execution while
+  // another tool's dialog is still awaited, so it proves nothing.
+  // `tool_execution_update` never withdraws: live
+  // background jobs (`bash_background` / `monitor`) emit updates while a real
+  // ask may legitimately be open. The rule keys on signals only — no
+  // command-name list and no title matching.
   const runningTools = new Set(); // toolCallId -> in-flight tool execution
   let uiPromptActive = false;
+  let uiPromptWithdrawn = false;
   let askIntentId;
   let askCounter = 0;
 
@@ -3258,6 +3290,13 @@ export default function (pi) {
     } catch { /* best effort: a failure here is non-fatal */ }
   }
 
+  // A generic UI prompt span contributes to ask only until the agent proves
+  // it is not waiting on it (see the withdrawal rule next to
+  // `uiPromptWithdrawn`); every other leg below is untouched.
+  function uiPromptAskActive() {
+    return uiPromptActive && !uiPromptWithdrawn;
+  }
+
   function askActiveNow() {
     return (
       choiceActive ||
@@ -3265,8 +3304,20 @@ export default function (pi) {
       questionnaireActive ||
       permissionPending.size > 0 ||
       askToolCalls.size > 0 ||
-      uiPromptActive
+      uiPromptAskActive()
     );
+  }
+
+  // Withdrawal of the generic prompt leg (odd/tasks/ui-prompt-ask-origin):
+  // called from the two signals that prove the run was never blocked on the
+  // open span — a new top-level tool execution and a finished assistant
+  // message. The span stops contributing to ask and to the beat until
+  // `ui_prompt_end`.
+  function withdrawUiPromptAsk() {
+    if (!uiPromptAskActive()) return;
+    uiPromptWithdrawn = true;
+    updateBlocker();
+    schedulePublish();
   }
 
   function desiredLabel() {
@@ -3814,7 +3865,9 @@ export default function (pi) {
     // task-mode role publishes even while the authoritative count is 0.
     // A pending ask tool call likewise keeps the beat alive so `ask:`
     // publishes while the call is in flight; the generic UI prompt leg
-    // holds the beat the same way while its span is open. Effective
+    // holds the beat the same way while its span is open and has not been
+    // withdrawn (a withdrawn span proves the agent is working, so the
+    // ordinary activity legs keep the beat). Effective
     // review (executing acknowledged capture/group calls) keeps the beat
     // alive so `review:` and the durable review token publish — NO GRACE:
     // the leg drops when the last execution ends or resolves. A live
@@ -3827,7 +3880,7 @@ export default function (pi) {
       pendingCalls.size > 0 ||
       freshRunningJobCount() > 0 ||
       askToolCalls.size > 0 ||
-      uiPromptActive ||
+      uiPromptAskActive() ||
       reviewActive ||
       // The standing run error keeps a beat alive so its durable token stays
       // republished (and TTL-fresh) until the leg releases, even after the
@@ -4305,6 +4358,7 @@ export default function (pi) {
     askToolCalls.clear();
     runningTools.clear();
     uiPromptActive = false;
+    uiPromptWithdrawn = false;
     askIntentId = undefined;
     reviewCalls.clear();
     reviewActive = false;
@@ -4390,6 +4444,15 @@ export default function (pi) {
     if (!rootSession || !isRecord(event) || typeof event.toolCallId !== "string") return;
     noteActivity();
     runningTools.add(event.toolCallId);
+    // A new TOP-LEVEL execution cannot start inside a run blocked on a
+    // dialog: if a generic UI prompt span is open, it was never waited on (a
+    // Gentle Shell command menu keeps the agent working), so the span
+    // withdraws for the rest of its life. A nested call proves the opposite of
+    // nothing: codemode's `ctx.executeTool` emits its start immediately, even
+    // before its own queue wait, while a sibling tool's dialog is still
+    // awaited (verified: 1 finding, false negative on a real confirmation), so
+    // nested starts never withdraw.
+    if (event.parentToolCallId === undefined) withdrawUiPromptAsk();
     // Structured ask tools open ONLY on genuine execution (never on
     // `tool_call` proposal), keyed by call id so the matching end or
     // result closes them.
@@ -4463,6 +4526,9 @@ export default function (pi) {
   pi.on("ui_prompt_end", () => {
     if (!rootSession || !uiPromptActive) return;
     uiPromptActive = false;
+    // A fresh span (nested or later) starts un-withdrawn: the withdrawal is
+    // per-span evidence, never session-wide.
+    uiPromptWithdrawn = false;
     updateBlocker();
   });
 
@@ -4698,6 +4764,11 @@ export default function (pi) {
     const message = event.message;
     if (!isRecord(message)) return;
     if (message.role === "assistant") {
+      // A finished assistant message while a generic UI prompt span is open
+      // proves the run was never blocked on it (same asymmetry as a new
+      // top-level tool execution), so the span withdraws for the rest of its
+      // life.
+      withdrawUiPromptAsk();
       // The one real error state. Pi derives `turn_end.outcome === "error"`
       // from exactly this stopReason, so a run that stopped on an error is
       // visible here without a second handler; any other assistant message
