@@ -10,8 +10,8 @@
 // `state_icon` + `workspace`, and the grey native agent identity with the
 // native separator. Row 2 wires the twelve presence-encoded gentle_title_*
 // state cells (state word only, one current title only, each in its
-// state's semantic color with no rules) followed by the three
-// change-segment tokens (added green, deleted red, pull blue, each its
+// state's semantic color with no rules) followed by the two
+// change-segment tokens (added green, deleted red, each its
 // own color cell with no rules). Absent tokens render empty. Native
 // separators on row 2 are acceptable. Custom heading/project/agent cells
 // (`$gentle_heading_*`, `$gentle_project`, `$gentle_agent`) and
@@ -68,8 +68,8 @@ const AGENT_ID = 'pi';
 // `gentle_title_*` state cells (state word only, one current title per
 // frame, each in its state's semantic color as base fg with no rules; role
 // labels include the total when two or more delegates run) followed by the
-// three change-segment tokens (added green `+N`, deleted
-// red `-N`, pull blue `↑N`, each its own color cell with no rules, never
+// two change-segment tokens (added green `+N`, deleted
+// red `-N`, each its own color cell with no rules, never
 // swapped). The review leg renders the user-facing word `rdd` (machine key
 // stays `review`; review execution is silent, never a notification); the error value renders `blocked`; the orchestrating
 // leg renders the user-facing word `gentle` (machine key stays
@@ -79,7 +79,7 @@ const AGENT_ID = 'pi';
 // cells stay published and owned for compatibility but are wired into no
 // visible row. Only one title token carries a value per frame (presence
 // encoding), so absent tokens render empty. Row 1 holds 3 native cells
-// and row 2 holds 14 cells (11 state + 3 changes), each within
+// and row 2 holds 13 cells (11 state + 2 changes), each within
 // Herdr's 16-token per-row ceiling. The agent name in each value is the snapshot-provided
 // validated identity (pi, op, codex, ...) — never a subagent name, never a
 // count — with no vendor colors invented here. The heading
@@ -87,17 +87,17 @@ const AGENT_ID = 'pi';
 // basename (never the Herdr workspace_id, never Git, never inferred).
 //
 // Palette values mirror herdr-pi-tree lib/palette.js: project white
-// #ffffff (state.branch, Spaces project names), explorer/pull blue
+// #ffffff (state.branch, Spaces project names), explorer blue
 // #89b4fa, added/done green #a6e3a1, removed/blocked red #f38ba8, working
 // amber #f9e2af; ask #fab387 is the warning hue; explorer icon uses Herdr
 // blue #89b4fa, verify teal #94e2d5, the root-session `orchestrating`
 // marker pink fuchsia #f5c2e7
 // (SIDEBAR_FUCHSIA for its heading icon and title), the RDD/review running state
-// uses blue #89b4fa (same as explorer/pull), and the judge delegate role
+// uses blue #89b4fa (same as explorer), and the judge delegate role
 // uses purple #cba6f7 (SIDEBAR_PURPLE, distinct from explorer blue, verify
 // teal, and orchestrating pink). Idle renders grey #7c7f93. Row 1 wires no colors:
 // plain native `state_icon`, `workspace`, `agent` strings. Row 2 is structural color cells with no rules:
-// each state word in its state color, added green, deleted red, pull blue. Added
+// each state word in its state color, added green, deleted red. Added
 // stays green and deleted stays red; the mapping is never swapped.
 const SIDEBAR_PROJECT = '#ffffff';
 const SIDEBAR_BLUE = '#89b4fa';
@@ -130,8 +130,8 @@ const PI_ROW_1 = ['"state_icon"', '"workspace"', '"agent"'];
 
 // Row 2: eleven state-word cells in state colors with no rules (one current
 // title per frame; role words carry a running-count suffix above one), followed by
-// the three change segments as their own
-// color cells (added green `+N`, deleted red `-N`, pull blue `↑N`, never
+// the two change segments as their own
+// color cells (added green `+N`, deleted red `-N`, never
 // swapped; empty segments collapse). Native separators on row 2 are
 // acceptable. No `$gentle_heading_*`, `$gentle_project`, `$gentle_agent`,
 // or `$gentle_changes_summary` token is visibly wired; those stay
@@ -152,7 +152,6 @@ const PI_ROW_2 = [
   sidebarCell('$gentle_title_idle', SIDEBAR_GREY),
   sidebarCell('$gentle_changes_added', SIDEBAR_GREEN),
   sidebarCell('$gentle_changes_deleted', SIDEBAR_RED),
-  sidebarCell('$gentle_changes_pull', SIDEBAR_BLUE),
 ];
 
 const PI_ROW = `pi = [[${PI_ROW_1.join(', ')}], [${PI_ROW_2.join(', ')}]]`;

@@ -49,8 +49,8 @@
 // Herdr emit that event and repaint. The subscription can never fail the
 // daemon: it reconnects on a bounded backoff, reports one line per distinct
 // failure, and the poll below is unchanged and correct without it. The
-// git-derived `+N/-N` and `↑N` row data and the presence prefix have no Herdr
-// event at all, which is why polling is never removed.
+// presence prefix and the done-view recede have no Herdr event at all, which
+// is why polling is never removed.
 //
 // T5 `gs` label ladder (DESIGN §5.5): an isolated Gentle Shell pane has no
 // Agents row because `gs` is not a canonical Herdr agent. A pane Herdr detects
@@ -135,10 +135,10 @@ function createPollStateObserved() {
   return { askActivity: false, failure: false, active: false };
 }
 
-// S4: the row data this daemon derives itself — the `+N/-N` changes summary
-// and the `↑N` pull marker, read from local git plus `agent.list` — is
-// refreshed by a frame, not by a producer report, so an idle pane waits a
-// whole baseline for a git change to appear. The reduced display a frame
+// S4: the row data this daemon refreshes by a frame rather than by a
+// producer report — the presence prefix and `agent.list` — means an idle pane
+// would otherwise wait a whole baseline for a change to appear. The reduced
+// display a frame
 // already computed is the only classification used: anything other than the
 // settled `idle` is active, while an absent or unknown display counts as
 // settled and keeps today's baseline (fail closed, like every parser).
@@ -221,59 +221,6 @@ const MAX_TOKENS_PER_REPORT = 16;
 const SOCKET_TIMEOUT_MS = 4000;
 const CLI_TIMEOUT_MS = 5000;
 const MAX_IN_FLIGHT = 16;
-
-// DESIGN §5.3 pull marker: behind-upstream count per pane cwd, read from
-// fixed-argv `git status --porcelain=2 --branch` ONLY (the `# branch.ab`
-// line). No shell, no diff, no fetch. Bounded: 2 s timeout, 64 KiB cap,
-// short-TTL per-cwd cache (default 30 s, env-overridable) with in-frame
-// dedupe via the same cache, so N panes in one worktree cost ~1 git call
-// per TTL window. Any failure (no cwd, no git, no upstream, timeout)
-// resolves to 0 — fail-closed, the marker simply stays absent.
-const PULL_TTL_MS = Number(process.env.GENTLE_PULL_TTL_MS ?? 30000) || 30000;
-const PULL_CACHE_MAX = 128;
-const pullCache = new Map(); // cwd -> { behind, at }
-
-function branchBehind(cwd) {
-  const now = Date.now();
-  if (typeof cwd === 'string' && cwd.length > 0) {
-    const hit = pullCache.get(cwd);
-    if (hit && now - hit.at < PULL_TTL_MS) return hit.behind;
-  }
-  let behind = 0;
-  try {
-    if (typeof cwd === 'string' && cwd.length > 0 && cwd.length <= 4096) {
-      const result = spawnSync(
-        'git',
-        ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--porcelain=2', '--branch', '--untracked-files=no'],
-        { cwd, encoding: 'utf8', timeout: 2000, maxBuffer: 64 * 1024, windowsHide: true },
-      );
-      if (result.status === 0 && typeof result.stdout === 'string') {
-        const ab = /^# branch\.ab \+(\d+) -(\d+)$/m.exec(result.stdout);
-        if (ab) behind = Number(ab[2]) || 0;
-      }
-    }
-  } catch {
-    behind = 0;
-  }
-  if (typeof cwd === 'string' && cwd.length > 0) {
-    if (pullCache.size >= PULL_CACHE_MAX) pullCache.clear();
-    pullCache.set(cwd, { behind, at: now });
-  }
-  return behind;
-}
-
-function pullMarkerFor(entry) {
-  const foreground = entry?.foreground_cwd;
-  const base = entry?.cwd;
-  const cwd =
-    typeof foreground === 'string' && foreground.length > 0
-      ? foreground
-      : typeof base === 'string'
-        ? base
-        : '';
-  const behind = branchBehind(cwd);
-  return behind > 0 ? `↑${behind}` : '';
-}
 
 const DEBUG = process.env.GENTLE_STATUS_DEBUG === '1';
 function debug(...args) {
@@ -1243,17 +1190,14 @@ async function frame(state, opts = {}) {
       liveOwned.push(paneId);
       continue;
     }
-    // Behind-upstream marker, resolved per cwd with TTL dedupe (no storm
-    // across panes sharing a worktree). Absent on any failure.
-    reduced.pull = pullMarkerFor(entry);
     // Ask activity keeps the P1 fast cycle armed while a question waits.
     // Desktop attention itself is native (DESIGN §7): no toast here.
     if (reduced.display === 'ask' && reduced.notify && state.pollObserved) {
       state.pollObserved.askActivity = true;
     }
-    // S4: any non-idle display keeps the fast cycle armed too, so the git
-    // changes summary and pull marker this daemon derives by itself stop
-    // lagging up to a whole baseline. Set before the signature short-circuit
+    // S4: any non-idle display keeps the fast cycle armed too, so the row
+    // data this daemon refreshes by itself stops lagging up to a whole
+    // baseline. Set before the signature short-circuit
     // below: an unchanged row is still a rendered one.
     observeDisplay(state.pollObserved, reduced.display);
     const patch = contract.displayTokens(reduced);

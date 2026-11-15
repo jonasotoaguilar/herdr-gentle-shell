@@ -154,13 +154,13 @@ an explicit writer-ownership decision. Rationale follows each choice.
   absent under single-writer handoff (O1). Gentle renders exactly two rows
   for the `pi` agent: row 1 is the heading context as exactly one active
   cell — the active `gentle_heading_*` value holds `<icon> <project>` plus
-  compact nonempty changes segments (` +N`, ` -N`, ` ↑N`) in that same
-  cell (e.g. `● myproj +110 -22 ↑3`). Exactly one row-1 cell is nonempty,
+  compact nonempty changes segments (` +N`, ` -N`) in that same
+  cell (e.g. `● myproj +110 -22`). Exactly one row-1 cell is nonempty,
   so Herdr inserts zero inter-cell `·` separators. The cell sits on white
   `#ffffff` (SIDEBAR_PROJECT) so the project text stays white; symbol
   `contains` rules recolor the icon (unchanged state mapping) plus ` +`
-  green (added), ` -` red (deleted, leading-space match so hyphens inside
-  project names never turn red), and ` ↑` blue (pull). `gentle_project`,
+  green (added), and ` -` red (deleted, leading-space match so hyphens inside
+  project names never turn red). `gentle_project`,
   `gentle_changes_summary`, and the change-segment tokens stay published
   and owned for compatibility but are wired into no visible row; row 2 is
   the agent context (the
@@ -483,7 +483,7 @@ explorers with count 3 → `explorer (3)`; 5 files
 `● myproj +110 -22` (` +` green for added, ` -` red for deleted with a
 leading-space match, zero `·` separators because exactly one heading cell
 is nonempty).
-A review label renders `rdd` with a blue `●` (`#89b4fa`, same as explorer/pull). A
+A review label renders `rdd` with a blue `●` (`#89b4fa`, same as explorer). A
 `gentle_orchestrating_v1` marker renders the pink `gentle` (machine display
 key `orchestrating`, pink palette unchanged): it covers the principal's
 queued/running subs and pending launches, and it yields to a delegate role
@@ -579,8 +579,7 @@ display — repairs a missed `error:` label edge, §4.3),
 `gentle_roles_v1` (authoritative activity roles,
 oldest-first by immutable firstSeen), `gentle_names_v1` (compat transport only — never
 rendered), `gentle_changes_v2` (normative; a
-v1-only pane renders no change segments, §4.3). Pane cwd
-(`foreground_cwd` ?? `cwd`) feeds the daemon-side pull marker (§5.3).
+v1-only pane renders no change segments, §4.3).
 Foreign `pi_subagents_work_v1` / `state_*` / `title_*` are observed only to
 ignore them under O1 (never parsed for state, never deleted).
 
@@ -706,7 +705,7 @@ cap has lapsed, does it recede to `idle` (§4.3).
   `#cba6f7` (distinct from explorer blue, verify teal, orchestrating pink),
   ask orange `#fab387`, blocked red `#f38ba8`, done green `#a6e3a1`,
   idle grey `#7c7f93` (recedes), review blue `#89b4fa` (same as
-  explorer/pull; internal TaskStore role slug stays `rdd`, machine display
+  explorer; internal TaskStore role slug stays `rdd`, machine display
   key stays `review`). Native separators on row 2 are acceptable. The
   `gentle_state_*` / `gentle_agent_*` / `gentle_icon_*` /
   `gentle_row_*` combined names stay published for compatibility but are
@@ -735,20 +734,17 @@ cap has lapsed, does it recede to `idle` (§4.3).
   running delegates and no pending launches; a settled principal with
   running delegates keeps the role word) | `idle`. Role labels append the
   total count when at least two delegates run.
-- Row-2 changes: the nonempty `+N`/`-N`/`↑N` segments ride as their own
+- Row-2 changes: the nonempty `+N`/`-N` segments ride as their own
   structural row-2 cells after the eleven title cells (each its own color
-  cell with no rules — added green, deleted red, pull blue, never
+  cell with no rules — added green, deleted red, never
   swapped; empty segments collapse so nothing renders). `+N`/`-N` come
   from fresh `gentle_changes_v2`
-  (exact SessionChanges evidence totals, never git status); `↑N` (blue)
-  marks the pane branch behind its upstream. The pull marker is derived by the daemon from fixed-argv,
-  bounded `git status --porcelain=2 --branch` (the `# branch.ab` line
-  only — no shell, no diff, no fetch), cached/deduped per cwd over a short
-  TTL so panes sharing a worktree cost ~1 call per window. Any pull failure
-  resolves to absent (fail-closed).
-- Each `+N`/`-N`/`↑N` segment renders only when its total is > 0; each
-  rides its own structural row-2 cell (added green, deleted red, pull
-  blue, no rules, never swapped; empty segments collapse). `gentle_project`,
+  (exact SessionChanges evidence totals, never git status). The row carries
+  no ahead/behind marker relative to the branch: only the exact added and
+  deleted line counts.
+- Each `+N`/`-N` segment renders only when its total is > 0; each
+  rides its own structural row-2 cell (added green, deleted red,
+  no rules, never swapped; empty segments collapse). `gentle_project`,
   `gentle_heading_*`, `gentle_agent` (both the single and per-display
   forms), and `gentle_changes_summary` stay published for compatibility
   but render no visible row. The retired
@@ -756,11 +752,11 @@ cap has lapsed, does it recede to `idle` (§4.3).
   badge is never emitted (see the §4.3 versioning rule).
 - Placement: exactly two pi-only rows — row 1 the native `state_icon` +
   `workspace` + `agent` strings (3 cells, no custom wiring, no plugin
-  colors), row 2 the eleven `gentle_title_*` state cells plus the three
-  change-segment cells (14 cells: 11 state + 3 changes), each row within
+  colors), row 2 the eleven `gentle_title_*` state cells plus the two
+  change-segment cells (13 cells: 11 state + 2 changes), each row within
   Herdr's 16-token per-row ceiling — with the
   herdr-pi-tree palette (added green `#a6e3a1`,
-  removed red `#f38ba8`, pull blue `#89b4fa`, working golden `#f9e2af`, ask
+  removed red `#f38ba8`, working golden `#f9e2af`, ask
   orange `#fab387`, orchestrating pink fuchsia `#f5c2e7`, explorer/rdd blue `#89b4fa` (same color; internal role slug stays `rdd`,
   visible word is `rdd`, machine key stays `review`), judge purple `#cba6f7` (distinct),
   blocked/error red `#f38ba8`,
@@ -1057,11 +1053,11 @@ exactly one mechanism writes each piece of state.
   `gentle_orchestrating_v1`, `gentle_principal_v1`, `gentle_done_v1`,
   `gentle_ask_v1`, `gentle_review_v1`, `gentle_error_v1`,
   `gentle_changes_v2`,
-  `gentle_changes_v1`) and the daemon publishes its 72-token owned family
+  `gentle_changes_v1`) and the daemon publishes its 71-token owned family
   chunked ≤ 16 per report (row 1 is the 3 native tokens
   `state_icon`/`workspace`/`agent`; the legacy 11 `gentle_heading_*` compat
   family stays published but wired into no visible row. Row 2 wires 11
-  title + 3 change cells = 14 — each within the per-row ceiling). Names are
+  title + 2 change cells = 13 — each within the per-row ceiling). Names are
   advisory; roles are authoritative for display and role labels carry the
   running total as a suffix when at least two delegates run.
 - TTL: `expiry <= now + 60000` at write; readers use `now` at read.
@@ -1078,8 +1074,8 @@ exactly one mechanism writes each piece of state.
   (`GENTLE_STATUS_FAST_QUIET_FRAMES`) or a TTL-bounded window
   (`GENTLE_STATUS_FAST_WINDOW_MS`), 250 ms floor, single dynamic
   `setTimeout` chain. The active-display trigger exists because the row data
-  the daemon derives by itself — the `+N/-N` changes summary and the `↑N`
-  pull marker, read from local git plus `agent.list` — cannot be driven by a
+  the daemon refreshes by a frame rather than from a producer report —
+  `agent.list` plus the presence prefix — cannot be driven by a
   producer report; only `idle` counts as settled, so an idle pane keeps the
   baseline exactly.
   Drawing is event-synchronized; polling is only the fallback. Every landed
@@ -1112,10 +1108,9 @@ exactly one mechanism writes each piece of state.
   Shutdown closes the socket and its retry timer, and neither keeps the process
   alive. Idle cost with no events is exactly today's: an idle subscription is
   silent and the loop sleeps as before.
-  What the subscription can never drive stays poll-only: the row data the
-  daemon derives by itself — the `+N/-N` changes summary and the `↑N` pull
-  marker, read from local git plus `agent.list` — plus the presence prefix,
-  because Herdr emits no event for either. That is why the fast cycle is armed
+  What the subscription can never drive stays poll-only: the daemon's own
+  `agent.list` snapshot and the presence prefix, because Herdr emits no event
+  for either. That is why the fast cycle is armed
   by a rendered non-idle display, and why polling is never removed.
   The sleep is also capped at the nearest live `gentle_done_v1` expiry AND the
   nearest pending view-dwell deadline (`DONE_VIEW_DWELL_MS`) among
@@ -1145,7 +1140,7 @@ exactly one mechanism writes each piece of state.
   `gentle_heading_*`, `gentle_project`, `gentle_row_*` (each family now
   includes the `judge` display alongside the original ten), plus display-only
   `gentle_changes_added`, `gentle_changes_deleted`,
-  `gentle_changes_pull`, `gentle_changes_summary`); no change to `pi_subagents_work_v1`, `state_*`,
+  `gentle_changes_summary`); no change to `pi_subagents_work_v1`, `state_*`,
   `title_*`, or native `working`/`blocked`/`idle` semantics.
   `gentle_title_error` keeps its machine-key-derived token name; only its
   user-facing value is `blocked` (§5.3). `gentle_title_review` likewise
@@ -1155,7 +1150,9 @@ exactly one mechanism writes each piece of state.
   likewise keeps its machine-key-derived token name; its user-facing value is
   a non-contemplated subagent's own sanitized name, never the word `working`.
   The retired `*_working_subs` token family (the old `working (n)`
-  count display) is swept, never written.
+  count display) is swept, never written. The retired
+  `gentle_changes_pull` name (the removed behind-upstream `↑N` marker) is
+  swept the same way, never written.
 - Coexistence: `herdr-pi-tree` stays installed but disabled for gentle-owned
   panes (O1). No uninstall, no token migration, no dual-run merge — ownership
   handoff is by enable/disable switch, reversible at any time.
@@ -1223,7 +1220,7 @@ exactly one mechanism writes each piece of state.
 - **U5. Changes badge — RESOLVED (two-row contract):** the `±N` vs `~N`
   selection no longer exists — the combined badge is retired in favor of
   independent `+N`/`-N` segments from exact `gentle_changes_v2` added/deleted
-  totals, plus the daemon-side `↑N` pull marker (§5.3). The producer mirrors
+  totals, plus the daemon-side change cells (§5.3). The producer mirrors
   the Gentle Shell `SessionChanges` model semantics over the same transcript
   `SESSION_CHANGE_ENTRY` evidence (never git and never an approximate
   reaggregation): files keyed by `(root, path)`, evidence-ID dedup,
@@ -1247,7 +1244,7 @@ confirming each criterion has a normative section:
 | V1 | Sidebar shows the active TaskStore role with live subagents | §4.2 (role source G3 + `gentle_roles_v1`), §5.2–§5.3 |
 | V2 | Sidebar shows `ask` on open question | §4.2 (G4 → `ask:`), §5.2 priority, §7 notify-once |
 | V3 | Sidebar shows `review` during native review | §4.2 (review tool lifecycle → `review:`, incl. capture-group parent call), §5.2 priority |
-| V4 | Change segments render from Gentle session-changes | §4.2/§4.4 (`gentle_changes_v2`), §5.3 `+N`/`-N`/`↑N` |
+| V4 | Change segments render from Gentle session-changes | §4.2/§4.4 (`gentle_changes_v2`), §5.3 `+N`/`-N` |
 | V5 | No collision with pi-tree `↳N` / `state_*` names | §3 O1/O2/O4, §9 rollback |
 | V6 | Stale panes fall back to `idle`, orphans swept on handover | §3 O5, §5.4, §6 |
 

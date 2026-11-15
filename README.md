@@ -40,9 +40,9 @@ nested `codemode` call, which starts while a sibling dialog is still awaited) or
 assistant message arriving while it is open — never counts either, so a Gentle Shell command
 menu opened mid-work leaves the row on the agent's real activity), and
 permission waiting; `gentle_review` starts never speculate ask, amber/orange `?`), `blocked`, `done`, `idle`) plus compact
-changes segments folded into the single row-1 heading cell (nonempty ` +N`/` -N`/` ↑N`
+changes segments (nonempty ` +N`/` -N`
 with leading spaces, symbols color-distinguished by `contains` rules: ` +` green for added,
-` -` red for deleted, ` ↑` blue for pull — added stays green, deleted stays red),
+` -` red for deleted — added stays green, deleted stays red),
 reduced from `gentle_*`
 pane-metadata tokens. It coexists with `herdr-pi-tree` through a single-writer handoff: while
 this plugin owns a pane, `herdr-pi-tree` stays disabled for that pane, so the
@@ -206,11 +206,11 @@ the native `state_icon`, is Herdr-native and not plugin-controlled); row 2
 wires the eleven presence-encoded `gentle_title_*` state cells (state word
 only, one current title per frame, each in its state's semantic color as
 base fg with no rules; role words carry a running-count suffix above one)
-followed by the three
-change-segment tokens (added green `+N`, deleted red `-N`, pull blue `↑N`,
+followed by the two
+change-segment tokens (added green `+N`, deleted red `-N`,
 each its own color cell with no rules, never swapped). The review leg
 renders the user-facing word `rdd` in blue `#89b4fa` (same as
-explorer/pull; internal TaskStore role slug stays `rdd`, machine display key
+explorer; internal TaskStore role slug stays `rdd`, machine display key
 and token names stay `review` — review execution is silent, never a
 notification; only an actual waiting prompt renders `ask` (desktop attention
 is Herdr's native `blocked` toast); the judge delegate role renders `judge` in
@@ -234,8 +234,8 @@ for compatibility but are wired into no visible row.
 Only one `gentle_title_*` token carries a value per frame (presence
 encoding), so row 2 shows the current state word plus any nonempty change
 segments while the rest render empty; native separators on row 2 are
-acceptable. Row 1 holds 3 native cells and row 2 holds 14 cells (11 state
-+ 3 changes), each within Herdr's 16-token per-row ceiling (full block below).
+acceptable. Row 1 holds 3 native cells and row 2 holds 13 cells (11 state
++ 2 changes), each within Herdr's 16-token per-row ceiling (full block below).
 The `gs` label of an isolated Gentle Shell pane needs no key here: `gs` is not
 one of Herdr's canonical agents, so `rows_by_agent.gs` is a configuration error
 rather than an inert key. Only the daemon's label ladder (DESIGN.md §5.5)
@@ -247,7 +247,7 @@ makes that row appear, and `rows_by_agent` stays keyed by the canonical `pi`.
 # row 1 native state_icon + workspace + agent, row 2 state word + changes.
 # The parent [ui.sidebar.agents] table is user-owned and never touched here.
 [ui.sidebar.agents.rows_by_agent]
-pi = [["state_icon", "workspace", "agent"], [{ token = "$gentle_title_working", fg = "#f9e2af" }, { token = "$gentle_title_orchestrating", fg = "#f5c2e7" }, { token = "$gentle_title_explorer", fg = "#89b4fa" }, { token = "$gentle_title_worker", fg = "#f9e2af" }, { token = "$gentle_title_verify", fg = "#94e2d5" }, { token = "$gentle_title_judge", fg = "#cba6f7" }, { token = "$gentle_title_ask", fg = "#fab387" }, { token = "$gentle_title_review", fg = "#89b4fa" }, { token = "$gentle_title_error", fg = "#f38ba8" }, { token = "$gentle_title_done", fg = "#a6e3a1" }, { token = "$gentle_title_idle", fg = "#7c7f93" }, { token = "$gentle_changes_added", fg = "#a6e3a1" }, { token = "$gentle_changes_deleted", fg = "#f38ba8" }, { token = "$gentle_changes_pull", fg = "#89b4fa" }]]
+pi = [["state_icon", "workspace", "agent"], [{ token = "$gentle_title_working", fg = "#f9e2af" }, { token = "$gentle_title_orchestrating", fg = "#f5c2e7" }, { token = "$gentle_title_explorer", fg = "#89b4fa" }, { token = "$gentle_title_worker", fg = "#f9e2af" }, { token = "$gentle_title_verify", fg = "#94e2d5" }, { token = "$gentle_title_judge", fg = "#cba6f7" }, { token = "$gentle_title_ask", fg = "#fab387" }, { token = "$gentle_title_review", fg = "#89b4fa" }, { token = "$gentle_title_error", fg = "#f38ba8" }, { token = "$gentle_title_done", fg = "#a6e3a1" }, { token = "$gentle_title_idle", fg = "#7c7f93" }, { token = "$gentle_changes_added", fg = "#a6e3a1" }, { token = "$gentle_changes_deleted", fg = "#f38ba8" }]]
 # END herdr-gentle-agents
 ```
 
@@ -255,11 +255,11 @@ The
 single row-1 heading cell mirrors the Gentle Shell SessionChanges model semantics
 (write/edit tool outcomes, never `git status`, never an approximate
 reaggregation): files keyed by `(root, path)` with snapshot-continuity and
-unavailable counts (unavailable files stay in the file count with 0/0); `↑N` shows when the pane
-branch is behind its upstream (branch-ab status only, no diff). `gentle_project`,
+unavailable counts (unavailable files stay in the file count with 0/0). `gentle_project`,
 `gentle_changes_summary`, and the segment
-tokens (`gentle_changes_added`/`_deleted`/`_pull`) stay published for
-compatibility but render no visible row. Pink `gentle` (machine key
+tokens (`gentle_changes_added`/`_deleted`) stay published for
+compatibility but render no visible row. The changes row carries no
+ahead/behind marker relative to the branch. Pink `gentle` (machine key
 `orchestrating`, pink palette unchanged) is the
 only user-facing `gentle`: it renders while the principal session actively
 works — even with zero subagents, with or without a fresh root marker — and
@@ -357,7 +357,7 @@ role word such as `worker`, `explorer`,
 once the principal itself is idle — and also while a
 task-mode subagent call blocks the principal's turn, until it returns), that
 a row never reads `gentle` on an idle pane; row 1
-shows the single heading cell (`● <project>` plus ` +N`/` -N`/` ↑N` inline, zero `·`) after edits / when behind upstream; then `ask` on an open
+shows the single heading cell (`● <project>` plus ` +N`/` -N` inline, zero `·`) after edits; then `ask` on an open
 question (choice / native-questionnaire / legacy event legs, executed `ask_user_question`/`ask_user_choice`, tool-gated `ui_prompt` dialog spans (a `custom` panel — agents view, ODD viewer, changes view, design canvas — never counts, because opening a panel is navigation, not a question; neither does a span the agent proves it is not waiting on, since a run blocked on its own dialog cannot start a new top-level tool execution (a nested `codemode` call proves nothing: it starts while a sibling dialog is still awaited) or finish an assistant message, so a Gentle Shell command menu opened mid-work keeps the row on the agent's real activity), or permission waiting; `gentle_review` starts never speculate ask, and no failed tool ever does either: a tool error changes nothing, see the error rule below). `rdd` (machine key `review`) applies during acknowledged native capture/group execution only (`reviewerRunAcknowledged: true` at execution start — never proposal, never forecast-only, never `correctionLines` planning, never `gentle_review`/`gentle_review_scope` in any operation; no hook/sidebar signal observed; unknown legacy shapes stay dark; call-id tracked so thrown/cancelled calls still clear, read-only `assess` excluded). Bounded approximation: the acknowledged interval contains preparation and admission; no exact reviewer internal events exist today. The orchestrator-host `ask_user_choice` prompt emits no Pi tool/event observable by this extension and stays covered only by the event legs above. Never point the fixture commands at the live config: keep
 `HERDR_CONFIG_PATH` on a temp file for apply/uninstall checks.
 
@@ -400,7 +400,7 @@ producer's own beat is 15 s by default and
 TTL. Reports in one window collapse into one frame, and refresh-driven frames
 are floored at 250 ms, so a burst can never spin the daemon. Polling stays the
 fallback for every lifecycle signal and the only source for what no Herdr event
-carries (the git-derived `+N/-N` and `↑N` row data and the presence prefix), so a
+carries (the presence prefix), so a
 missed, undelivered, or rejected event never sticks. Read-only
 supervision triage ships beside it: the `doctor` and `whois` plugin actions
 (`node bin/gentle-doctor.js`, `node bin/gentle-whois.js`) plus the explicit-pane
@@ -440,13 +440,14 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   NeedsAttention toast and sound, so the sidebar carries the error on the
   durable `gentle_error_v1` token while the pane stays quiet on `working`,
   and no phone envelope is sent).
-- Single-cell row-1 heading (`<icon> <project>` plus ` +N`/` -N`/` ↑N`
+- Single-cell row-1 heading (`<icon> <project>` plus ` +N`/` -N`
   inline, exactly one nonempty cell so zero `·` separators; white base with
   `contains` rules keeping ` +` green (added), ` -` red (deleted,
-  leading-space match), ` ↑` blue (pull)) mirroring the Gentle Shell
+  leading-space match)) mirroring the Gentle Shell
   SessionChanges model semantics over Gentle tool outcomes, never `git`
   status and never an approximate reaggregation (root+path continuity and
-  unavailable counts); behind-upstream `↑N` from branch-ab status only.
+  unavailable counts). The changes row carries no ahead/behind marker
+  relative to the branch.
   Session-change tokens are refreshed/cleared from the current Gentle Shell
   session model and never carried across sessions.
 - Single-writer coexistence with `herdr-pi-tree`: no shared token names, no
