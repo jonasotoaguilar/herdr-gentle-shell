@@ -229,6 +229,166 @@ test('session shutdown clears the prompt leg', async () => {
   assert.equal(blockedLabels(h).length, 2);
 });
 
+// --- ui-prompt-ask-origin S1-S6: withdrawal of the generic leg ----------
+// The host emits no origin signal for `ui_prompt_start`, so a Gentle Shell
+// slash command that renders its option menu through `ctx.ui.select`
+// (`kind: "select"` — `/rdd`, `/warp` list, the `customize` fallback) looks
+// exactly like a real question at entry. The one asymmetry that cannot lie:
+// a run genuinely blocked on a dialog cannot also start new TOP-LEVEL tool
+// executions (a nested `codemode` call starts while a sibling dialog is still
+// awaited, so it proves nothing) or finish assistant messages. Either signal
+// withdraws the generic leg for the rest of that prompt span; every dedicated
+// ask leg is untouched.
+
+test('S1/S4: a command menu mid-execution withdraws ask on the next tool start', async () => {
+  const { default: factory } = await factoryPromise;
+  const h = harness();
+  factory(h.pi);
+  startRootSession(h);
+  h.fire('tool_execution_start', { toolCallId: 't1', toolName: 'read' });
+  // Entry stays immediate: the tool-gated span still asks at first sight,
+  // because a missed real question is worse than a briefly wrong label.
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'select' });
+  let labels = blockedLabels(h);
+  assert.equal(labels.length, 1);
+  assert.match(labels[0].label, /^ask:/, 'the span enters ask like any tool-gated dialog');
+  // `/rdd`, `/warp list`, the `customize` fallback: the command keeps the
+  // agent working while its menu is open, so a NEW tool execution starts
+  // inside the span. That proves the run was never waiting on the prompt.
+  h.fire('tool_execution_start', { toolCallId: 't2', toolName: 'bash' });
+  labels = blockedLabels(h);
+  assert.equal(labels.length, 2, 'withdrawal republishes the row on that beat');
+  assert.deepEqual(
+    labels[1],
+    { active: false },
+    'the row drops out of ask on the real activity label instead of holding ask:',
+  );
+  assert.ok(
+    !labels.slice(1).some((payload) => /^ask:/.test(payload.label ?? '')),
+    'a withdrawn span publishes no ask label',
+  );
+  // Coalesced lifecycle for the SAME span (a nested/duplicate start) never
+  // re-enters ask: the withdrawal holds until the span ends.
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'confirm' });
+  assert.equal(blockedLabels(h).length, 2, 'a withdrawn span never re-enters ask');
+  // `ui_prompt_end` leaves the session consistent: the withdrawn span ends
+  // silently, and the next span starts fresh.
+  h.fire('ui_prompt_end', {});
+  assert.equal(blockedLabels(h).length, 2, 'ending a withdrawn span emits nothing');
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'confirm' });
+  labels = blockedLabels(h);
+  assert.equal(labels.length, 3, 'a fresh span after the end is not withdrawn');
+  assert.match(labels[2].label, /^ask:/, 'a real dialog mid-execution still asks');
+  h.fire('ui_prompt_end', {});
+  labels = blockedLabels(h);
+  assert.equal(labels.length, 4);
+  assert.deepEqual(labels[3], { active: false });
+});
+
+test('S1: an assistant message while a prompt is open withdraws ask', async () => {
+  const { default: factory } = await factoryPromise;
+  const h = harness();
+  factory(h.pi);
+  startRootSession(h);
+  h.fire('tool_execution_start', { toolCallId: 't1', toolName: 'read' });
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'select' });
+  assert.match(blockedLabels(h)[0].label, /^ask:/);
+  // A finished assistant message is the same proof as a new execution: a run
+  // blocked on a dialog cannot produce one while the dialog is open.
+  h.fire('message_end', { message: { role: 'assistant', content: [], stopReason: 'stop' } });
+  let labels = blockedLabels(h);
+  assert.equal(labels.length, 2, 'withdrawal republishes the row on that beat');
+  assert.deepEqual(
+    labels[1],
+    { active: false },
+    'the row drops out of ask on the real activity label instead of holding ask:',
+  );
+  assert.ok(
+    !labels.slice(1).some((payload) => /^ask:/.test(payload.label ?? '')),
+    'no ask label survives the withdrawal',
+  );
+  // The withdrawal holds for the rest of the span, and its end is silent.
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'confirm' });
+  assert.equal(blockedLabels(h).length, 2, 'a withdrawn span never re-enters ask');
+  h.fire('ui_prompt_end', {});
+  assert.equal(blockedLabels(h).length, 2, 'ending a withdrawn span emits nothing');
+});
+
+test('S3: a prompt the run really waits on holds ask until the span ends', async () => {
+  const { default: factory } = await factoryPromise;
+  const h = harness();
+  factory(h.pi);
+  startRootSession(h);
+  h.fire('tool_execution_start', { toolCallId: 't1', toolName: 'read' });
+  h.fire('ui_prompt_start', { reason: 'ui_prompt', kind: 'select' });
+  let labels = blockedLabels(h);
+  assert.equal(labels.length, 1);
+  const intent = labels[0].label;
+  assert.match(intent, /^ask:q1-/);
+  // Live background jobs (`bash_background` / `monitor`) emit
+  // `tool_execution_update` while a real ask may legitimately be open, so an
+  // update is never proof the run was not waiting: ask holds.
+  h.fire('tool_execution_update', { toolCallId: 't1', toolName: 'bash_background' });
+  h.fire('tool_execution_update', { toolCallId: 't1', toolName: 'monitor' });
+  assert.equal(blockedLabels(h).length, 1, 'a live job update never withdraws ask');
+  assert.equal(blockedLabels(h)[0].label, intent, 'the intent episode stays stable');
+  // No assistant message, no new execution: the run is blocked on the user.
+  h.fire('tool_execution_end', { toolCallId: 't1' });
+  assert.equal(blockedLabels(h).length, 1, 'a tool end mid-span never clears ask');
+  h.fire('ui_prompt_end', {});
+  labels = blockedLabels(h);
+  assert.equal(labels.length, 2);
+  assert.deepEqual(labels[1], { active: false }, 'ask releases on the real prompt end');
+});
+
+test('nested sibling execution cannot hide an awaited generic question', async () => {
+  const { default: factory } = await factoryPromise;
+  const h = harness();
+  factory(h.pi);
+  startRootSession(h);
+  try {
+    // Independent verification finding: codemode's `ctx.executeTool` emits a
+    // nested start immediately, even before its own queue wait, while a
+    // sibling tool's dialog is still awaited. A nested start is therefore
+    // never proof that the run was not waiting, and must not withdraw ask.
+    h.fire('tool_execution_start', {
+      toolCallId: 'code',
+      toolName: 'codemode',
+    });
+    h.fire('tool_execution_start', {
+      toolCallId: 'code/1',
+      parentToolCallId: 'code',
+      toolName: 'deployment_confirmation',
+    });
+    h.fire('ui_prompt_start', {
+      reason: 'ui_prompt',
+      kind: 'confirm',
+    });
+    const intent = blockedLabels(h).at(-1).label;
+
+    // Confirmation still awaits the user while its sibling starts.
+    h.fire('tool_execution_start', {
+      toolCallId: 'code/2',
+      parentToolCallId: 'code',
+      toolName: 'read',
+    });
+    h.fire('tool_execution_end', {
+      toolCallId: 'code/2',
+      parentToolCallId: 'code',
+      toolName: 'read',
+    });
+    assert.deepEqual(blockedLabels(h).at(-1), {
+      active: true,
+      label: intent,
+    });
+
+    h.fire('ui_prompt_end', {});
+    assert.deepEqual(blockedLabels(h).at(-1), { active: false });
+  } finally {
+    h.fire('session_shutdown', {});
+  }
+});
+
 test('review call emits review and clears immediately on resolve (no grace)', async () => {
   const { default: factory } = await factoryPromise;
   const h = harness();
