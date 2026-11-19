@@ -613,6 +613,35 @@ describe('pane change signature', () => {
     }
   });
 
+  it('distinguishes every patch input independently', () => {
+    // The equivalence table above mutates `display` always together with
+    // `label`, so it never proves `display` matters on its own: dropping it
+    // from the signature would survive that table and silently skip every
+    // republish between two displays that share a label. Each field is mutated
+    // alone here, and must move both the patch and the signature.
+    const mutations = {
+      display: 'done',
+      label: 'a different label',
+      agent: 'gentle-ai-explorer',
+      workspace: 'otherproj',
+      added: '+3',
+      deleted: '-2',
+    };
+    for (const [field, value] of Object.entries(mutations)) {
+      const changed = { ...base, [field]: value };
+      assert.notEqual(
+        JSON.stringify(contract.displayTokens(base)),
+        JSON.stringify(contract.displayTokens(changed)),
+        `${field} must change the patch`,
+      );
+      assert.notEqual(
+        daemon.paneChangeSignature(base),
+        daemon.paneChangeSignature(changed),
+        `${field} must change the signature`,
+      );
+    }
+  });
+
   it('separates an empty title from an absent one', () => {
     // displayTokens writes the label raw, so "" and undefined are NOT the same
     // token; a signature that collapsed them would skip a real republish.
