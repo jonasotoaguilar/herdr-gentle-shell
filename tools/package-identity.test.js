@@ -35,11 +35,13 @@ describe('Pi package identity', () => {
 
   it('declares the Pi extensions and every declared file exists', () => {
     const declared = PKG.pi?.extensions ?? [];
-    // Two extensions: the Herdr state producer, and the worktree session
-    // opener that stays with Herdr (S6). Everything else was removed.
+    // Three extensions: the Herdr state producer, the worktree session opener
+    // that stays with Herdr (S6), and the theme sync follower. Everything else
+    // was removed.
     assert.deepEqual(declared, [
       './extensions/gentle-herdr-state.ts',
       './extensions/herdr-session-open.ts',
+      './extensions/herdr-theme-sync.ts',
     ]);
     for (const rel of declared) {
       assert.ok(fs.existsSync(path.join(REPO_ROOT, rel)), `missing extension ${rel}`);

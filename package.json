@@ -35,7 +35,8 @@
   "pi": {
     "extensions": [
       "./extensions/gentle-herdr-state.ts",
-      "./extensions/herdr-session-open.ts"
+      "./extensions/herdr-session-open.ts",
+      "./extensions/herdr-theme-sync.ts"
     ]
   }
 }

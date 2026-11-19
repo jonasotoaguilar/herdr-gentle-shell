@@ -341,6 +341,7 @@ describe('herdr_session_open registration', () => {
     assert.deepEqual(pkg.pi.extensions.slice().sort(), [
       './extensions/gentle-herdr-state.ts',
       './extensions/herdr-session-open.ts',
+      './extensions/herdr-theme-sync.ts',
     ]);
   });
 });
