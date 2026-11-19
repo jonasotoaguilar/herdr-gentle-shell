@@ -10,7 +10,7 @@
 // The extension is TypeScript with one package import that is unresolvable
 // under plain node (@earendil-works/pi-coding-agent, used only for
 // transcript patch accounting). The tests load a renamed copy with exactly
-// that import line stubbed — production is untouched — the same approach as
+// that import line srcText — production is untouched — the same approach as
 // the installed herdr-pi-tree tools/prompt-state.test.js.
 
 const { test } = require('node:test');
@@ -22,21 +22,16 @@ const { pathToFileURL } = require('node:url');
 
 const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
 const srcText = fs.readFileSync(src, 'utf8');
-const stubbed = srcText.replace(
-  /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-  'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
-);
-assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-herdr-state-'));
 // Single-file deployment boundary: state.ts ships alone (installed copy or
 // symlink) with no sibling helper, so the copy is exactly one file and the
 // load proves no relative import is needed.
 assert.ok(
-  !/^import .* from "\.\//m.test(stubbed),
+  !/^import .* from "\.\//m.test(srcText),
   'state.ts must stay self-contained (no relative imports)',
 );
 const copy = path.join(root, 'gentle-herdr-state.mjs');
-fs.writeFileSync(copy, stubbed);
+fs.writeFileSync(copy, srcText);
 const copyUrl = pathToFileURL(copy).href;
 
 // Module-level env/pane binding is captured at import, so it is pinned
@@ -634,7 +629,7 @@ test('review token bytes clear immediately when the last call resolves under ask
     // Single file only — no sibling helper alongside the copy.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-herdr-state-bytes-'));
     const copy2 = path.join(dir, 'gentle-herdr-state-bytes.mjs');
-    fs.writeFileSync(copy2, stubbed);
+    fs.writeFileSync(copy2, srcText);
     const { default: factory2 } = await import(pathToFileURL(copy2).href);
     const h = harness();
     factory2(h.pi);
@@ -817,7 +812,7 @@ async function loadWireFactory(sockPath, paneId) {
   try {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-herdr-wire-'));
     const wireCopy = path.join(dir, 'gentle-herdr-state-wire.mjs');
-    fs.writeFileSync(wireCopy, stubbed);
+    fs.writeFileSync(wireCopy, srcText);
     const { default: factory } = await import(pathToFileURL(wireCopy).href);
     return { factory, prevEnv };
   } catch (error) {
@@ -1062,7 +1057,7 @@ test('deferred chat result still completes the delegate under a settled principa
 // only one file (a copy per the public installer, or a symlink of the repo
 // file). A relative helper import resolves against the installed directory
 // and breaks child startup there. These tests simulate the installed
-// directory exactly — one state.ts plus a stubbed Pi package — and prove the
+// directory exactly — one state.ts plus a srcText Pi package — and prove the
 // deployed file loads and reconciles with no sibling helper present.
 
 function makeInstalledDir() {
@@ -1080,7 +1075,7 @@ function makeInstalledDir() {
   );
   fs.writeFileSync(
     path.join(stubPkg, 'index.js'),
-    'export const generateUnifiedPatch = () => { throw new Error("stubbed in installed-dir test"); };\n',
+    'export const generateUnifiedPatch = () => { throw new Error("srcText in installed-dir test"); };\n',
   );
   return installedDir;
 }
@@ -2192,7 +2187,7 @@ test('Herdr byte ceiling: an over-long astral label truncates on a character bou
 });
 
 // --- T2b sound presence firstSeen refinement --------------------------------
-// Uses the already-imported stubbed module's named exports directly: a
+// Uses the already-imported srcText module's named exports directly: a
 // sound earlier same-binding createdAt corrects a late local firstSeen
 // (backfills tasks that lack one); future or later timestamps never move
 // it, and epochs/witness state are untouched (T1 preserved).
@@ -2535,7 +2530,7 @@ async function loadNativeFactory(sockPath, paneId, _ownerValueIgnored) {
   delete process.env.GENTLE_HERDR_NATIVE_OWNER;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-native-mod-'));
   const modCopy = path.join(dir, 'gentle-herdr-state-native.mjs');
-  fs.writeFileSync(modCopy, stubbed);
+  fs.writeFileSync(modCopy, srcText);
   try {
     const { default: factory, ...named } = await import(pathToFileURL(modCopy).href);
     return { factory, named, prevEnv };

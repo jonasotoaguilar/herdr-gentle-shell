@@ -275,7 +275,6 @@
 import net from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { generateUnifiedPatch } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import { delimiter as pathDelimiter, dirname, join, resolve as resolvePath, relative as pathRelative, basename as pathBasename, isAbsolute as pathIsAbsolute } from "node:path";
@@ -294,7 +293,15 @@ const nodeRequire = createRequire(import.meta.url);
 // are the only surface the harness extracts.
 
 export const PRESENCE_HEADER_LIMIT = 16 * 1024;
-export const PRESENCE_ACTIVITY_LIMIT = 16 * 1024 * 1024;
+// The activity read is synchronous and runs on the agent's own event loop on
+// every beat, so this ceiling is a cost the session pays rather than a hostile
+// file's business alone. The envelope the writer emits is bounded by the same
+// caps the reader honours (128 tracked tasks, ≤120-char labels): 16× the header
+// limit covers that worst case with margin, and keeps the per-beat parse in
+// single-digit milliseconds instead of the hundreds of milliseconds a 16 MiB
+// ceiling allowed. An oversized file still resolves to no snapshot, never a
+// partial one.
+export const PRESENCE_ACTIVITY_LIMIT = 256 * 1024;
 export const PRESENCE_FRESH_MS = 15_000;
 export const PRESENCE_MAX_DIR_ENTRIES = 128;
 export const PRESENCE_MAX_WITNESSED = 256;
@@ -1304,138 +1311,6 @@ export function computeNativeState({
 }
 
 // ---------------------------------------------------------------------------
-// Live session-changes metric (S62: authoritative publisher, never transcript)
-//
-// Gentle-shell shows the CURRENT working tree against HEAD for the session's
-// subscribed roots. The transcript aggregate below (aggregateChanges over
-// SESSION_CHANGE_ENTRY before/after patches) is retained as legacy evidence
-// for other needs but is NOT the publisher authority: beats publish the
-// live Git scan instead, so external/untracked edits and scope registration
-// reflect immediately with numerical equality to the reference.
-// ---------------------------------------------------------------------------
-
-function sameSnapshot(before, after) {
-  return (
-    before?.kind === after?.kind &&
-    (before?.kind === "absent" ||
-      (before?.kind === "text" &&
-        after?.kind === "text" &&
-        before?.text === after?.text))
-  );
-}
-
-function snapshotPatchText(snapshot) {
-  return snapshot && snapshot.kind === "text" && typeof snapshot.text === "string" ? snapshot.text : "";
-}
-
-function unavailableReason(snapshot) {
-  if (snapshot?.kind === "unavailable" && typeof snapshot?.reason === "string" && snapshot.reason.length > 0) {
-    return snapshot.reason;
-  }
-  return "Snapshot unavailable.";
-}
-
-// Unified-patch accounting identical to Gentle Shell
-// SessionChanges.changed(): generateUnifiedPatch(path, before, after),
-// enter after the first @@ hunk, count lines beginning + and -. Fail-closed
-// to 0/0 so token bounds hold when the patch cannot be built.
-function safePatchPath(path) {
-  if (typeof path !== "string") return "change";
-  const clean = path.replace(/[\0\r\n]/g, "").slice(0, 256);
-  return clean.length > 0 ? clean : "change";
-}
-
-function patchLineCounts(pathLabel, before, after) {
-  try {
-    const patch = generateUnifiedPatch(pathLabel, before, after);
-    const patchLines = patch.split("\n");
-    const firstHunk = patchLines.findIndex((line) => line.startsWith("@@"));
-    const lines = firstHunk < 0 ? [] : patchLines.slice(firstHunk + 1);
-    return {
-      added: lines.filter((line) => line.startsWith("+")).length,
-      deleted: lines.filter((line) => line.startsWith("-")).length,
-    };
-  } catch {
-    return { added: 0, deleted: 0 };
-  }
-}
-
-function isPlausibleEvidence(evidence) {
-  return (
-    isRecord(evidence) &&
-    typeof evidence.id === "string" &&
-    evidence.id.length > 0 &&
-    typeof evidence.root === "string" &&
-    evidence.root.length > 0 &&
-    typeof evidence.path === "string" &&
-    evidence.path.length > 0 &&
-    isRecord(evidence.before) &&
-    isRecord(evidence.after)
-  );
-}
-
-function aggregateChanges(entries, sessionId) {
-  const seen = new Set();
-  const perRoot = new Map();
-  let paths = 0;
-  for (const entry of entries ?? []) {
-    if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== CHANGE_ENTRY) continue;
-    const data = entry.data;
-    if (!isRecord(data) || data.sessionId !== sessionId || !isPlausibleEvidence(data.evidence)) continue;
-    const evidence = data.evidence;
-    if (seen.has(evidence.id)) continue;
-    seen.add(evidence.id);
-    if (sameSnapshot(evidence.before, evidence.after)) continue;
-    let perPath = perRoot.get(evidence.root);
-    if (!perPath) {
-      perPath = new Map();
-      perRoot.set(evidence.root, perPath);
-    }
-    let slot = perPath.get(evidence.path);
-    if (!slot) {
-      if (paths >= MAX_CHANGE_PATHS) continue;
-      paths += 1;
-      slot = { before: evidence.before, after: evidence.after };
-      if (evidence.before?.kind === "unavailable") slot.unavailable = unavailableReason(evidence.before);
-      if (evidence.after?.kind === "unavailable" && !slot.unavailable) {
-        slot.unavailable = unavailableReason(evidence.after);
-      }
-      perPath.set(evidence.path, slot);
-    } else {
-      if (!slot.unavailable && !sameSnapshot(slot.after, evidence.before)) {
-        slot.unavailable =
-          "Snapshot continuity lost (external or unobserved edit); session diff unavailable.";
-      }
-      if (evidence.before?.kind === "unavailable" && !slot.unavailable) {
-        slot.unavailable = unavailableReason(evidence.before);
-      }
-      if (evidence.after?.kind === "unavailable" && !slot.unavailable) {
-        slot.unavailable = unavailableReason(evidence.after);
-      }
-      slot.after = evidence.after;
-    }
-  }
-  let files = 0;
-  let added = 0;
-  let deleted = 0;
-  for (const perPath of perRoot.values()) {
-    for (const [changePath, { before, after, unavailable }] of perPath) {
-      if (!unavailable && sameSnapshot(before, after)) continue;
-      files += 1;
-      if (unavailable) continue;
-      const { added: fileAdded, deleted: fileDeleted } = patchLineCounts(
-        safePatchPath(changePath),
-        snapshotPatchText(before),
-        snapshotPatchText(after),
-      );
-      added += fileAdded;
-      deleted += fileDeleted;
-    }
-  }
-  return { files, added, deleted };
-}
-
-// ---------------------------------------------------------------------------
 // Live Git scope + scan (S62, mirrored from gentle-shell shell-changes.ts +
 // session-changes.ts + bounded-writer-admission.ts). Self-contained like the
 // rest of this file: no relative imports. lib/live-session-changes.js is the
@@ -1922,6 +1797,10 @@ function sidebarPublishingEnabled() {
 // jiti; the tests load a copy as .mjs), so it carries no type annotations.
 const MOSHI_AGENT = "pi";
 const MOSHI_MAX_CHILD_HEADER = 16 * 1024;
+// Upper bound on one envelope's socket lifetime. Long enough for a local
+// daemon to answer a session.update, short enough that a hung peer cannot tie
+// up a descriptor for the rest of the session.
+const MOSHI_SEND_TIMEOUT_MS = 2000;
 
 function moshiSocketPath() {
   const override = process.env.MOSHI_SOCKET_PATH;
@@ -1945,6 +1824,20 @@ function moshiSendEnvelope(envelope) {
     const done = new Promise((resolve) => sock.once("close", () => resolve()));
     moshiInFlight.add(done);
     void done.then(() => moshiInFlight.delete(done));
+    // A peer that accepts the envelope and never finishes the connection holds
+    // this socket — and its fd — in FIN_WAIT_2 for the life of the session: the
+    // half-close below is not an answer from it, only a request. One bounded,
+    // unref'd destroy settles the envelope either way, so `moshiInFlight`
+    // always drains and a broken daemon can never accumulate open handles.
+    const giveUp = setTimeout(() => {
+      try {
+        sock.destroy();
+      } catch {
+        // Already gone; the close event below still settles the promise.
+      }
+    }, MOSHI_SEND_TIMEOUT_MS);
+    giveUp.unref?.();
+    sock.once("close", () => clearTimeout(giveUp));
     sock.setNoDelay(true);
     sock.on("error", () => {
       try {

@@ -18,11 +18,6 @@ const { pathToFileURL } = require('node:url');
 
 const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
 const srcText = fs.readFileSync(src, 'utf8');
-const stubbed = srcText.replace(
-  /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-  'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
-);
-assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-moshi-int-'));
 const moshiSock = path.join(root, 'moshi.sock');
@@ -49,6 +44,9 @@ process.env.GENTLE_STATUS_STATE_DIR = stateDir;
 
 const moshiFrames = [];
 const herdrFrames = [];
+// S2 fixture: the peer can be told to accept an envelope and never finish the
+// connection, which is the only shape that can expose a socket nobody closes.
+let moshiStuckOpen = false;
 
 function socketListener(record, { reply = false } = {}) {
   return (conn) => {
@@ -75,6 +73,9 @@ function socketListener(record, { reply = false } = {}) {
       }
     });
     conn.on('end', () => {
+      // A stuck peer never answers the client's half-close: nothing here ends
+      // the connection, so only the plugin's own bounded destroy can settle it.
+      if (record === moshiFrames && moshiStuckOpen) return;
       try {
         conn.end();
       } catch {}
@@ -83,7 +84,9 @@ function socketListener(record, { reply = false } = {}) {
   };
 }
 
-const moshiServer = net.createServer(socketListener(moshiFrames));
+// allowHalfOpen: the peer must be able to receive the client's FIN and stay
+// silent, which is the only shape that reproduces a socket nobody closes.
+const moshiServer = net.createServer({ allowHalfOpen: true }, socketListener(moshiFrames));
 // The Herdr side records only the beats that LANDED, and it can be told to
 // reject metadata publishes, so a test can prove a notification reached Moshi
 // while no token beat did.
@@ -209,7 +212,7 @@ let runtimeSeq = 0;
 async function loadRuntime() {
   runtimeSeq += 1;
   const copy = path.join(root, `runtime-${runtimeSeq}.mjs`);
-  fs.writeFileSync(copy, stubbed);
+  fs.writeFileSync(copy, srcText);
   const module = await import(pathToFileURL(copy).href);
   return module.default;
 }
@@ -554,4 +557,39 @@ test('enabled: shutdown closes the session for Moshi', async () => {
   assert.ok(closed, 'expected a session.closed envelope');
   assert.equal(closed.category, 'session_ended');
   assert.equal(closed.sessionId, 'sess-1');
+});
+
+// S2: a peer that accepts the envelope and never finishes the connection must
+// not hold the socket (and its fd) for the life of the session. The client's
+// half-close is not an answer — only a peer close or a bounded destroy settles
+// the envelope. A stuck peer never notices the difference on its own side (a
+// reset surfaces only on its next write), so the assertion is made on the
+// socket the plugin itself opened.
+test('a Moshi peer that never closes cannot hold a socket forever', async () => {
+  await listening;
+  enableMoshi();
+  moshiStuckOpen = true;
+  const factory = await loadRuntime();
+  const h = harness();
+  const opened = [];
+  const realConnect = net.connect;
+  // Builtins are cached, so the extension copy resolves this same object: the
+  // wrapper therefore sees exactly the sockets the plugin opens toward Moshi.
+  net.connect = function capturedConnect(options, ...rest) {
+    const socket = realConnect.call(this, options, ...rest);
+    if (options && options.path === moshiSock) opened.push(socket);
+    return socket;
+  };
+  try {
+    factory(h.pi);
+    h.fire('session_start', { reason: 'startup' }, ctx());
+    await waitFor(() => moshiFrames.some((f) => f.type === 'session.update'));
+    assert.ok(opened.length > 0, 'the envelope must open a Moshi socket');
+    const socket = opened.at(-1);
+    const drained = await waitFor(() => socket.destroyed === true, 8000);
+    assert.ok(drained, 'the plugin must destroy a peer-held socket instead of leaking it');
+  } finally {
+    net.connect = realConnect;
+    moshiStuckOpen = false;
+  }
 });

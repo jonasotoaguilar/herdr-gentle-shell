@@ -511,3 +511,143 @@ describe('performance trace frames', () => {
     assert.equal(readTrace().length, 1, '`true` switches the trace on');
   });
 });
+
+// S3: the sleep loop probes the coalesced refresh and gs-scan markers about
+// four times a second, and every probe used to re-resolve the state root —
+// mkdirSync, a known-file scan over two candidate directories and two realpath
+// walks — to return a path that cannot change within a poll cycle. The dir is
+// resolved once per loop iteration and handed to the probes instead.
+describe('marker probes reuse the resolved state dir', () => {
+  const daemon = require('../herdr-plugin/bin/gentle-status.js');
+
+  // Resolving the root is the only thing that calls mkdirSync or realpathSync;
+  // a known-file scan also calls existsSync once per candidate name, so the
+  // three counters together tell a resolution apart from the single marker
+  // probe that must remain.
+  function counting() {
+    const real = { existsSync: fs.existsSync, realpathSync: fs.realpathSync, mkdirSync: fs.mkdirSync };
+    const state = { existsSync: 0, realpathSync: 0, mkdirSync: 0 };
+    fs.existsSync = (...args) => { state.existsSync += 1; return real.existsSync(...args); };
+    fs.realpathSync = (...args) => { state.realpathSync += 1; return real.realpathSync(...args); };
+    fs.mkdirSync = (...args) => { state.mkdirSync += 1; return real.mkdirSync(...args); };
+    return { state, restore: () => Object.assign(fs, real) };
+  }
+
+  it('consumes the refresh marker where it is handed, never re-resolving the root', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-marker-refresh-'));
+    fs.writeFileSync(path.join(dir, 'gentle-status.refresh'), String(Date.now()), 'utf8');
+    const spy = counting();
+    try {
+      assert.equal(daemon.takeRefresh(dir), true, 'the marker in the handed dir must be consumed');
+      assert.equal(spy.state.mkdirSync, 0, 'a handed-in dir must never be re-resolved');
+      assert.equal(spy.state.realpathSync, 0, 'a handed-in dir must never be re-realpathed');
+      assert.equal(spy.state.existsSync, 1, 'only the marker probe may touch the filesystem');
+      assert.equal(daemon.takeRefresh(dir), false, 'the marker is consumed exactly once');
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it('consumes the gs-scan marker where it is handed, never re-resolving the root', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-marker-gs-'));
+    fs.writeFileSync(path.join(dir, 'gentle-status.gs-scan'), String(Date.now()), 'utf8');
+    const spy = counting();
+    try {
+      assert.equal(daemon.takeGsScanRequest(dir), true, 'the marker in the handed dir must be consumed');
+      assert.equal(spy.state.mkdirSync, 0, 'a handed-in dir must never be re-resolved');
+      assert.equal(spy.state.realpathSync, 0, 'a handed-in dir must never be re-realpathed');
+      assert.equal(spy.state.existsSync, 1, 'only the marker probe may touch the filesystem');
+      assert.equal(daemon.takeGsScanRequest(dir), false, 'the marker is consumed exactly once');
+    } finally {
+      spy.restore();
+    }
+  });
+});
+
+// S6: publish dedupe used to build the 71-token patch and JSON.stringify it for
+// every owned pane on every frame, to compare against the previous publish — so
+// steady state (nothing changed) paid the most expensive work in the frame. The
+// cheap signature is compared first and the patch is built only when it moved.
+// The optimization is only sound if the signature and the patch agree about
+// what "changed" means, which is exactly what is pinned here.
+describe('pane change signature', () => {
+  const daemon = require('../herdr-plugin/bin/gentle-status.js');
+  const contract = require('../herdr-plugin/lib/gentle-tokens.js');
+
+  const base = {
+    display: 'idle',
+    label: 'idle',
+    agent: null,
+    workspace: 'myproj',
+    added: null,
+    deleted: null,
+  };
+
+  it('is equivalent to the patch it stands in for', () => {
+    const variants = [
+      base,
+      { ...base, display: 'working', label: 'working' },
+      { ...base, label: 'a different label' },
+      { ...base, agent: 'gentle-ai-explorer' },
+      { ...base, workspace: 'otherproj' },
+      { ...base, added: '+3' },
+      { ...base, deleted: '-2' },
+      { ...base, added: '+3', deleted: '-2' },
+      { ...base, display: 'done', label: 'done', agent: 'worker' },
+      // Fields the token builders intentionally collapse: an absent and an
+      // empty value must produce the SAME tokens and so the same signature.
+      { ...base, agent: undefined, workspace: undefined },
+      { ...base, agent: '', added: '', deleted: '' },
+      { ...base, added: 0 },
+    ];
+    for (const left of variants) {
+      for (const right of variants) {
+        const samePatch = JSON.stringify(contract.displayTokens(left)) === JSON.stringify(contract.displayTokens(right));
+        const sameSignature = daemon.paneChangeSignature(left) === daemon.paneChangeSignature(right);
+        assert.equal(
+          sameSignature,
+          samePatch,
+          `signature and patch must agree:\n${JSON.stringify(left)}\n${JSON.stringify(right)}`,
+        );
+      }
+    }
+  });
+
+  it('distinguishes every patch input independently', () => {
+    // The equivalence table above mutates `display` always together with
+    // `label`, so it never proves `display` matters on its own: dropping it
+    // from the signature would survive that table and silently skip every
+    // republish between two displays that share a label. Each field is mutated
+    // alone here, and must move both the patch and the signature.
+    const mutations = {
+      display: 'done',
+      label: 'a different label',
+      agent: 'gentle-ai-explorer',
+      workspace: 'otherproj',
+      added: '+3',
+      deleted: '-2',
+    };
+    for (const [field, value] of Object.entries(mutations)) {
+      const changed = { ...base, [field]: value };
+      assert.notEqual(
+        JSON.stringify(contract.displayTokens(base)),
+        JSON.stringify(contract.displayTokens(changed)),
+        `${field} must change the patch`,
+      );
+      assert.notEqual(
+        daemon.paneChangeSignature(base),
+        daemon.paneChangeSignature(changed),
+        `${field} must change the signature`,
+      );
+    }
+  });
+
+  it('separates an empty title from an absent one', () => {
+    // displayTokens writes the label raw, so "" and undefined are NOT the same
+    // token; a signature that collapsed them would skip a real republish.
+    assert.notEqual(
+      daemon.paneChangeSignature({ ...base, label: '' }),
+      daemon.paneChangeSignature({ ...base, label: undefined }),
+    );
+  });
+});
