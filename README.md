@@ -484,10 +484,11 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   managed Herdr rows and records the owned native-extension exclusion;
   `disable` removes only our owned rows and exclusion, never a user table.
   See [docs/sidebar-control.md](docs/sidebar-control.md).
-- In-Pi switches (`/herdr-gentle:customize`): two switches, both local
-  state and both reachable from a plain Pi session outside a Herdr pane. With
+- In-Pi switches (`/herdr-gentle:customize`): three switches, all local
+  state and all reachable from a plain Pi session outside a Herdr pane. With
   no argument the command opens the floating panel in Gentle Shell's own
-  layout: one left `CATEGORIES` list (`Herdr Sidebar`, `Moshi notifications`)
+  layout: one left `CATEGORIES` list (`Herdr Sidebar`, `Moshi notifications`,
+  `Herdr Theme`)
   and one right pane headed `<Category> · n/m` with its setting rows, each row
   painting the stored value with `●` and the other with `○`; one line above the
   footer describes the focused setting (`<setting> — <what it changes>`), and
@@ -499,11 +500,14 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   it is a key the panel answers to, and a narrow card compacts it instead of
   wrapping. Pointer input still works without being advertised — a click on a
   category selects it, a click on a row applies it, and a click outside the
-  panes is ignored. Each category owns exactly one switch: `Herdr Sidebar`
+  panes is ignored. Each category owns its own rows: `Herdr Sidebar`
   shows the single `Sidebar agent rows` row, and the only Moshi switch is the
-  `Notifications` row under `Moshi notifications`. The two are never mixed —
-  `Sidebar agent rows` neither reads nor writes `gentle-moshi.json`, so turning
-  the agent rows off never turns the notification channel off. Herdr's own
+  `Notifications` row under `Moshi notifications`, while `Herdr Theme` owns
+  both theme rows (the `Theme sync` toggle and the non-toggle
+  `Gentle Shell theme` value row described in the subsection below). The
+  sidebar and Moshi switches are never mixed — `Sidebar agent rows` neither
+  reads nor writes `gentle-moshi.json`, so turning the agent rows off never
+  turns the notification channel off. Herdr's own
   done/ask attention (the finished and needs-attention pop-ups and their
   sound) is Herdr's native behavior, configured in Herdr itself — its config
   and its settings — and this package deliberately offers no switch for it:
@@ -518,7 +522,8 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   `settings.json`, running the `moshi-hook` pairing gate before enabling (a
   refusal writes nothing) and reloading Pi only when that settings entry
   actually changed. `/herdr-gentle:customize status` prints one read-only line
-  (`customize status: sidebar=<on|off|unknown> moshi=<on|off>`); an unknown
+  (`customize status: sidebar=<on|off|unknown> moshi=<on|off>
+  theme-sync=<on|off|unknown> theme=<name|none|unknown>`); an unknown
   argument, Esc, or a cancelled menu writes nothing. A sidebar verdict of
   `unknown` is never a refusal: the panel says the state is unknown and
   choosing `On` still runs the apply step, reporting that step's own error
@@ -588,6 +593,22 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   reached through `/herdr-gentle:customize`. See
   [docs/herdr-session-open.md](docs/herdr-session-open.md).
 
+### Theme sync (Herdr palette follows Pi)
+
+`/herdr-gentle:customize` → `Herdr Theme` is one switch and one pinned value.
+`Theme sync` is **OFF by default**: while it is on, Herdr's palette is the
+palette of the theme Pi is showing, and it follows a theme change while Pi keeps
+running. While it is off, `Gentle Shell theme` assigns one Gentle Shell / Pi
+theme by name and the picker's `Off (no theme assigned)` entry clears the pin; the row is refused while the sync is on
+(`Turn Theme sync off to pick a specific theme.`). Turning the sync off writes
+nothing to Herdr, so **Herdr keeps the last applied palette** — a fresh install
+whose sync is off and whose theme is unassigned writes nothing at all. State is
+one file, `gentle-theme.json`, beside `gentle-moshi.json`; the palette reaches
+Herdr through the plugin's own `bin/configure-theme.js`, which owns a marked
+`[theme]` block and refuses to touch a `[theme]` table you maintain yourself.
+See [docs/theme-sync.md](docs/theme-sync.md) for the projection, the CLI and
+the limits.
+
 ## Documentation
 
 | Your task | Start here |
@@ -598,6 +619,7 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 | Supervision triage (read-only doctor/trace/whois) | [docs/diagnostics.md](docs/diagnostics.md) |
 | Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
 | Sidebar switch (`bin/gentle-sidebar.js`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
+| Theme sync (Pi palette → Herdr theme) | [docs/theme-sync.md](docs/theme-sync.md) |
 | Herdr session opener (`herdr_session_open`) | [docs/herdr-session-open.md](docs/herdr-session-open.md) |
 | Performance trace and its report | [docs/performance-trace.md](docs/performance-trace.md) |
 

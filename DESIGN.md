@@ -989,10 +989,10 @@ report with a higher seq lands. Parity contract: `working` carries the specific 
 
 The package ships one CLI switch command,
 `node bin/gentle-sidebar.js (enable|disable|status|toggle)` (§7), and one in-Pi
-command, `/herdr-gentle:customize`, with exactly two switches: the managed
-sidebar agent rows and the Moshi notification channel. The command registers
-before the `enabled()` pane gate, so both switches stay reachable from a plain
-Pi session outside a Herdr pane. It owns no state of its own and reimplements
+command, `/herdr-gentle:customize`, with exactly three switches: the managed
+sidebar agent rows, the Moshi notification channel and the Herdr theme sync
+(§12). The command registers before the `enabled()` pane gate, so every switch
+stays reachable from a plain Pi session outside a Herdr pane. It owns no state of its own and reimplements
 nothing:
 
 - `Sidebar agent rows` drives the Herdr plugin's own `bin/configure.js` —
@@ -1161,9 +1161,9 @@ exactly one mechanism writes each piece of state.
   panel, the ODD and Issues readers, and the `Plugin tools` toggles no longer
   ship. This package publishes the Herdr producer sidecar and the Moshi channel
   only; `bin/gentle-sidebar.js` is its one CLI and `/herdr-gentle:customize`
-  its one in-Pi command, carrying just the sidebar-rows and Moshi switches.
-  Its provider slot `globalThis[Symbol.for("herdr-gentle.customize.v1")]` stays
-  removed, so no other extension renders those two switches.
+  its one in-Pi command, carrying just the sidebar-rows, Moshi and theme-sync
+  switches. Its provider slot `globalThis[Symbol.for("herdr-gentle.customize.v1")]`
+  stays removed, so no other extension renders those switches.
 - Rollback: disable this plugin → producer stops writing; consumer sweeps
   only `gentle_*` tokens + labels it set (O5); pi-tree re-enable restores
   `↳N` behavior with zero data migration.
@@ -1251,3 +1251,95 @@ confirming each criterion has a normative section:
 Task closes when V1–V6 are all traceable above and the file re-read reports
 path + line count. Any untraceable cell → `status: partial` with the gap
 list, not silent.
+
+## 12. Theme sync (Pi palette → Herdr theme)
+
+Herdr's palette follows the theme active in Gentle Shell / Pi, or one theme
+pinned while the sync is off (S1–S5). The switch lives with the other two in
+`/herdr-gentle:customize`; the user-facing reference is
+[docs/theme-sync.md](docs/theme-sync.md). Three modules with three owners, and
+one direction of data:
+
+| Module | Package | Owns |
+|---|---|---|
+| `lib/theme-store.js` | Pi (`herdr-gentle-shell`) | The one persisted document (`gentle-theme.json`): the state-dir resolution copied verbatim from the sidecar's Moshi flag, a normalised read, and the atomic replace. |
+| `lib/theme-projection.js` | Pi | The pure translation: assignable Herdr theme names, Herdr token order, `HERDR_ROLE_SOURCES`, `projectPalette`, `paletteFingerprint`, and the `null`/`Off` spelling the panel paints. No filesystem, no host import. |
+| `herdr-plugin/lib/gentle-theme-config.js` + `bin/configure-theme.js` | Herdr plugin | Everything that touches `config.toml`: payload validation, the managed block, the refusals, the atomic write with its own `.bak`, and the optional reload. |
+
+Two thin glue layers sit above them and own no state: the follower
+`extensions/herdr-theme-sync.ts` (tick, fingerprint, one spawn per change,
+notices) and the switch in `extensions/gentle-herdr-state.ts` plus
+`lib/customize-panel.js` (`applyThemeSync`, `applyThemeSelection`,
+`customize status`). Pi colours become hex strings in the follower through
+`colorToHex` from `@earendil-works/pi-tui`, which is why the follower is its own
+extension rather than a section of the state sidecar: the sidecar is loaded by
+every suite as a renamed copy with one stubbed host import, and the projection
+needs no host at all.
+
+**The state file is the only persisted truth.** `gentle-theme.json` holds
+`{sync, theme, updatedAt}` and nothing else is cached, mirrored or inferred: the
+panel and the follower read the same document, so the row, the switch and the
+applied palette can never disagree. Missing is inert (`sync:false`,
+`theme:null`); a document that cannot be read or parsed is a refusal — `ok:false`,
+painted `Unknown`, follower silent — never a guess, and it is written over only
+when the user acts. The default install (sync off, no theme) therefore writes
+nothing at all (S7), while a stored pin is carried across a sync toggle so
+turning the sync off restores that choice instead of unassigning it.
+
+**Tick and fingerprint.** The host publishes no theme-change event, so the
+palette is a pull-read of `ctx.ui.theme` (or `ctx.ui.getTheme(name)` for a pin):
+one immediate evaluation on `session_start` and then one every 500 ms, on an
+unreferenced timer so an idle follower never keeps Pi alive. Each evaluation
+computes two identities — the requested `[sync, chosen]` and the palette
+fingerprint (`[theme name, sorted token/hex pairs]`) — and acts only when one
+differs from the last one it recorded, so a theme recoloured in place (same
+name, new colours) is noticed without a restart, and the same palette is never
+applied twice. The observation is recorded **before** the spawn, so a failed or
+refused apply is never retried on the next tick and never blocks the next real
+change either. One apply is in flight at a time, each spawn is capped at 60 s,
+and the apply is exactly
+`<plugin>/bin/configure-theme.js --apply --json --reload` with the projection on
+stdin. Nothing on shutdown writes, removes or reloads: Herdr keeps the last
+applied palette (S5). There is deliberately no Herdr pane gate — the config is
+the user's own and outlives any pane — and no automatic repair of a config the
+user also edits.
+
+**Managed block and refusal policy.** The writer owns a second marker-delimited
+block (`# BEGIN herdr-gentle-theme (managed; do not edit)` …
+`# END herdr-gentle-theme`) holding `[theme] name = "one-dark"` and a
+`[theme.custom]` table, in a fixed token order with lower-cased hex, so the same
+palette is always the same bytes, `current` is a no-op answer, and a refusal can
+never be mistaken for a change. It reuses `bin/configure.js`'s
+`herdrConfigPath`/`readConfig`/`writeAtomic`/`removeBlock`/`appendBlock`/
+`reloadConfig` primitives rather than copying them, so both blocks fail, back up
+and reload identically — but shares no marker bytes and no backup file, because
+two writers that share markers each treat the other's block as their own and the
+last one erases the first. Validation happens before disk: an unknown theme
+name, an unknown token or a non-`#rrggbb` value is a refusal, not a file Herdr
+would reject or silently ignore. A `[theme]` or `[theme.custom]` table outside
+the markers is user config: refuse, never adopt, merge or overwrite. Malformed
+markers (lone begin, lone end, end before begin, a second pair) refuse instead
+of guessing where the block ends. `--remove` on an absent block is `absent` and
+exits 0 even when a foreign table exists, because uninstall must not touch user
+config. Every refusal guarantees no write, no reload and unchanged config bytes;
+exit 1 means a stale `--check` or a reload that failed after a successful write.
+
+**Limits** (the §10 style, none of them a promise this design makes):
+
+- The 500 ms tick is the whole observation granularity — there is no event to
+  subscribe to, so a theme change is noticed within one tick and not sooner.
+- The automated evidence is a stubbed Pi host plus a real CLI stand-in on disk;
+  **no live Pi TUI run is recorded**. `ctx.ui.theme`, `getTheme`,
+  `getAllThemes`, `select` and `notify` are used as documented, and a host
+  missing one degrades to "nothing changed" rather than to a guess.
+- Herdr's surface tokens (`sidebar_bg`, `panel_bg`, `active_row_bg`,
+  `selection_bg`, `surface*`) and `peach` are never written: Pi names
+  foregrounds and accents, not panel backgrounds, so backgrounds and status
+  colours stay with the Herdr base theme.
+- One machine: another Herdr client reads its own `config.toml`, so this is a
+  local sync and not a fleet setting.
+- Plugin-root resolution goes through `herdr plugin list --json` and fails
+  closed on zero or ambiguous matches; that refusal is reported once per session
+  and retried silently afterwards.
+- The CLI requires Node 18 or newer; an older runtime exits 1 before reading
+  anything.
