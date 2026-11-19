@@ -1117,6 +1117,23 @@ async function clearOwnedFamily(paneId) {
   return reportChunked(SOURCE, paneId, ownedClearPatch());
 }
 
+// The dedupe signature for one reduced pane. `displayTokens` derives every
+// token from display, label, agent, workspace, added and deleted, and collapses
+// an absent or empty agent/workspace/added/deleted into the same token; this
+// mirrors those coercions exactly, so two panes share a signature if and only if
+// they would publish the same patch. `label` is written raw, so an empty and an
+// absent label stay distinct.
+function paneChangeSignature(reduced) {
+  return JSON.stringify([
+    reduced.display ?? null,
+    reduced.label ?? null,
+    reduced.agent || null,
+    reduced.workspace ?? null,
+    reduced.added || null,
+    reduced.deleted || null,
+  ]);
+}
+
 async function frame(state, opts = {}) {
   // Off path: one environment check, no clock read, no object built.
   const trace = perfTrace();
@@ -1200,9 +1217,14 @@ async function frame(state, opts = {}) {
     // baseline. Set before the signature short-circuit
     // below: an unchanged row is still a rendered one.
     observeDisplay(state.pollObserved, reduced.display);
-    const patch = contract.displayTokens(reduced);
-    const signature = JSON.stringify(patch);
+    // Cheapest sufficient summary of what a patch would say: every token in
+    // `displayTokens` is a function of these six values alone, so an unchanged
+    // signature means an unchanged patch. Comparing it first keeps the 71-key
+    // object and its JSON off the steady-state path, which is where a frame
+    // spends its time when nothing moved.
+    const signature = paneChangeSignature(reduced);
     if (lastSent.get(paneId) === signature) continue;
+    const patch = contract.displayTokens(reduced);
     publishJobs.push({ paneId, patch, signature });
   }
   // The next sleep may not outlive the soonest hold it just drew.
@@ -1690,6 +1712,7 @@ if (require.main === module) {
     observeDisplay,
     capDelayToExpiry,
     refreshGateMs,
+    paneChangeSignature,
     requestRefresh,
     takeRefresh,
     requestGsScan,
