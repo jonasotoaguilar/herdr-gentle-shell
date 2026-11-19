@@ -24,7 +24,11 @@
 //   follows the focus and costs no width;
 // - a legend that names only keys: `Click` is gone;
 // - the key-release guard, the narrow single-pane fallback, the unknown note,
-//   short-terminal clipping and a hostile theme degrading to plain text.
+//   short-terminal clipping and a hostile theme degrading to plain text;
+// - the `Herdr Theme` category (theme-sync T3a, S1/S2/S4): the ordinary
+//   `Theme sync` toggle, the `Gentle Shell theme` value row that opens a list
+//   instead of toggling, that row painted dim and offered no selection band
+//   while the sync is on, and `Unknown` for a store that could not be read.
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
@@ -58,6 +62,10 @@ function makeHostTui() {
   return { paints, tui: { requestRender: () => { paints.push(true); } } };
 }
 
+// A readable, inert theme state: theme sync off and no theme assigned, which is
+// what a fresh install reads.
+const THEME_OFF_STATE = { ok: true, sync: false, theme: null };
+
 function open({ model, host, rowsAvailable, theme = {}, helpers = stubTui } = {}) {
   const hostTui = host || makeHostTui();
   let settled = 'pending';
@@ -66,7 +74,7 @@ function open({ model, host, rowsAvailable, theme = {}, helpers = stubTui } = {}
     hostTui: hostTui.tui,
     theme,
     rowsAvailable,
-    model: model || customizePanelModel({ sidebar: 'on', moshi: 'off' }),
+    model: model || customizePanelModel({ sidebar: 'on', moshi: 'off', theme: THEME_OFF_STATE }),
     done: (result) => { settled = result; },
   });
   assert.equal(typeof component.render, 'function');
@@ -105,10 +113,10 @@ function click(component, width, needle, { type = 'click', column, boxHeight } =
 }
 
 describe('customize panel model', () => {
-  test('carries the two categories and the switches each one shows', () => {
-    const model = customizePanelModel({ sidebar: 'off', moshi: 'on' });
-    assert.deepEqual(model.map((category) => category.id), ['sidebar', 'moshi']);
-    assert.deepEqual(model.map((category) => category.title), ['Herdr Sidebar', 'Moshi notifications']);
+  test('carries the three categories and the switches each one shows', () => {
+    const model = customizePanelModel({ sidebar: 'off', moshi: 'on', theme: THEME_OFF_STATE });
+    assert.deepEqual(model.map((category) => category.id), ['sidebar', 'moshi', 'theme']);
+    assert.deepEqual(model.map((category) => category.title), ['Herdr Sidebar', 'Moshi notifications', 'Herdr Theme']);
     // `Herdr Sidebar` owns the managed agent rows only: the Moshi channel has
     // its own category and is never duplicated here.
     assert.deepEqual(model[0].rows.map((row) => row.setting), ['Sidebar agent rows']);
@@ -142,11 +150,75 @@ describe('customize panel model', () => {
   });
 
   test('an unknown sidebar state carries a note but stays repairable', () => {
-    const model = customizePanelModel({ sidebar: 'unknown', moshi: 'off' });
+    const model = customizePanelModel({ sidebar: 'unknown', moshi: 'off', theme: THEME_OFF_STATE });
     assert.equal(model[0].rows[0].current, null, 'unknown is not a guessed value');
     assert.equal(model[0].rows[0].currentLabel, 'Unknown');
     assert.equal(model[0].rows[0].id, 'on', 'the repair is still one key away');
     assert.match(model[0].rows[0].note, /state unknown/);
+  });
+
+  test('the Herdr Theme category follows Moshi with one toggle and one value row', () => {
+    const model = customizePanelModel({ sidebar: 'on', moshi: 'off', theme: THEME_OFF_STATE });
+    const theme = model[2];
+    assert.equal(
+      theme.description,
+      'The palette Herdr draws, either following Pi or pinned to one theme.',
+    );
+    assert.deepEqual(theme.rows.map((row) => row.switchId), ['theme-sync', 'theme']);
+    assert.deepEqual(theme.rows.map((row) => row.setting), ['Theme sync', 'Gentle Shell theme']);
+    assert.equal(
+      theme.rows[0].description,
+      "Keeps Herdr's palette in step with the theme that is active in Pi.",
+    );
+    // The sync switch is the ordinary pill toggle: a stored Off offers On.
+    assert.equal(theme.rows[0].current, 'off');
+    assert.equal(theme.rows[0].currentLabel, 'Off');
+    assert.equal(theme.rows[0].id, 'on');
+    assert.equal(theme.rows[0].note, undefined);
+    // The theme value is not a toggle: its one row opens the theme list, and an
+    // unassigned theme reads as the inert choice.
+    assert.equal(theme.rows[1].id, 'select');
+    assert.equal(theme.rows[1].description, 'Applies one Gentle Shell theme to Herdr; available only while Theme sync is off.');
+    assert.equal(theme.rows[1].current, null);
+    assert.equal(theme.rows[1].currentLabel, 'Off');
+    assert.equal(theme.rows[1].otherLabel, 'Select…');
+    assert.equal(theme.rows[1].disabled, false, 'the selection is available while the sync is off');
+    assert.equal(theme.rows[1].note, undefined);
+  });
+
+  test('the theme row names the assigned theme and is disabled only while the sync is on', () => {
+    const off = customizePanelModel({
+      sidebar: 'on',
+      moshi: 'off',
+      theme: { ok: true, sync: false, theme: 'dracula' },
+    });
+    assert.equal(off[2].rows[1].current, 'dracula');
+    assert.equal(off[2].rows[1].currentLabel, 'dracula');
+    assert.equal(off[2].rows[1].disabled, false);
+
+    const on = customizePanelModel({
+      sidebar: 'on',
+      moshi: 'off',
+      theme: { ok: true, sync: true, theme: 'dracula' },
+    });
+    assert.equal(on[2].rows[0].current, 'on');
+    assert.equal(on[2].rows[0].id, 'off', 'On toggles back off');
+    assert.equal(on[2].rows[1].disabled, true, 'the selection is only available while the sync is off');
+    assert.equal(on[2].rows[1].note, 'Turn Theme sync off to pick a specific theme.');
+    assert.equal(on[2].rows[1].currentLabel, 'dracula', 'the assigned theme stays readable');
+  });
+
+  test('an unreadable theme state reads Unknown and never a guessed value', () => {
+    const model = customizePanelModel({
+      sidebar: 'on',
+      moshi: 'off',
+      theme: { ok: false, sync: false, theme: null, error: 'cannot parse x: bad json' },
+    });
+    assert.equal(model[2].rows[0].current, null, 'an unreadable store is not a guessed Off');
+    assert.equal(model[2].rows[0].currentLabel, 'Unknown');
+    assert.equal(model[2].rows[0].id, 'on');
+    assert.match(model[2].rows[0].note, /state unknown/);
+    assert.equal(model[2].rows[1].current, null);
   });
 });
 
@@ -247,6 +319,56 @@ describe('customize panel render', () => {
     assert.ok(seen.includes('○ On'), 'and On stays the actionable value');
   });
 
+  test('the Herdr Theme category renders its pills and the disabled note', () => {
+    const { component } = open({
+      model: customizePanelModel({
+        sidebar: 'on',
+        moshi: 'off',
+        theme: { ok: true, sync: true, theme: 'dracula' },
+      }),
+    });
+    component.handleInput('down');
+    component.handleInput('down');
+    const lines = component.render(100);
+    assert.ok(lines.some((line) => line.includes('Herdr Theme · 1/2')), 'the category counts its two rows');
+    const syncRow = lines.find((line) => line.includes('● On'));
+    assert.ok(syncRow.includes('Theme sync'), 'the sync row paints its stored On');
+    assert.ok(syncRow.includes('○ Off'), 'and the other value as the target');
+    const themeRow = lines.find((line) => line.includes('Gentle Shell theme'));
+    assert.ok(themeRow.includes('● dracula'), 'the value row paints the assigned theme');
+    assert.ok(themeRow.includes('○ Select…'), 'and offers the list as its other value');
+    assert.ok(lines.some((line) => line.includes('Turn Theme sync off to pick a specific theme.')), 'the disabled row explains itself');
+  });
+
+  test('a theme row disabled by the sync paints dim and takes no selection band', () => {
+    // The dim role is the only paint a disabled row may use, and the band is the
+    // active pane's focus marker: a row the panel cannot apply must show neither.
+    const dimTheme = {
+      fg: (role, text) => (role === 'dim' ? `«${text}»` : text),
+      bold: (text) => text,
+      bg: (_role, text) => `[${text}]`,
+    };
+    const { component } = open({
+      model: customizePanelModel({
+        sidebar: 'on',
+        moshi: 'off',
+        theme: { ok: true, sync: true, theme: null },
+      }),
+      theme: dimTheme,
+    });
+    component.handleInput('down');
+    component.handleInput('down');
+    component.handleInput('right');
+    // The first row (the still-actionable toggle) keeps the band …
+    const enabled = component.render(100).find((line) => line.includes('● On'));
+    assert.ok(enabled.includes('['), 'an actionable row keeps the selection band');
+    // … the disabled value row below it never gets one.
+    component.handleInput('down');
+    const row = component.render(100).find((line) => line.includes('Gentle Shell theme'));
+    assert.ok(row.includes('«'), 'the disabled row is painted in the dim role');
+    assert.equal(row.includes('['), false, 'the disabled row is never offered the selection band');
+  });
+
   test('a hostile theme degrades to plain text', () => {
     const hostile = {
       fg: () => { throw new Error('no colours'); },
@@ -258,6 +380,41 @@ describe('customize panel render', () => {
     assert.ok(seen.includes('Customize · Herdr Gentle Shell'));
     assert.ok(seen.includes('Moshi notifications'));
     assert.ok(seen.includes('● On'));
+  });
+});
+
+describe('customize panel preserved rows', () => {
+  // PRESERVE (theme-sync T3a): the disabled-row paint touched the ONE renderer
+  // every setting row shares, so the rows this feature does not own are pinned
+  // byte for byte — focused and not, with and without the selection band, and
+  // with the inconclusive sidebar state.
+  test('the sidebar and Moshi rows render exactly as they did before', () => {
+    const model = customizePanelModel({ sidebar: 'on', moshi: 'off', theme: THEME_OFF_STATE });
+    const bandTheme = { fg: (_role, text) => text, bold: (text) => text, bg: (_role, text) => `[${text}]` };
+    const rowOf = (theme, steps, needle) => {
+      const { component } = open({ model, theme });
+      for (const step of steps) component.handleInput(step);
+      return component.render(100).find((line) => line.includes(needle));
+    };
+    assert.equal(
+      rowOf({}, ['right'], 'Sidebar agent rows'),
+      '│   Herdr Sidebar          │ ▸ Sidebar agent rows  ● On  ○ Off                                     │',
+    );
+    assert.equal(
+      rowOf(bandTheme, ['right'], 'Sidebar agent rows'),
+      '│   Herdr Sidebar          │ [▸ Sidebar agent rows  ● On  ○ Off                                    │',
+    );
+    assert.equal(
+      rowOf(bandTheme, ['down', 'right'], 'Notifications'),
+      '│   Herdr Sidebar          │ [▸ Notifications  ● Off  ○ On                                         │',
+    );
+    const unknown = customizePanelModel({ sidebar: 'unknown', moshi: 'off', theme: THEME_OFF_STATE });
+    const { component } = open({ model: unknown });
+    component.handleInput('right');
+    assert.equal(
+      component.render(100).find((line) => line.includes('Sidebar agent rows')),
+      '│   Herdr Sidebar          │ ▸ Sidebar agent rows  ● Unknown  ○ On                                 │',
+    );
   });
 });
 
@@ -361,6 +518,8 @@ describe('customize panel navigation', () => {
     component.handleInput('down');
     assert.equal(host.paints.length, 1, 'a selection change requests a repaint');
     assert.ok(seenAt(component, 100).includes('▸ Moshi notifications'));
+    component.handleInput('j');
+    assert.ok(seenAt(component, 100).includes('▸ Herdr Theme'), 'the third category is next');
     component.handleInput('j');
     assert.ok(seenAt(component, 100).includes('▸ Herdr Sidebar'), 'the cursor wraps');
     assert.equal(done(), 'pending', 'movement never finishes the overlay');
