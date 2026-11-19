@@ -1381,7 +1381,7 @@ function daemonAlive() {
   }
 }
 
-const REFRESH_FILE = () => path.join(stateRoot(), 'gentle-status.refresh');
+const REFRESH_FILE = (dir = stateRoot()) => path.join(dir, 'gentle-status.refresh');
 
 // Coalesced immediate-refresh request: event hooks, the producer extension
 // (after every landed token report) and operators touch this file; the daemon
@@ -1400,10 +1400,15 @@ function requestRefresh() {
   }
 }
 
-function takeRefresh() {
+// `dir` is the state root already resolved for the current loop iteration:
+// resolving it here would re-run mkdirSync, the known-file scan over both
+// candidate directories and two realpath walks on every 250 ms probe, which is
+// how an idle daemon used to spend roughly a thousand syscalls per poll cycle
+// returning a path that cannot change within one.
+function takeRefresh(dir = stateRoot()) {
   try {
-    if (!fs.existsSync(REFRESH_FILE())) return false;
-    fs.rmSync(REFRESH_FILE(), { force: true });
+    if (!fs.existsSync(REFRESH_FILE(dir))) return false;
+    fs.rmSync(REFRESH_FILE(dir), { force: true });
     return true;
   } catch {
     return false;
@@ -1415,7 +1420,7 @@ function takeRefresh() {
 // per-beat wake below never does — otherwise "on an explicit refresh" would
 // degrade into a scan per frame. Same bounded file discipline: one coalesced
 // timestamp, consumed once, never written by the token path.
-const GS_SCAN_FILE = () => path.join(stateRoot(), 'gentle-status.gs-scan');
+const GS_SCAN_FILE = (dir = stateRoot()) => path.join(dir, 'gentle-status.gs-scan');
 
 function requestGsScan() {
   try {
@@ -1426,10 +1431,10 @@ function requestGsScan() {
   }
 }
 
-function takeGsScanRequest() {
+function takeGsScanRequest(dir = stateRoot()) {
   try {
-    if (!fs.existsSync(GS_SCAN_FILE())) return false;
-    fs.rmSync(GS_SCAN_FILE(), { force: true });
+    if (!fs.existsSync(GS_SCAN_FILE(dir))) return false;
+    fs.rmSync(GS_SCAN_FILE(dir), { force: true });
     return true;
   } catch {
     return false;
@@ -1568,14 +1573,18 @@ async function run() {
     // be shortened by a coalesced refresh request, never extended.
     const deadline = now + sleepMs;
     const sliceMs = 250;
+    // Resolved once per iteration and handed to every probe below: the markers
+    // live in one directory, and re-resolving it per slice was the only work
+    // the idle sleep actually did.
+    const markerDir = stateRoot();
     while (!stopped) {
       const at = Date.now();
       const left = deadline - at;
       if (left <= 0) break;
       const gateMs = refreshGateMs(frameStartedAt, at);
       if (gateMs === 0) {
-        const requested = takeRefresh();
-        const scanRequested = takeGsScanRequest();
+        const requested = takeRefresh(markerDir);
+        const scanRequested = takeGsScanRequest(markerDir);
         if (scanRequested) state.gs.scanPending = true;
         if (takeEventWake() || requested || scanRequested) break;
       }

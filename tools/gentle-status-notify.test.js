@@ -511,3 +511,55 @@ describe('performance trace frames', () => {
     assert.equal(readTrace().length, 1, '`true` switches the trace on');
   });
 });
+
+// S3: the sleep loop probes the coalesced refresh and gs-scan markers about
+// four times a second, and every probe used to re-resolve the state root —
+// mkdirSync, a known-file scan over two candidate directories and two realpath
+// walks — to return a path that cannot change within a poll cycle. The dir is
+// resolved once per loop iteration and handed to the probes instead.
+describe('marker probes reuse the resolved state dir', () => {
+  const daemon = require('../herdr-plugin/bin/gentle-status.js');
+
+  // Resolving the root is the only thing that calls mkdirSync or realpathSync;
+  // a known-file scan also calls existsSync once per candidate name, so the
+  // three counters together tell a resolution apart from the single marker
+  // probe that must remain.
+  function counting() {
+    const real = { existsSync: fs.existsSync, realpathSync: fs.realpathSync, mkdirSync: fs.mkdirSync };
+    const state = { existsSync: 0, realpathSync: 0, mkdirSync: 0 };
+    fs.existsSync = (...args) => { state.existsSync += 1; return real.existsSync(...args); };
+    fs.realpathSync = (...args) => { state.realpathSync += 1; return real.realpathSync(...args); };
+    fs.mkdirSync = (...args) => { state.mkdirSync += 1; return real.mkdirSync(...args); };
+    return { state, restore: () => Object.assign(fs, real) };
+  }
+
+  it('consumes the refresh marker where it is handed, never re-resolving the root', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-marker-refresh-'));
+    fs.writeFileSync(path.join(dir, 'gentle-status.refresh'), String(Date.now()), 'utf8');
+    const spy = counting();
+    try {
+      assert.equal(daemon.takeRefresh(dir), true, 'the marker in the handed dir must be consumed');
+      assert.equal(spy.state.mkdirSync, 0, 'a handed-in dir must never be re-resolved');
+      assert.equal(spy.state.realpathSync, 0, 'a handed-in dir must never be re-realpathed');
+      assert.equal(spy.state.existsSync, 1, 'only the marker probe may touch the filesystem');
+      assert.equal(daemon.takeRefresh(dir), false, 'the marker is consumed exactly once');
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it('consumes the gs-scan marker where it is handed, never re-resolving the root', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-marker-gs-'));
+    fs.writeFileSync(path.join(dir, 'gentle-status.gs-scan'), String(Date.now()), 'utf8');
+    const spy = counting();
+    try {
+      assert.equal(daemon.takeGsScanRequest(dir), true, 'the marker in the handed dir must be consumed');
+      assert.equal(spy.state.mkdirSync, 0, 'a handed-in dir must never be re-resolved');
+      assert.equal(spy.state.realpathSync, 0, 'a handed-in dir must never be re-realpathed');
+      assert.equal(spy.state.existsSync, 1, 'only the marker probe may touch the filesystem');
+      assert.equal(daemon.takeGsScanRequest(dir), false, 'the marker is consumed exactly once');
+    } finally {
+      spy.restore();
+    }
+  });
+});
