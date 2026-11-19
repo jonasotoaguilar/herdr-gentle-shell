@@ -31,12 +31,26 @@ theme configuration, so the default install leaves Herdr's palette untouched.
 
 ## Tasks
 
-| ID | What | Specs | Route |
-| --- | --- | --- | --- |
-| T1 | Pi-side theme catalogue + Herdr palette projection (`lib/theme-projection.js`, `tools/theme-projection.test.js`) | S3, S4 | writer |
-| T2 | Herdr plugin managed `[theme]` block writer (`herdr-plugin/lib/gentle-theme-config.js`, `herdr-plugin/bin/configure-theme.js`, `tools/gentle-theme-config.test.js`) | S3, S5 | writer |
-| T3 | `/herdr-gentle:customize` category + extension apply path + theme watch (`lib/customize-panel.js`, `lib/theme-sync.js`, `extensions/gentle-herdr-state.ts`, `tools/gentle-customize-command.test.js`, `tools/customize-panel.test.js`) | S1-S5, S7 | inline |
-| T4 | Docs: README, DESIGN.md, `docs/theme-sync.md` | S6 | inline |
+| ID | What | Specs | Route | Commit |
+| --- | --- | --- | --- | --- |
+| T1 | Pi-side theme catalogue + Herdr palette projection (`lib/theme-projection.js`, `lib/theme-store.js`) | S3, S4, S7 | writer | 681ae7a |
+| T2 | Herdr plugin managed `[theme]` block writer (`herdr-plugin/lib/gentle-theme-config.js`, `herdr-plugin/bin/configure-theme.js`) | S3, S5 | writer | 9c77445 |
+| T3a | `/herdr-gentle:customize` `Herdr Theme` category + state wiring (`lib/customize-panel.js`, `extensions/gentle-herdr-state.ts`) | S1, S2, S4, S7 | writer | 61b35ca |
+| T3b | Follower extension (`extensions/herdr-theme-sync.ts`, `package.json`) | S3, S4, S5, S7 | writer | c1459d4 |
+| T3c | Verifier findings: quoted `["theme"]` refusal, `Off`-named theme pinnable, real-writer S7/S5 proofs | S3, S4, S5, S7 | writer | 61b35ca, c1459d4 (same slices) |
+| T4 | Docs: README, DESIGN.md, `docs/theme-sync.md` | S6 | writer | b79e10d |
+
+Slice boundary: the feature is 4548 authored changed lines across the five commits above,
+which is past the ~400-line review slice. The bounded slices are the five commits
+themselves; T2's `configure.js` change and T3a's shared renderer change are each alone
+inside their commit so review can take them separately. Delivery shape (one PR or a
+chain) is the human's decision at publish time.
+
+Evidence: `node --test tools/*.test.js` -> 970 tests, 152 suites, 970 pass, 0 fail,
+`NODE_EXIT=0`. Differential against `main@39bc045`: 48 CLI cases and 24 panel renders,
+0 differences. Independent verifier (`gentle-ai-verify`) could not execute its probes
+in this environment (its preparer refuses a linked worktree); its inspection findings
+were fixed in T3c and its own regression sketches were added as tests.
 
 ## Log
 
