@@ -18,11 +18,6 @@ const { pathToFileURL } = require('node:url');
 
 const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
 const srcText = fs.readFileSync(src, 'utf8');
-const stubbed = srcText.replace(
-  /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-  'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
-);
-assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-moshi-int-'));
 const moshiSock = path.join(root, 'moshi.sock');
@@ -217,7 +212,7 @@ let runtimeSeq = 0;
 async function loadRuntime() {
   runtimeSeq += 1;
   const copy = path.join(root, `runtime-${runtimeSeq}.mjs`);
-  fs.writeFileSync(copy, stubbed);
+  fs.writeFileSync(copy, srcText);
   const module = await import(pathToFileURL(copy).href);
   return module.default;
 }

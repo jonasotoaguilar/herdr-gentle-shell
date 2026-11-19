@@ -563,3 +563,62 @@ describe('marker probes reuse the resolved state dir', () => {
     }
   });
 });
+
+// S6: publish dedupe used to build the 71-token patch and JSON.stringify it for
+// every owned pane on every frame, to compare against the previous publish — so
+// steady state (nothing changed) paid the most expensive work in the frame. The
+// cheap signature is compared first and the patch is built only when it moved.
+// The optimization is only sound if the signature and the patch agree about
+// what "changed" means, which is exactly what is pinned here.
+describe('pane change signature', () => {
+  const daemon = require('../herdr-plugin/bin/gentle-status.js');
+  const contract = require('../herdr-plugin/lib/gentle-tokens.js');
+
+  const base = {
+    display: 'idle',
+    label: 'idle',
+    agent: null,
+    workspace: 'myproj',
+    added: null,
+    deleted: null,
+  };
+
+  it('is equivalent to the patch it stands in for', () => {
+    const variants = [
+      base,
+      { ...base, display: 'working', label: 'working' },
+      { ...base, label: 'a different label' },
+      { ...base, agent: 'gentle-ai-explorer' },
+      { ...base, workspace: 'otherproj' },
+      { ...base, added: '+3' },
+      { ...base, deleted: '-2' },
+      { ...base, added: '+3', deleted: '-2' },
+      { ...base, display: 'done', label: 'done', agent: 'worker' },
+      // Fields the token builders intentionally collapse: an absent and an
+      // empty value must produce the SAME tokens and so the same signature.
+      { ...base, agent: undefined, workspace: undefined },
+      { ...base, agent: '', added: '', deleted: '' },
+      { ...base, added: 0 },
+    ];
+    for (const left of variants) {
+      for (const right of variants) {
+        const samePatch = JSON.stringify(contract.displayTokens(left)) === JSON.stringify(contract.displayTokens(right));
+        const sameSignature = daemon.paneChangeSignature(left) === daemon.paneChangeSignature(right);
+        assert.equal(
+          sameSignature,
+          samePatch,
+          `signature and patch must agree:\n${JSON.stringify(left)}\n${JSON.stringify(right)}`,
+        );
+      }
+    }
+  });
+
+  it('separates an empty title from an absent one', () => {
+    // displayTokens writes the label raw, so "" and undefined are NOT the same
+    // token; a signature that collapsed them would skip a real republish.
+    assert.notEqual(
+      daemon.paneChangeSignature({ ...base, label: '' }),
+      daemon.paneChangeSignature({ ...base, label: undefined }),
+    );
+  });
+});

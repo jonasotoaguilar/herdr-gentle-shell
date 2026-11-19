@@ -26,7 +26,7 @@
 //
 // The extension is TypeScript with one package import that is unresolvable
 // under plain node, so the tests load a renamed copy with exactly that import
-// line stubbed (same approach as tools/gentle-herdr-state.test.js). Every
+// line srcText (same approach as tools/gentle-herdr-state.test.js). Every
 // filesystem and process seam is an isolated temp directory; no live Herdr
 // config, state dir or `moshi-hook` is ever touched.
 
@@ -40,13 +40,8 @@ const { pathToFileURL } = require('node:url');
 const REPO_ROOT = path.resolve(__dirname, '..');
 const src = path.join(REPO_ROOT, 'extensions', 'gentle-herdr-state.ts');
 const srcText = fs.readFileSync(src, 'utf8');
-const stubbed = srcText.replace(
-  /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-  'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
-);
-assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
 assert.ok(
-  !/^import .* from "\.\//m.test(stubbed),
+  !/^import .* from "\.\//m.test(srcText),
   'state.ts must stay self-contained (no relative imports)',
 );
 
@@ -55,7 +50,7 @@ const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-customize-'));
 // from the real lib/ through the documented override.
 process.env.GENTLE_CUSTOMIZE_LIB_DIR = path.join(REPO_ROOT, 'lib');
 const COPY = path.join(ROOT, 'gentle-herdr-state.mjs');
-fs.writeFileSync(COPY, stubbed);
+fs.writeFileSync(COPY, srcText);
 const copyUrl = pathToFileURL(COPY).href;
 
 // The whole point of the command: it must work outside a Herdr pane. The

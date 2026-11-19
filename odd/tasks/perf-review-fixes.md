@@ -84,6 +84,22 @@ bounded re-read of the code:
   per-frame `gsBeat` set is `held`, typically 0-2 panes. Rejected: adds concurrency to
   a write-adjacent loop to save tens of milliseconds on a rare path.
 
+L5 (decision, T4 rejected): the state-dir extraction was dropped after reading all three
+copies. Evidence: there are FIVE copies, not three, and they live in three separate
+shipping units — the npm package (`lib/perf-trace.js`, `lib/gentle-sidebar.js`), the
+`herdr-plugin/` install unit, and `extensions/gentle-herdr-state.ts`, whose own test
+forbids relative imports ("single-file deployment boundary"). A shared `lib/state-dir.js`
+cannot be required from the other two units without breaking what they ship. The drift
+risk the extraction was meant to remove is already enforced:
+`tools/state-dir-known-files.test.js` reads `STATE_KNOWN_FILES` out of every consumer's
+source and fails on divergence. Extracting only the two `lib/` copies would weaken that
+source-reading guard for the two most used resolvers while leaving the dangerous
+cross-unit divergence untouched. The copies have already diverged in two real ways, and
+both are recorded as a separate finding for the human, not silently unified here:
+`gentle-diagnostics.js` honours `LOCALAPPDATA` on win32 and `path.resolve`s the
+`GENTLE_STATUS_STATE_DIR` / `HERDR_PLUGIN_STATE_DIR` overrides, while the other four
+copies do neither.
+
 L3: Review delivered read-only; three explore passes plus parent verification of the
 highest-impact claims. One reported finding was rejected as a performance issue
 (`lib/perf-trace.js` per-event state-dir resolution) because `createFrameObserver` and

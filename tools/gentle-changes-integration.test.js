@@ -45,12 +45,8 @@ describe('inline live-change helpers keep their fixed-vector contract', { concur
   test('parsers and scope resolve known inputs', async () => {
     const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
     const srcText = fs.readFileSync(src, 'utf8');
-    const stubbed = srcText.replace(
-      /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-      'const generateUnifiedPatch = () => { throw new Error("stubbed"); };',
-    );
     const copy = path.join(scratch, 'inline-state.mjs');
-    fs.writeFileSync(copy, stubbed);
+    fs.writeFileSync(copy, srcText);
     const mod = await import(pathToFileURL(copy).href);
     for (const name of ['liveParseNumstat', 'liveParsePorcelain', 'liveSnapshotChanges', 'liveSessionChangeRoots', 'liveResolveScopeRoots', 'liveSummarizeRoots']) {
       assert.equal(typeof mod[name], 'function', `${name} must be exported live (not a stub)`);
@@ -120,12 +116,8 @@ describe('producer publishes live totals with unchanged schema', { concurrency: 
     const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
     const srcText = fs.readFileSync(src, 'utf8');
     assert.ok(!/^import .* from "\.\//m.test(srcText), 'state.ts stays self-contained (no relative imports)');
-    const stubbed = srcText.replace(
-      /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-      'const generateUnifiedPatch = () => { throw new Error("stubbed"); };',
-    );
     const copy = path.join(scratch, 'live-state.mjs');
-    fs.writeFileSync(copy, stubbed);
+    fs.writeFileSync(copy, srcText);
     const mod = await import(pathToFileURL(copy).href);
     const factory = mod.default;
     assert.equal(typeof factory, 'function');

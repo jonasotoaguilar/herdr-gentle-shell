@@ -161,12 +161,7 @@ function canonical(dir) {
 // module load.
 function extensionSource() {
   const srcText = fs.readFileSync(path.resolve(__dirname, '../extensions/gentle-herdr-state.ts'), 'utf8');
-  const stubbed = srcText.replace(
-    /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-    'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
-  );
-  assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
-  return stubbed;
+  return srcText;
 }
 
 // A landed beat requests one coalesced daemon wake, and that refresh flag is

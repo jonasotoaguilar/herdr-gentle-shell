@@ -3,7 +3,7 @@
 // extensions/gentle-herdr-state.ts (single-file deployment boundary: the
 // installed copy/symlink ships without the helper module). The tests
 // extract the exported helpers from an isolated single-file copy of
-// state.ts — the package import is stubbed exactly like
+// state.ts — the package import is srcText exactly like
 // tools/gentle-herdr-state.test.js; production is untouched. Bounded,
 // session-bound full activity reconciliation independent of delayed chat
 // results: explicit terminal task statuses are preferred over absence; no
@@ -20,20 +20,15 @@ const { pathToFileURL } = require('node:url');
 
 const src = path.resolve(__dirname, '../extensions/gentle-herdr-state.ts');
 const srcText = fs.readFileSync(src, 'utf8');
-const stubbed = srcText.replace(
-  /import \{ generateUnifiedPatch \} from "@earendil-works\/pi-coding-agent";/,
-  'const generateUnifiedPatch = () => { throw new Error("stubbed in tests"); };',
-);
-assert.ok(stubbed !== srcText, 'expected the package import line to be stubbed');
 // Single-file deployment boundary: no sibling helper may be needed. Fail
 // the load if state.ts still carries a relative import.
 assert.ok(
-  !/^import .* from "\.\//m.test(stubbed),
+  !/^import .* from "\.\//m.test(srcText),
   'state.ts must stay self-contained (no relative imports)',
 );
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-herdr-presence-'));
 const copy = path.join(root, 'gentle-herdr-state-helpers.mjs');
-fs.writeFileSync(copy, stubbed);
+fs.writeFileSync(copy, srcText);
 const presencePromise = import(pathToFileURL(copy).href);
 
 const INCARNATION = '123e4567-e89b-42d3-a456-426614174000';
