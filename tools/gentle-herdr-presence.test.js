@@ -992,3 +992,63 @@ test('unavailable prior incarnation never suppresses the fresh current owner', a
   assert.ok(snapshot, 'fresh available owner must resolve despite the unavailable leftover');
   assert.equal(snapshot.generation, 9);
 });
+
+// S1: the activity read is synchronous and runs on the agent's own event loop
+// every beat, so its ceiling is a cost the session pays. 16 MiB let a corrupt
+// or hostile file block the loop for hundreds of milliseconds. The envelope the
+// writer produces is bounded by the same caps the reader honours (128 tracked
+// tasks, ≤120-char labels), so a small multiple of the header limit is generous.
+test('the per-beat activity read is bounded far below its old 16 MiB ceiling', async () => {
+  const mod = await presencePromise;
+  assert.ok(
+    mod.PRESENCE_ACTIVITY_LIMIT <= 256 * 1024,
+    `activity limit must stay bounded (got ${mod.PRESENCE_ACTIVITY_LIMIT} bytes)`,
+  );
+  assert.ok(
+    mod.PRESENCE_ACTIVITY_LIMIT >= 64 * 1024,
+    'the bound must stay above a legitimate worst-case envelope',
+  );
+});
+
+test('a fully populated activity envelope still reads under the bounded limit', async () => {
+  const { readPresenceSnapshot } = await presencePromise;
+  const { dir, presenceRoot } = makeProfile();
+  const sessionId = 'sess-max-tasks';
+  const now = Date.now();
+  // Worst case the reader is willing to honour: every tracked slot filled with
+  // the longest label the writer emits. A ceiling below this would drop real
+  // sessions, so lower it only against this fixture.
+  const tasks = [];
+  for (let i = 0; i < 128; i += 1) {
+    const status = i % 2 === 0 ? 'completed' : 'running';
+    const summary = summaryFor(`task-${i}`, status);
+    summary.label = 'l'.repeat(120);
+    tasks.push({ id: `task-${i}`, status, summary });
+  }
+  writeSnapshot(presenceRoot, { sessionId, generation: 3, heartbeat: now, tasks });
+  const snapshot = readPresenceSnapshot(sessionId, now, { env: envFor(dir) });
+  assert.ok(snapshot, 'a max-size legitimate envelope must never be rejected by the ceiling');
+  assert.equal(snapshot.tasks.length, 128);
+});
+
+test('an activity file past the bounded limit is rejected, never partially parsed', async () => {
+  const { readPresenceSnapshot, PRESENCE_ACTIVITY_LIMIT } = await presencePromise;
+  const { dir, presenceRoot } = makeProfile();
+  const sessionId = 'sess-oversized-activity';
+  const now = Date.now();
+  // Authentic header (its digest matches these exact bytes) so only the size
+  // ceiling can reject the read: an oversized file must yield no snapshot at
+  // all rather than a truncated or half-validated task list.
+  writeSnapshot(presenceRoot, {
+    sessionId,
+    generation: 5,
+    heartbeat: now,
+    tasks: [{ id: 'one', status: 'running' }],
+    rawActivityBytes: 'x'.repeat(PRESENCE_ACTIVITY_LIMIT + 1),
+  });
+  assert.equal(
+    readPresenceSnapshot(sessionId, now, { env: envFor(dir) }),
+    undefined,
+    'an oversized activity file must resolve to no snapshot',
+  );
+});

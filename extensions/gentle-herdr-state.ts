@@ -294,7 +294,15 @@ const nodeRequire = createRequire(import.meta.url);
 // are the only surface the harness extracts.
 
 export const PRESENCE_HEADER_LIMIT = 16 * 1024;
-export const PRESENCE_ACTIVITY_LIMIT = 16 * 1024 * 1024;
+// The activity read is synchronous and runs on the agent's own event loop on
+// every beat, so this ceiling is a cost the session pays rather than a hostile
+// file's business alone. The envelope the writer emits is bounded by the same
+// caps the reader honours (128 tracked tasks, ≤120-char labels): 16× the header
+// limit covers that worst case with margin, and keeps the per-beat parse in
+// single-digit milliseconds instead of the hundreds of milliseconds a 16 MiB
+// ceiling allowed. An oversized file still resolves to no snapshot, never a
+// partial one.
+export const PRESENCE_ACTIVITY_LIMIT = 256 * 1024;
 export const PRESENCE_FRESH_MS = 15_000;
 export const PRESENCE_MAX_DIR_ENTRIES = 128;
 export const PRESENCE_MAX_WITNESSED = 256;
@@ -1922,6 +1930,10 @@ function sidebarPublishingEnabled() {
 // jiti; the tests load a copy as .mjs), so it carries no type annotations.
 const MOSHI_AGENT = "pi";
 const MOSHI_MAX_CHILD_HEADER = 16 * 1024;
+// Upper bound on one envelope's socket lifetime. Long enough for a local
+// daemon to answer a session.update, short enough that a hung peer cannot tie
+// up a descriptor for the rest of the session.
+const MOSHI_SEND_TIMEOUT_MS = 2000;
 
 function moshiSocketPath() {
   const override = process.env.MOSHI_SOCKET_PATH;
@@ -1945,6 +1957,20 @@ function moshiSendEnvelope(envelope) {
     const done = new Promise((resolve) => sock.once("close", () => resolve()));
     moshiInFlight.add(done);
     void done.then(() => moshiInFlight.delete(done));
+    // A peer that accepts the envelope and never finishes the connection holds
+    // this socket — and its fd — in FIN_WAIT_2 for the life of the session: the
+    // half-close below is not an answer from it, only a request. One bounded,
+    // unref'd destroy settles the envelope either way, so `moshiInFlight`
+    // always drains and a broken daemon can never accumulate open handles.
+    const giveUp = setTimeout(() => {
+      try {
+        sock.destroy();
+      } catch {
+        // Already gone; the close event below still settles the promise.
+      }
+    }, MOSHI_SEND_TIMEOUT_MS);
+    giveUp.unref?.();
+    sock.once("close", () => clearTimeout(giveUp));
     sock.setNoDelay(true);
     sock.on("error", () => {
       try {
