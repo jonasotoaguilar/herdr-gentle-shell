@@ -247,6 +247,8 @@ function backupPathFor(file) {
 
 // Atomic write with backup: temp file in the target directory, then rename.
 // On any failure the original is untouched and the temp is removed.
+// Shared by both managed-block writers (this sidebar block and the theme
+// projection in bin/configure-theme.js) so every failure mode is identical.
 function writeAtomic(file, next, backup) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
@@ -278,19 +280,29 @@ function writeAtomic(file, next, backup) {
   }
 }
 
-function appendManaged(text) {
-  if (text === null) return MANAGED_BLOCK;
-  if (text.length === 0) return MANAGED_BLOCK;
+// Both managed-block writers in this plugin use the same separator rule so a
+// config.toml written by one and read back by the other never gains or loses a
+// blank line. `block` must end with a newline.
+function appendBlock(text, block) {
+  if (text === null) return block;
+  if (text.length === 0) return block;
   const sep = text.endsWith('\n') ? (text.endsWith('\n\n') ? '' : '\n') : '\n\n';
-  return text + sep + MANAGED_BLOCK;
+  return text + sep + block;
 }
 
-function removeManaged(text) {
+function appendManaged(text) {
+  return appendBlock(text, MANAGED_BLOCK);
+}
+
+// Cut each marker pair (and the newline that follows it) out of `text`.
+// Unterminated markers break out: callers detect that case themselves and
+// refuse rather than guess where the block ends.
+function removeBlock(text, beginMarker, endMarker) {
   let next = text;
   for (;;) {
-    const begin = next.indexOf(MANAGED_BEGIN);
+    const begin = next.indexOf(beginMarker);
     if (begin < 0) break;
-    const end = next.indexOf(MANAGED_END, begin);
+    const end = next.indexOf(endMarker, begin);
     if (end < 0) break; // unterminated: refuse to guess; leave as-is.
     // Extend the cut to whole lines (drop a single preceding blank line and
     // the trailing newline) so uninstall does not accumulate gaps.
@@ -298,31 +310,39 @@ function removeManaged(text) {
     const lineStart = next.lastIndexOf('\n', begin - 1);
     const gap = next.slice(lineStart + 1, begin);
     if (/^[ \t]*$/.test(gap)) cutStart = lineStart + 1;
-    let cutEnd = end + MANAGED_END.length;
+    let cutEnd = end + endMarker.length;
     if (next[cutEnd] === '\n') cutEnd += 1;
     next = next.slice(0, cutStart) + next.slice(cutEnd);
   }
   return next;
 }
 
+function removeManaged(text) {
+  return removeBlock(text, MANAGED_BEGIN, MANAGED_END);
+}
+
 /* ------------------------------------------------------------ reload */
 
-function reloadConfig() {
+// Reload the running Herdr server after a write. The reporters are injectable
+// so a second caller (bin/configure-theme.js) can keep its own single-result
+// stdout contract without duplicating the spawn, timeout and exit semantics;
+// the defaults are exactly the sidebar CLI's previous behaviour.
+function reloadConfig(log = (message) => console.log(message), warn = (message) => console.error(message)) {
   const result = spawnSync(herdrBinary(), ['server', 'reload-config'], {
     encoding: 'utf8',
     timeout: 15000,
     windowsHide: true,
   });
   if (result.error) {
-    console.error(`configure: reload failed: ${result.error.message}`);
+    warn(`configure: reload failed: ${result.error.message}`);
     return false;
   }
   if (result.status !== 0) {
     const detail = (result.stderr || result.stdout || '').trim();
-    console.error(`configure: reload failed (exit ${result.status})${detail ? `: ${detail}` : ''}`);
+    warn(`configure: reload failed (exit ${result.status})${detail ? `: ${detail}` : ''}`);
     return false;
   }
-  console.log('configure: reloaded Herdr config');
+  log('configure: reloaded Herdr config');
   return true;
 }
 
@@ -461,4 +481,16 @@ module.exports = {
   MANAGED_BEGIN,
   MANAGED_END,
   sidebarCell,
+  // Shared primitives for the second managed-block writer
+  // (bin/configure-theme.js): reusing them keeps the config path, the atomic
+  // write with `.bak` backup and the reload semantics from drifting apart
+  // between the two blocks. Exporting them changes no sidebar behaviour.
+  herdrConfigPath,
+  herdrBinary,
+  readConfig,
+  writeAtomic,
+  backupPathFor,
+  appendBlock,
+  removeBlock,
+  reloadConfig,
 };

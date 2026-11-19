@@ -15,7 +15,11 @@
 // - a Pi reload happens only when the settings exclusion entry actually
 //   changed;
 // - the sidebar switch drives the Herdr plugin's own
-//   `bin/configure.js --check|--apply --reload|--uninstall --reload`.
+//   `bin/configure.js --check|--apply --reload|--uninstall --reload`;
+// - the theme rows (theme-sync T3a, S1/S2/S4/S7) write only
+//   `gentle-theme.json`: the toggle never reloads Pi, the theme value opens the
+//   host's own theme list and is refused while the sync is on, and every
+//   refusal or cancellation leaves the file byte-identical.
 //
 // The restored floating panel (odd/tasks/restore-customize-panel.md T1) adds
 // one more path, pinned below through `ctx.ui.custom` only: no argument opens
@@ -73,6 +77,15 @@ const NOT_PAIRED_TEXT =
 
 const COMMAND = 'herdr-gentle:customize';
 
+// The theme picker's "no theme assigned" entry. It is deliberately distinct from
+// `Off`, the label the row paints for a stored `null`: a theme may be called
+// `Off`, and reusing that spelling as the sentinel would shadow the theme.
+const THEME_UNASSIGN = 'Off (no theme assigned)';
+
+// The panel rows the command offers before the first prompt; the theme rows are
+// part of it so the feature is reachable without `ctx.ui.custom`.
+const MENU_OPTIONS = ['Sidebar agent rows', 'Moshi notifications', 'Theme sync', 'Gentle Shell theme'];
+
 /* ------------------------------------------------------------ fixtures */
 
 function writeExecutable(file, body) {
@@ -87,7 +100,7 @@ function fixture(name) {
   return dir;
 }
 
-function harness({ customImpl } = {}) {
+function harness({ customImpl, themes } = {}) {
   const commands = new Map();
   const notices = [];
   const selections = [];
@@ -103,6 +116,10 @@ function harness({ customImpl } = {}) {
     notify: (message, level) => notices.push([message, level ?? 'info']),
     select: async () => selections.shift(),
   };
+  // The host's theme catalogue: `{ name, path }` records, exactly the shape
+  // `ctx.ui.getAllThemes()` documents. A test that omits it simulates a host
+  // without the accessor.
+  if (themes !== undefined) ui.getAllThemes = () => themes;
   if (typeof customImpl === 'function') {
     ui.custom = async (factory, options) => {
       customs.push([factory, options]);
@@ -231,6 +248,19 @@ function readSettings(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+// The theme store's one document, in the same state dir the Moshi flag uses.
+function themePath(env) {
+  return path.join(env.stateDir, 'gentle-theme.json');
+}
+
+function writeThemeFile(env, doc) {
+  fs.writeFileSync(themePath(env), `${JSON.stringify(doc, null, 2)}\n`);
+}
+
+function readThemeFile(env) {
+  return JSON.parse(fs.readFileSync(themePath(env), 'utf8'));
+}
+
 /* ------------------------------------------------------------ tests */
 
 describe('registration', () => {
@@ -254,11 +284,33 @@ describe('status', () => {
     const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
     const h = harness();
     await run(h, 'status');
-    assert.deepEqual(noticeTexts(h), ['customize status: sidebar=off moshi=off']);
+    assert.deepEqual(noticeTexts(h), ['customize status: sidebar=off moshi=off theme-sync=off theme=none']);
     assert.deepEqual(h.reloads, []);
-    // Read-only: no flag file, no settings write, no config write.
+    // Read-only: no flag file, no theme store, no settings write, no config write.
     assert.equal(fs.existsSync(env.flagPath), false);
+    assert.equal(fs.existsSync(themePath(env)), false, 'a status read never creates the theme store');
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
+  });
+
+  test('reads the stored theme state in the same line', async () => {
+    const env = setupEnvironment('status-theme');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const themeBefore = fs.readFileSync(themePath(env), 'utf8');
+    const h = harness({ themes: [{ name: 'nord' }] });
+    await run(h, 'status');
+    assert.deepEqual(noticeTexts(h), ['customize status: sidebar=off moshi=off theme-sync=on theme=dracula']);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), themeBefore, 'status writes nothing');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('an unreadable theme store reads unknown, never a guessed value', async () => {
+    const env = setupEnvironment('status-theme-unknown');
+    fs.writeFileSync(env.configPath, '');
+    fs.writeFileSync(themePath(env), '{not json');
+    const h = harness();
+    await run(h, 'status');
+    assert.deepEqual(noticeTexts(h), ['customize status: sidebar=off moshi=off theme-sync=unknown theme=unknown']);
   });
 
   test('reads the managed sidebar block through configure.js --check', async () => {
@@ -267,7 +319,7 @@ describe('status', () => {
     const configBefore = fs.readFileSync(env.configPath, 'utf8');
     const h = harness();
     await run(h, 'status');
-    assert.deepEqual(noticeTexts(h), ['customize status: sidebar=on moshi=off']);
+    assert.deepEqual(noticeTexts(h), ['customize status: sidebar=on moshi=off theme-sync=off theme=none']);
     assert.equal(fs.readFileSync(env.configPath, 'utf8'), configBefore);
   });
 });
@@ -435,6 +487,18 @@ describe('sidebar switch', () => {
     assert.deepEqual(calls, ['server reload-config', 'server reload-config']);
   });
 
+  test('the shared apply path leaves the theme store alone', async () => {
+    // PRESERVE (theme-sync T3a): the apply path now routes three switches, so the
+    // untouched sidebar switch is pinned to write only its own state.
+    const env = setupEnvironment('sidebar-leaves-theme-store');
+    fs.writeFileSync(env.configPath, '[ui.sidebar.agents]\nignored = true\n');
+    const h = harness();
+    h.selections.push('Sidebar agent rows', 'On');
+    await run(h, '');
+    assert.equal(fs.existsSync(themePath(env)), false, 'the sidebar switch writes no theme state');
+    assert.deepEqual(h.reloads, []);
+  });
+
   test('reporting "already enabled" writes nothing', async () => {
     const env = setupEnvironment('sidebar-already');
     const on = harness();
@@ -454,7 +518,7 @@ describe('sidebar switch', () => {
   });
 });
 
-test('customize menu offers exactly the two switches and On/Off', async () => {
+test('customize menu offers both switches, the theme rows and On/Off', async () => {
   const h = harness();
   const offered = [];
   const queueNext = h.ctx.ui.select;
@@ -465,11 +529,204 @@ test('customize menu offers exactly the two switches and On/Off', async () => {
   h.selections.push('Moshi notifications', 'Off');
   await run(h, '');
   assert.deepEqual(offered.map(([, options]) => options), [
-    ['Sidebar agent rows', 'Moshi notifications'],
+    MENU_OPTIONS,
     ['On', 'Off'],
   ]);
   assert.equal(offered[0][0], 'Customize · Herdr Gentle Shell');
   assert.equal(offered[1][0], 'Moshi notifications (currently off)');
+});
+
+describe('theme sync switch', () => {
+  test('the toggle writes the theme store and never reloads Pi', async () => {
+    const env = setupEnvironment('theme-sync-on');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness();
+    h.selections.push('Theme sync', 'On');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), ["Theme sync on; Herdr's palette follows the theme active in Pi."]);
+    assert.deepEqual(h.notices.map(([, level]) => level), ['info']);
+    const doc = readThemeFile(env);
+    assert.equal(doc.sync, true);
+    assert.equal(doc.theme, 'dracula', 'the assigned theme is preserved across the toggle');
+    assert.match(doc.updatedAt, /^\d{4}-\d{2}-\d{2}T/, 'the store stamps its own timestamp');
+    assert.deepEqual(h.reloads, [], 'a theme change never reloads Pi');
+    assert.equal(fs.existsSync(env.flagPath), false, 'the theme switch writes no Moshi flag');
+  });
+
+  test('turning the sync off keeps the theme the user had assigned', async () => {
+    const env = setupEnvironment('theme-sync-off');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: true, theme: 'nord', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness();
+    h.selections.push('Theme sync', 'Off');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), ["Theme sync off; Herdr keeps the palette it was last given."]);
+    const doc = readThemeFile(env);
+    assert.equal(doc.sync, false);
+    assert.equal(doc.theme, 'nord');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('reporting "already on" writes nothing', async () => {
+    const env = setupEnvironment('theme-sync-already');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: true, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    const h = harness();
+    h.selections.push('Theme sync', 'On');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), ['Theme sync already on; nothing was changed.']);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before);
+    assert.deepEqual(h.reloads, []);
+  });
+});
+
+describe('theme selection', () => {
+  test('refuses while the sync is on and leaves the store byte-identical', async () => {
+    const env = setupEnvironment('theme-select-refused');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    const h = harness({ themes: [{ name: 'nord' }] });
+    const offered = [];
+    const queueNext = h.ctx.ui.select;
+    h.ctx.ui.select = async (title, options) => {
+      offered.push([title, options]);
+      return queueNext();
+    };
+    h.selections.push('Gentle Shell theme');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), ['Turn Theme sync off to pick a specific theme.']);
+    assert.deepEqual(h.notices.map(([, level]) => level), ['warning']);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'the refusal writes nothing');
+    assert.deepEqual(offered.map(([, options]) => options), [MENU_OPTIONS], 'the theme list never opens');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('lists the host themes sorted and deduplicated and writes the chosen name', async () => {
+    const env = setupEnvironment('theme-select-choose');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [
+        { name: 'zeta', path: '/themes/zeta.json' },
+        { name: 'alpha' },
+        { name: 'alpha', path: '/themes/alpha-light.json' },
+      ],
+    });
+    const offered = [];
+    const queueNext = h.ctx.ui.select;
+    h.ctx.ui.select = async (title, options) => {
+      offered.push([title, options]);
+      return queueNext();
+    };
+    h.selections.push('Gentle Shell theme', 'zeta');
+    await run(h, '');
+    assert.deepEqual(offered[1], ['Gentle Shell theme', ['alpha', 'zeta', THEME_UNASSIGN]]);
+    const doc = readThemeFile(env);
+    assert.equal(doc.sync, false, 'a pinned theme never turns the sync on');
+    assert.equal(doc.theme, 'zeta');
+    assert.deepEqual(h.reloads, []);
+    assert.equal(fs.existsSync(env.flagPath), false);
+  });
+
+  // A user theme may legitimately be called `Off`, the label the row paints for
+  // "no theme assigned". The picker sentinel must therefore be a different
+  // entry, or selecting that theme would be read as clearing the pin and the
+  // theme would be unpinnable.
+  test('a theme named Off is pinned, not read as "unassign"', async () => {
+    const env = setupEnvironment('theme-select-named-off');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({ themes: [{ name: 'Off' }, { name: 'nord' }] });
+    h.selections.push('Gentle Shell theme', 'Off');
+    await run(h, '');
+    const doc = readThemeFile(env);
+    assert.equal(doc.theme, 'Off', 'the real theme named Off is written as the assigned theme');
+    assert.equal(doc.sync, false);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('the picker\'s unassign entry is its own label and writes an unassigned theme', async () => {
+    const env = setupEnvironment('theme-select-off');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({ themes: [{ name: 'Off' }, { name: 'nord' }] });
+    const prompts = [];
+    // The command appends its unassign entry AFTER the sorted theme list, so
+    // answering with the last option proves that exactly this entry unassigns.
+    h.ctx.ui.select = async (title, options) => {
+      prompts.push([title, options]);
+      if (prompts.length === 1) return 'Gentle Shell theme';
+      return options[options.length - 1];
+    };
+    await run(h, '');
+    const options = prompts[1][1];
+    assert.deepEqual(options.slice(0, 2), ['Off', 'nord'], 'every real theme keeps its own entry');
+    assert.notEqual(options[2], 'Off', 'the unassign entry never claims the Off theme name');
+    assert.equal(new Set(options).size, options.length, 'the unassign entry cannot collide with a theme name');
+    const doc = readThemeFile(env);
+    assert.equal(doc.theme, null, 'the unassign entry means no theme is assigned');
+    assert.equal(doc.sync, false);
+    assert.deepEqual(h.reloads, []);
+    // `Off` stays the STORED-value label the panel paints, so the confirmation
+    // still speaks about Off even though the picker entry is spelled differently.
+    assert.match(noticeTexts(h)[0], /theme set to Off/);
+  });
+
+  test('a theme named like the unassign entry still gets its own entry', async () => {
+    const env = setupEnvironment('theme-select-sentinel-collision');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({ themes: [{ name: THEME_UNASSIGN }] });
+    const prompts = [];
+    h.ctx.ui.select = async (title, options) => {
+      prompts.push([title, options]);
+      if (prompts.length === 1) return 'Gentle Shell theme';
+      // The theme itself, listed before the sentinel that had to move aside.
+      return options[0];
+    };
+    await run(h, '');
+    assert.deepEqual(
+      prompts[1][1],
+      [THEME_UNASSIGN, `${THEME_UNASSIGN} 2`],
+      'the sentinel moves instead of shadowing a theme that carries its spelling',
+    );
+    assert.equal(readThemeFile(env).theme, THEME_UNASSIGN, 'the theme keeps its own name');
+  });
+
+  test('a cancelled theme selection writes nothing', async () => {
+    const env = setupEnvironment('theme-select-cancelled');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    const h = harness({ themes: [{ name: 'nord' }] });
+    // The menu pick is consumed; the theme list prompt is then cancelled.
+    h.selections.push('Gentle Shell theme');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), []);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('an unreadable theme list is reported and writes nothing', async () => {
+    const env = setupEnvironment('theme-select-no-list');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    // No `getAllThemes` on this host: the command must say so instead of
+    // guessing a theme list or writing an unresolvable name.
+    const h = harness();
+    h.selections.push('Gentle Shell theme');
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), [
+      "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.",
+    ]);
+    assert.deepEqual(h.notices.map(([, level]) => level), ['warning']);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before);
+    assert.deepEqual(h.reloads, []);
+  });
 });
 
 /* ------------------------------------------------ restored floating panel */
@@ -815,6 +1072,135 @@ describe('floating customize panel', () => {
       `Moshi notifications disabled. removed ${MOSHI_ENTRY}. Reloading now to apply the change.`,
     ]);
     assert.equal(h.reloads.length, 1);
+  });
+});
+
+/* --------------------------------------------- floating panel theme rows */
+
+describe('floating panel theme rows', () => {
+  test('the overlay carries the Herdr Theme category and its two rows', async () => {
+    const env = setupEnvironment('overlay-theme-rows');
+    fs.writeFileSync(env.configPath, '');
+    const seen = {};
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        seen.theme = component.render(100).join('\n');
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.ok(seen.theme.includes('Herdr Theme · 1/2'), 'the category counts its two rows');
+    const syncRow = seen.theme.split('\n').find((line) => line.includes('● Off'));
+    assert.ok(syncRow.includes('Theme sync'), 'the sync row reads the inert default Off');
+    const themeRow = seen.theme.split('\n').find((line) => line.includes('Gentle Shell theme'));
+    assert.ok(themeRow.includes('● Off'), 'an unassigned theme reads as the inert choice');
+    assert.ok(themeRow.includes('○ Select…'), 'and the list is the other value');
+    assert.deepEqual(noticeTexts(h), []);
+    assert.equal(fs.existsSync(themePath(env)), false, 'opening the panel writes nothing');
+  });
+
+  test('the overlay reads the stored theme and disables the row while the sync is on', async () => {
+    const env = setupEnvironment('overlay-theme-stored');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    let seen = '';
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        seen = component.render(100).join('\n');
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.ok(seen.includes('● On'), 'the sync switch reads its stored On');
+    assert.ok(seen.includes('● dracula'), 'the assigned theme stays readable');
+    assert.ok(seen.includes('Turn Theme sync off to pick a specific theme.'), 'the disabled row explains itself');
+  });
+
+  test('Enter on the sync row writes the store and skips the Pi reload', async () => {
+    const env = setupEnvironment('overlay-theme-toggle');
+    fs.writeFileSync(env.configPath, '');
+    const h = harness({
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), ["Theme sync on; Herdr's palette follows the theme active in Pi."]);
+    assert.equal(readThemeFile(env).sync, true);
+    assert.deepEqual(h.reloads, [], 'the theme watch applies the palette; Pi is not reloaded');
+    assert.equal(fs.existsSync(env.flagPath), false);
+  });
+
+  test('the disabled theme row refuses through the overlay and writes nothing', async () => {
+    const env = setupEnvironment('overlay-theme-refused');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    const h = harness({
+      themes: [{ name: 'nord' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        assert.ok(component.render(100).join('\n').includes('▸ Gentle Shell theme'));
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    assert.deepEqual(noticeTexts(h), ['Turn Theme sync off to pick a specific theme.']);
+    assert.deepEqual(h.notices.map(([, level]) => level), ['warning']);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'the refusal writes nothing');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('the overlay theme row opens the host list and writes the chosen name', async () => {
+    const env = setupEnvironment('overlay-theme-select');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [{ name: 'nord' }, { name: 'dracula' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        component.handleInput('enter');
+        return done();
+      },
+    });
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    h.selections.push('dracula');
+    await run(h, '');
+    assert.equal(readThemeFile(env).theme, 'dracula');
+    assert.equal(readThemeFile(env).sync, false);
+    assert.equal(h.notices.length, 1, 'one notification for the write');
+    assert.match(h.notices[0][0], /dracula/);
   });
 });
 

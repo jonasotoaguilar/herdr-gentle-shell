@@ -2039,13 +2039,13 @@ function lastFinishedLabel(taskMap) {
 }
 
 // ---------------------------------------------------------------------------
-// `/herdr-gentle:customize`: exactly two switches, offered in the floating panel
+// `/herdr-gentle:customize`: three categories, offered in the floating panel
 // shaped like Gentle Shell's own card (odd/tasks/restore-customize-panel.md T1;
-// odd/tasks/customize-parity-done-idle.md T1/T3).
+// odd/tasks/customize-parity-done-idle.md T1/T3; odd/tasks/theme-sync.md T3).
 //
 // The command is registered BEFORE the `enabled()` gate in the factory below,
 // so it stays reachable from a plain Pi session outside a Herdr pane; the
-// producer itself still needs a pane. The two switches are:
+// producer itself still needs a pane. The switches are:
 //
 // - Sidebar agent rows. The marked `[ui.sidebar.agents.rows_by_agent]` block
 //   belongs to the Herdr plugin's own `bin/configure.js`, which is installed as
@@ -2061,6 +2061,12 @@ function lastFinishedLabel(taskMap) {
 //   nothing at all. Disabling skips the gate and stays unconditional. A Pi
 //   reload is requested only when the settings entry actually changed, because
 //   that entry is the only part that waits for the next Pi extension load.
+// - Theme sync. `lib/theme-store.js` holds the one persisted document
+//   (`gentle-theme.json`): whether Herdr follows the theme active in Pi (S1/S2)
+//   and, with the sync off, the one theme the user pinned (S4). The toggle
+//   writes that document and needs NO Pi reload — the palette lives in Herdr,
+//   not in this extension — and the theme row lists `ctx.ui.getAllThemes()`
+//   while refusing to change anything as long as the stored sync is on.
 //
 // No argument opens the recovered panel from lib/customize-panel.js through
 // `ctx.ui.custom` with the overlay options the former implementation pinned;
@@ -2074,8 +2080,31 @@ function lastFinishedLabel(taskMap) {
 const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
 const CUSTOMIZE_SIDEBAR_LABEL = "Sidebar agent rows";
 const CUSTOMIZE_MOSHI_LABEL = "Moshi notifications";
+const CUSTOMIZE_THEME_SYNC_LABEL = "Theme sync";
+const CUSTOMIZE_THEME_LABEL = "Gentle Shell theme";
 const CUSTOMIZE_ON = "On";
 const CUSTOMIZE_OFF = "Off";
+
+// The theme picker's "no theme assigned" entry. It is deliberately NOT `Off`:
+// `Off` is the label the panel paints for a stored `null`
+// (THEME_OFF_LABEL in lib/theme-projection.js), and a Pi theme may legitimately
+// be named `Off`. Reusing that spelling as the sentinel would make such a theme
+// unpinnable, because selecting it would read as "clear the pin".
+const CUSTOMIZE_THEME_UNASSIGN = "Off (no theme assigned)";
+
+// The row id `lib/customize-panel.js` gives the theme value row. It is not an
+// On/Off pair: the row opens the host's theme list, so the apply path keys the
+// list on this id instead of on a value it could toggle.
+const CUSTOMIZE_THEME_SELECT_ROW_ID = "select";
+const THEME_SYNC_ON_TEXT = "Theme sync on; Herdr's palette follows the theme active in Pi.";
+const THEME_SYNC_OFF_TEXT = "Theme sync off; Herdr keeps the palette it was last given.";
+// The refusal keeps S4's promise: the pinned theme is only available while the
+// sync is off, so a stored sync turns the row into a no-op with a reason.
+const THEME_SYNC_REFUSED_TEXT = "Turn Theme sync off to pick a specific theme.";
+const THEME_LIST_UNAVAILABLE_TEXT =
+  "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.";
+const THEME_STORE_UNAVAILABLE_TEXT =
+  "Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.";
 
 // The former panel's geometry and overlay options, unchanged. The helpers
 // module (@earendil-works/pi-tui) is resolved lazily through the injectable
@@ -2096,20 +2125,47 @@ export function setCustomizeTuiLoader(loader) {
   customizeTuiLoader = loader;
 }
 
-// The panel module lives in lib/, resolved relative to this file in the
-// installed package. Tests load a copy from a temp directory and point the
+// The panel and the theme store live in lib/, resolved relative to this file in
+// the installed package. Tests load a copy from a temp directory and point the
 // documented override at the real lib dir. A single-file deployment (the
-// installed copy or symlink without sibling helpers) has no panel module, so
-// the callback returns null and the command keeps the plain menu below.
+// installed copy or symlink without sibling helpers) has neither module, so the
+// panel loader returns null (keeping the plain menu below) and the theme store
+// reports `ok: false`, which the panel paints as `Unknown` instead of guessing.
+function customizeLibDir() {
+  const override = process.env.GENTLE_CUSTOMIZE_LIB_DIR;
+  return typeof override === "string" && override.length > 0
+    ? override
+    : join(dirname(fileURLToPath(import.meta.url)), "..", "lib");
+}
+
 function customizePanelModule() {
   try {
-    const override = process.env.GENTLE_CUSTOMIZE_LIB_DIR;
-    const dir = typeof override === "string" && override.length > 0
-      ? override
-      : join(dirname(fileURLToPath(import.meta.url)), "..", "lib");
-    return nodeRequire(join(dir, "customize-panel.js"));
+    return nodeRequire(join(customizeLibDir(), "customize-panel.js"));
   } catch {
     return null;
+  }
+}
+
+function themeStoreModule() {
+  try {
+    return nodeRequire(join(customizeLibDir(), "theme-store.js"));
+  } catch {
+    return null;
+  }
+}
+
+// Never throws: an unreadable decision is `ok: false` with the inert defaults,
+// so the panel shows `Unknown` and the apply path refuses instead of writing a
+// value nobody chose (S7).
+function readCustomizeThemeState() {
+  const inert = { ok: false, sync: false, theme: null, updatedAt: null };
+  const store = themeStoreModule();
+  if (!store || typeof store.readThemeState !== "function") return inert;
+  try {
+    const state = store.readThemeState(process.env);
+    return isRecord(state) ? state : inert;
+  } catch (error) {
+    return { ...inert, error: `could not read the theme state: ${error?.message ?? error}` };
   }
 }
 
@@ -2119,6 +2175,7 @@ function customizePanelModel() {
   return panel.customizePanelModel({
     sidebar: sidebarRowsState().state,
     moshi: moshiFlagEnabled(moshiFlagPath()) ? "on" : "off",
+    theme: readCustomizeThemeState(),
   });
 }
 
@@ -2509,11 +2566,16 @@ function applyMoshiNotifications(want) {
 }
 
 // One apply path for both switches: notify once with the verdict and reload Pi
-// only when the Moshi settings entry actually changed.
+// only when the Moshi settings entry actually changed. The theme switch never
+// reloads: the palette it writes belongs to Herdr, so a Pi reload would only
+// restart the extension for nothing.
 async function applyCustomizeSwitch(id, value, ctx) {
+  const want = value === "on";
   const result = id === "sidebar"
-    ? await applySidebarRows(value === "on")
-    : applyMoshiNotifications(value === "on");
+    ? await applySidebarRows(want)
+    : id === "theme-sync"
+      ? applyThemeSync(want)
+      : applyMoshiNotifications(want);
   const notify = ctx?.ui?.notify;
   if (typeof notify === "function") {
     notify(`${result.text}${result.needsReload ? " Reloading now to apply the change." : ""}`, result.level);
@@ -2521,42 +2583,205 @@ async function applyCustomizeSwitch(id, value, ctx) {
   if (result.needsReload && typeof ctx?.reload === "function") await ctx.reload();
 }
 
+// The one-line spelling of the theme state, shared by `status` and the menu
+// fallback so "unknown" can never drift from what the panel shows: an unreadable
+// store names no value at all, and an unassigned theme reads as `none`.
+function themeStateLabels(state) {
+  if (!state || state.ok === false) return { sync: "unknown", theme: "unknown" };
+  const theme = typeof state.theme === "string" && state.theme.length > 0 ? state.theme : "none";
+  return { sync: state.sync === true ? "on" : "off", theme };
+}
+
+function themeStoreWriteError(error) {
+  return `Could not write the theme store: ${error?.message ?? error}; nothing was changed.`;
+}
+
+// S1/S2: the sync flag is the whole toggle, and the theme the user pinned is
+// carried across it untouched, so turning the sync off restores that choice
+// instead of silently unassigning it. Nothing is reloaded.
+function applyThemeSync(want) {
+  const store = themeStoreModule();
+  if (!store || typeof store.writeThemeState !== "function") {
+    return { changed: false, needsReload: false, level: "error", text: THEME_STORE_UNAVAILABLE_TEXT };
+  }
+  const state = readCustomizeThemeState();
+  // An unreadable document is written over rather than blocked on (the same
+  // repair the sidebar switch offers), but an already-correct flag still reports
+  // "already" instead of rewriting the file.
+  const current = state.sync === true;
+  if (current === want) {
+    return {
+      changed: false,
+      needsReload: false,
+      level: "info",
+      text: `Theme sync already ${want ? "on" : "off"}; nothing was changed.`,
+    };
+  }
+  try {
+    store.writeThemeState(process.env, { sync: want, theme: state.theme ?? null });
+  } catch (error) {
+    return { changed: false, needsReload: false, level: "error", text: themeStoreWriteError(error) };
+  }
+  return {
+    changed: true,
+    needsReload: false,
+    level: "info",
+    text: want ? THEME_SYNC_ON_TEXT : THEME_SYNC_OFF_TEXT,
+  };
+}
+
+// `ctx.ui.getAllThemes()` documents `{ name, path }` records; a plain string list
+// is accepted too. A malformed entry is skipped instead of failing the whole
+// list, and the result is deduplicated and sorted so the prompt is stable.
+function themeNames(themes) {
+  if (!Array.isArray(themes)) return null;
+  const names = [];
+  for (const entry of themes) {
+    const name = typeof entry === "string" ? entry : isRecord(entry) ? entry.name : null;
+    if (typeof name !== "string") continue;
+    const clean = name.trim();
+    if (clean.length > 0) names.push(clean);
+  }
+  return [...new Set(names)].sort();
+}
+
+// The picker's entries plus the ONE entry that means "unassign". A theme really
+// named like the sentinel moves the sentinel instead of being shadowed, so every
+// theme name stays selectable and only the returned label writes `theme: null`.
+function themeSelectionOptions(names) {
+  let unassign = CUSTOMIZE_THEME_UNASSIGN;
+  let attempt = 2;
+  while (names.includes(unassign)) {
+    unassign = `${CUSTOMIZE_THEME_UNASSIGN} ${attempt}`;
+    attempt += 1;
+  }
+  return { options: [...names, unassign], unassign };
+}
+
+// S4: pin one of Pi's themes while the sync is off. The refusal, the missing
+// theme list and an empty answer all write NOTHING, so the stored document only
+// ever changes to a value the user actually picked.
+async function applyThemeSelection(ctx) {
+  const notify = ctx?.ui?.notify;
+  const store = themeStoreModule();
+  if (!store || typeof store.writeThemeState !== "function") {
+    if (typeof notify === "function") notify(THEME_STORE_UNAVAILABLE_TEXT, "warning");
+    return;
+  }
+  if (readCustomizeThemeState().sync === true) {
+    if (typeof notify === "function") notify(THEME_SYNC_REFUSED_TEXT, "warning");
+    return;
+  }
+  const listThemes = ctx?.ui?.getAllThemes;
+  if (typeof listThemes !== "function") {
+    if (typeof notify === "function") notify(THEME_LIST_UNAVAILABLE_TEXT, "warning");
+    return;
+  }
+  let themes;
+  try {
+    themes = listThemes.call(ctx.ui);
+  } catch {
+    themes = null;
+  }
+  const names = themeNames(themes);
+  if (names === null) {
+    if (typeof notify === "function") notify(THEME_LIST_UNAVAILABLE_TEXT, "warning");
+    return;
+  }
+  const select = ctx?.ui?.select;
+  if (typeof select !== "function") return;
+  const picker = themeSelectionOptions(names);
+  let picked;
+  try {
+    // The unassign entry is its own label, never the stored-value label `Off`, so
+    // a theme named `Off` is pinned like any other and a way back to "no theme"
+    // is always offered.
+    picked = await select(CUSTOMIZE_THEME_LABEL, picker.options);
+  } catch {
+    picked = undefined;
+  }
+  // Esc/cancel and an empty answer write nothing at all.
+  if (typeof picked !== "string" || picked.length === 0) return;
+  const next = picked === picker.unassign ? null : picked;
+  try {
+    store.writeThemeState(process.env, { sync: false, theme: next });
+  } catch (error) {
+    if (typeof notify === "function") notify(themeStoreWriteError(error), "error");
+    return;
+  }
+  if (typeof notify === "function") {
+    notify(
+      next === null
+        ? "Gentle Shell theme set to Off; Herdr keeps the palette it was last given."
+        : `Gentle Shell theme set to ${next}.`,
+      "info",
+    );
+  }
+}
+
 // The single apply path shared by the overlay and the menu fallback. The choice
 // the panel resolves names the switch it drives (`switchId`) and the value to
 // apply; that switch id is the only thing read here, so a row can never apply a
 // switch its category does not own. An inconclusive sidebar verdict is never a
 // refusal: choosing On still attempts the repair and reports the apply step's
-// own error, exactly like the baseline menu did.
-const CUSTOMIZE_SWITCH_IDS = ["sidebar", "moshi"];
+// own error, exactly like the baseline menu did. The theme value is the one row
+// that is not a toggle: it carries the `select` row id, and the refusal for a
+// stored sync lives in `applyThemeSelection` so both entry points share it.
+const CUSTOMIZE_SWITCH_IDS = ["sidebar", "moshi", "theme-sync", "theme"];
 
 async function applyCustomizeChoice(choice, ctx) {
   if (!isRecord(choice)) return;
   const switchId = choice.switchId;
   const valueId = choice.valueId;
   if (!CUSTOMIZE_SWITCH_IDS.includes(switchId)) return;
+  if (switchId === "theme") {
+    if (valueId !== CUSTOMIZE_THEME_SELECT_ROW_ID) return;
+    await applyThemeSelection(ctx);
+    return;
+  }
   if (valueId !== "on" && valueId !== "off") return;
   await applyCustomizeSwitch(switchId, valueId, ctx);
 }
 
 // The former plain menu, kept as the fallback when the TUI helpers or
 // `ctx.ui.custom` are unavailable. It reads the same model and applies
-// through the same path as the overlay.
+// through the same path as the overlay, and it offers the theme rows too, so
+// theme sync is reachable in a plain terminal.
 async function runCustomizeFallback(ctx) {
   const select = ctx?.ui?.select;
   if (typeof select !== "function") return;
   let picked = null;
   try {
-    picked = await select(CUSTOMIZE_TITLE, [CUSTOMIZE_SIDEBAR_LABEL, CUSTOMIZE_MOSHI_LABEL]);
+    picked = await select(CUSTOMIZE_TITLE, [
+      CUSTOMIZE_SIDEBAR_LABEL,
+      CUSTOMIZE_MOSHI_LABEL,
+      CUSTOMIZE_THEME_SYNC_LABEL,
+      CUSTOMIZE_THEME_LABEL,
+    ]);
   } catch {
     picked = undefined;
   }
   // Esc/cancel (null or undefined) writes nothing and reloads nothing.
   if (picked === undefined || picked === null) return;
-  const id = picked === CUSTOMIZE_SIDEBAR_LABEL ? "sidebar" : picked === CUSTOMIZE_MOSHI_LABEL ? "moshi" : null;
+  // The theme value is not an On/Off switch: it opens the (already sorted)
+  // theme list itself, so the second prompt below never applies to it.
+  if (picked === CUSTOMIZE_THEME_LABEL) {
+    await applyThemeSelection(ctx);
+    return;
+  }
+  const id = picked === CUSTOMIZE_SIDEBAR_LABEL
+    ? "sidebar"
+    : picked === CUSTOMIZE_MOSHI_LABEL
+      ? "moshi"
+      : picked === CUSTOMIZE_THEME_SYNC_LABEL
+        ? "theme-sync"
+        : null;
   if (!id) return;
   const current = id === "sidebar"
     ? sidebarRowsState().state
-    : (moshiFlagEnabled(moshiFlagPath()) ? "on" : "off");
+    : id === "theme-sync"
+      ? themeStateLabels(readCustomizeThemeState()).sync
+      : (moshiFlagEnabled(moshiFlagPath()) ? "on" : "off");
   let choice = null;
   try {
     choice = await select(`${picked} (currently ${current})`, [CUSTOMIZE_ON, CUSTOMIZE_OFF]);
@@ -2575,8 +2800,12 @@ async function executeCustomize(rawArgs, ctx) {
     // One read-only line: nothing is written and nothing is reloaded.
     const sidebar = sidebarRowsState();
     const moshi = moshiFlagEnabled(moshiFlagPath()) ? "on" : "off";
+    const theme = themeStateLabels(readCustomizeThemeState());
     if (typeof notify === "function") {
-      notify(`customize status: sidebar=${sidebar.state} moshi=${moshi}`, "info");
+      notify(
+        `customize status: sidebar=${sidebar.state} moshi=${moshi} theme-sync=${theme.sync} theme=${theme.theme}`,
+        "info",
+      );
     }
     return;
   }
@@ -2646,7 +2875,7 @@ export default function (pi) {
   // must stay reachable from a plain Pi session outside a Herdr pane.
   if (typeof pi?.registerCommand === "function") {
     pi.registerCommand("herdr-gentle:customize", {
-      description: "Customize Herdr Gentle Shell: sidebar agent rows and Moshi notifications",
+      description: "Customize Herdr Gentle Shell: sidebar agent rows, Moshi notifications and the Herdr theme",
       handler: async (args, ctx) => {
         await executeCustomize(args, ctx);
       },
