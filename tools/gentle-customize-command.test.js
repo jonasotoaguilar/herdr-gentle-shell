@@ -100,7 +100,7 @@ function fixture(name) {
   return dir;
 }
 
-function harness({ customImpl, themes } = {}) {
+function harness({ customImpl, themes, getTheme } = {}) {
   const commands = new Map();
   const notices = [];
   const selections = [];
@@ -120,6 +120,9 @@ function harness({ customImpl, themes } = {}) {
   // `ctx.ui.getAllThemes()` documents. A test that omits it simulates a host
   // without the accessor.
   if (themes !== undefined) ui.getAllThemes = () => themes;
+  // The host's per-theme palette reader. A test that omits it simulates a host
+  // whose themes cannot be previewed, which must read `Preview unavailable`.
+  if (typeof getTheme === 'function') ui.getTheme = getTheme;
   if (typeof customImpl === 'function') {
     ui.custom = async (factory, options) => {
       customs.push([factory, options]);
@@ -162,12 +165,21 @@ const stubTui = {
 // Drive the component the way the host does: factory(hostTui, theme,
 // keybindings, done), keystrokes through handleInput and the result through
 // done(). A component that never finishes fails fast instead of hanging.
-function openPanel(factory, hostTui = {}) {
+function openPanel(factory, hostTui = {}, theme = {}) {
   let settled = 'pending';
-  const component = factory(hostTui, {}, {}, (result) => { settled = result; });
+  const component = factory(hostTui, theme, {}, (result) => { settled = result; });
   assert.equal(typeof component.render, 'function');
   assert.equal(typeof component.handleInput, 'function');
   return { component, done: () => settled };
+}
+
+// Enter confirms an option behind the panel's busy guard and the panel stays
+// open, so every test waits for the apply instead of assuming a tick.
+async function settlePanel(component) {
+  for (let attempt = 0; attempt < 400 && component.state.busy; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(component.state.busy, false, 'the panel apply settled');
 }
 
 before(() => {
@@ -604,7 +616,7 @@ describe('theme selection', () => {
     assert.deepEqual(h.reloads, []);
   });
 
-  test('lists the host themes sorted and deduplicated and writes the chosen name', async () => {
+  test('lists the host themes in host order, deduplicated and without subdirectory names', async () => {
     const env = setupEnvironment('theme-select-choose');
     fs.writeFileSync(env.configPath, '');
     writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
@@ -612,6 +624,7 @@ describe('theme selection', () => {
       themes: [
         { name: 'zeta', path: '/themes/zeta.json' },
         { name: 'alpha' },
+        { name: 'nested/theme' },
         { name: 'alpha', path: '/themes/alpha-light.json' },
       ],
     });
@@ -623,7 +636,8 @@ describe('theme selection', () => {
     };
     h.selections.push('Gentle Shell theme', 'zeta');
     await run(h, '');
-    assert.deepEqual(offered[1], ['Gentle Shell theme', ['alpha', 'zeta', THEME_UNASSIGN]]);
+    // S2: Pi's own order is kept and a name under a subdirectory is not a theme.
+    assert.deepEqual(offered[1], ['Gentle Shell theme', ['zeta', 'alpha', THEME_UNASSIGN]]);
     const doc = readThemeFile(env);
     assert.equal(doc.sync, false, 'a pinned theme never turns the sync on');
     assert.equal(doc.theme, 'zeta');
@@ -759,7 +773,7 @@ describe('floating customize panel', () => {
 
     const host = makeHostTui();
     const { component } = openPanel(h.customs[0][0], host.tui);
-    const seen = component.render(100).join('\n');
+    const seen = component.render(100).map((line) => String(line)).join('\n');
     for (const copy of [
       'Customize · Herdr Gentle Shell',
       'CATEGORIES',
@@ -768,13 +782,13 @@ describe('floating customize panel', () => {
       'Sidebar agent rows',
       '● Off',
       '○ On',
-      '←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close',
+      'Click · ←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close',
+      'Preview · Off · static sidebar sample',
     ]) {
       assert.ok(seen.includes(copy), `panel copy missing: ${copy}`);
     }
     assert.equal(seen.includes('Notifications'), false, 'the Herdr Sidebar category lists no notification row');
-    assert.equal(seen.includes('Click'), false, 'the legend names keys only');
-    for (const gone of ['Plugin tools', 'Worktree tools', 'Preview', 'Reset every option']) {
+    for (const gone of ['Plugin tools', 'Worktree tools', 'Reset every option']) {
       assert.equal(seen.includes(gone), false, `removed section still rendered: ${gone}`);
     }
   });
@@ -794,13 +808,13 @@ describe('floating customize panel', () => {
         const box = rendered.slice(0, Math.floor(20 * 0.85));
         observed.rendered = rendered.length;
         observed.box = box.length;
-        const y = box.findIndex((line) => line.includes('Sidebar agent rows'));
-        observed.rowVisible = y >= 0;
+        const observedRow = box.find((line) => String(line).includes('○ On'));
+        observed.rowVisible = observedRow !== undefined;
         const result = component.handleMouse({
           type: 'click',
           button: 'left',
-          x: y >= 0 ? box[y].indexOf('Sidebar agent rows') : 0,
-          y: y >= 0 ? y : 0,
+          x: observedRow === undefined ? 0 : String(observedRow).indexOf('○ On'),
+          y: Math.max(0, box.indexOf(observedRow)),
           width: 100,
           height: box.length,
           shift: false,
@@ -808,6 +822,8 @@ describe('floating customize panel', () => {
           ctrl: false,
         });
         observed.result = result;
+        await settlePanel(component);
+        component.handleInput('escape');
         return done();
       },
     });
@@ -816,8 +832,8 @@ describe('floating customize panel', () => {
     await run(h, '');
     assert.equal(observed.box, 17, 'the overlay box is 85% of a 20-row terminal');
     assert.equal(observed.rendered, observed.box, 'the card already fits the overlay box');
-    assert.equal(observed.rowVisible, true, 'the first sidebar row is inside the box');
-    assert.equal(observed.result?.handled, true, 'the click on the rendered row is handled');
+    assert.equal(observed.rowVisible, true, 'the first sidebar option is inside the box');
+    assert.equal(observed.result?.handled, true, 'the click on the rendered option is handled');
     assert.deepEqual(noticeTexts(h), [
       'Sidebar agent rows enabled; the managed block is in place and Herdr reloaded its config.',
     ]);
@@ -869,7 +885,7 @@ describe('floating customize panel', () => {
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
   });
 
-  test('Enter applies the chosen sidebar row through the same apply path', async () => {
+  test('Enter applies the chosen sidebar option through the same apply path', async () => {
     const env = setupEnvironment('overlay-sidebar-on');
     fs.writeFileSync(env.configPath, '[ui.sidebar.agents]\nignored = true\n');
     const h = harness({
@@ -877,7 +893,12 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('right');
         assert.ok(component.render(100).join('\n').includes('▸ Sidebar agent rows'));
+        // The cursor lands on the stored option: one step left is the other one.
+        component.handleInput('left');
         component.handleInput('enter');
+        await settlePanel(component);
+        assert.equal(done(), 'pending', 'the panel stays open after an apply');
+        component.handleInput('escape');
         return done();
       },
     });
@@ -907,7 +928,10 @@ describe('floating customize panel', () => {
         const seen = component.render(100).join('\n');
         assert.ok(seen.includes('▸ Sidebar agent rows'));
         assert.equal(seen.includes('Notifications'), false, 'the category carries no Moshi switch');
+        component.handleInput('left');
         component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
         return done();
       },
     });
@@ -921,7 +945,7 @@ describe('floating customize panel', () => {
     assert.deepEqual(h.reloads, []);
   });
 
-  test('Enter applies the chosen Moshi row with the usual gate and reload', async () => {
+  test('Enter applies the chosen Moshi option with the usual gate and reload', async () => {
     const env = setupEnvironment('overlay-moshi-on');
     installMoshiHook(env.pathDir, { paired: true });
     writeSettings(env.settingsPath, { extensions: ['keep-me'] });
@@ -930,8 +954,10 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('up');
+        // The stored Off is the second option, so ← is the way to On.
+        component.handleInput('left');
         component.handleInput('enter');
+        await settlePanel(component);
         return done();
       },
     });
@@ -957,7 +983,9 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
+        component.handleInput('left');
         component.handleInput('enter');
+        await settlePanel(component);
         return done();
       },
     });
@@ -995,7 +1023,10 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
+        // The stored On is the first option; the second one is Off.
+        component.handleInput('right');
         component.handleInput('enter');
+        await settlePanel(component);
         return done();
       },
     });
@@ -1078,7 +1109,16 @@ describe('floating customize panel', () => {
 /* --------------------------------------------- floating panel theme rows */
 
 describe('floating panel theme rows', () => {
-  test('the overlay carries the Herdr Theme category and its two rows', async () => {
+  // Everything the panel needs to reach the Herdr Theme category without
+  // touching a live theme store or Pi settings.
+  async function withThemePanel(h, drive) {
+    const mod = await loadExtension(h);
+    mod.setCustomizeTuiLoader(async () => stubTui);
+    await run(h, '');
+    return drive;
+  }
+
+  test('the overlay carries the Herdr Theme category and its two settings', async () => {
     const env = setupEnvironment('overlay-theme-rows');
     fs.writeFileSync(env.configPath, '');
     const seen = {};
@@ -1087,70 +1127,243 @@ describe('floating panel theme rows', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('down');
-        seen.theme = component.render(100).join('\n');
+        seen.categories = component.render(100).join('\n');
+        component.handleInput('right');
+        seen.controls = component.render(100).join('\n');
         component.handleInput('escape');
         return done();
       },
     });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    await run(h, '');
-    assert.ok(seen.theme.includes('Herdr Theme · 1/2'), 'the category counts its two rows');
-    const syncRow = seen.theme.split('\n').find((line) => line.includes('● Off'));
-    assert.ok(syncRow.includes('Theme sync'), 'the sync row reads the inert default Off');
-    const themeRow = seen.theme.split('\n').find((line) => line.includes('Gentle Shell theme'));
-    assert.ok(themeRow.includes('● Off'), 'an unassigned theme reads as the inert choice');
-    assert.ok(themeRow.includes('○ Select…'), 'and the list is the other value');
+    await withThemePanel(h);
+    assert.ok(seen.categories.includes('▸ Herdr Theme'), 'the cursor reaches the theme category');
+    assert.ok(seen.controls.includes('Herdr Theme · 1/2'), 'the category counts its two settings');
+    const syncLine = seen.controls.split('\n').find((line) => line.includes('Theme sync'));
+    assert.ok(syncLine.includes('● Off'), 'the sync setting reads the inert default Off');
+    const themeLine = seen.controls.split('\n').find((line) => line.includes('Gentle Shell theme'));
+    // S2: a host without the theme API shows the note and NO options at all, so
+    // the setting can never look like a pickable list.
+    assert.ok(seen.controls.includes('Themes unavailable; use Pi /settings'), 'the missing list says so');
+    assert.equal(themeLine.includes('None'), false, 'no inert option is invented without the host list');
+    assert.equal(themeLine.includes('●'), false, 'and nothing is marked current');
     assert.deepEqual(noticeTexts(h), []);
     assert.equal(fs.existsSync(themePath(env)), false, 'opening the panel writes nothing');
   });
 
-  test('the overlay reads the stored theme and disables the row while the sync is on', async () => {
+  test('the theme setting lists Pi themes in host order, deduped, without subdirectory names', async () => {
+    const env = setupEnvironment('overlay-theme-list');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const seen = {};
+    const h = harness({
+      themes: [
+        { name: 'zeta', path: '/themes/zeta.json' },
+        { name: 'nested/theme' },
+        { name: 'alpha' },
+        { name: 'alpha', path: '/themes/alpha-light.json' },
+      ],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        seen.row = component.render(100).join('\n');
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    const themeLine = seen.row.split('\n').find((line) => line.includes('Gentle Shell theme'));
+    assert.ok(themeLine.includes('● None'));
+    assert.ok(themeLine.includes('○ zeta') && themeLine.includes('○ alpha'), 'the host order is kept');
+    assert.equal(themeLine.indexOf('○ zeta') < themeLine.indexOf('○ alpha'), true, 'zeta stays before alpha');
+    assert.equal(seen.row.includes('nested/theme'), false, 'a subdirectory name is not a theme');
+  });
+
+  test('Enter on an inline theme writes the pinned name and never reloads Pi', async () => {
+    const env = setupEnvironment('overlay-theme-inline');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [{ name: 'nord' }, { name: 'dracula' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        // None -> nord.
+        component.handleInput('right');
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    const doc = readThemeFile(env);
+    assert.deepEqual(Object.keys(doc).sort(), ['sync', 'theme', 'updatedAt'], 'only the store document fields');
+    assert.equal(doc.sync, false, 'a pinned theme never turns the sync on');
+    assert.equal(doc.theme, 'nord');
+    assert.deepEqual(h.reloads, []);
+    assert.equal(fs.existsSync(env.flagPath), false);
+  });
+
+  test('Enter on None writes an unassigned theme', async () => {
+    const env = setupEnvironment('overlay-theme-none');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [{ name: 'nord' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        // The stored value is not in Pi's list, so the cursor lands on None.
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    assert.equal(readThemeFile(env).theme, null, 'the None option writes no theme');
+    assert.equal(readThemeFile(env).sync, false);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('a theme named Off is pinned, not read as the inert choice', async () => {
+    const env = setupEnvironment('overlay-theme-named-off');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [{ name: 'Off' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    assert.equal(readThemeFile(env).theme, 'Off', 'the structural option id keeps the theme pinnable');
+  });
+
+  test('the preview renders the swatch of the highlighted theme through ctx.ui.getTheme', async () => {
+    const env = setupEnvironment('overlay-theme-preview');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const seen = {};
+    const h = harness({
+      themes: [{ name: 'nord' }],
+      getTheme: (name) => ({
+        name,
+        getBgAnsi: () => '\x1b[48;5;17m',
+        getFgAnsi: () => '\x1b[38;5;250m',
+      }),
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        component.handleInput('right');
+        seen.frame = component.render(100).join('\n');
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    assert.ok(seen.frame.includes('Preview · nord · source palette'), 'the upstream headline');
+    assert.ok(seen.frame.includes('\x1b[48;5;17m'), "the swatch uses that theme's own accent background");
+    assert.ok(seen.frame.includes('Aa  sample text'), 'the upstream sample text');
+  });
+
+  test('a theme that cannot be read renders Preview unavailable, never the active theme', async () => {
+    const env = setupEnvironment('overlay-theme-preview-unavailable');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const seen = {};
+    const h = harness({
+      themes: [{ name: 'nord' }],
+      getTheme: () => undefined,
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        component.handleInput('right');
+        seen.frame = component.render(100).join('\n');
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    assert.ok(seen.frame.includes('Preview unavailable'));
+    assert.equal(seen.frame.includes('source palette'), false);
+  });
+
+  test('the overlay reads the stored theme and disables the setting while the sync is on', async () => {
     const env = setupEnvironment('overlay-theme-stored');
     fs.writeFileSync(env.configPath, '');
     writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
     let seen = '';
     const h = harness({
+      themes: [{ name: 'dracula' }, { name: 'nord' }],
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
         component.handleInput('down');
         seen = component.render(100).join('\n');
         component.handleInput('escape');
         return done();
       },
     });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    await run(h, '');
-    assert.ok(seen.includes('● On'), 'the sync switch reads its stored On');
+    await withThemePanel(h);
+    assert.ok(seen.includes('● On'), 'the sync setting reads its stored On');
     assert.ok(seen.includes('● dracula'), 'the assigned theme stays readable');
-    assert.ok(seen.includes('Turn Theme sync off to pick a specific theme.'), 'the disabled row explains itself');
+    assert.ok(seen.includes('Turn Theme sync off to pick a specific theme.'), 'the disabled setting explains itself');
   });
 
-  test('Enter on the sync row writes the store and skips the Pi reload', async () => {
+  test('Enter on the sync setting writes the store, keeps the pin and skips the Pi reload', async () => {
     const env = setupEnvironment('overlay-theme-toggle');
     fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
     const h = harness({
+      themes: [{ name: 'dracula' }],
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('down');
         component.handleInput('right');
+        component.handleInput('right');
         component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
         return done();
       },
     });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    await run(h, '');
+    await withThemePanel(h);
     assert.deepEqual(noticeTexts(h), ["Theme sync on; Herdr's palette follows the theme active in Pi."]);
-    assert.equal(readThemeFile(env).sync, true);
+    const doc = readThemeFile(env);
+    assert.equal(doc.sync, true);
+    assert.equal(doc.theme, 'dracula', 'the pinned name survives the toggle');
     assert.deepEqual(h.reloads, [], 'the theme watch applies the palette; Pi is not reloaded');
     assert.equal(fs.existsSync(env.flagPath), false);
   });
 
-  test('the disabled theme row refuses through the overlay and writes nothing', async () => {
+  test('the disabled theme setting refuses through the overlay and writes nothing', async () => {
     const env = setupEnvironment('overlay-theme-refused');
     fs.writeFileSync(env.configPath, '');
     writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
@@ -1165,42 +1378,41 @@ describe('floating panel theme rows', () => {
         component.handleInput('down');
         assert.ok(component.render(100).join('\n').includes('▸ Gentle Shell theme'));
         component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
         return done();
       },
     });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    await run(h, '');
+    await withThemePanel(h);
     assert.deepEqual(noticeTexts(h), ['Turn Theme sync off to pick a specific theme.']);
     assert.deepEqual(h.notices.map(([, level]) => level), ['warning']);
     assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'the refusal writes nothing');
     assert.deepEqual(h.reloads, []);
   });
 
-  test('the overlay theme row opens the host list and writes the chosen name', async () => {
-    const env = setupEnvironment('overlay-theme-select');
-    fs.writeFileSync(env.configPath, '');
-    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+  test('a Moshi apply that needs a reload closes the overlay before Pi reloads', async () => {
+    const env = setupEnvironment('overlay-moshi-close-first');
+    installMoshiHook(env.pathDir, { paired: true });
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    let reloadsWhileOpen = null;
     const h = harness({
-      themes: [{ name: 'nord' }, { name: 'dracula' }],
       customImpl: async (factory) => {
-        const { component, done } = openPanel(factory, makeHostTui().tui);
-        component.handleInput('down');
+        const { component } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('down');
+        component.handleInput('left');
         component.handleInput('enter');
-        return done();
+        await settlePanel(component);
+        // The panel closed itself (close:true) so the host can reload.
+        reloadsWhileOpen = h.reloads.length;
+        return null;
       },
     });
-    const mod = await loadExtension(h);
-    mod.setCustomizeTuiLoader(async () => stubTui);
-    h.selections.push('dracula');
-    await run(h, '');
-    assert.equal(readThemeFile(env).theme, 'dracula');
-    assert.equal(readThemeFile(env).sync, false);
-    assert.equal(h.notices.length, 1, 'one notification for the write');
-    assert.match(h.notices[0][0], /dracula/);
+    await withThemePanel(h);
+    assert.equal(reloadsWhileOpen, 0, 'nothing reloaded while the overlay was still mounted');
+    assert.equal(h.reloads.length, 1, 'the reload runs after the overlay resolved');
+    assert.equal(readSettings(env.flagPath).enabled, true);
+    assert.deepEqual(readSettings(env.settingsPath).extensions, ['keep-me', MOSHI_ENTRY]);
   });
 });
 
@@ -1238,7 +1450,12 @@ describe('inconclusive sidebar state', () => {
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         renderSeen = component.render(100).join('\n');
+        // The cursor lands on the first option (an unknown state has no stored
+        // one), and Enter confirms it through the same apply path.
+        component.handleInput('right');
         component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
         return done();
       },
     });
