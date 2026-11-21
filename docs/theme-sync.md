@@ -552,7 +552,11 @@ no-op, and every user-visible outcome is a fixed string:
   Herdr's palette was left unchanged; pick an installed theme in
   /herdr-gentle:customize.` — once per session; a later install of that exact
   theme is picked up without a restart. The notice names the command, which
-  always exists, byte-identical to the pre-page build.
+  always exists, byte-identical to the pre-page build. The customize surfaces
+  reuse the same sentence when a theme row outlives the catalogue it was built
+  from: applying a theme re-reads `ctx.ui.getAllThemes()` first, and a name that
+  is gone refuses as a `warning` write-nothing instead of pinning a theme this
+  install no longer has.
 - **Nothing to project**: `Herdr theme not applied: <theme name> has no concrete
   colours to project.` (`the active theme` replaces the name when the active
   theme exposes none) — once per session, `warning`. A palette with no concrete
@@ -742,6 +746,18 @@ the arrows and applied with `Enter` (the bridge never applies on a cursor move),
 the theme row keeps its own swatch, and the theme rows are simply not shown
 while the sync is on instead of being refused in place. The notices are the
 same fixed strings, and the sync needs no Pi reload on either surface.
+
+The page's rows are FIXED for as long as the menu is open, which is why its
+theme rows cost one model read per paint burst instead of one per row. Two
+consequences are accepted: an external write while the menu is idle is shown on
+the next render (the cache expires on the next read and never asks the host to
+repaint, so the display has no upper freshness bound), and an external write
+that hides the focused row leaves the host to clamp the cursor to the
+neighbouring row, so `Enter` can act on that one — the clamp itself writes
+nothing. Because a row can outlive the catalogue it was built from, applying a
+theme re-reads `ctx.ui.getAllThemes()` first: a theme removed after the build is
+refused with the sync's own not-installed notice
+(`The Pi theme "<name>" is not installed, …`) and the store is left untouched.
 
 ## Implementation
 

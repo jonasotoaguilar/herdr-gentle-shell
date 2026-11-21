@@ -75,6 +75,12 @@ const COMMAND = 'herdr-gentle:customize';
 const BRIDGE_API_KEY = Symbol.for('gentle-shell-bridge/api/v1');
 const PAGE = 'Herdr';
 const THEME_UNASSIGN = 'Off (no theme assigned)';
+// The package's ONE wording for "that theme is not installed": the notice the
+// theme-sync surface already gives for a stored name this install does not have
+// (`extensions/herdr-theme-sync.ts`, S4). A refusal reuses it instead of
+// inventing a second spelling for the same fact.
+const THEME_NOT_INSTALLED = (name) =>
+  `The Pi theme "${name}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`;
 
 /* ------------------------------------------------------------ fixtures */
 
@@ -465,6 +471,92 @@ describe('the rows apply through the command\'s own path (S3)', () => {
 
     // No rebuild, no reopen: the SAME objects.
     assert.deepEqual([on.choice.current(), theme.visible()], [true, false], 'the bullet moves and the picker disappears in place');
+  });
+});
+
+// T10 (independent verification, reproduced on the real host): the page holds
+// ONE ROW PER THEME from the build, so a theme removed from the catalogue
+// afterwards keeps a selectable row. The command's own picker cannot do this —
+// it reads the catalogue when it prompts — so the page applied the vanished name
+// and claimed success. The apply now checks the name against a FRESH read before
+// it writes, and a name that is gone refuses instead of landing in the store.
+describe('a mounted theme row never writes a theme that no longer exists (T10)', () => {
+  test('a removed theme is refused, the store stays untouched and no success is claimed', async () => {
+    const env = setupEnvironment('theme-vanished');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const catalog = ['Dark', 'Light'];
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge, themes: catalog });
+    await h.load();
+    await h.start();
+
+    // ONE build: these are the objects the host keeps and repaints.
+    const mounted = h.provider().rows();
+    const dark = rowFor(mounted, 'Select theme', 'Dark');
+
+    // The catalogue changes behind the open menu: `Dark` is uninstalled.
+    catalog.splice(catalog.indexOf('Dark'), 1);
+    assert.deepEqual(catalog, ['Light']);
+
+    // Enter on the stale row: no write, and the refusal the package already
+    // gives for a theme this install does not have — never a success notice.
+    await dark.action(INLINE_HELPERS);
+    assert.deepEqual(h.notices, [[THEME_NOT_INSTALLED('Dark'), 'warning']]);
+    assert.equal(fs.existsSync(env.themePath), false, 'no store document is created');
+    assert.deepEqual(h.reloads, [], 'nothing is reloaded either');
+  });
+
+  test('a theme that still exists applies, and the unassign entry is unchanged', async () => {
+    const env = setupEnvironment('theme-still-there');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const catalog = ['Dark', 'Light'];
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge, themes: catalog });
+    await h.load();
+    await h.start();
+    const mounted = h.provider().rows();
+
+    // The same catalogue change, then Enter on a theme that is still installed.
+    catalog.splice(catalog.indexOf('Dark'), 1);
+    await rowFor(mounted, 'Select theme', 'Light').action(INLINE_HELPERS);
+    const doc = readThemeFile(env.themePath);
+    assert.equal(doc.theme, 'Light', 'a theme that still exists is written');
+    assert.equal(doc.sync, false, 'a pinned theme never turns the sync on');
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to Light.', 'info']]);
+
+    // The unassign choice is not a theme name: it keeps working, catalogue or
+    // not, and still writes the stored `null`.
+    await rowFor(mounted, 'Select theme', THEME_UNASSIGN).action(INLINE_HELPERS);
+    assert.equal(readThemeFile(env.themePath).theme, null, 'the pin is cleared');
+    assert.deepEqual(h.notices.slice(1), [[
+      'Gentle Shell theme set to Off; Herdr keeps the palette it was last given.',
+      'info',
+    ]]);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('an unreadable catalogue at apply time refuses instead of writing an unverified name', async () => {
+    const env = setupEnvironment('theme-catalogue-gone');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const dark = rowFor(h.provider().rows(), 'Select theme', 'Dark');
+
+    // The host can no longer answer the catalogue: existence cannot be proven,
+    // so nothing is written and the surface says exactly that.
+    h.ctx.ui.getAllThemes = () => { throw new Error('catalogue gone'); };
+    await dark.action(INLINE_HELPERS);
+    assert.deepEqual(h.notices, [[
+      "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.",
+      'warning',
+    ]]);
+    assert.equal(fs.existsSync(env.themePath), false, 'nothing was written');
+    assert.deepEqual(h.reloads, []);
   });
 });
 

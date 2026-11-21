@@ -2747,10 +2747,37 @@ function themeSelectionOptions(names) {
   return { options: [...names, unassign], unassign };
 }
 
-// One write for the pinned theme, shared by the inline panel setting and the
-// `ctx.ui.select` fallback: the refusal, the missing store and a failure all
-// write NOTHING, so the stored document only ever changes to a value the user
-// actually picked (S7).
+// T10 (odd/tasks/herdr-customize-page.md): a surface that holds its rows can
+// outlive the catalogue it built them from. The Herdr page keeps one row per
+// theme for as long as Gentle Shell shows the menu, and the inline panel keeps
+// its rows while it is open, so a theme can be uninstalled between the build and
+// the Enter that pins it. The command's own picker cannot do this — it lists
+// `getAllThemes()` when it prompts — so the check below is a no-op on that path
+// and the refusal only ever fires for a mounted row.
+//
+// The wording is the notice the theme sync already gives for a stored name this
+// install does not have (`extensions/herdr-theme-sync.ts`, S4): one sentence for
+// one fact, spelled once. A catalogue that cannot be read at all is this
+// surface's own "could not read the theme list" refusal, because a name nothing
+// verified is never written.
+function themeNotInstalledText(name) {
+  return `The Pi theme "${name}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`;
+}
+
+// A FRESH read, never the page's row cache and never the model the panel
+// captured when it opened: `readHostThemeNames` calls the host accessor again on
+// every call, so the answer describes the install as it is at APPLY time.
+function themeStillInstalled(ctx, name) {
+  const names = readHostThemeNames(ctx);
+  if (names === null) return { ok: false, text: THEME_LIST_UNAVAILABLE_TEXT };
+  return names.includes(name) ? { ok: true, text: null } : { ok: false, text: themeNotInstalledText(name) };
+}
+
+// One write for the pinned theme, shared by the inline panel setting, the Herdr
+// page rows and the `ctx.ui.select` fallback: the refusal, the missing store, a
+// theme that is no longer installed and a failure all write NOTHING, so the
+// stored document only ever changes to a value the user actually picked and this
+// install still has (S7, T10).
 function writeThemeChoice(ctx, name) {
   const notify = ctx?.ui?.notify;
   const store = themeStoreModule();
@@ -2761,6 +2788,16 @@ function writeThemeChoice(ctx, name) {
   if (readCustomizeThemeState().sync === true) {
     if (typeof notify === "function") notify(THEME_SYNC_REFUSED_TEXT, "warning");
     return false;
+  }
+  if (name !== null) {
+    // T10: the name is checked against the catalogue as it is NOW, so a row built
+    // before a theme was removed refuses instead of writing a name nobody can
+    // apply (and instead of reporting a success the user cannot see).
+    const installed = themeStillInstalled(ctx, name);
+    if (!installed.ok) {
+      if (typeof notify === "function") notify(installed.text, "warning");
+      return false;
+    }
   }
   try {
     store.writeThemeState(process.env, { sync: false, theme: name });

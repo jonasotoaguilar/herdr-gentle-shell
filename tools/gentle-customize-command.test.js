@@ -78,6 +78,12 @@ const MISSING_CLI_TEXT =
   'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.';
 const NOT_PAIRED_TEXT =
   'Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.';
+// T10: the package's ONE wording for "that theme is not installed" — the notice
+// the theme-sync surface already gives for a stored name this install does not
+// have (`extensions/herdr-theme-sync.ts`, S4). A theme row that outlived the
+// catalogue it was built from reuses it instead of inventing a second spelling.
+const THEME_NOT_INSTALLED = (name) =>
+  `The Pi theme "${name}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`;
 
 const COMMAND = 'herdr-gentle:customize';
 
@@ -435,11 +441,78 @@ describe('refusals', () => {
     const h = harness();
     h.selections.push('Moshi notifications', 'On');
     await run(h, '');
-    assert.deepEqual(noticeTexts(h), [
+    // T9: the WHOLE pair — the refusal's text and its level — never just a
+    // substring, so neither the wording nor the severity can drift silently.
+    assert.deepEqual(h.notices, [[
       'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (produced no parseable JSON); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
-    ]);
+      'error',
+    ]]);
     assert.equal(fs.existsSync(env.flagPath), false);
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  // T9: the gate's other two unreachable-by-happy-path answers. `runMoshiStatus`
+  // reports a non-zero exit and a document without a literal `paired: true`, and
+  // each one is a REFUSAL with its own sentence — the exit status is quoted, and
+  // a document that carries no pairing flag is named as such.
+  test('a status CLI that exits non-zero quotes its exit status and writes nothing', async () => {
+    const env = setupEnvironment('moshi-status-exit');
+    writeExecutable(
+      path.join(env.pathDir, 'moshi-hook'),
+      `#!/bin/sh\nprintf '%s\\n' '{"paired":true}'\nexit 7\n`,
+    );
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness();
+    h.selections.push('Moshi notifications', 'On');
+    await run(h, '');
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (exited with status 7); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes no flag');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore, 'and no settings entry');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('a status document without a paired flag refuses and writes nothing', async () => {
+    const env = setupEnvironment('moshi-status-unpaired-field');
+    writeExecutable(
+      path.join(env.pathDir, 'moshi-hook'),
+      `#!/bin/sh\nprintf '%s\\n' '{"secretStore":"keychain","hooks":[]}'\nexit 0\n`,
+    );
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness();
+    h.selections.push('Moshi notifications', 'On');
+    await run(h, '');
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (reported no paired flag); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes no flag');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore, 'and no settings entry');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('a paired flag that is not literally true is the same missing-flag refusal', async () => {
+    const env = setupEnvironment('moshi-status-paired-not-bool');
+    writeExecutable(
+      path.join(env.pathDir, 'moshi-hook'),
+      `#!/bin/sh\nprintf '%s\\n' '{"paired":"yes"}'\nexit 0\n`,
+    );
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness();
+    h.selections.push('Moshi notifications', 'On');
+    await run(h, '');
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (reported no paired flag); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes no flag');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore, 'and no settings entry');
     assert.deepEqual(h.reloads, []);
   });
 });
@@ -467,7 +540,7 @@ describe('moshi switch', () => {
     const h = harness();
     h.selections.push('Moshi notifications', 'On');
     await run(h, '');
-    assert.deepEqual(noticeTexts(h), [NOT_PAIRED_TEXT]);
+    assert.deepEqual(h.notices, [[NOT_PAIRED_TEXT, 'error']]);
     assert.equal(fs.existsSync(env.flagPath), false);
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
     assert.deepEqual(h.reloads, []);
@@ -1262,6 +1335,43 @@ describe('floating panel theme rows', () => {
     assert.equal(doc.theme, 'nord');
     assert.deepEqual(h.reloads, []);
     assert.equal(fs.existsSync(env.flagPath), false);
+  });
+
+  // T10: the card keeps its rows while it is open (`createCustomizePanel`
+  // captures the model once and only swaps it after an apply), so the catalogue
+  // can change under the cursor. Enter on a theme that is gone refuses and
+  // writes nothing instead of pinning a name this install no longer has.
+  test('Enter on a theme removed while the panel is open refuses and writes nothing', async () => {
+    const env = setupEnvironment('overlay-theme-vanished');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    const catalog = [{ name: 'nord' }, { name: 'dracula' }];
+    const h = harness({
+      themes: catalog,
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        // None -> nord -> dracula.
+        component.handleInput('right');
+        component.handleInput('right');
+        assert.ok(component.render(100).join('\n').includes('● None'), 'the stored value is still None');
+        // The theme is uninstalled with the card open.
+        catalog.splice(1, 1);
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    assert.deepEqual(h.notices, [[THEME_NOT_INSTALLED('dracula'), 'warning']]);
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'the refusal writes nothing');
+    assert.equal(fs.existsSync(env.flagPath), false);
+    assert.deepEqual(h.reloads, []);
   });
 
   test('Enter on None writes an unassigned theme', async () => {

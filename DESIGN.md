@@ -1554,10 +1554,33 @@ than refused in place. The sync never needs a Pi reload on either surface; the
 one surface-specific difference in this feature is Moshi's, which asks for a
 restart on the page because a row action has no reload handle (§7).
 
+The page's row set is FIXED for the life of the menu, and the cache in
+`lib/customize-rows.js` is what makes that affordable: one model read per paint
+burst (one synchronous `configure.js --check`, not one per callback), dropped
+after an `apply` settles and after a one-second TTL. Two properties follow and
+are accepted rather than promised away. First, an external write while the menu
+is idle is shown on the NEXT render: the cache expires on the next read and
+never asks the host to repaint, so the displayed state has no upper freshness
+bound — a change nobody typed here is visible at the next keystroke or rebuild.
+Second, when an external write hides the row the user had focused (the theme
+picker, with the sync turned on elsewhere), the host clamps the focus to the
+neighbouring row, so Enter can act on that one; the clamp itself writes nothing.
+The fixed row set is also why a theme applied from a row is checked against a
+fresh `ctx.ui.getAllThemes()` read at apply time: a theme removed after the
+build refuses and writes nothing instead of pinning a name this install no
+longer has.
+
 **Limits** (the §10 style, none of them a promise this design makes):
 
 - The 500 ms tick is the whole observation granularity — there is no event to
   subscribe to, so a theme change is noticed within one tick and not sooner.
+- The page's displayed state has **no upper freshness bound**: its row cache
+  expires on the next read and never requests a repaint, so a write from another
+  process while the menu is idle appears at the next keystroke or rebuild, not
+  when it lands.
+- The page cannot keep the cursor on a row an external write hid: the host clamps
+  the focus to the neighbouring row, so the next Enter can act on that neighbour.
+  The clamp writes nothing; it only moves the cursor.
 - The automated evidence is a stubbed Pi host plus a real binary stand-in on
   disk; **no live Pi TUI run is recorded**. `ctx.ui.theme`, `getTheme`,
   `getAllThemes`, `notify` and the host component contract are used as
