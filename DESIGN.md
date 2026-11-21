@@ -1202,9 +1202,9 @@ exactly one mechanism writes each piece of state.
   panel, the ODD and Issues readers, and the `Plugin tools` toggles no longer
   ship. This package publishes the Herdr producer sidecar and the Moshi channel
   only; `bin/gentle-sidebar.js` is its one CLI and the customize switches are
-  its one in-Pi surface, carried by `/herdr-gentle:customize` always and, when
-  gentle-shell-bridge answers its handshake, also by the `Herdr` page of Gentle
-  Shell's own `/gentle:customize` menu (§7). The former
+  reached two ways, additively: `/herdr-gentle:customize`, always, and — when
+  gentle-shell-bridge answers its handshake — the `Herdr` page of Gentle Shell's
+  own `/gentle:customize` menu as well (§7). The former
   in-process provider slot `globalThis[Symbol.for("herdr-gentle.customize.v1")]`
   stays removed.
 - Rollback: disable this plugin → producer stops writing; consumer sweeps

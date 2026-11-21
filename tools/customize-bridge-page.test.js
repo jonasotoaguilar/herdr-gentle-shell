@@ -429,14 +429,42 @@ describe('the rows apply through the command\'s own path (S3)', () => {
     assert.equal(JSON.parse(fs.readFileSync(env.flagPath, 'utf8')).enabled, true);
     assert.deepEqual(readSettings(env.settingsPath).extensions, ['-extensions/moshi-hooks.ts']);
     // ...and the sentence says what a row can actually do: a row action has no
-    // reload handle, so the user restarts Pi.
-    assert.equal(h.notices.length, 1);
-    const [text] = h.notices[0];
-    assert.match(text, /Moshi notifications enabled\./);
-    assert.match(text, /Restart Pi so the new Moshi hook exclusion takes effect\./);
-    assert.equal(/Reloading now/.test(text), false, 'the page never claims a reload it cannot run');
+    // reload handle, so the user restarts Pi. The WHOLE notice, level included.
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications enabled. added -extensions/moshi-hooks.ts. Restart Pi so the new Moshi hook exclusion takes effect.',
+      'info',
+    ]]);
     assert.deepEqual(h.reloads, [], 'no reload is attempted from a row');
     assert.equal(rowFor(provider.rows(), 'Moshi', 'On').choice.current(), true);
+  });
+
+  // The verifier's regression, shaped like the host: Gentle Shell's
+  // VisualCustomizeView repaints the rows it ALREADY mounted
+  // (`lib/visual-customize-view.ts:224-231`, `:391-392` re-read `choice.current()`
+  // and the gate on the same objects after the action settles), so a second
+  // build proves nothing — the mounted objects must answer the applied state.
+  test('the rows the host already mounted repaint the applied state', async () => {
+    const env = setupEnvironment('row-mounted-repaint');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    // ONE build. These are the objects the host holds and repaints.
+    const mounted = h.provider().rows();
+    const on = rowFor(mounted, 'Theme sync', 'On');
+    const theme = rowFor(mounted, 'Select theme', 'Dark');
+    assert.equal(on.choice.current(), false, 'the sync starts off');
+    assert.equal(theme.visible(), true, 'so the picker is shown');
+
+    // Enter on `On`: the command's own apply path writes the real store.
+    await on.action(INLINE_HELPERS);
+    assert.equal(readThemeFile(env.themePath).sync, true, 'the store really says sync: true');
+
+    // No rebuild, no reopen: the SAME objects.
+    assert.deepEqual([on.choice.current(), theme.visible()], [true, false], 'the bullet moves and the picker disappears in place');
   });
 });
 

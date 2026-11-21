@@ -21,9 +21,10 @@
 // - S3: one row per value with the model's structural option ids (`on`, `off`,
 //   `none`, `theme:<name>`), so each row drives the same apply path the panel
 //   (and the removed command) drives;
-// - the live reads: one model read per build (the model runs a subprocess), so
-//   `current()`, `visible()` and `preview()` answer from that snapshot and a
-//   REBUILD follows the changed model; the theme rows are hidden while the
+// - the live reads: one model run per synchronous burst, with a cache that is
+//   dropped when an `apply` settles — so the SAME row objects the host repaints
+//   report the applied state without a rebuild — and a TTL that bounds a repaint
+//   arriving while nothing was applied; the theme rows are hidden while the
 //   stored sync is on, and a throwing preview factory leaves the row usable;
 // - the unassign entry never collides with an installed theme's value word, and
 //   every row still applies its own option id;
@@ -36,7 +37,11 @@ const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { customizePanelModel } = require('../lib/customize-panel.js');
-const { customizeRows, CUSTOMIZE_ROWS_CATEGORY } = require('../lib/customize-rows.js');
+const {
+  customizeRows,
+  CUSTOMIZE_ROWS_CATEGORY,
+  MODEL_CACHE_TTL_MS,
+} = require('../lib/customize-rows.js');
 
 const PAGE = 'Herdr';
 const S1_LINES = ['Herd agents', 'Moshi', 'Theme sync', 'Select theme'];
@@ -104,6 +109,18 @@ function linesOf(rows) {
 
 function rowsFor(rows, line) {
   return rows.filter((row) => row.choice.setting === line);
+}
+
+// The cache's TTL is measured with `Date.now()`, so the test drives that real
+// clock instead of sleeping: the module reads exactly this and nothing else.
+function withClock(start = 1_000_000) {
+  const real = Date.now;
+  let now = start;
+  Date.now = () => now;
+  return {
+    advance(ms) { now += ms; },
+    restore() { Date.now = real; },
+  };
 }
 
 describe('customizeRows — the Herdr page (S1)', () => {
@@ -175,51 +192,142 @@ describe('customizeRows — the Herdr page (S1)', () => {
 });
 
 describe('customizeRows — live reads (S3)', () => {
-  test('ONE model read per build, and a second build sees the changed model', () => {
-    // The extension's model runs a synchronous `configure.js --check` subprocess,
-    // so a read per callback is unbounded work while the menu opens (the
-    // verifier measured 41 checks for the build plus 68 for the values). The
-    // build takes one snapshot; live-ness is across BUILDS, which is what the
-    // host does after every action (`rows()` calls `customizeRows` again).
+  // The host does NOT rebuild the row objects after an action: Gentle Shell's
+  // VisualCustomizeView repaints the rows it already holds and calls
+  // `choice.current()` / the visibility gate again on the SAME objects
+  // (`lib/visual-customize-view.ts:224-231`, `:391-392`). So the live read is a
+  // cache with explicit invalidation, not a copy taken at build time: these tests
+  // are shaped the way the host behaves — one build, kept rows, then an action.
+  test('after an action settles, the SAME rows report the new state (no rebuild)', async () => {
+    const state = { sync: false };
+    const apply = async (choice) => {
+      if (choice.settingId === 'theme-sync') state.sync = choice.optionId === 'on';
+    };
+    // The real model shape: the stored sync decides both the bullet and whether
+    // the theme picker exists at all.
+    let reads = 0;
+    const model = () => {
+      reads += 1;
+      return modelFor({ sync: state.sync ? 'on' : 'off', theme: 'Dark', themeNames: ['Dark', 'Light'] });
+    };
+    const rows = customizeRows({ model, apply });
+    const syncOff = rowsFor(rows, 'Theme sync').find((row) => row.choice.value === 'Off');
+    const syncOn = rowsFor(rows, 'Theme sync').find((row) => row.choice.value === 'On');
+    const themeRows = rowsFor(rows, 'Select theme');
+    assert.equal(reads, 1);
+    assert.equal(syncOff.choice.current(), true);
+    assert.equal(syncOn.choice.current(), false);
+    for (const row of themeRows) assert.equal(row.visible(), true);
+
+    // Enter on `On`: the apply really flips the stored state...
+    await syncOn.action({ input: async () => undefined, confirm: async () => true, capture: async () => undefined });
+    assert.equal(state.sync, true, 'the apply reached the store');
+
+    // ...and the SAME objects — never a rebuilt row set — paint it, which is the
+    // reported symptom: `● On` and no picker without closing and reopening.
+    assert.equal(syncOn.choice.current(), true, 'the bullet moves to On in place');
+    assert.equal(syncOff.choice.current(), false);
+    for (const row of themeRows) assert.equal(row.visible(), false, 'the picker disappears in place');
+    void reads;
+  });
+
+  test('the theme picker reappears in place when the sync is turned off again', async () => {
+    const state = { sync: true };
+    const apply = async (choice) => {
+      if (choice.settingId === 'theme-sync') state.sync = choice.optionId === 'on';
+    };
+    const rows = customizeRows({ model: () => modelFor({ sync: state.sync ? 'on' : 'off', theme: 'Dark', themeNames: ['Dark'] }), apply });
+    const themeRows = rowsFor(rows, 'Select theme');
+    // Rows exist while hidden; only `visible()` answers.
+    for (const row of themeRows) assert.equal(row.visible(), false);
+
+    await rowsFor(rows, 'Theme sync').find((row) => row.choice.value === 'Off')
+      .action({ input: async () => undefined, confirm: async () => true, capture: async () => undefined });
+
+    for (const row of themeRows) assert.equal(row.visible(), true, 'the picker is back on the same objects');
+  });
+
+  // The model runs a synchronous `configure.js --check` subprocess, so a read per
+  // callback is unbounded work while the menu opens (the verifier measured 41
+  // checks for the build plus 68 for the values, ~2.6 s with 30 themes). A
+  // synchronous paint burst is one model run; only an apply or the TTL re-reads.
+  test('one model run per burst, in place, with the TTL bounding the next', () => {
+    const clock = withClock();
+    try {
+      let reads = 0;
+      const model = () => {
+        reads += 1;
+        return modelFor({
+          sync: 'off',
+          theme: 'Dark',
+          themeNames: Array.from({ length: 30 }, (_, at) => `Theme ${at + 1}`),
+        });
+      };
+      const rows = customizeRows({ model, apply: recorder().apply });
+      assert.equal(reads, 1, 'the build is one model run');
+      assert.ok(rows.length > 30, 'the page is built from it');
+
+      // Every value bullet, gate and swatch of all four lines, synchronously.
+      for (const row of rows) {
+        assert.equal(typeof row.choice.current(), 'boolean');
+        if (typeof row.visible === 'function') assert.equal(typeof row.visible(), 'boolean');
+        if (typeof row.preview === 'function') row.preview();
+      }
+      assert.equal(reads, 1, 'a synchronous paint burst never re-runs the model');
+
+      // An arrow-key repaint arrives inside the TTL: still free.
+      clock.advance(MODEL_CACHE_TTL_MS - 1);
+      rows[0].choice.current();
+      rows.at(-1).visible?.();
+      assert.equal(reads, 1, 'a keystroke repaint inside the TTL is free');
+
+      // Past the TTL the cache is dropped: one re-read, then cached again.
+      clock.advance(2);
+      rows[0].choice.current();
+      assert.equal(reads, 2, 'a repaint after the TTL re-reads exactly once');
+      rows.at(-1).visible?.();
+      assert.equal(reads, 2, 'and that new snapshot serves the rest of its own burst');
+    } finally {
+      clock.restore();
+    }
+  });
+
+  test('a refusal re-reads too, and an apply is the only thing that must invalidate', async () => {
+    let reads = 0;
+    const rows = customizeRows({
+      model: () => {
+        reads += 1;
+        return modelFor({ sync: 'off', theme: 'Dark', themeNames: ['Dark'] });
+      },
+      apply: () => Promise.reject(new Error('refused')),
+    });
+    assert.equal(reads, 1);
+    rows[0].choice.current();
+    assert.equal(reads, 1);
+    await assert.rejects(() => rows[0].action({ input: async () => undefined, confirm: async () => true, capture: async () => undefined }));
+    rows[0].choice.current();
+    assert.equal(reads, 2, 'a settled apply drops the cache, even when it refused');
+  });
+
+  test('a second build is a fresh read that sees the changed model', () => {
     let reads = 0;
     let sidebar = 'off';
     const model = () => {
       reads += 1;
-      return modelFor({
-        sidebar,
-        moshi: 'on',
-        sync: 'off',
-        theme: 'Dark',
-        themeNames: Array.from({ length: 30 }, (_, at) => `Theme ${at + 1}`),
-      });
+      return modelFor({ sidebar, moshi: 'on', sync: 'off', theme: 'Dark', themeNames: ['Dark', 'Light'] });
     };
 
-    const rows = customizeRows({ model, apply: recorder().apply });
-    assert.equal(reads, 1, 'the build reads the model once, never once per row');
-    assert.ok(rows.length > 30, 'the page is built from that one read');
+    const first = customizeRows({ model, apply: recorder().apply });
+    assert.equal(reads, 1);
+    assert.equal(rowsFor(first, 'Herd agents').find((row) => row.choice.value === 'On').choice.current(), false);
 
-    const on = rowsFor(rows, 'Herd agents').find((row) => row.choice.value === 'On');
-    const off = rowsFor(rows, 'Herd agents').find((row) => row.choice.value === 'Off');
-    assert.equal(off.choice.current(), true);
-    // Every value's bullet, every gate and every swatch answers from the
-    // snapshot: reading them re-runs nothing.
-    for (const row of rows) {
-      assert.equal(typeof row.choice.current(), 'boolean');
-      if (typeof row.visible === 'function') assert.equal(typeof row.visible(), 'boolean');
-      if (typeof row.preview === 'function') row.preview();
-    }
-    assert.equal(reads, 1, 'current(), visible() and preview() never re-run the model');
-
-    // The stored state changes behind the page: the NEXT build is a new read and
-    // shows it, while the rows already built keep answering what they were built
-    // from (the host replaces them, it never re-reads through them).
+    // The stored state changes behind the page: the host's next build — after an
+    // action, or when the menu is opened again — is a new read and shows it.
     sidebar = 'on';
     const rebuilt = customizeRows({ model, apply: recorder().apply });
-    assert.equal(reads, 2, 'one read per build');
+    assert.equal(reads, 2, 'one model run per build');
     assert.equal(rowsFor(rebuilt, 'Herd agents').find((row) => row.choice.value === 'On').choice.current(), true);
     assert.equal(rowsFor(rebuilt, 'Herd agents').find((row) => row.choice.value === 'Off').choice.current(), false);
-    assert.equal(on.choice.current(), false, 'the earlier build is unchanged');
-    assert.equal(off.choice.current(), true);
 
     // An edit landing in the SAME option object is read, because the snapshot is
     // the model's own array and not a copy of it.
