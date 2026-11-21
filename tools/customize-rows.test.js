@@ -669,29 +669,53 @@ describe('customizeRows — the panel\'s own previews on every row (S1/S3)', () 
     }
   });
 
-  test('the panel\'s per-setting note is the row\'s hint, and only when it has one', () => {
-    // An unreadable sidebar state is the panel's own note line; the page says the
-    // same thing through `choice.hint` instead of inventing a second wording.
+  test('the panel\'s per-setting note rides in the preview title, live, never in a hint', () => {
+    // An unreadable sidebar state is the panel's own note line; the page carries
+    // the same sentence — no new wording — inside the preview TITLE, because a
+    // `choice.hint` would be a build-time string the host prefers over the live
+    // preview (D3).
     const unknown = modelFor({ sidebar: 'unknown', moshi: 'on', sync: 'off', theme: null, themeNames: ['Dark'] });
     const sidebarNote = unknown.flatMap((category) => category.settings)
       .find((setting) => setting.id === 'sidebar').note;
     assert.equal(sidebarNote, 'state unknown; Enter turns the rows on', 'the panel owns the sentence');
 
     const rows = customizeRows({ model: unknown, apply: recorder().apply });
-    for (const row of rowsFor(rows, 'Herd agents')) assert.equal(row.choice.hint, sidebarNote);
+    for (const row of rowsFor(rows, 'Herd agents')) {
+      assert.equal('hint' in row.choice, false, 'the choice carries no hint at all');
+      assert.equal(row.preview().title, `static sidebar sample · ${sidebarNote}`, 'the note is in the live title');
+      assert.equal(
+        row.preview().sample,
+        row.choice.value === 'On' ? '● project   gentle   worker' : 'native Herdr rows; no managed block',
+        'and the sample stays the value\'s own',
+      );
+    }
 
-    // The theme picker's own unknown note rides on its rows too.
+    // The theme picker's own unknown note rides there too.
     const unreadableTheme = modelFor({ theme: null, readable: false, themeNames: ['Dark'] });
     const themeNote = unreadableTheme.flatMap((category) => category.settings)
       .find((setting) => setting.id === 'theme').note;
     assert.match(themeNote, /state unknown/);
-    for (const row of rowsFor(customizeRows({ model: unreadableTheme, apply: recorder().apply }), 'Select theme')) {
-      assert.equal(row.choice.hint, themeNote);
+    const themeRows = rowsFor(customizeRows({ model: unreadableTheme, apply: recorder().apply }), 'Select theme');
+    assert.ok(themeRows.length > 0);
+    for (const row of themeRows) {
+      assert.equal('hint' in row.choice, false);
+      assert.ok(row.preview().title.endsWith(` · ${themeNote}`), 'the theme note is live in its preview title');
     }
 
-    // A state the panel can read carries NO note, so no row carries a hint: a
-    // hint would replace the host's `Preview · …` headline with a needless line.
-    const healthy = customizeRows({ model: ALL_VALUES(), apply: recorder().apply });
-    for (const row of healthy) assert.equal(row.choice.hint, undefined, 'no hint without a panel note');
+    // A readable state carries no note, so no title carries one.
+    for (const row of customizeRows({ model: ALL_VALUES(), apply: recorder().apply })) {
+      assert.equal('hint' in row.choice, false);
+      assert.equal(row.preview().title.includes('state unknown'), false, 'no note without a panel note');
+    }
+
+    // LIVE: the state becomes readable underneath the mounted row (the model the
+    // page was built from is edited in place). The note must leave with it: a
+    // stale sentence on screen would hide the correct preview.
+    const mounted = customizeRows({ model: unknown, apply: recorder().apply });
+    const mountedSidebar = rowsFor(mounted, 'Herd agents')[0];
+    assert.ok(mountedSidebar.preview().title.includes(sidebarNote));
+    const sidebarSetting = unknown.flatMap((category) => category.settings).find((setting) => setting.id === 'sidebar');
+    delete sidebarSetting.note;
+    assert.equal(mountedSidebar.preview().title, 'static sidebar sample', 'the note is gone from the same row');
   });
 });

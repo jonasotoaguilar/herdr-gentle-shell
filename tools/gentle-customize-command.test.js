@@ -1572,8 +1572,17 @@ describe('floating panel theme rows', () => {
       themes: [{ name: 'nord' }],
       getTheme: (name) => ({
         name,
-        getBgAnsi: () => '\x1b[48;5;17m',
-        getFgAnsi: () => '\x1b[38;5;250m',
+        // The real Pi 1.6.0 Theme accepts only background tokens here (`accent`
+        // is a foreground token and throws `Unknown theme color: accent`), so
+        // the double refuses anything else instead of accepting by accident.
+        getBgAnsi: (token) => {
+          if (token !== 'selectedBg') throw new Error(`Unknown theme color: ${token}`);
+          return '\x1b[48;5;17m';
+        },
+        getFgAnsi: (token) => {
+          if (token !== 'text') throw new Error(`Unknown theme color: ${token}`);
+          return '\x1b[38;5;250m';
+        },
       }),
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);

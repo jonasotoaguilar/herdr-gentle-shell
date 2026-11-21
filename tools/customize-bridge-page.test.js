@@ -795,9 +795,11 @@ describe('exactly one provider, never two', () => {
 // `ctx.ui.getTheme(name)`, exactly what the panel draws.
 describe('every page row paints the panel\'s own preview (defect 1)', () => {
   // A host theme object with the two raw escapes `themePreviewFactory` reads.
+  // The swatch asks for the BACKGROUND token `selectedBg` (never `accent`, which
+  // Pi's `getBgAnsi` refuses) and the FOREGROUND token `text`.
   const previewTheme = (name) => ({
     name,
-    getBgAnsi: (role) => (role === 'accent' ? '\x1b[48;5;17m' : '\x1b[48;5;18m'),
+    getBgAnsi: (role) => (role === 'selectedBg' ? '\x1b[48;5;17m' : '\x1b[48;5;18m'),
     getFgAnsi: (role) => (role === 'text' ? '\x1b[38;5;250m' : '\x1b[38;5;251m'),
   });
 
@@ -867,5 +869,92 @@ describe('every page row paints the panel\'s own preview (defect 1)', () => {
       rowFor(mounted, 'Theme sync', 'Off').preview(),
       { title: 'static sync sample', sample: 'Herdr keeps its last palette' },
     );
+  });
+});
+
+// D1 (independent verification, real Pi 1.6.0 themes): `getBgAnsi("accent")`
+// throws `Unknown theme color: accent` — `accent` is a FOREGROUND token
+// (`theme-tokens.d.ts`, `slot: "foreground"`) and only the background tokens are
+// accepted by `getBgAnsi` (selectedBg, searchMatchBg, userMessageBg,
+// customMessageBg, toolPendingBg, toolSuccessBg, toolErrorBg). The double below
+// is exactly that strict, so the test cannot pass by accident.
+function realPiTheme(name) {
+  return {
+    name,
+    getBgAnsi(token) {
+      if (token !== 'selectedBg') throw new Error(`Unknown theme color: ${token}`);
+      return '\x1b[48;2;33;59;73m';
+    },
+    getFgAnsi(token) {
+      if (token !== 'text') throw new Error(`Unknown theme color: ${token}`);
+      return '\x1b[38;2;222;224;225m';
+    },
+  };
+}
+
+describe('a native Pi theme keeps its swatch (D1)', () => {
+  const SWATCH = '\x1b[48;2;33;59;73m  \x1b[0m \x1b[38;2;222;224;225mAa  sample text\x1b[0m';
+
+  test('the page paints the swatch from the background token the real themes accept', async () => {
+    const env = setupEnvironment('native-theme-swatch');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge, themes: ['system', 'dark', 'light'], getTheme: realPiTheme });
+    await h.load();
+    await h.start();
+    const rows = h.provider().rows();
+
+    for (const name of ['system', 'dark', 'light']) {
+      const row = rowFor(rows, 'Select theme', name);
+      assert.deepEqual(row.preview(), { title: 'source palette', sample: SWATCH }, `${name} keeps its swatch`);
+    }
+    // An unreadable theme is still no preview at all, never a crash.
+    const broken = harness({
+      bridge: fakeBridge(),
+      themes: ['dark'],
+      getTheme: () => ({ name: 'dark', getBgAnsi: () => { throw new Error('Unknown theme color: selectedBg'); }, getFgAnsi: () => '\x1b[39m' }),
+    });
+    broken.bridge.publish();
+    await broken.load();
+    await broken.start();
+    assert.equal(rowFor(broken.provider().rows(), 'Select theme', 'dark').preview(), undefined);
+  });
+});
+
+// D3 (independent verification): `choice.hint` was a build-time string, so after
+// the user repaired an unreadable store by turning the sync on, the mounted row
+// still showed `Theme sync — state unknown; Enter turns the sync on`, and the
+// host gives that hint precedence over the preview title. The note is carried by
+// `preview()` (a function, re-read against the live model) instead, so nothing
+// stale can be drawn.
+describe('the unknown-state note is live, never a stale hint (D3)', () => {
+  test('a mounted row drops the note as soon as the store is repaired', async () => {
+    const env = setupEnvironment('note-goes-live');
+    writeSettings(env.settingsPath, { extensions: [] });
+    fs.writeFileSync(env.themePath, 'not json\n');
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    const mounted = h.provider().rows();
+    const on = rowFor(mounted, 'Theme sync', 'On');
+    assert.equal(on.choice.hint, undefined, 'no build-time hint that can outlive its state');
+    assert.equal('hint' in on.choice, false, 'the choice carries no hint at all');
+    assert.deepEqual(on.preview(), {
+      title: 'static sync sample · state unknown; Enter turns the sync on',
+      sample: 'Herdr follows the theme active in Pi',
+    });
+
+    // Enter repairs the store; the SAME mounted row is repainted by the host.
+    await on.action(INLINE_HELPERS);
+    assert.equal(readThemeFile(env.themePath).sync, true, 'the repair really wrote the store');
+    assert.deepEqual(on.preview(), {
+      title: 'static sync sample',
+      sample: 'Herdr follows the theme active in Pi',
+    }, 'and the note is gone from the same row, with the correct live preview');
+    assert.equal('hint' in on.choice, false);
   });
 });

@@ -2225,6 +2225,16 @@ function readHostThemeNames(ctx) {
 // here: the panel is a plain CommonJS module with no host colour API, and
 // falling back to the active theme would show a palette the user did not pick.
 // An unreadable theme throws, and the panel renders `Preview unavailable`.
+//
+// The background token is `selectedBg`, NEVER `accent`: Pi's `Theme.getBgAnsi`
+// throws `Unknown theme color: accent` because `accent` is a FOREGROUND token
+// (`theme-tokens.d.ts`: `accent` has `slot: "foreground"`; only `selectedBg`,
+// `searchMatchBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`,
+// `toolSuccessBg` and `toolErrorBg` are background tokens). Every native theme
+// (`system`, `dark`, `light`, `TokyoNight`) answers `selectedBg`, so those
+// swatches render again; the text side stays on the `text` foreground token,
+// which the same themes answer. A theme that throws for either, or answers a
+// non-string, still throws here and both surfaces paint `Preview unavailable`.
 function themePreviewFactory(ctx) {
   const getTheme = ctx?.ui?.getTheme;
   if (typeof getTheme !== "function") return null;
@@ -2239,13 +2249,13 @@ function themePreviewFactory(ctx) {
     if (typeof theme.name === "string" && theme.name !== name) {
       throw new Error(`Theme ${name} is unavailable.`);
     }
-    const accent = typeof theme.getBgAnsi === "function" ? theme.getBgAnsi("accent") : undefined;
+    const background = typeof theme.getBgAnsi === "function" ? theme.getBgAnsi("selectedBg") : undefined;
     const text = typeof theme.getFgAnsi === "function" ? theme.getFgAnsi("text") : undefined;
-    if (typeof accent !== "string" || typeof text !== "string") {
+    if (typeof background !== "string" || typeof text !== "string") {
       throw new Error(`Theme ${name} exposes no palette escapes.`);
     }
     // The upstream sample: a background block then the sample text.
-    return { title: "source palette", sample: `${accent}  \x1b[0m ${text}Aa  sample text\x1b[0m` };
+    return { title: "source palette", sample: `${background}  \x1b[0m ${text}Aa  sample text\x1b[0m` };
   };
 }
 

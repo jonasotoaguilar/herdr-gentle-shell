@@ -892,3 +892,23 @@ describe('customize panel theme gate (S3, S7)', () => {
     assert.equal(done(), 'pending');
   });
 });
+
+// D2 (independent verification on the real host): withholding the theme setting
+// removed the widest label from the column computation, so `Off`/`On` jumped
+// eight columns left on the panel that was already open. The column comes from
+// the category's FULL setting set now — offered or not — so it never moves.
+describe('customize panel theme gate — the value column (D2)', () => {
+  test('hiding the picker does not move the Theme sync value column', () => {
+    const columnOf = (lines) => lines.find((line) => line.includes('▸ Theme sync')).indexOf('Off');
+    const linesFor = (sync) => {
+      const { component } = open({ model: modelWith({ theme: { ...THEME_OFF, sync } }) });
+      for (const key of ['down', 'down', 'right']) component.handleInput(key);
+      return component.render(100);
+    };
+    const off = linesFor(false);
+    const on = linesFor(true);
+    assert.ok(off.some((line) => line.includes('Gentle Shell theme')), 'the picker is offered with the sync off');
+    assert.ok(on.every((line) => !line.includes('Gentle Shell theme')), 'and withheld with the sync on');
+    assert.equal(columnOf(on), columnOf(off), 'the sync values keep their column whether the picker is there or not');
+  });
+});
