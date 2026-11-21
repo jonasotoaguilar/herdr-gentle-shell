@@ -562,6 +562,88 @@ describe('a mounted theme row never writes a theme that no longer exists (T10)',
   });
 });
 
+// S3 ordering (independent verification): with the stored sync ON the gate is the
+// ONLY thing the user can act on — the pinned theme is not available at all — so
+// it must answer FIRST, exactly as it does on every other surface. The apply path
+// used to read the catalogue before the gate, which turned "Turn Theme sync off"
+// into a refusal about a theme the row could never apply in the first place.
+//
+// The shape is the host's: the rows are built once and repainted, and the cache
+// window (`lib/customize-rows.js`) keeps the picker on screen while another
+// process turns the sync on, so the clock is pinned and the row is provably still
+// visible when Enter arrives.
+describe('the sync gate answers before the catalogue check (S3)', () => {
+  // Pin `Date.now` for the duration of the action: the row cache expires after
+  // 1000ms, and this test is about the mounted row, not about a rebuild.
+  function frozenClock(now) {
+    const real = Date.now;
+    Date.now = () => now;
+    return () => {
+      Date.now = real;
+    };
+  }
+
+  function writeThemeFile(file, doc) {
+    fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+  }
+
+  // Mount the page once, then let ANOTHER process turn the sync on and change the
+  // catalogue. Returns the mounted `Dark` row, still visible, about to be Entered.
+  async function mountedRowWithSyncOn(name, changeCatalogue) {
+    const env = setupEnvironment(name);
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    // ONE build: these are the objects the host keeps and repaints. The clock is
+    // pinned to the instant of that build, so the cache window never lapses and
+    // the row stays exactly as mounted.
+    const mounted = h.provider().rows();
+    const dark = rowFor(mounted, 'Select theme', 'Dark');
+    const mountedAt = Date.now();
+
+    writeThemeFile(env.themePath, { sync: true, theme: 'Dark', updatedAt: '2024-01-01T00:00:00.000Z' });
+    changeCatalogue(h.ctx.ui);
+    const before = fs.readFileSync(env.themePath);
+    return { env, h, dark, before, mountedAt };
+  }
+
+  async function assertSyncSentenceWins({ env, h, dark, before, mountedAt }) {
+    const restore = frozenClock(mountedAt);
+    try {
+      assert.equal(dark.visible(), true, 'the picker is still mounted inside its cache window');
+      await dark.action(INLINE_HELPERS);
+    } finally {
+      restore();
+    }
+    // The gate's sentence and nothing else: no catalogue refusal, no success.
+    assert.deepEqual(h.notices, [['Turn Theme sync off to pick a specific theme.', 'warning']]);
+    assert.ok(before.equals(fs.readFileSync(env.themePath)), 'the theme document is byte-unchanged');
+    assert.deepEqual(h.reloads, [], 'nothing is reloaded either');
+  }
+
+  test('a theme removed from the catalogue while the sync is on gets the sync sentence', async () => {
+    const state = await mountedRowWithSyncOn('sync-gate-theme-vanished', (ui) => {
+      // The theme is uninstalled behind the open menu: the catalogue no longer
+      // lists `Dark`, so the pre-fix ordering answered "not installed".
+      ui.getAllThemes = () => [{ name: 'Light', path: '/themes/Light.json' }];
+    });
+    await assertSyncSentenceWins(state);
+  });
+
+  test('an unreadable catalogue while the sync is on gets the sync sentence', async () => {
+    const state = await mountedRowWithSyncOn('sync-gate-catalogue-throws', (ui) => {
+      ui.getAllThemes = () => {
+        throw new Error('catalogue gone');
+      };
+    });
+    await assertSyncSentenceWins(state);
+  });
+});
+
 describe('every message names the command that always exists (S4)', () => {
   test('a page refusal keeps the 865d360 spelling', async () => {
     const env = setupEnvironment('s4-strings');

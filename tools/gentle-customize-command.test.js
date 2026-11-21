@@ -1440,6 +1440,81 @@ describe('floating panel theme rows', () => {
     assert.deepEqual(h.reloads, []);
   });
 
+  // S2: the card lists Pi's themes when it builds its model and then waits for a
+  // key, so the catalogue can change while it is open — exactly like the command's
+  // own `ctx.ui.select` picker. 865d360 saved the theme the card had already
+  // offered, whatever happened to the catalogue afterwards; the fixed-row
+  // catalogue refusal belongs to the Gentle Shell page only
+  // (tools/customize-bridge-page.test.js pins it there). These four cases are the
+  // shapes "the catalogue changed" can take.
+  async function enterDarkAfterCatalogueChanges(name, changeCatalogue) {
+    const env = setupEnvironment(name);
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [{ name: 'Dark' }, { name: 'Light' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        // Herdr Theme -> the theme setting -> `Dark` (the first offered theme).
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        component.handleInput('right');
+        const painted = component.render(100).join('\n');
+        assert.ok(painted.includes('▸ Gentle Shell theme'), 'the cursor is on the theme setting');
+        assert.ok(painted.includes('● None'), 'the stored value is still None');
+        // The catalogue changes with the card open, then Enter confirms the
+        // theme the card had already offered.
+        changeCatalogue(h);
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    return { env, h };
+  }
+
+  function assertOfferedThemeSaved(env, h) {
+    const doc = readThemeFile(env);
+    assert.deepEqual([doc.sync, doc.theme], [false, 'Dark'], 'the offered theme is saved');
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to Dark.', 'info']], 'the baseline notice and level');
+    assert.deepEqual(h.reloads, [], 'a theme pin never reloads Pi');
+  }
+
+  test('an emptied catalogue while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-emptied', (host) => {
+      const catalog = host.ctx.ui.getAllThemes();
+      catalog.length = 0;
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
+  test('a catalogue that starts throwing while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-throws', (host) => {
+      host.ctx.ui.getAllThemes = () => {
+        throw new Error('catalogue gone');
+      };
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
+  test('a host that loses getAllThemes while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-missing', (host) => {
+      delete host.ctx.ui.getAllThemes;
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
+  test('a malformed catalogue while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-malformed', (host) => {
+      host.ctx.ui.getAllThemes = () => 42;
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
   test('Enter on None writes an unassigned theme', async () => {
     const env = setupEnvironment('overlay-theme-none');
     fs.writeFileSync(env.configPath, '');

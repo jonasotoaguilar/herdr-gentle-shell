@@ -3115,7 +3115,12 @@ function publishedBridge() {
 async function applyCustomizePageChoice(choice, ctx) {
   if (isRecord(choice) && choice.settingId === CUSTOMIZE_THEME_SETTING_ID) {
     const optionId = choice.optionId;
-    if (typeof optionId === "string" && optionId.startsWith(CUSTOMIZE_THEME_OPTION_PREFIX)) {
+    // The sync gate answers FIRST, exactly as it does on every other surface.
+    // While sync is on the pinned theme is not available at all, so asking the
+    // catalogue whether the theme still exists would answer a question the row
+    // cannot act on and would bury the one thing the user has to do first.
+    const syncOn = readCustomizeThemeState().sync === true;
+    if (!syncOn && typeof optionId === "string" && optionId.startsWith(CUSTOMIZE_THEME_OPTION_PREFIX)) {
       const installed = themeStillInstalled(ctx, optionId.slice(CUSTOMIZE_THEME_OPTION_PREFIX.length));
       if (!installed.ok) {
         const notify = ctx?.ui?.notify;
