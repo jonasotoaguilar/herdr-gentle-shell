@@ -489,22 +489,29 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   no argument the command opens the floating panel in Gentle Shell's own
   layout: one left `CATEGORIES` list (`Herdr Sidebar`, `Moshi notifications`,
   `Herdr Theme`)
-  and one right pane headed `<Category> · n/m` with its setting rows, each row
-  painting the stored value with `●` and the other with `○`; one line above the
-  footer describes the focused setting (`<setting> — <what it changes>`), and
-  the footer reads
-  `←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`, while `←/→` or
-  `Tab` moves between the category and value panes, `↑/↓` or `j/k` moves the
-  cursor, `Enter` applies the focused row and `Esc` closes without a write. The
-  legend names only keys: it never advertises `Click`, because every token in
-  it is a key the panel answers to, and a narrow card compacts it instead of
-  wrapping. Pointer input still works without being advertised — a click on a
-  category selects it, a click on a row applies it, and a click outside the
-  panes is ignored. Each category owns its own rows: `Herdr Sidebar`
+  and one right pane headed `<Category> · n/m`, where each setting is ONE line
+  with its options inline — `●` the stored option, `›` the cursor while it sits
+  elsewhere, `○` the rest. The arrows move the option cursor and only `Enter`
+  applies; `Enter` keeps the card open (a Moshi change that needs a Pi reload
+  closes it first), `Esc` closes without a write, `Tab`
+  switches panes and `↑/↓` (or `j/k`) moves between settings. A line whose
+  options do not fit scrolls sideways behind muted `‹` / `›` markers with an
+  `n/m` counter (falling back to a compact `‹ value ›` when not even one option
+  fits), and the Preview block below the panes reads
+  `Preview · <option> · <title>` plus a sample painted with the host theme (a
+  theme option shows that theme's own palette). The footer carries one of three
+  legends after a `Click · ` prefix —
+  `↑/↓ categories · → open · Esc close`,
+  `←/→ choose · Enter apply · ↑/↓ settings · Tab panes · Esc close`, or
+  `←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close` — and compacts
+  instead of wrapping on a narrow card. A click on an option applies exactly
+  that option, a click on a setting's name only moves the focus, a click on a
+  category selects it, and a click outside the panes is ignored. Each category
+  owns its own rows: `Herdr Sidebar`
   shows the single `Sidebar agent rows` row, and the only Moshi switch is the
   `Notifications` row under `Moshi notifications`, while `Herdr Theme` owns
-  both theme rows (the `Theme sync` toggle and the non-toggle
-  `Gentle Shell theme` value row described in the subsection below). The
+  both theme settings (the `Theme sync` toggle and the inline
+  `Gentle Shell theme` list described in the subsection below). The
   sidebar and Moshi switches are never mixed — `Sidebar agent rows` neither
   reads nor writes `gentle-moshi.json`, so turning the agent rows off never
   turns the notification channel off. Herdr's own
@@ -595,19 +602,72 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
 
 ### Theme sync (Herdr palette follows Pi)
 
-`/herdr-gentle:customize` → `Herdr Theme` is one switch and one pinned value.
+`/herdr-gentle:customize` → `Herdr Theme` is one switch and one pinned theme.
 `Theme sync` is **OFF by default**: while it is on, Herdr's palette is the
 palette of the theme Pi is showing, and it follows a theme change while Pi keeps
-running. While it is off, `Gentle Shell theme` assigns one Gentle Shell / Pi
-theme by name and the picker's `Off (no theme assigned)` entry clears the pin; the row is refused while the sync is on
+running. While it is off, `Gentle Shell theme` pins one Gentle Shell / Pi theme
+from Pi's own inline list (`None` first, then the host's order) and `None`
+clears the pin; the setting is painted dim and refused while the sync is on
 (`Turn Theme sync off to pick a specific theme.`). Turning the sync off writes
 nothing to Herdr, so **Herdr keeps the last applied palette** — a fresh install
 whose sync is off and whose theme is unassigned writes nothing at all. State is
-one file, `gentle-theme.json`, beside `gentle-moshi.json`; the palette reaches
-Herdr through the plugin's own `bin/configure-theme.js`, which owns a marked
-`[theme]` block and refuses to touch a `[theme]` table you maintain yourself.
-See [docs/theme-sync.md](docs/theme-sync.md) for the projection, the CLI and
-the limits.
+one file, `gentle-theme.json`, beside `gentle-moshi.json`.
+
+The writer runs **in process in this Pi package**
+(`lib/herdr-theme-config.js` plans it, `lib/herdr-theme-apply.js` writes it,
+`extensions/herdr-theme-sync.ts` follows the theme), so the Herdr plugin is not
+involved and needs no update for this feature. It is a **line splicer, not a TOML
+validator**: it finds the boundaries of your `[theme]` and `[theme.custom]`
+tables (a header only counts at a real line start, never inside a multi-line
+string, array or comment) and treats every line outside them as opaque bytes —
+nothing there is validated or rewritten (escapes included), and an invalid line
+outside those tables is left exactly as it is, because Herdr already refuses such
+a file (the scanner only looks at those lines far enough to find where a table
+starts and ends). A
+splice invariant is enforced before a plan is returned: the non-theme lines of
+the output must be byte-identical to the input's.
+
+Inside the two theme tables it edits in place and keeps two kinds of value
+apart: a value you already had is replaced where it stands and remembered by one
+comment recording **the whole original line** (one per key; the first original
+wins, and restoring gives back your quoting, spacing and inline comment — or
+**your current comment** when you edited it after the planner wrote the value,
+because the latest edit wins), while
+a token you did not have is written inside ONE marked block — a `begin`/`end`
+comment pair naming this package, spelled `begin created` when the planner also
+created the table and closed with `end after a missing line ending` when placing
+the block also added the file's missing final newline, so clearing gives that
+byte back — at the
+end of `[theme.custom]`, regenerated on every apply. Leaving a theme therefore
+never leaves a stale colour: a token that leaves the projection is restored from
+its comment byte for byte (or when the projection returns to the recorded value),
+or dropped with the block when the package created it, and a token you own
+without such a comment is never touched. Removing or moving that block is refused
+(`ambiguous herdr-gentle-shell marker above the managed block`) when a
+marker-shaped comment directly above `begin` would end up attached to the key
+under it. Everything else — other tables,
+comments, ordering, a BOM, CRLF or mixed endings, a missing final newline — is
+preserved, a one-time `<config>.herdr-gentle-shell.bak` is published atomically
+before the first modification and never overwritten, and a temp file that
+survives a failed replace is named in the error instead of being hidden, while a
+temp path the writer did not create itself is never deleted (the apply reports
+the `EEXIST` and leaves it alone). What
+fails closed, with the line number and no write, is what a theme-table edit
+cannot be done safely over: `auto_switch` with a value other than `false`,
+`dark_name`, `light_name`, a top-level `theme` key, a dotted key extending the
+theme tables, a duplicated `[theme]`/`[theme.custom]` table or duplicated key
+inside them, a line inside the marked block that is not a token assignment, and a
+value the plan must touch that is not a strict single-line string/boolean/number
+(an unterminated multi-line string or array anywhere also blocks the plan,
+because table boundaries depend on it). While the sync is on (or a theme is
+pinned) the package owns the tokens it projects, so another tool that rewrites
+the same keys (a desktop-theme sync, for example) overwrites them on its next run
+and the next palette change here overwrites them back. There is no "full clear":
+a projection always carries a theme name, so a `name` line the planner inserted
+stays, and only the `[theme.custom]` table it created is removed again. See
+[docs/theme-sync.md](docs/theme-sync.md) for the golden example, the exact
+comment and block lines, what is and is not guaranteed, the refusals, the
+notices and the limits.
 
 ## Documentation
 
@@ -619,7 +679,7 @@ the limits.
 | Supervision triage (read-only doctor/trace/whois) | [docs/diagnostics.md](docs/diagnostics.md) |
 | Lifecycle recovery and interruption (polling fallback) | [docs/supervision.md](docs/supervision.md) |
 | Sidebar switch (`bin/gentle-sidebar.js`) | [docs/sidebar-control.md](docs/sidebar-control.md) |
-| Theme sync (Pi palette → Herdr theme) | [docs/theme-sync.md](docs/theme-sync.md) |
+| Theme sync (Pi palette → Herdr theme, written in process) | [docs/theme-sync.md](docs/theme-sync.md) |
 | Herdr session opener (`herdr_session_open`) | [docs/herdr-session-open.md](docs/herdr-session-open.md) |
 | Performance trace and its report | [docs/performance-trace.md](docs/performance-trace.md) |
 

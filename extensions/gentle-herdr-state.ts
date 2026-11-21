@@ -2092,10 +2092,13 @@ const CUSTOMIZE_OFF = "Off";
 // unpinnable, because selecting it would read as "clear the pin".
 const CUSTOMIZE_THEME_UNASSIGN = "Off (no theme assigned)";
 
-// The row id `lib/customize-panel.js` gives the theme value row. It is not an
-// On/Off pair: the row opens the host's theme list, so the apply path keys the
-// list on this id instead of on a value it could toggle.
-const CUSTOMIZE_THEME_SELECT_ROW_ID = "select";
+// The theme setting's STRUCTURAL option ids from `lib/customize-panel.js`. They
+// are never labels: `none` is the "no theme assigned" choice and `theme:<name>`
+// a real theme, so an installed theme literally called `None` or `Off` keeps its
+// own option and stays pinnable.
+const CUSTOMIZE_THEME_SETTING_ID = "theme";
+const CUSTOMIZE_THEME_NONE_OPTION_ID = "none";
+const CUSTOMIZE_THEME_OPTION_PREFIX = "theme:";
 const THEME_SYNC_ON_TEXT = "Theme sync on; Herdr's palette follows the theme active in Pi.";
 const THEME_SYNC_OFF_TEXT = "Theme sync off; Herdr keeps the palette it was last given.";
 // The refusal keeps S4's promise: the pinned theme is only available while the
@@ -2169,13 +2172,57 @@ function readCustomizeThemeState() {
   }
 }
 
-function customizePanelModel() {
+// S2: the panel lists Pi's own themes, so the extension reads them from the
+// host instead of shipping a copy. `null` means "this host exposes no list" and
+// the panel says so with one note instead of showing an empty picker.
+function readHostThemeNames(ctx) {
+  const listThemes = ctx?.ui?.getAllThemes;
+  if (typeof listThemes !== "function") return null;
+  try {
+    return themeNames(listThemes.call(ctx.ui));
+  } catch {
+    return null;
+  }
+}
+
+// S6: a theme's preview is a swatch in THAT theme's colours, taken from the
+// theme object the host hands back. The raw SGR is deliberate and lives only
+// here: the panel is a plain CommonJS module with no host colour API, and
+// falling back to the active theme would show a palette the user did not pick.
+// An unreadable theme throws, and the panel renders `Preview unavailable`.
+function themePreviewFactory(ctx) {
+  const getTheme = ctx?.ui?.getTheme;
+  if (typeof getTheme !== "function") return null;
+  return (name) => {
+    let theme;
+    try {
+      theme = getTheme.call(ctx.ui, name);
+    } catch {
+      theme = null;
+    }
+    if (!theme) throw new Error(`Theme ${name} is unavailable.`);
+    if (typeof theme.name === "string" && theme.name !== name) {
+      throw new Error(`Theme ${name} is unavailable.`);
+    }
+    const accent = typeof theme.getBgAnsi === "function" ? theme.getBgAnsi("accent") : undefined;
+    const text = typeof theme.getFgAnsi === "function" ? theme.getFgAnsi("text") : undefined;
+    if (typeof accent !== "string" || typeof text !== "string") {
+      throw new Error(`Theme ${name} exposes no palette escapes.`);
+    }
+    // The upstream sample: a background block then the sample text.
+    return { title: "source palette", sample: `${accent}  \x1b[0m ${text}Aa  sample text\x1b[0m` };
+  };
+}
+
+function customizePanelModel(ctx) {
   const panel = customizePanelModule();
   if (!panel) return null;
   return panel.customizePanelModel({
     sidebar: sidebarRowsState().state,
     moshi: moshiFlagEnabled(moshiFlagPath()) ? "on" : "off",
     theme: readCustomizeThemeState(),
+    themeNames: readHostThemeNames(ctx),
+    themePreview: themePreviewFactory(ctx),
   });
 }
 
@@ -2569,7 +2616,7 @@ function applyMoshiNotifications(want) {
 // only when the Moshi settings entry actually changed. The theme switch never
 // reloads: the palette it writes belongs to Herdr, so a Pi reload would only
 // restart the extension for nothing.
-async function applyCustomizeSwitch(id, value, ctx) {
+async function applyCustomizeSwitch(id, value, ctx, options = {}) {
   const want = value === "on";
   const result = id === "sidebar"
     ? await applySidebarRows(want)
@@ -2580,7 +2627,11 @@ async function applyCustomizeSwitch(id, value, ctx) {
   if (typeof notify === "function") {
     notify(`${result.text}${result.needsReload ? " Reloading now to apply the change." : ""}`, result.level);
   }
-  if (result.needsReload && typeof ctx?.reload === "function") await ctx.reload();
+  // The overlay defers the reload (`deferReload`): reloading while the card is
+  // still mounted restarts Pi behind an open overlay, so the panel closes first
+  // and the caller reloads after `ctx.ui.custom` resolved.
+  if (result.needsReload && options.deferReload !== true && typeof ctx?.reload === "function") await ctx.reload();
+  return result;
 }
 
 // The one-line spelling of the theme state, shared by `status` and the menu
@@ -2632,7 +2683,9 @@ function applyThemeSync(want) {
 
 // `ctx.ui.getAllThemes()` documents `{ name, path }` records; a plain string list
 // is accepted too. A malformed entry is skipped instead of failing the whole
-// list, and the result is deduplicated and sorted so the prompt is stable.
+// list. S2 keeps Pi's OWN order (the list the user sees in /settings), drops the
+// names that are paths rather than themes (`/` in the name, as upstream does) and
+// deduplicates, so one theme is never offered twice.
 function themeNames(themes) {
   if (!Array.isArray(themes)) return null;
   const names = [];
@@ -2640,9 +2693,10 @@ function themeNames(themes) {
     const name = typeof entry === "string" ? entry : isRecord(entry) ? entry.name : null;
     if (typeof name !== "string") continue;
     const clean = name.trim();
-    if (clean.length > 0) names.push(clean);
+    if (clean.length === 0 || clean.includes("/")) continue;
+    names.push(clean);
   }
-  return [...new Set(names)].sort();
+  return [...new Set(names)];
 }
 
 // The picker's entries plus the ONE entry that means "unassign". A theme really
@@ -2658,9 +2712,41 @@ function themeSelectionOptions(names) {
   return { options: [...names, unassign], unassign };
 }
 
-// S4: pin one of Pi's themes while the sync is off. The refusal, the missing
-// theme list and an empty answer all write NOTHING, so the stored document only
-// ever changes to a value the user actually picked.
+// One write for the pinned theme, shared by the inline panel setting and the
+// `ctx.ui.select` fallback: the refusal, the missing store and a failure all
+// write NOTHING, so the stored document only ever changes to a value the user
+// actually picked (S7).
+function writeThemeChoice(ctx, name) {
+  const notify = ctx?.ui?.notify;
+  const store = themeStoreModule();
+  if (!store || typeof store.writeThemeState !== "function") {
+    if (typeof notify === "function") notify(THEME_STORE_UNAVAILABLE_TEXT, "warning");
+    return false;
+  }
+  if (readCustomizeThemeState().sync === true) {
+    if (typeof notify === "function") notify(THEME_SYNC_REFUSED_TEXT, "warning");
+    return false;
+  }
+  try {
+    store.writeThemeState(process.env, { sync: false, theme: name });
+  } catch (error) {
+    if (typeof notify === "function") notify(themeStoreWriteError(error), "error");
+    return false;
+  }
+  if (typeof notify === "function") {
+    notify(
+      name === null
+        ? "Gentle Shell theme set to Off; Herdr keeps the palette it was last given."
+        : `Gentle Shell theme set to ${name}.`,
+      "info",
+    );
+  }
+  return true;
+}
+
+// S4: pin one of Pi's themes while the sync is off, through the host's own
+// picker. The refusal, the missing theme list and an empty answer all write
+// NOTHING, so the stored document only ever changes to a value the user picked.
 async function applyThemeSelection(ctx) {
   const notify = ctx?.ui?.notify;
   const store = themeStoreModule();
@@ -2702,45 +2788,48 @@ async function applyThemeSelection(ctx) {
   }
   // Esc/cancel and an empty answer write nothing at all.
   if (typeof picked !== "string" || picked.length === 0) return;
-  const next = picked === picker.unassign ? null : picked;
-  try {
-    store.writeThemeState(process.env, { sync: false, theme: next });
-  } catch (error) {
-    if (typeof notify === "function") notify(themeStoreWriteError(error), "error");
-    return;
-  }
-  if (typeof notify === "function") {
-    notify(
-      next === null
-        ? "Gentle Shell theme set to Off; Herdr keeps the palette it was last given."
-        : `Gentle Shell theme set to ${next}.`,
-      "info",
-    );
-  }
+  writeThemeChoice(ctx, picked === picker.unassign ? null : picked);
 }
 
-// The single apply path shared by the overlay and the menu fallback. The choice
-// the panel resolves names the switch it drives (`switchId`) and the value to
-// apply; that switch id is the only thing read here, so a row can never apply a
-// switch its category does not own. An inconclusive sidebar verdict is never a
-// refusal: choosing On still attempts the repair and reports the apply step's
-// own error, exactly like the baseline menu did. The theme value is the one row
-// that is not a toggle: it carries the `select` row id, and the refusal for a
-// stored sync lives in `applyThemeSelection` so both entry points share it.
-const CUSTOMIZE_SWITCH_IDS = ["sidebar", "moshi", "theme-sync", "theme"];
+// The apply path of the menu fallback. The choice names the switch it drives
+// (`switchId`) and the value to apply; that switch id is the only thing read
+// here, so a row can never apply a switch its category does not own. An
+// inconclusive sidebar verdict is never a refusal: choosing On still attempts
+// the repair and reports the apply step's own error, exactly like the baseline
+// menu did. The fallback has no inline theme list, so its theme setting keeps
+// opening the host's picker through `applyThemeSelection`.
+const CUSTOMIZE_SWITCH_IDS = ["sidebar", "moshi", "theme-sync"];
 
 async function applyCustomizeChoice(choice, ctx) {
   if (!isRecord(choice)) return;
   const switchId = choice.switchId;
   const valueId = choice.valueId;
   if (!CUSTOMIZE_SWITCH_IDS.includes(switchId)) return;
-  if (switchId === "theme") {
-    if (valueId !== CUSTOMIZE_THEME_SELECT_ROW_ID) return;
-    await applyThemeSelection(ctx);
-    return;
-  }
   if (valueId !== "on" && valueId !== "off") return;
   await applyCustomizeSwitch(switchId, valueId, ctx);
+}
+
+// The overlay's apply path: it receives the structural ids of the setting and
+// the option the user confirmed, writes through the same functions the menu
+// uses, and answers with a freshly read model so the panel shows the real state
+// instead of guessing it. `close` is only true when Pi must reload: the caller
+// closes the overlay first and reloads after it resolved.
+async function applyCustomizePanel(choice, ctx) {
+  const model = () => customizePanelModel(ctx);
+  if (!isRecord(choice)) return { model: model(), close: false, reload: false };
+  const { settingId, optionId } = choice;
+  if (settingId === CUSTOMIZE_THEME_SETTING_ID) {
+    if (optionId === CUSTOMIZE_THEME_NONE_OPTION_ID) writeThemeChoice(ctx, null);
+    else if (typeof optionId === "string" && optionId.startsWith(CUSTOMIZE_THEME_OPTION_PREFIX)) {
+      writeThemeChoice(ctx, optionId.slice(CUSTOMIZE_THEME_OPTION_PREFIX.length));
+    }
+    return { model: model(), close: false, reload: false };
+  }
+  if (!CUSTOMIZE_SWITCH_IDS.includes(settingId)) return { model: model(), close: false, reload: false };
+  if (optionId !== "on" && optionId !== "off") return { model: model(), close: false, reload: false };
+  const result = await applyCustomizeSwitch(settingId, optionId, ctx, { deferReload: true });
+  const reload = Boolean(result && result.needsReload);
+  return { model: model(), close: reload, reload };
 }
 
 // The former plain menu, kept as the fallback when the TUI helpers or
@@ -2826,11 +2915,11 @@ async function executeCustomize(rawArgs, ctx) {
   }
   if (helpers && ctx?.ui && typeof ctx.ui.custom === "function") {
     const panel = customizePanelModule();
-    const model = customizePanelModel();
-    let choice = null;
+    const model = customizePanelModel(ctx);
+    let reloadPending = false;
     if (panel && model) {
       try {
-        choice = await ctx.ui.custom(
+        await ctx.ui.custom(
           // Theme and terminal rows travel through the real factory arguments:
           // the card paints with the host theme and clips to the live height.
           (hostTui, theme, _keybindings, done) => panel.createCustomizePanel({
@@ -2848,6 +2937,15 @@ async function executeCustomize(rawArgs, ctx) {
               }
             },
             model,
+            // Enter applies in place behind the panel's busy guard: the panel
+            // swaps in the model this reads back and stays open, except when a
+            // reload is needed — then it closes so `ctx.reload()` runs here,
+            // never behind a mounted card.
+            apply: async (request) => {
+              const outcome = await applyCustomizePanel(request, ctx);
+              if (outcome.reload) reloadPending = true;
+              return { model: outcome.model, close: outcome.close };
+            },
             done,
           }),
           CUSTOMIZE_OVERLAY_OPTIONS,
@@ -2857,14 +2955,10 @@ async function executeCustomize(rawArgs, ctx) {
         await runCustomizeFallback(ctx);
         return;
       }
-    } else {
-      await runCustomizeFallback(ctx);
+      if (reloadPending && typeof ctx.reload === "function") await ctx.reload();
       return;
     }
-    // Esc (null) does nothing at all: no notification, no write, no reload.
-    // Anything else runs the single apply path once the overlay is disposed.
-    if (!choice || typeof choice !== "object") return;
-    await applyCustomizeChoice(choice, ctx);
+    await runCustomizeFallback(ctx);
     return;
   }
   await runCustomizeFallback(ctx);

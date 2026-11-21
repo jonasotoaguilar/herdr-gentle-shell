@@ -9,6 +9,19 @@
 // be spelled as a guess), and the shared-source rule for `subtext0`/`overlay0`
 // (both come from Pi's `muted`, so they are emitted or omitted together).
 //
+// Two rules came from the reference implementation
+// (/home/jona/dev/upstream/gentle-herdr lib/herdr-theme-projection.ts, MIT,
+// Copyright (c) MarsSall) and are pinned here because they change what the user
+// sees on screen:
+//
+//   - the role map is EIGHT tokens. Working/done status and notification colours
+//     (yellow, blue, teal, peach) are left to Herdr's base theme; our extra
+//     mappings recoloured them, which the reference never does;
+//   - the three Gentle theme names carry the reference's `DOTS_FIXED` surface
+//     colours, because the Gentle palette defines foregrounds only. A fixed
+//     value wins over the mapped one for the same token (Sexy's `mauve` and
+//     `subtext0`, Cute's `overlay0`).
+//
 // The fingerprint is asserted as an exact string because it is the change
 // detector: same name plus one changed colour must produce a different value,
 // and a different key order in the input must not.
@@ -32,6 +45,8 @@ const PI_COLORS = {
 };
 
 // The exact document a fully concrete Pi palette projects to, in Herdr's order.
+// The palette above names every role our own 1.8.0 map used; only the reference's
+// eight survive, so `yellow`, `blue` and `teal` are absent by design.
 const FULL_CUSTOM = {
   accent: '#7aa2f7',
   text: '#c0caf5',
@@ -41,9 +56,6 @@ const FULL_CUSTOM = {
   overlay0: '#a9b1d6',
   overlay1: '#565f89',
   mauve: '#bb9af7',
-  yellow: '#e0af68',
-  blue: '#7dcfff',
-  teal: '#2ac3de',
 };
 
 describe('projection constants', () => {
@@ -83,18 +95,44 @@ describe('projection constants', () => {
       'surface1',
       'surface_dim',
     ]);
+    // Exactly the reference's eight sources. Adding one back is a visible
+    // regression: it repaints a status or notification colour the base theme owns.
     assert.deepEqual(projection.HERDR_ROLE_SOURCES, {
       accent: 'accent',
       text: 'text',
       red: 'error',
       green: 'success',
-      yellow: 'warning',
-      blue: 'mdLink',
-      teal: 'syntaxType',
       subtext0: 'muted',
       overlay0: 'muted',
       overlay1: 'thinkingText',
       mauve: 'borderAccent',
+    });
+  });
+
+  test('the fixed Gentleman.Dots surfaces are the reference table, keyed by Pi theme name', () => {
+    // Values are the reference's own, verbatim (they carry upper-case hex): the
+    // table is a copy of Gentleman.Dots, and normalisation belongs to the
+    // emitted document, not to the reference data.
+    assert.deepEqual(projection.DOTS_FIXED, {
+      'Gentleman-Cute': {
+        panel_bg: '#000000',
+        surface0: '#241822',
+        surface1: '#342230',
+        surface_dim: '#20161E',
+        overlay0: '#B99AA9',
+      },
+      'Gentleman-Sexy': {
+        panel_bg: '#000000',
+        surface0: '#241822',
+        surface1: '#342230',
+        surface_dim: '#20161E',
+        overlay0: '#B99AA9',
+        subtext0: '#FF4F9A',
+        mauve: '#B99AA9',
+        active_row_bg: '#2E0F1F',
+        selection_bg: '#2E0F1F',
+      },
+      Gentle: { panel_bg: '#06080f' },
     });
   });
 });
@@ -120,15 +158,24 @@ describe('projectPalette', () => {
     assert.deepEqual(result, { theme: { name: 'one-dark', custom: FULL_CUSTOM } });
     assert.deepEqual(
       Object.keys(result.theme.custom),
-      ['accent', 'text', 'red', 'green', 'subtext0', 'overlay0', 'overlay1', 'mauve', 'yellow', 'blue', 'teal'],
+      ['accent', 'text', 'red', 'green', 'subtext0', 'overlay0', 'overlay1', 'mauve'],
       'the emitted order is Herdr token order, never input or role-map order',
     );
   });
 
+  test('working/done status and notification colours stay with the base theme', () => {
+    // The palette DOES carry all three (as it did for real, hence the bug): they
+    // must still never reach Herdr's custom table.
+    const { custom } = projection.projectPalette({ name: 'tokyo-night', colors: PI_COLORS }).theme;
+    for (const token of ['yellow', 'blue', 'teal', 'peach']) {
+      assert.equal(token in custom, false, `${token} belongs to Herdr's base theme, never to the projection`);
+    }
+  });
+
   test('surfaces the palette does not own stay with the base theme', () => {
     const { custom } = projection.projectPalette({ colors: PI_COLORS }).theme;
-    for (const token of ['sidebar_bg', 'panel_bg', 'active_row_bg', 'selection_bg', 'surface0', 'surface1', 'surface_dim', 'peach']) {
-      assert.equal(token in custom, false, `${token} is never projected`);
+    for (const token of ['sidebar_bg', 'surface0', 'surface1', 'surface_dim']) {
+      assert.equal(token in custom, false, `${token} is never projected from an arbitrary Pi theme`);
     }
   });
 
@@ -144,8 +191,6 @@ describe('projectPalette', () => {
       overlay0: '#a9b1d6',
       overlay1: '#565f89',
       mauve: '#bb9af7',
-      yellow: '#e0af68',
-      blue: '#7dcfff',
     });
   });
 
@@ -189,11 +234,89 @@ describe('projectPalette', () => {
   });
 });
 
+describe('the fixed Gentleman.Dots surfaces', () => {
+  test('Gentleman-Cute adds its surfaces in Herdr order and its fixed overlay0 wins', () => {
+    const { custom } = projection.projectPalette({ name: 'Gentleman-Cute', colors: PI_COLORS }).theme;
+    assert.deepEqual(Object.keys(custom), [
+      'panel_bg',
+      'active_row_bg',
+      'selection_bg',
+      'accent',
+      'text',
+      'red',
+      'green',
+      'subtext0',
+      'overlay0',
+      'overlay1',
+      'mauve',
+      'surface0',
+      'surface1',
+      'surface_dim',
+    ].filter((token) => token in custom));
+    assert.deepEqual(custom, {
+      panel_bg: '#000000',
+      accent: '#7aa2f7',
+      text: '#c0caf5',
+      red: '#f7768e',
+      green: '#9ece6a',
+      subtext0: '#a9b1d6',
+      overlay0: '#b99aa9',
+      overlay1: '#565f89',
+      mauve: '#bb9af7',
+      surface0: '#241822',
+      surface1: '#342230',
+      surface_dim: '#20161e',
+    });
+    assert.equal(custom.overlay0, '#b99aa9', 'a fixed value wins over the mapped muted colour');
+  });
+
+  test('Gentleman-Sexy overrides subtext0, mauve and its two row surfaces', () => {
+    const { custom } = projection.projectPalette({ name: 'Gentleman-Sexy', colors: PI_COLORS }).theme;
+    assert.equal(custom.subtext0, '#ff4f9a', 'Sexy draws unfocused session names in fuchsia');
+    assert.equal(custom.mauve, '#b99aa9', 'and branches in grayish pink');
+    assert.equal(custom.overlay0, '#b99aa9', 'Cute\'s overlay0 is inherited by Sexy');
+    assert.equal(custom.active_row_bg, '#2e0f1f');
+    assert.equal(custom.selection_bg, '#2e0f1f');
+    assert.equal(custom.panel_bg, '#000000');
+  });
+
+  test('Gentle adds only its panel background', () => {
+    assert.deepEqual(projection.projectPalette({ name: 'Gentle', colors: PI_COLORS }).theme.custom, {
+      panel_bg: '#06080f',
+      accent: '#7aa2f7',
+      text: '#c0caf5',
+      red: '#f7768e',
+      green: '#9ece6a',
+      subtext0: '#a9b1d6',
+      overlay0: '#a9b1d6',
+      overlay1: '#565f89',
+      mauve: '#bb9af7',
+    });
+  });
+
+  test('the lookup is by theme name alone: other names get no fixed values', () => {
+    for (const name of ['tokyo-night', 'gentleman-cute', 'Gentleman', '', null, undefined]) {
+      const { custom } = projection.projectPalette({ name, colors: PI_COLORS }).theme;
+      assert.equal('panel_bg' in custom, false, `${String(name)} is not a Gentle theme name`);
+    }
+  });
+
+  test('a fixed surface is emitted even when the palette supplies no mapped colour', () => {
+    assert.deepEqual(projection.projectPalette({ name: 'Gentleman-Cute', colors: {} }).theme.custom, {
+      panel_bg: '#000000',
+      overlay0: '#b99aa9',
+      surface0: '#241822',
+      surface1: '#342230',
+      surface_dim: '#20161e',
+    });
+  });
+});
+
 describe('paletteFingerprint', () => {
   const first = { name: 'nord', colors: { accent: '#111111', mdLink: '#222222' } };
 
   test('the fingerprint is the stable name plus role/hex pairs sorted by role', () => {
-    assert.equal(projection.paletteFingerprint(first), JSON.stringify(['nord', [['accent', '#111111'], ['blue', '#222222']]]));
+    assert.equal(projection.paletteFingerprint(first), JSON.stringify(['nord', [['accent', '#111111']]]));
   });
 
   test('the same palette in another key order is the same fingerprint', () => {
@@ -206,6 +329,15 @@ describe('paletteFingerprint', () => {
     assert.notEqual(projection.paletteFingerprint(recoloured), projection.paletteFingerprint(first));
     const renamed = { name: 'dracula', colors: { accent: '#111111', mdLink: '#222222' } };
     assert.notEqual(projection.paletteFingerprint(renamed), projection.paletteFingerprint(first));
+  });
+
+  test('switching between the Gentle themes changes the fingerprint for the same colours', () => {
+    const cute = projection.paletteFingerprint({ name: 'Gentleman-Cute', colors: PI_COLORS });
+    const sexy = projection.paletteFingerprint({ name: 'Gentleman-Sexy', colors: PI_COLORS });
+    const gentle = projection.paletteFingerprint({ name: 'Gentle', colors: PI_COLORS });
+    assert.notEqual(cute, sexy, 'the fixed surfaces are part of the palette, not decoration');
+    assert.notEqual(cute, gentle);
+    assert.notEqual(sexy, gentle);
   });
 });
 
