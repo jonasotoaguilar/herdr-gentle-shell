@@ -20,7 +20,7 @@
 //   `select theme` — in that order, on the `Herdr` page, never on `Keymaps`;
 // - S3: one row per value with the model's structural option ids (`on`, `off`,
 //   `none`, `theme:<name>`), so each row drives the same apply path the panel
-//   (and the removed command) drives;
+//   (and the removed command) drives; every switch reads Off then On;
 // - the live reads: one model run per synchronous burst, with a cache that is
 //   dropped when an `apply` settles — so the SAME row objects the host repaints
 //   report the applied state without a rebuild — and a TTL that bounds a repaint
@@ -35,8 +35,10 @@
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
-const { customizePanelModel } = require('../lib/customize-panel.js');
+const { createCustomizePanel, customizePanelModel } = require('../lib/customize-panel.js');
 const {
   customizeRows,
   CUSTOMIZE_ROWS_CATEGORY,
@@ -111,6 +113,63 @@ function rowsFor(rows, line) {
   return rows.filter((row) => row.choice.setting === line);
 }
 
+// The panel's own geometry helpers, mirrored here so the panel can be rendered
+// and read back: the point of these tests is what the USER sees on the panel,
+// never a private field of the model.
+const stripAnsi = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+const stubTui = {
+  visibleWidth: (text) => [...stripAnsi(text)].length,
+  truncateToWidth: (text, width, ellipsis = '…') => {
+    const chars = [...stripAnsi(text)];
+    if (chars.length <= width) return String(text);
+    return chars.slice(0, Math.max(0, width - 1)).join('') + ellipsis;
+  },
+  matchesKey: (key, name) => key === name,
+  isKeyRelease: (key) => key === 'release',
+};
+const PANEL_WIDTH = 100;
+const TALL = () => 24;
+
+// The { title, sample } the PANEL paints for one value of one setting: the
+// rendered `Preview · <value> · <title>` headline and the first sample line
+// below it, with the card border and its padding removed. This is the parity
+// oracle — the page must answer exactly this pair, from the panel's own copy.
+function panelPaintedPreview(model, settingId, optionId) {
+  const categoryAt = model.findIndex((category) => (category.settings || []).some((setting) => setting.id === settingId));
+  assert.ok(categoryAt >= 0, `the panel lists the ${settingId} setting`);
+  const settings = model[categoryAt].settings;
+  const settingAt = settings.findIndex((setting) => setting.id === settingId);
+  const setting = settings[settingAt];
+  const at = setting.options.findIndex((option) => option.id === optionId);
+  assert.ok(at >= 0, `the panel lists ${settingId}/${optionId}`);
+
+  const component = createCustomizePanel({
+    helpers: stubTui,
+    hostTui: { requestRender: () => {} },
+    theme: {},
+    rowsAvailable: TALL,
+    model,
+    apply: async () => ({ model }),
+    done: () => {},
+  });
+  for (let step = 0; step < categoryAt; step += 1) component.handleInput('down');
+  component.handleInput('right');
+  for (let step = 0; step < settingAt; step += 1) component.handleInput('down');
+  const landed = setting.options.findIndex((option) => option.current === true);
+  const from = landed < 0 ? 0 : landed;
+  if (at > from) for (let step = from; step < at; step += 1) component.handleInput('right');
+  if (at < from) for (let step = at; step < from; step += 1) component.handleInput('left');
+
+  const lines = component.render(PANEL_WIDTH).map(stripAnsi);
+  const headlineAt = lines.findIndex((line) => line.includes('Preview · '));
+  assert.ok(headlineAt >= 0, `the panel paints a preview for ${settingId}/${optionId}`);
+  const inner = (line) => line.slice(2, -2).trimEnd();
+  const headline = inner(lines[headlineAt]);
+  const prefix = `Preview · ${setting.options[at].label} · `;
+  assert.ok(headline.startsWith(prefix), `the panel names the highlighted value: ${headline}`);
+  return { title: headline.slice(prefix.length), sample: inner(lines[headlineAt + 1] || '') };
+}
+
 // The cache's TTL is measured with `Date.now()`, so the test drives that real
 // clock instead of sleeping: the module reads exactly this and nothing else.
 function withClock(start = 1_000_000) {
@@ -140,7 +199,7 @@ describe('customizeRows — the Herdr page (S1)', () => {
     assert.deepEqual(linesOf(rows), S1_LINES);
 
     // The apply path each line drives is the panel's own setting id, which is
-    // never a row name: `sidebar  ● On  ○ Off` would not read as a name.
+    // never a row name: `sidebar  ○ Off  ● On` would not read as a name.
     const settings = [];
     for (const row of rows) settings.push((await rec.choiceOf(row)).settingId);
     assert.deepEqual([...new Set(settings)], ['sidebar', 'moshi', 'theme-sync', 'theme']);
@@ -154,8 +213,8 @@ describe('customizeRows — the Herdr page (S1)', () => {
     });
 
     const ids = (line) => rowsFor(rows, line).map((row) => row.choice.value);
-    assert.deepEqual(ids('Herd agents'), ['On', 'Off']);
-    assert.deepEqual(ids('Moshi'), ['On', 'Off']);
+    assert.deepEqual(ids('Herd agents'), ['Off', 'On']);
+    assert.deepEqual(ids('Moshi'), ['Off', 'On']);
     // The panel's own order for this switch, unchanged: Off first.
     assert.deepEqual(ids('Theme sync'), ['Off', 'On']);
     assert.deepEqual(ids('Select theme'), [UNASSIGN_TEXT, 'Dark', 'Light']);
@@ -165,8 +224,8 @@ describe('customizeRows — the Herdr page (S1)', () => {
       for (const row of rowsFor(rows, line)) out.push((await rec.choiceOf(row)).optionId);
       return out;
     };
-    assert.deepEqual(await optionIds('Herd agents'), ['on', 'off']);
-    assert.deepEqual(await optionIds('Moshi'), ['on', 'off']);
+    assert.deepEqual(await optionIds('Herd agents'), ['off', 'on']);
+    assert.deepEqual(await optionIds('Moshi'), ['off', 'on']);
     assert.deepEqual(await optionIds('Theme sync'), ['off', 'on']);
     assert.deepEqual(await optionIds('Select theme'), ['none', 'theme:Dark', 'theme:Light']);
 
@@ -516,5 +575,178 @@ describe('customizeRows — no model, no rows', () => {
     assert.deepEqual(customizeRows(), []);
     assert.deepEqual(customizeRows({ model: null, apply: () => undefined }), []);
     assert.deepEqual(customizeRows({ model: () => { throw new Error('unreadable'); }, apply: () => undefined }), []);
+  });
+});
+
+// Defect 1 (parity regression found by using the shipped page): every row of the
+// four S1 settings answers the very title and sample the floating panel paints
+// for that setting and value. The texts are NOT copied here — the page reads them
+// from the model the panel builds (`customizePanelModel`), which owns them — and
+// these tests prove it by rendering the panel and reading its Preview block back.
+describe('customizeRows — the panel\'s own previews on every row (S1/S3)', () => {
+  // One model carries every value of all four settings: `sidebar`/`moshi` both
+  // list On and Off, `theme-sync` both Off and On, and the theme picker lists
+  // the unassign entry plus every installed theme.
+  const ALL_VALUES = () => modelFor({
+    sidebar: 'on',
+    moshi: 'on',
+    sync: 'off',
+    theme: 'Dark',
+    themeNames: ['Dark', 'Light'],
+  });
+
+  test('every value of every setting paints the panel\'s own title and sample', () => {
+    const model = ALL_VALUES();
+    const rows = customizeRows({ model, apply: recorder().apply });
+    const settings = model.flatMap((category) => category.settings);
+    // The page's own line names (S1) for the model's setting ids; the values are
+    // in the model's order, one page row each.
+    const PAGE_LINE = { sidebar: 'Herd agents', moshi: 'Moshi', 'theme-sync': 'Theme sync', theme: 'Select theme' };
+
+    let checked = 0;
+    for (const setting of settings) {
+      const pageRows = rowsFor(rows, PAGE_LINE[setting.id]);
+      assert.equal(pageRows.length, setting.options.length, `one page row per ${setting.id} value`);
+      for (let at = 0; at < setting.options.length; at += 1) {
+        const option = setting.options[at];
+        const row = pageRows[at];
+        assert.equal(typeof row.preview, 'function', `${setting.id}/${option.id} answers a preview`);
+        const preview = row.preview();
+        assert.deepEqual(
+          preview,
+          panelPaintedPreview(model, setting.id, option.id),
+          `${setting.id}/${option.id}: the page paints what the panel paints`,
+        );
+        assert.ok(preview.title.length > 0, 'the title is never empty');
+        assert.ok(preview.sample.length > 0, 'the sample is never empty');
+        checked += 1;
+      }
+    }
+    // The four settings, every value: 2 sidebar + 2 moshi + 2 sync + 3 themes.
+    assert.equal(checked, 9, 'all four settings were checked, on every value');
+  });
+
+  test('the sample follows a changed state without a rebuild', () => {
+    const model = ALL_VALUES();
+    const rows = customizeRows({ model, apply: recorder().apply });
+    const moshiOff = rowsFor(rows, 'Moshi').find((row) => row.choice.value === 'Off');
+    assert.equal(moshiOff.preview().sample, 'silent; no Moshi notification');
+
+    // The state changes underneath the mounted rows (the model the page was built
+    // from is edited in place, exactly like the host's live model): the SAME row
+    // answers the new sample without any rebuild.
+    const moshiSetting = model.flatMap((category) => category.settings).find((setting) => setting.id === 'moshi');
+    moshiSetting.options.find((option) => option.id === 'off').preview = {
+      title: 'static notification sample',
+      sample: 'changed sample',
+    };
+    assert.equal(moshiOff.preview().sample, 'changed sample', 'the mounted row re-reads the live model');
+  });
+
+  test('the page carries no copy of the panel\'s samples: one source of truth', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'customize-rows.js'), 'utf8');
+    for (const sample of [
+      '● project   gentle   worker',
+      'native Herdr rows; no managed block',
+      'ask   finished',
+      'silent; no Moshi notification',
+      'Herdr follows the theme active in Pi',
+      'Herdr keeps its last palette',
+      'no theme pinned; Herdr keeps its last palette',
+      'static sidebar sample',
+      'static notification sample',
+      'static sync sample',
+      'static unassigned sample',
+      'source palette',
+    ]) {
+      assert.equal(source.includes(sample), false, `lib/customize-rows.js must not copy ${JSON.stringify(sample)}`);
+    }
+    // And the samples really come from the panel module: its own model is the
+    // only place those strings live.
+    const panel = fs.readFileSync(path.join(__dirname, '..', 'lib', 'customize-panel.js'), 'utf8');
+    for (const sample of ['● project   gentle   worker', 'ask   finished', 'Herdr keeps its last palette']) {
+      assert.equal(panel.includes(sample), true, `lib/customize-panel.js owns ${JSON.stringify(sample)}`);
+    }
+  });
+
+  test('the panel\'s per-setting note rides in the preview title, live, never in a hint', () => {
+    // An unreadable sidebar state is the panel's own note line; the page carries
+    // the same sentence — no new wording — inside the preview TITLE, because a
+    // `choice.hint` would be a build-time string the host prefers over the live
+    // preview (D3).
+    const unknown = modelFor({ sidebar: 'unknown', moshi: 'on', sync: 'off', theme: null, themeNames: ['Dark'] });
+    const sidebarNote = unknown.flatMap((category) => category.settings)
+      .find((setting) => setting.id === 'sidebar').note;
+    assert.equal(sidebarNote, 'state unknown; Enter turns the rows on', 'the panel owns the sentence');
+
+    const rows = customizeRows({ model: unknown, apply: recorder().apply });
+    for (const row of rowsFor(rows, 'Herd agents')) {
+      assert.equal('hint' in row.choice, false, 'the choice carries no hint at all');
+      assert.equal(row.preview().title, `static sidebar sample · ${sidebarNote}`, 'the note is in the live title');
+      assert.equal(
+        row.preview().sample,
+        row.choice.value === 'On' ? '● project   gentle   worker' : 'native Herdr rows; no managed block',
+        'and the sample stays the value\'s own',
+      );
+    }
+
+    // The theme picker's own unknown note rides there too.
+    const unreadableTheme = modelFor({ theme: null, readable: false, themeNames: ['Dark'] });
+    const themeNote = unreadableTheme.flatMap((category) => category.settings)
+      .find((setting) => setting.id === 'theme').note;
+    assert.match(themeNote, /state unknown/);
+    const themeRows = rowsFor(customizeRows({ model: unreadableTheme, apply: recorder().apply }), 'Select theme');
+    assert.ok(themeRows.length > 0);
+    for (const row of themeRows) {
+      assert.equal('hint' in row.choice, false);
+      assert.ok(row.preview().title.endsWith(` · ${themeNote}`), 'the theme note is live in its preview title');
+    }
+
+    // A readable state carries no note, so no title carries one.
+    for (const row of customizeRows({ model: ALL_VALUES(), apply: recorder().apply })) {
+      assert.equal('hint' in row.choice, false);
+      assert.equal(row.preview().title.includes('state unknown'), false, 'no note without a panel note');
+    }
+
+    // LIVE: the state becomes readable underneath the mounted row (the model the
+    // page was built from is edited in place). The note must leave with it: a
+    // stale sentence on screen would hide the correct preview.
+    const mounted = customizeRows({ model: unknown, apply: recorder().apply });
+    const mountedSidebar = rowsFor(mounted, 'Herd agents')[0];
+    assert.ok(mountedSidebar.preview().title.includes(sidebarNote));
+    const sidebarSetting = unknown.flatMap((category) => category.settings).find((setting) => setting.id === 'sidebar');
+    delete sidebarSetting.note;
+    assert.equal(mountedSidebar.preview().title, 'static sidebar sample', 'the note is gone from the same row');
+  });
+});
+
+// The human's report, on the page: the same three switches, one order. The page
+// builds its rows from the panel's model, so this observes the rows the host
+// walks and the `current()` bullet the host lands on.
+describe('customizeRows — every switch reads Off then On', () => {
+  const STATES = [
+    { sidebar: 'on', moshi: 'on' },
+    { sidebar: 'on', moshi: 'off' },
+    { sidebar: 'off', moshi: 'on' },
+    { sidebar: 'off', moshi: 'off' },
+  ];
+  const LINES = [['Herd agents', 'sidebar'], ['Moshi', 'moshi'], ['Theme sync', 'theme-sync']];
+  const word = (value) => (value === 'on' ? 'On' : 'Off');
+
+  test('the rows are Off then On for every state, and current() marks the stored value', () => {
+    for (const state of STATES) {
+      for (const sync of ['on', 'off']) {
+        const rows = customizeRows({ model: modelFor({ ...state, sync }), apply: recorder().apply });
+        for (const [line, id] of LINES) {
+          const lineRows = rowsFor(rows, line);
+          assert.deepEqual(lineRows.map((row) => row.choice.value), ['Off', 'On'], `${id} reads Off then On`);
+          const stored = id === 'theme-sync' ? sync : state[id];
+          const current = lineRows.filter((row) => row.choice.current()).map((row) => row.choice.value);
+          // The host lands the cursor on the row whose `current()` is true, so
+          // this is where the cursor starts — never on the first row by position.
+          assert.deepEqual(current, [word(stored)], `${id}: ${stored} is the current row`);
+        }
+      }
+    }
   });
 });

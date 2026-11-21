@@ -133,3 +133,27 @@ tasks are the slices that make them true.
   swallowed `registerRows` failure leaves only the command, and the synchronous root discovery plus
   `configure.js --check` have per-process timeouts but no end-to-end UI latency bound.
   Delivery shape is the human's decision and is not taken here.
+- **L8** (post-release correction, user, verbatim fragments): after using the shipped 1.9.0 the user
+  reported «no le pusiste preview» on the Herdr page, that the old panel «se muestra siempre» with the
+  theme picker even while theme sync is on and it should only be offered when sync is off «como lo
+  hiciste en gentle customize», and later «deberia ser off primero y luego on» for all three switches,
+  «que haya consistencia». Root cause of the miss: every check asserted the shape of the rows, none
+  compared what the screen shows against the old panel.
+  Fixes, all on `fix/herdr-customize-parity` and shipped as 1.9.1: the page's four settings answer the
+  panel's own `{ title, sample }` (`bb8700c`); the panel withholds the theme picker while sync is on and
+  brings it back on the same mounted card (`bb8700c`); native Pi themes got a swatch (the preview asked
+  for the foreground token `accent` as a background, and Pi throws on it; it now uses `selectedBg`),
+  the Theme sync column no longer moves when the picker is withheld, and the per-setting note travels in
+  the live preview instead of a build-time hint (`3e7aaa1`); the swatch words are painted over the
+  theme's own background instead of the ambient one (`6f1ce7f`); every switch reads Off then On, fixed at
+  the model both surfaces read, with the unknown-state cursor chosen by id and no longer by position
+  (`37e30d0`); the plain text fallback follows (the commit after it).
+- **L9** (verification, parent): two further independent passes, this time on the rendered screen with
+  the real Gentle Shell view, the real bridge and Pi 1.6.0's theme module. They found, and the commits
+  above fixed: native swatches unavailable, an eight-column jump of the Theme sync values, a stale
+  note on a mounted row, and an unreadable light-on-dark / dark-on-light swatch. They also listed items
+  inherited from the base and from the host that this release does NOT change: the theme catalogue
+  stays fixed after mount, a theme literally named `None` is ambiguous on the old panel, the
+  unknown-state note can read "Enter turns the sync on" while Off is highlighted, and the host omits the
+  preview at 15 terminal rows. The last two changes (the order and the fallback menu) were verified by
+  tests and by a differential against `daee1ba`, not by a third screen pass; the user chose to publish.

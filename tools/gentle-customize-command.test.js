@@ -202,6 +202,19 @@ async function settlePanel(component) {
   assert.equal(component.state.busy, false, 'the panel apply settled');
 }
 
+// The last background operation before the swatch's sample words. It must be a
+// PAINTED background (`48;…`), never a reset (`\x1b[0m`) or a default
+// (`\x1b[49m`): those end the theme's background and drop the words onto the
+// user's ambient terminal background, which is the unreadable pairing the
+// verifier measured (light on #141414 = 1.62:1, dark on #fafafa = 1.22:1).
+function backgroundBeforeSample(frame) {
+  const at = frame.indexOf('Aa  sample text');
+  assert.ok(at >= 0, 'the sample words are painted');
+  const marks = [...frame.slice(0, at).matchAll(/\x1b\[(?:0|49|48;[0-9;]*)m/g)];
+  assert.ok(marks.length > 0, 'the sample paints a background before the words');
+  return marks.at(-1)[0];
+}
+
 before(() => {
   // The real artifact the sidebar switch drives, plus a fake `herdr` for the
   // `--reload` leg: the plugin root is the repository checkout, the config is
@@ -663,10 +676,32 @@ test('customize menu offers both switches, the theme rows and On/Off', async () 
   await run(h, '');
   assert.deepEqual(offered.map(([, options]) => options), [
     MENU_OPTIONS,
-    ['On', 'Off'],
+    ['Off', 'On'],
   ]);
   assert.equal(offered[0][0], 'Customize · Herdr Gentle Shell');
   assert.equal(offered[1][0], 'Moshi notifications (currently off)');
+});
+
+// The fallback is a surface like any other: its second prompt offers Off first
+// and On second, for every switch. The menu entry keeps its own order, and the
+// prompt title (with `(currently …)`) is untouched by this change.
+test('the fallback second prompt offers Off then On for every switch', async () => {
+  for (const label of ['Sidebar agent rows', 'Moshi notifications', 'Theme sync']) {
+    const h = harness();
+    const offered = [];
+    const queueNext = h.ctx.ui.select;
+    h.ctx.ui.select = async (title, options) => {
+      offered.push([title, options]);
+      return queueNext();
+    };
+    // The menu pick is consumed; the second prompt is cancelled, so nothing is
+    // applied and this observes the offer alone.
+    h.selections.push(label);
+    await run(h, '');
+    assert.deepEqual(offered.map(([, options]) => options), [MENU_OPTIONS, ['Off', 'On']], label);
+    assert.match(offered[1][0], new RegExp(`^${label} \\(currently .+\\)$`), `${label}: the prompt title keeps its shape`);
+    assert.deepEqual(noticeTexts(h), [], `${label}: cancelling the second prompt writes nothing and says nothing`);
+  }
 });
 
 describe('theme sync switch', () => {
@@ -1087,8 +1122,9 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('right');
         assert.ok(component.render(100).join('\n').includes('▸ Sidebar agent rows'));
-        // The cursor lands on the stored option: one step left is the other one.
-        component.handleInput('left');
+        // The cursor lands on the stored option (Off, the first one): one step
+        // right is the other one.
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         assert.equal(done(), 'pending', 'the panel stays open after an apply');
@@ -1122,7 +1158,7 @@ describe('floating customize panel', () => {
         const seen = component.render(100).join('\n');
         assert.ok(seen.includes('▸ Sidebar agent rows'));
         assert.equal(seen.includes('Notifications'), false, 'the category carries no Moshi switch');
-        component.handleInput('left');
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         component.handleInput('escape');
@@ -1148,8 +1184,8 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        // The stored Off is the second option, so ← is the way to On.
-        component.handleInput('left');
+        // The stored Off is the first option, so → is the way to On.
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         return done();
@@ -1177,7 +1213,7 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('left');
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         return done();
@@ -1217,8 +1253,8 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        // The stored On is the first option; the second one is Off.
-        component.handleInput('right');
+        // The stored On is the second option; ← reaches Off.
+        component.handleInput('left');
         component.handleInput('enter');
         await settlePanel(component);
         return done();
@@ -1572,8 +1608,17 @@ describe('floating panel theme rows', () => {
       themes: [{ name: 'nord' }],
       getTheme: (name) => ({
         name,
-        getBgAnsi: () => '\x1b[48;5;17m',
-        getFgAnsi: () => '\x1b[38;5;250m',
+        // The real Pi 1.6.0 Theme accepts only background tokens here (`accent`
+        // is a foreground token and throws `Unknown theme color: accent`), so
+        // the double refuses anything else instead of accepting by accident.
+        getBgAnsi: (token) => {
+          if (token !== 'selectedBg') throw new Error(`Unknown theme color: ${token}`);
+          return '\x1b[48;5;17m';
+        },
+        getFgAnsi: (token) => {
+          if (token !== 'text') throw new Error(`Unknown theme color: ${token}`);
+          return '\x1b[38;5;250m';
+        },
       }),
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
@@ -1589,8 +1634,14 @@ describe('floating panel theme rows', () => {
     });
     await withThemePanel(h);
     assert.ok(seen.frame.includes('Preview · nord · source palette'), 'the upstream headline');
-    assert.ok(seen.frame.includes('\x1b[48;5;17m'), "the swatch uses that theme's own accent background");
+    assert.ok(seen.frame.includes('\x1b[48;5;17m'), "the swatch uses that theme's own palette");
     assert.ok(seen.frame.includes('Aa  sample text'), 'the upstream sample text');
+    // The words are painted OVER that theme's background, never after a reset.
+    assert.match(
+      backgroundBeforeSample(seen.frame),
+      /^\x1b\[48;/,
+      'the last background before the sample words is the theme background, not a reset',
+    );
   });
 
   test('a theme that cannot be read renders Preview unavailable, never the active theme', async () => {
@@ -1618,28 +1669,37 @@ describe('floating panel theme rows', () => {
     assert.equal(seen.frame.includes('source palette'), false);
   });
 
-  test('the overlay reads the stored theme and disables the setting while the sync is on', async () => {
+  test('the overlay never offers the theme setting while the stored sync is on', async () => {
     const env = setupEnvironment('overlay-theme-stored');
     fs.writeFileSync(env.configPath, '');
     writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
-    let seen = '';
+    const before = fs.readFileSync(themePath(env), 'utf8');
+    const seen = {};
     const h = harness({
       themes: [{ name: 'dracula' }, { name: 'nord' }],
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('down');
-        component.handleInput('right');
-        component.handleInput('down');
-        seen = component.render(100).join('\n');
+        seen.categories = component.render(100).join('\n');
+        // Enter in the categories pane only opens the controls: nothing on this
+        // screen can apply a theme, so no refusal is ever reached.
+        component.handleInput('enter');
+        seen.controls = component.render(100).join('\n');
         component.handleInput('escape');
         return done();
       },
     });
     await withThemePanel(h);
-    assert.ok(seen.includes('● On'), 'the sync setting reads its stored On');
-    assert.ok(seen.includes('● dracula'), 'the assigned theme stays readable');
-    assert.ok(seen.includes('Turn Theme sync off to pick a specific theme.'), 'the disabled setting explains itself');
+    for (const frame of [seen.categories, seen.controls]) {
+      assert.equal(frame.includes('Gentle Shell theme'), false, 'the picker is not offered at all');
+      assert.equal(frame.includes('Turn Theme sync off to pick a specific theme.'), false, 'and it is not refused in place: it is absent');
+      assert.ok(frame.includes('Herdr Theme · 1/1'), 'the category counts only the sync setting');
+    }
+    assert.ok(seen.controls.includes('● On'), 'the sync setting reads its stored On');
+    assert.deepEqual(h.notices, [], 'Enter on that screen emits no notice');
+    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'and writes nothing');
+    assert.deepEqual(h.reloads, []);
   });
 
   test('Enter on the sync setting writes the store, keeps the pin and skips the Pi reload', async () => {
@@ -1669,31 +1729,57 @@ describe('floating panel theme rows', () => {
     assert.equal(fs.existsSync(env.flagPath), false);
   });
 
-  test('the disabled theme setting refuses through the overlay and writes nothing', async () => {
+  test('the same mounted overlay brings the picker back when the sync is turned off, and drops it again', async () => {
     const env = setupEnvironment('overlay-theme-refused');
     fs.writeFileSync(env.configPath, '');
     writeThemeFile(env, { sync: true, theme: 'dracula', updatedAt: '2024-01-01T00:00:00.000Z' });
-    const before = fs.readFileSync(themePath(env), 'utf8');
+    const seen = {};
     const h = harness({
-      themes: [{ name: 'nord' }],
+      themes: [{ name: 'dracula' }, { name: 'nord' }],
       customImpl: async (factory) => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
+        // Herdr Theme → its only offered setting, whose cursor lands on the
+        // stored On.
         component.handleInput('down');
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('down');
-        assert.ok(component.render(100).join('\n').includes('▸ Gentle Shell theme'));
+        seen.on = component.render(100).join('\n');
+        // ← reaches Off on ONE key and Enter turns the sync off in the panel
+        // that is already mounted.
+        component.handleInput('left');
         component.handleInput('enter');
         await settlePanel(component);
+        seen.off = component.render(100).join('\n');
+        // The cursor stayed on the sync setting, so → returns to On and Enter
+        // hides the picker again.
+        component.handleInput('right');
+        component.handleInput('enter');
+        await settlePanel(component);
+        seen.onAgain = component.render(100).join('\n');
         component.handleInput('escape');
         return done();
       },
     });
     await withThemePanel(h);
-    assert.deepEqual(noticeTexts(h), ['Turn Theme sync off to pick a specific theme.']);
-    assert.deepEqual(h.notices.map(([, level]) => level), ['warning']);
-    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'the refusal writes nothing');
-    assert.deepEqual(h.reloads, []);
+
+    assert.equal(seen.on.includes('Gentle Shell theme'), false, 'absent with the stored sync on');
+    assert.ok(seen.on.includes('Herdr Theme · 1/1'), 'the category counts only the sync setting');
+
+    assert.ok(seen.off.includes('Gentle Shell theme'), 'the picker is back without closing and reopening');
+    assert.ok(seen.off.includes('Herdr Theme · 1/2'));
+    assert.ok(seen.off.includes('● dracula'), 'with the pin the store kept');
+
+    assert.equal(seen.onAgain.includes('Gentle Shell theme'), false, 'and it is gone again when the sync returns');
+    assert.equal(seen.onAgain.includes('Turn Theme sync off to pick a specific theme.'), false, 'nothing refuses an absent setting');
+    assert.ok(seen.onAgain.includes('Herdr Theme · 1/1'));
+
+    assert.deepEqual(noticeTexts(h), [
+      "Theme sync off; Herdr keeps the palette it was last given.",
+      "Theme sync on; Herdr's palette follows the theme active in Pi.",
+    ]);
+    const doc = readThemeFile(env);
+    assert.deepEqual([doc.sync, doc.theme], [true, 'dracula'], 'the pin survived both toggles');
+    assert.deepEqual(h.reloads, [], 'the theme switch never reloads Pi');
   });
 
   test('a Moshi apply that needs a reload closes the overlay before Pi reloads', async () => {
@@ -1706,7 +1792,7 @@ describe('floating panel theme rows', () => {
         const { component } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('left');
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         // The panel closed itself (close:true) so the host can reload.

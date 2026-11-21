@@ -645,9 +645,13 @@ switch and one pinned theme.
 palette of the theme Pi is showing, and it follows a theme change while Pi keeps
 running. While it is off, `Gentle Shell theme` pins one Gentle Shell / Pi theme
 from Pi's own inline list (`None` first, then the host's order) and `None`
-clears the pin; the setting is painted dim and refused while the sync is on
-(`Turn Theme sync off to pick a specific theme.`). Turning the sync off writes
-nothing to Herdr, so **Herdr keeps the last applied palette** — a fresh install
+clears the pin. While the sync is on, `Gentle Shell theme` is not offered at
+all: it is absent from the panel and from the page alike, and it comes back on
+the surface you already have the moment the sync is turned off. A theme attempt
+that still arrives (the plain fallback menu, the apply path) writes nothing and
+is refused with `Turn Theme sync off to pick a specific theme.`. Turning the
+sync off writes nothing to Herdr, so **Herdr keeps the last applied palette** — a
+fresh install
 whose sync is off and whose theme is unassigned writes nothing at all. State is
 one file, `gentle-theme.json`, beside `gentle-moshi.json`.
 

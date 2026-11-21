@@ -63,14 +63,6 @@ const bandTheme = {
   bg: (_role, text) => `[${text}]`,
 };
 
-// A theme that answers only the dim role, so a disabled line is recognisable
-// without turning every other role into noise.
-const dimTheme = {
-  fg: (role, text) => (role === 'dim' ? `«${text}»` : text),
-  bold: (text) => text,
-  bg: (_role, text) => `[${text}]`,
-};
-
 // Records the roles the panel asks for, without changing a single column.
 function roleTheme() {
   const roles = [];
@@ -180,9 +172,9 @@ describe('customize panel model', () => {
     assert.deepEqual(model.map((category) => category.id), ['sidebar', 'moshi', 'theme']);
     assert.deepEqual(model.map((category) => category.title), ['Herdr Sidebar', 'Moshi notifications', 'Herdr Theme']);
     assert.deepEqual(model[0].settings.map((setting) => setting.id), ['sidebar']);
-    assert.deepEqual(model[0].settings[0].options.map((option) => option.label), ['On', 'Off']);
+    assert.deepEqual(model[0].settings[0].options.map((option) => option.label), ['Off', 'On']);
     assert.deepEqual(model[1].settings.map((setting) => setting.id), ['moshi']);
-    assert.deepEqual(model[1].settings[0].options.map((option) => option.label), ['On', 'Off']);
+    assert.deepEqual(model[1].settings[0].options.map((option) => option.label), ['Off', 'On']);
     assert.deepEqual(model[2].settings.map((setting) => setting.id), ['theme-sync', 'theme']);
     assert.deepEqual(model[2].settings[0].options.map((option) => option.label), ['Off', 'On']);
     assert.deepEqual(model[2].settings[1].options.map((option) => option.label), ['None', 'nord', 'dracula']);
@@ -253,11 +245,13 @@ describe('customize panel model', () => {
     assert.equal(setting.note, 'Themes unavailable; use Pi /settings');
   });
 
-  test('a stored sync On disables the theme setting and explains the refusal', () => {
+  test('a stored sync On marks the theme setting unavailable while keeping its rows', () => {
     const model = modelWith({ theme: { ok: true, sync: true, theme: 'dracula' } });
     const setting = model[2].settings[1];
+    // The model still carries the picker (the Gentle Shell page keeps its
+    // mounted rows and hides them with `visible()`, so the picker returns in
+    // place); the PANEL is where it is not offered — see the theme gate block.
     assert.equal(setting.disabled, true);
-    assert.equal(setting.note, 'Turn Theme sync off to pick a specific theme.');
     assert.deepEqual(setting.options.filter((option) => option.current).map((option) => option.id), ['theme:dracula']);
     assert.equal(model[2].settings[0].options.find((option) => option.current).label, 'On');
   });
@@ -271,7 +265,7 @@ describe('customize panel render', () => {
     assert.equal(lines[1], card(`${TITLE}${' '.repeat(INNER - TITLE.length - 3)}esc`));
     assert.equal(lines[2], row('CATEGORIES', 'Herdr Sidebar · 1/1'));
     assert.equal(lines[3], card(''));
-    assert.equal(lines[4], row('▸ Herdr Sidebar', '▸ Sidebar agent rows  ● On  ○ Off'));
+    assert.equal(lines[4], row('▸ Herdr Sidebar', '▸ Sidebar agent rows  ○ Off  ● On'));
     assert.equal(lines[23], `╰${'─'.repeat(INNER + 2)}╯`);
     // The fixed `● On  ○ Off` button pair is gone: the line is ONE setting with
     // its options inline, and nothing toggles on navigation.
@@ -318,7 +312,7 @@ describe('customize panel render', () => {
     assert.equal(opening[4].includes('[▸ Sidebar agent rows'), false, 'the setting line has no band yet');
     assert.ok(opening[4].includes('▸ Sidebar agent rows'), 'but it still marks the line Enter would use');
     component.handleInput('right');
-    assert.ok(lineWith(component, 'Sidebar agent rows').includes('[▸ Sidebar agent rows  ● On  ○ Off'));
+    assert.ok(lineWith(component, 'Sidebar agent rows').includes('[▸ Sidebar agent rows  ○ Off  ● On'));
     assert.equal(lineWith(component, 'Herdr Sidebar ·').includes('[  Herdr Sidebar'), false, 'the categories gave the band up');
   });
 
@@ -358,7 +352,7 @@ describe('customize panel render', () => {
     const { component } = open({ theme: hostile });
     const seen = frame(component).join('\n');
     assert.ok(seen.includes(TITLE));
-    assert.ok(seen.includes('Sidebar agent rows  ● On  ○ Off'));
+    assert.ok(seen.includes('Sidebar agent rows  ○ Off  ● On'));
     assert.ok(seen.includes('Moshi notifications'));
   });
 });
@@ -383,12 +377,12 @@ describe('customize panel focus and keys', () => {
     const calls = [];
     const { component, done } = open({ apply: async (request) => { calls.push(request); return {}; } });
     component.handleInput('right');
-    component.handleInput('right');
-    assert.ok(lineWith(component, 'Sidebar agent rows').includes('● On  › Off'));
     component.handleInput('left');
-    assert.ok(lineWith(component, 'Sidebar agent rows').includes('● On  ○ Off'));
+    assert.ok(lineWith(component, 'Sidebar agent rows').includes('› Off  ● On'));
     component.handleInput('right');
+    assert.ok(lineWith(component, 'Sidebar agent rows').includes('○ Off  ● On'));
     component.handleInput('left');
+    component.handleInput('right');
     await settle(component);
     assert.deepEqual(calls, [], 'moving never applies');
     assert.equal(done(), 'pending');
@@ -398,7 +392,10 @@ describe('customize panel focus and keys', () => {
     const { component } = open();
     component.handleInput('right');
     assert.equal(component.state.pane, 'controls');
-    // The cursor is on the first option (the stored On): ← leaves the pane.
+    // The cursor is on the stored On (the second option): ← reaches Off, and ←
+    // again, past the first option, leaves the pane.
+    component.handleInput('left');
+    assert.equal(component.state.pane, 'controls');
     component.handleInput('left');
     assert.equal(component.state.pane, 'categories');
   });
@@ -432,12 +429,12 @@ describe('customize panel focus and keys', () => {
       apply: async (request) => { calls.push(request); return { model: next }; },
     });
     component.handleInput('right');
-    component.handleInput('right');
+    component.handleInput('left');
     component.handleInput('enter');
     await settle(component);
     assert.deepEqual(calls, [{ categoryId: 'sidebar', settingId: 'sidebar', optionId: 'off' }]);
     assert.equal(done(), 'pending', 'Enter confirms the option, it does not close the overlay');
-    assert.ok(lineWith(component, 'Sidebar agent rows').includes('○ On  ● Off'), 'the panel re-read the new state');
+    assert.ok(lineWith(component, 'Sidebar agent rows').includes('● Off  ○ On'), 'the panel re-read the new state');
   });
 
   test('Enter in the categories pane opens the controls instead of applying', async () => {
@@ -473,7 +470,7 @@ describe('customize panel apply flow', () => {
     const next = modelWith({ sidebar: 'off', moshi: 'on' });
     const { component } = open({ apply: async () => ({ model: next }) });
     component.handleInput('right');
-    component.handleInput('right');
+    component.handleInput('left');
     component.handleInput('enter');
     await settle(component);
     // The cursor stayed on the option it applied (`off`), which is now current.
@@ -482,7 +479,7 @@ describe('customize panel apply flow', () => {
     component.handleInput('tab');
     component.handleInput('down');
     component.handleInput('tab');
-    assert.ok(lineWith(component, 'Notifications').includes('● On  ○ Off'));
+    assert.ok(lineWith(component, 'Notifications').includes('○ Off  ● On'));
   });
 
   test('a second Enter while apply is in flight does nothing', async () => {
@@ -602,7 +599,6 @@ describe('customize panel overflow', () => {
   // 32 installed themes, from a short-name family: the point of this block is
   // the sideways window, not the width of a real theme name.
   const MANY = Array.from({ length: 32 }, (_, index) => String(index).padStart(2, '0'));
-  const TOTAL = MANY.length + 1;
   const manyModel = () => modelWith({ themeNames: MANY });
 
   function focusThemeSetting(component) {
@@ -615,7 +611,7 @@ describe('customize panel overflow', () => {
   // The cursor option is visible when the line prints it whole (window or plain
   // form) or, in the compact form, when the value between its arrows is an
   // ellipsized prefix of that same option. It is never another option's value.
-  function cursorVisible(line, label, counter) {
+  function cursorVisible(line, label) {
     if (line.includes(`› ${label}`) || line.includes(`● ${label}`)) return true;
     const at = line.indexOf('‹ ');
     if (at < 0) return false;
@@ -638,9 +634,8 @@ describe('customize panel overflow', () => {
       for (let step = 0; step <= MANY.length; step += 1) {
         const line = lineWith(component, 'Gentle Shell theme', width);
         const label = cursor === 0 ? 'None' : MANY[cursor - 1];
-        const counter = `${cursor + 1}/${TOTAL}`;
         assert.ok(
-          cursorVisible(line, label, counter),
+          cursorVisible(line, label),
           `cursor option ${label} is what the card shows at ${width} columns (cursor ${cursor}): ${line}`,
         );
         assert.equal([...line].length, width, `the line is exactly ${width} columns`);
@@ -771,7 +766,7 @@ describe('customize panel narrow and small terminals', () => {
     component.handleInput('down');
     assert.ok(frame(component, 50).join('\n').includes('▸ Moshi notifications'));
     component.handleInput('right');
-    assert.ok(lineWith(component, 'Notifications', 50).includes('○ On  ● Off'));
+    assert.ok(lineWith(component, 'Notifications', 50).includes('● Off  ○ On'));
     for (const line of frame(component, 50)) assert.equal([...line].length, 50);
   });
 
@@ -792,7 +787,7 @@ describe('customize panel narrow and small terminals', () => {
     // At 60 columns the right pane is too narrow for both options on one line,
     // so the stored one stays visible and the hidden one becomes an arrow.
     assert.ok(seen.includes('● On'));
-    assert.ok(seen.includes('› 1/2'));
+    assert.ok(seen.includes('‹ ● On 2/2'));
   });
 });
 
@@ -803,34 +798,231 @@ describe('customize panel preserved rows', () => {
     const sidebar = open();
     assert.equal(
       lineWith(sidebar.component, 'Sidebar agent rows'),
-      row('▸ Herdr Sidebar', setting('▸ ', 'Sidebar agent rows', '● On  ○ Off')),
+      row('▸ Herdr Sidebar', setting('▸ ', 'Sidebar agent rows', '○ Off  ● On')),
     );
     const moshi = open({ model: modelWith({ moshi: 'on' }) });
     moshi.component.handleInput('down');
     moshi.component.handleInput('right');
     assert.equal(
       lineWith(moshi.component, 'Notifications'),
-      row('  Herdr Sidebar', setting('▸ ', 'Notifications', '● On  ○ Off', 13)),
+      row('  Herdr Sidebar', setting('▸ ', 'Notifications', '○ Off  ● On', 13)),
     );
     const unknown = open({ model: modelWith({ sidebar: 'unknown' }) });
     unknown.component.handleInput('right');
     assert.equal(
       lineWith(unknown.component, 'Sidebar agent rows'),
-      row('  Herdr Sidebar', setting('▸ ', 'Sidebar agent rows', '› On  ○ Off')),
+      row('  Herdr Sidebar', setting('▸ ', 'Sidebar agent rows', '○ Off  › On')),
     );
   });
 
-  test('the disabled theme setting is painted dim and never offered the band', () => {
+  test('a setting the model marks unavailable is never offered, dim or not', () => {
     const model = modelWith({ theme: { ok: true, sync: true, theme: null } });
-    const { component } = open({ model, theme: dimTheme });
+    const { component } = open({ model, theme: bandTheme });
     component.handleInput('down');
     component.handleInput('down');
     component.handleInput('right');
-    const enabled = lineWith(component, 'Theme sync');
-    assert.ok(enabled.includes('['), 'an actionable setting keeps the band');
+    const seen = frame(component).join('\n');
+    assert.equal(seen.includes('Gentle Shell theme'), false, 'no line, no dim role, no note: simply absent');
+    const sync = lineWith(component, 'Theme sync');
+    assert.ok(sync.includes('[▸ Theme sync'), 'the actionable setting keeps the band');
+  });
+});
+
+// Defect 2 (found by using the shipped command): `/herdr-gentle:customize` always
+// offered the theme picker while the sync was on, while the Gentle Shell page
+// hides it — the pinned theme is only available when the sync is off. The panel
+// now behaves the same way: the setting is ABSENT (not dim, not refusing, not a
+// note), and it is back the moment the sync is turned off from the panel that is
+// already open. Everything else about the card is untouched, which the rest of
+// this file guards.
+describe('customize panel theme gate (S3, S7)', () => {
+  const syncState = (sync, theme = 'dracula') => ({ ok: true, sync, theme });
+
+  test('the theme setting is absent while the stored sync is on, and returns without reopening', async () => {
+    const calls = [];
+    const apply = async (request) => {
+      calls.push(request);
+      return { model: modelWith({ theme: syncState(request.optionId === 'on') }) };
+    };
+    const { component, done } = open({ model: modelWith({ theme: syncState(true) }), apply });
     component.handleInput('down');
-    const disabled = lineWith(component, 'Gentle Shell theme');
-    assert.ok(disabled.includes('«'), 'the disabled setting is painted in the dim role');
-    assert.equal(disabled.includes('['), false, 'the disabled setting is never offered the band');
+    component.handleInput('down');
+
+    let seen = frame(component).join('\n');
+    assert.equal(seen.includes('Gentle Shell theme'), false, 'the picker is not offered at all');
+    assert.equal(seen.includes('Turn Theme sync off'), false, 'and it is not explained either: it is absent');
+    assert.ok(seen.includes('Herdr Theme · 1/1'), 'the category holds only the sync switch');
+    assert.equal(frame(component)[1], card(`${TITLE}${' '.repeat(INNER - TITLE.length - 3)}esc`), 'the card chrome is unchanged');
+
+    // Turn the sync off from inside the same panel: the cursor landed on the
+    // stored On, so ← reaches Off and Enter applies it.
+    component.handleInput('right');
+    component.handleInput('left');
+    component.handleInput('enter');
+    await settle(component);
+    assert.deepEqual(calls, [{ categoryId: 'theme', settingId: 'theme-sync', optionId: 'off' }]);
+
+    seen = frame(component).join('\n');
+    assert.ok(seen.includes('Gentle Shell theme'), 'the picker is back without closing and reopening');
+    assert.ok(seen.includes('Herdr Theme · 1/2'), 'and the category counts it again');
+    assert.ok(seen.includes('● dracula'), 'with the pin the store kept');
+    assert.equal(done(), 'pending', 'the panel never closed');
+  });
+
+  test('turning the sync back on removes the setting from the panel that is open', async () => {
+    const calls = [];
+    const apply = async (request) => {
+      calls.push(request);
+      return { model: modelWith({ theme: syncState(request.optionId === 'on') }) };
+    };
+    const { component, done } = open({ model: modelWith({ theme: syncState(false) }), apply });
+    component.handleInput('down');
+    component.handleInput('down');
+    assert.ok(frame(component).join('\n').includes('Gentle Shell theme'), 'the picker starts offered');
+
+    // Theme sync is the category's first setting and the cursor landed on the
+    // stored Off, so → moves to On and Enter applies it.
+    component.handleInput('right');
+    component.handleInput('right');
+    component.handleInput('enter');
+    await settle(component);
+    assert.deepEqual(calls, [{ categoryId: 'theme', settingId: 'theme-sync', optionId: 'on' }]);
+
+    const seen = frame(component).join('\n');
+    assert.equal(seen.includes('Gentle Shell theme'), false, 'the picker is gone from the same panel');
+    assert.equal(seen.includes('Turn Theme sync off to pick a specific theme.'), false, 'nothing explains an absent setting');
+    assert.ok(seen.includes('Herdr Theme · 1/1'));
+    assert.equal(done(), 'pending');
+  });
+});
+
+// D2 (independent verification on the real host): withholding the theme setting
+// removed the widest label from the column computation, so `Off`/`On` jumped
+// eight columns left on the panel that was already open. The column comes from
+// the category's FULL setting set now — offered or not — so it never moves.
+describe('customize panel theme gate — the value column (D2)', () => {
+  test('hiding the picker does not move the Theme sync value column', () => {
+    const columnOf = (lines) => lines.find((line) => line.includes('▸ Theme sync')).indexOf('Off');
+    const linesFor = (sync) => {
+      const { component } = open({ model: modelWith({ theme: { ...THEME_OFF, sync } }) });
+      for (const key of ['down', 'down', 'right']) component.handleInput(key);
+      return component.render(100);
+    };
+    const off = linesFor(false);
+    const on = linesFor(true);
+    assert.ok(off.some((line) => line.includes('Gentle Shell theme')), 'the picker is offered with the sync off');
+    assert.ok(on.every((line) => !line.includes('Gentle Shell theme')), 'and withheld with the sync on');
+    assert.equal(columnOf(on), columnOf(off), 'the sync values keep their column whether the picker is there or not');
+  });
+});
+
+// S2 (independent verification): the column fix must be durable, not a one-frame
+// coincidence. ONE mounted panel, Theme sync cycled Off→On→Off three times, at
+// four card widths: the `Off`/`On` columns of the `Theme sync` line are identical
+// on every cycle whether the picker is offered or withheld, the picker is absent
+// while the sync is on, and it returns when the sync is off. The pinned pairs are
+// the verifier's own measurements of this geometry (zero-based), so a future
+// column change is a deliberate one.
+describe('customize panel theme gate — the column is durable (S2)', () => {
+  test('the Theme sync columns never move across three cycles at four widths', async () => {
+    const SANITY = { 52: [26, 33], 72: [50, 57], 82: [50, 57], 104: [53, 60] };
+    const WIDTHS = Object.keys(SANITY).map(Number);
+
+    let sync = false;
+    const apply = async (request) => {
+      if (request.settingId === 'theme-sync') sync = request.optionId === 'on';
+      return { model: modelWith({ theme: { ...THEME_OFF, sync } }) };
+    };
+    // ONE panel, mounted once: every navigation below happens on this component.
+    const { component } = open({ model: modelWith({ theme: { ...THEME_OFF, sync: false } }), apply });
+    for (const key of ['down', 'down', 'right']) component.handleInput(key);
+
+    const seen = {};
+    const assertOffered = (width, offered) => {
+      const lines = frame(component, width);
+      const hasPicker = lines.some((line) => line.includes('Gentle Shell theme'));
+      assert.equal(hasPicker, offered, `${width}: the picker is ${offered ? 'offered' : 'withheld'}`);
+      const line = lineWith(component, 'Theme sync', width);
+      const columns = [line.indexOf('Off'), line.indexOf('On')];
+      assert.deepEqual(columns, SANITY[width], `${width}: the measured geometry`);
+      if (seen[width]) assert.deepEqual(columns, seen[width], `${width}: the values did not move`);
+      seen[width] = columns;
+    };
+
+    // The mount starts with the sync off, so the picker is offered.
+    for (const width of WIDTHS) assertOffered(width, true);
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      // Cursor landed on the stored Off: → reaches On, Enter turns the sync on.
+      component.handleInput('right');
+      component.handleInput('enter');
+      await settle(component);
+      for (const width of WIDTHS) assertOffered(width, false);
+      // The cursor stayed on On: ← reaches Off, Enter turns the sync off again.
+      component.handleInput('left');
+      component.handleInput('enter');
+      await settle(component);
+      for (const width of WIDTHS) assertOffered(width, true);
+    }
+    assert.deepEqual(Object.keys(seen).map(Number).sort((left, right) => left - right), WIDTHS, 'every width was checked');
+  });
+});
+
+// The human's report: three switches, two orders. Every switch must read Off on
+// the left and On on the right, on the panel and on the page, while the cursor
+// still lands on the CURRENT value — not on whichever value sits first.
+describe('customize panel switch order (Off then On)', () => {
+  // The four reachable sidebar × Moshi states, each with the sync on and off.
+  const STATES = [
+    { sidebar: 'on', moshi: 'on' },
+    { sidebar: 'on', moshi: 'off' },
+    { sidebar: 'off', moshi: 'on' },
+    { sidebar: 'off', moshi: 'off' },
+  ];
+  const SWITCHES = [
+    { line: 'Sidebar agent rows', id: 'sidebar', walk: [] },
+    { line: 'Notifications', id: 'moshi', walk: ['down'] },
+    { line: 'Theme sync', id: 'theme-sync', walk: ['down', 'down'] },
+  ];
+
+  test('every switch paints Off before On, with the cursor on the current value', () => {
+    for (const state of STATES) {
+      for (const sync of ['on', 'off']) {
+        for (const toggle of SWITCHES) {
+          const current = toggle.id === 'theme-sync' ? sync : state[toggle.id];
+          const { component } = open({
+            model: modelWith({
+              sidebar: state.sidebar,
+              moshi: state.moshi,
+              theme: { ...THEME_OFF, sync: sync === 'on' },
+            }),
+          });
+          for (const key of toggle.walk) component.handleInput(key);
+          component.handleInput('right');
+          const line = lineWith(component, toggle.line);
+          assert.ok(line.indexOf('Off') < line.indexOf('On'), `${toggle.id} (${current}) reads Off then On: ${line}`);
+          assert.ok(line.includes(`● ${current === 'on' ? 'On' : 'Off'}`), `${toggle.id}: the current value carries the bullet`);
+          assert.equal(line.includes('›'), false, `${toggle.id}: the cursor starts on the current value, not on the first one`);
+        }
+      }
+    }
+  });
+
+  // Position must never decide the cursor: an unreadable state has no current
+  // option, and the panel's own note promises what Enter will do ("Enter turns
+  // the rows on"), so the cursor has to land on the On option by ID.
+  test('an unknown state starts on the On option the note promises', async () => {
+    const calls = [];
+    const { component } = open({
+      model: modelWith({ sidebar: 'unknown' }),
+      apply: async (request) => { calls.push(request); return {}; },
+    });
+    component.handleInput('right');
+    const line = lineWith(component, 'Sidebar agent rows');
+    assert.ok(line.indexOf('Off') < line.indexOf('On'), `unknown state still reads Off then On: ${line}`);
+    assert.ok(line.includes('› On'), `the cursor lands on On, which is what the note promises: ${line}`);
+    component.handleInput('enter');
+    await settle(component);
+    assert.deepEqual(calls, [{ categoryId: 'sidebar', settingId: 'sidebar', optionId: 'on' }]);
   });
 });
