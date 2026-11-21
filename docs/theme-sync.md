@@ -18,8 +18,14 @@ plugin-side planner and no 1.8.0 managed block.
 
 ## The switch
 
-`/herdr-gentle:customize` → `Herdr Theme` holds two settings, laid out like the
-rest of the card (see [Panel](#panel)):
+The whole feature is two settings: `Theme sync` and `Select theme`. They are
+served on whichever customize surface is live for the session — one surface,
+never both: on the `Herdr` page of Gentle Shell's own `/gentle:customize` menu
+when gentle-shell-bridge answers its handshake (its
+`gentle-shell-bridge/api/v1` object is published on `globalThis`), and in
+`/herdr-gentle:customize` → `Herdr Theme` when it does not, laid out like the
+rest of the card (see [Panel](#panel)). The page's rows come from the same
+model and the same apply path, so everything below holds on either:
 
 - `Theme sync` is **OFF by default**. `On` makes Herdr's palette the palette of
   the theme Pi is showing, and it follows a change of the active theme while Pi
@@ -47,12 +53,14 @@ The notices are fixed strings:
 | Toggle already in that state | `Theme sync already on/off; nothing was changed.` |
 | Theme setting while the sync is on | `Turn Theme sync off to pick a specific theme.` |
 | Theme assigned | `Gentle Shell theme set to <name>.` |
-| Pin cleared | `Gentle Shell theme set to Off; Herdr keeps the palette it was last given.` (the stored value stays `null` and the inline list marks `None`; only this notice — and the fallback menu's `Off (no theme assigned)` entry — spell it `Off`) |
+| Pin cleared | `Gentle Shell theme set to Off; Herdr keeps the palette it was last given.` (the stored value stays `null` and the inline list marks `None`; only this notice — and the `Off (no theme assigned)` entry of the fallback menu and of the Gentle Shell page — spell it `Off`) |
 | Host exposes no theme list | `Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.` |
 | Theme store missing | `Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.` |
 | State file not writable | `Could not write the theme store: <detail>; nothing was changed.` |
 
-`/herdr-gentle:customize status` prints one read-only line and writes nothing:
+`/herdr-gentle:customize status` prints one read-only line and writes nothing.
+The subcommand belongs to the command — the surface without the bridge; the
+menu page offers no `status` operation:
 
 ```text
 customize status: sidebar=<on|off|unknown> moshi=<on|off> theme-sync=<on|off|unknown> theme=<name|none|unknown>
@@ -541,9 +549,10 @@ no-op, and every user-visible outcome is a fixed string:
   this is a remote session and Herdr reads its config on another machine.`, or
   `Herdr theme sync is not supported in this environment.`
 - **Pinned theme not installed**: `The Pi theme "<name>" is not installed, so
-  Herdr's palette was left unchanged; pick an installed theme in
-  /herdr-gentle:customize.` — once per session; a later install of that exact
-  theme is picked up without a restart.
+  Herdr's palette was left unchanged; pick an installed theme in the Gentle
+  Shell customize menu.` — once per session; a later install of that exact
+  theme is picked up without a restart. The notice names the menu, not the
+  command, because the pinned theme is offered on both surfaces.
 - **Nothing to project**: `Herdr theme not applied: <theme name> has no concrete
   colours to project.` (`the active theme` replaces the name when the active
   theme exposes none) — once per session, `warning`. A palette with no concrete
@@ -690,10 +699,12 @@ Tests and isolated runs:
 
 ## Panel
 
-`/herdr-gentle:customize` with no argument opens the card. It behaves like
-Gentle Shell's own: one left `CATEGORIES` list and one right pane headed
-`<Category> · n/m`, with one line per setting and its options inline —
-`●` the stored option, `›` the cursor while it sits elsewhere, `○` the rest.
+`/herdr-gentle:customize` with no argument opens the card — the command's own
+surface, since the page replaces the command only when gentle-shell-bridge
+answers. It behaves like Gentle Shell's own: one left `CATEGORIES` list and one
+right pane headed `<Category> · n/m`, with one line per setting and its options
+inline — `●` the stored option, `›` the cursor while it sits elsewhere, `○`
+the rest.
 
 - The arrows move the option cursor and **only Enter applies**; Enter keeps the
   card open (only a Moshi settings change that needs a Pi reload closes it),
@@ -724,6 +735,14 @@ Gentle Shell's own: one left `CATEGORIES` list and one right pane headed
   note (`Themes unavailable; use Pi /settings`) instead of an empty picker, and
   an unreadable store adds `state unknown; Enter pins a theme`.
 
+When gentle-shell-bridge answers, this card is not registered at all: the same
+two settings are the `Theme sync` and `Select theme` rows of the `Herdr` page in
+Gentle Shell's own menu, painted by that host. One row per value, walked with
+the arrows and applied with `Enter` (the bridge never applies on a cursor move),
+the theme row keeps its own swatch, and the theme rows are simply not shown
+while the sync is on instead of being refused in place. The notices are the
+same fixed strings, and the sync needs no Pi reload on either surface.
+
 ## Implementation
 
 | File | Role |
@@ -733,5 +752,6 @@ Gentle Shell's own: one left `CATEGORIES` list and one right pane headed
 | `lib/herdr-theme-config.js` | The pure planner — a **line splicer**, not a TOML validator: table-boundary scanning, opaque bytes outside the two theme tables, a strict theme-table grammar, the whole-line `was` marker with byte-exact restoration (the user's latest trailing comment wins), the one regenerated block (`begin` / `begin created` … `end` / `end after a missing line ending`), the ambiguity refusal above a block being removed or moved, the 1.8.0 marker-pair migration, the BOM and the enforced splice invariant. |
 | `lib/herdr-theme-apply.js` | The writer: availability guards, bounded snapshot, compare-and-swap, atomic non-overwriting backup (a regular existing file is accepted as is), retried temp cleanup that reports a survivor and never deletes a temp it did not create, growth limit, `forceReload`, reload. |
 | `extensions/herdr-theme-sync.ts` | The follower: session-start evaluation, 500 ms tick, fingerprint, owed-reload repair, the notices. |
-| `extensions/gentle-herdr-state.ts` | The switch: `applyThemeSync`, `writeThemeChoice`, `applyCustomizePanel`, `customize status`. |
+| `extensions/gentle-herdr-state.ts` | The switch: `applyThemeSync`, `writeThemeChoice`, `applyCustomizePanel`, `customize status`, and the two-surface registration (`registerCustomizeSurface`). |
 | `lib/customize-panel.js` | The card: categories, option lines, sideways window, Preview block, legends, pointer hits. |
+| `lib/customize-rows.js` | The page: the same model and settings translated into the four `Herdr` row lines Gentle Shell renders. |
