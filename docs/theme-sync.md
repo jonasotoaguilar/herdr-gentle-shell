@@ -34,8 +34,11 @@ on both:
   applied palette survives Pi closing.
 - `Gentle Shell theme` assigns one Gentle Shell / Pi theme by name from Pi's own
   list (`None` first, then the host's order). While the stored sync is on the
-  setting is painted dim, never given the selection band, and pressing Enter on
-  it writes nothing: the apply path refuses with
+  setting is not offered at all: it is absent from the panel and from the
+  `Herdr` page alike, never painted dim and never a refusal line, and it comes
+  back on the surface you already have the moment the sync is turned off. A
+  theme attempt that still arrives — the plain fallback menu or the apply path —
+  writes nothing and is refused with
   `Turn Theme sync off to pick a specific theme.` Choosing `None` clears the pin
   (`theme: null`); choosing a name stores it. The stored pin is carried across a
   sync toggle untouched, so turning the sync off restores that choice instead of
@@ -51,7 +54,7 @@ The notices are fixed strings:
 | Sync turned on | `Theme sync on; Herdr's palette follows the theme active in Pi.` |
 | Sync turned off | `Theme sync off; Herdr keeps the palette it was last given.` |
 | Toggle already in that state | `Theme sync already on/off; nothing was changed.` |
-| Theme setting while the sync is on | `Turn Theme sync off to pick a specific theme.` |
+| Theme attempt while the sync is on (fallback menu, apply path) | `Turn Theme sync off to pick a specific theme.` |
 | Theme assigned | `Gentle Shell theme set to <name>.` |
 | Pin cleared | `Gentle Shell theme set to Off; Herdr keeps the palette it was last given.` (the stored value stays `null` and the inline list marks `None`; only this notice — and the `Off (no theme assigned)` entry of the fallback menu and of the Gentle Shell page — spell it `Off`) |
 | Host exposes no theme list | `Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.` |
@@ -93,7 +96,9 @@ then rename), preserve an existing file's mode and create a new one as `0600`.
   setting marks no option and carries `state unknown; Enter turns the sync on`,
   the theme list marks nothing, and the follower does nothing. It is
   written over only when you act — toggling the sync writes a fresh document,
-  and the theme setting is refused only by a *stored* `sync: true`.
+  and the theme setting is withheld only by a *stored* `sync: true` (the write
+  still refuses such an attempt, with
+  `Turn Theme sync off to pick a specific theme.`).
 - **`sync: false` with `theme: null`** is the default install: the follower
   asks for no palette at all, so nothing is written, nothing is reloaded and
   nothing is removed (S7).
@@ -737,15 +742,19 @@ the rest.
 - The theme list is read automatically from the host (`ctx.ui.getAllThemes()`)
   in the host's own order, `None` first; a host that exposes no list shows one
   note (`Themes unavailable; use Pi /settings`) instead of an empty picker, and
-  an unreadable store adds `state unknown; Enter pins a theme`.
+  an unreadable store adds `state unknown; Enter pins a theme`. While the stored
+  sync is on the setting is not offered at all: the card reads
+  `Herdr Theme · 1/1`, with no dim line and no note, and the picker is back on
+  the same mounted card as soon as the sync is turned off.
 
 When gentle-shell-bridge answers, this card is still there and the same two
 settings are ALSO the `Theme sync` and `Select theme` rows of the `Herdr` page in
 Gentle Shell's own menu, painted by that host. One row per value, walked with
 the arrows and applied with `Enter` (the bridge never applies on a cursor move),
 the theme row keeps its own swatch, and the theme rows are simply not shown
-while the sync is on instead of being refused in place. The notices are the
-same fixed strings, and the sync needs no Pi reload on either surface.
+while the sync is on instead of being refused in place — the panel withholds the
+same setting the same way. The notices are the same fixed strings, and the sync
+needs no Pi reload on either surface.
 
 The page's rows are FIXED for as long as the menu is open, which is why its
 theme rows cost one model read per paint burst instead of one per row. Two

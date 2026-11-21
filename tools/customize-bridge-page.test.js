@@ -132,7 +132,7 @@ function fakeBridge() {
   };
 }
 
-function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
+function harness({ bridge, themes = ['Dark', 'Light'], getTheme } = {}) {
   const commands = new Map();
   const handlers = new Map();
   const listeners = new Map();
@@ -165,6 +165,9 @@ function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
     select: async () => undefined,
     // Pi's own theme catalogue, the shape `ctx.ui.getAllThemes()` documents.
     getAllThemes: () => themes.map((name) => ({ name, path: `/themes/${name}.json` })),
+    // `ctx.ui.getTheme(name)`, the host object `themePreviewFactory` reads for a
+    // theme's swatch. Omitted unless the test asks for it.
+    ...(getTheme ? { getTheme } : {}),
   };
   const ctx = { ui, reload: async () => reloads.push(true) };
   const h = {
@@ -781,5 +784,88 @@ describe('exactly one provider, never two', () => {
     assert.equal(bridge.rows.size, 1, 'the next session adds one provider again');
     assert.notEqual(h.provider(), firstProvider);
     assert.equal(h.commands.has(COMMAND), true, 'and still one command');
+  });
+});
+
+// Defect 1, on the surface the human actually used: the page built by the real
+// extension used to answer no preview at all for the four settings, so the menu
+// painted `Preview unavailable` / `No read-only sample for this choice`. The rows
+// now read the panel's own model — the texts stay in lib/customize-panel.js and
+// are never copied into the page — and a theme row keeps its swatch from
+// `ctx.ui.getTheme(name)`, exactly what the panel draws.
+describe('every page row paints the panel\'s own preview (defect 1)', () => {
+  // A host theme object with the two raw escapes `themePreviewFactory` reads.
+  const previewTheme = (name) => ({
+    name,
+    getBgAnsi: (role) => (role === 'accent' ? '\x1b[48;5;17m' : '\x1b[48;5;18m'),
+    getFgAnsi: (role) => (role === 'text' ? '\x1b[38;5;250m' : '\x1b[38;5;251m'),
+  });
+
+  test('the four settings answer the panel\'s title and sample', async () => {
+    const env = setupEnvironment('page-previews');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge, getTheme: previewTheme });
+    await h.load();
+    await h.start();
+    const rows = h.provider().rows();
+
+    // The panel's own copy, pinned here from the user's side: every row answers
+    // one of these pairs, never `Preview unavailable`.
+    const SAMPLES = {
+      'Herd agents': [
+        { title: 'static sidebar sample', sample: '● project   gentle   worker' },
+        { title: 'static sidebar sample', sample: 'native Herdr rows; no managed block' },
+      ],
+      Moshi: [
+        { title: 'static notification sample', sample: 'ask   finished' },
+        { title: 'static notification sample', sample: 'silent; no Moshi notification' },
+      ],
+      'Theme sync': [
+        { title: 'static sync sample', sample: 'Herdr keeps its last palette' },
+        { title: 'static sync sample', sample: 'Herdr follows the theme active in Pi' },
+      ],
+      'Select theme': [
+        { title: 'static unassigned sample', sample: 'no theme pinned; Herdr keeps its last palette' },
+        { title: 'source palette', sample: '\x1b[48;5;17m  \x1b[0m \x1b[38;5;250mAa  sample text\x1b[0m' },
+        { title: 'source palette', sample: '\x1b[48;5;17m  \x1b[0m \x1b[38;5;250mAa  sample text\x1b[0m' },
+      ],
+    };
+    for (const [line, expected] of Object.entries(SAMPLES)) {
+      const lineRows = rows.filter((row) => row.choice && row.choice.setting === line);
+      assert.equal(lineRows.length, expected.length, `one row per ${line} value`);
+      for (let at = 0; at < lineRows.length; at += 1) {
+        const preview = lineRows[at].preview();
+        assert.deepEqual(preview, expected[at], `${line} / ${lineRows[at].choice.value} paints the panel's pair`);
+      }
+    }
+  });
+
+  test('a mounted row keeps its preview after an apply, without a rebuild (defect 1)', async () => {
+    const env = setupEnvironment('page-previews-mounted');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge, getTheme: previewTheme });
+    await h.load();
+    await h.start();
+
+    // ONE build: the objects the host holds and repaints.
+    const mounted = h.provider().rows();
+    const syncOn = rowFor(mounted, 'Theme sync', 'On');
+    assert.equal(syncOn.preview().sample, 'Herdr follows the theme active in Pi');
+
+    await syncOn.action(INLINE_HELPERS);
+    assert.equal(readThemeFile(env.themePath).sync, true, 'the apply really wrote the store');
+
+    // The same objects answer the applied value's own sample: a preview is a
+    // live read of the model, never a value copied at build time.
+    assert.equal(syncOn.choice.current(), true);
+    assert.deepEqual(syncOn.preview(), { title: 'static sync sample', sample: 'Herdr follows the theme active in Pi' });
+    assert.deepEqual(
+      rowFor(mounted, 'Theme sync', 'Off').preview(),
+      { title: 'static sync sample', sample: 'Herdr keeps its last palette' },
+    );
   });
 });

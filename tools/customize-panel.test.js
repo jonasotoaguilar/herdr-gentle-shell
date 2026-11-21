@@ -63,14 +63,6 @@ const bandTheme = {
   bg: (_role, text) => `[${text}]`,
 };
 
-// A theme that answers only the dim role, so a disabled line is recognisable
-// without turning every other role into noise.
-const dimTheme = {
-  fg: (role, text) => (role === 'dim' ? `«${text}»` : text),
-  bold: (text) => text,
-  bg: (_role, text) => `[${text}]`,
-};
-
 // Records the roles the panel asks for, without changing a single column.
 function roleTheme() {
   const roles = [];
@@ -253,11 +245,13 @@ describe('customize panel model', () => {
     assert.equal(setting.note, 'Themes unavailable; use Pi /settings');
   });
 
-  test('a stored sync On disables the theme setting and explains the refusal', () => {
+  test('a stored sync On marks the theme setting unavailable while keeping its rows', () => {
     const model = modelWith({ theme: { ok: true, sync: true, theme: 'dracula' } });
     const setting = model[2].settings[1];
+    // The model still carries the picker (the Gentle Shell page keeps its
+    // mounted rows and hides them with `visible()`, so the picker returns in
+    // place); the PANEL is where it is not offered — see the theme gate block.
     assert.equal(setting.disabled, true);
-    assert.equal(setting.note, 'Turn Theme sync off to pick a specific theme.');
     assert.deepEqual(setting.options.filter((option) => option.current).map((option) => option.id), ['theme:dracula']);
     assert.equal(model[2].settings[0].options.find((option) => option.current).label, 'On');
   });
@@ -602,7 +596,6 @@ describe('customize panel overflow', () => {
   // 32 installed themes, from a short-name family: the point of this block is
   // the sideways window, not the width of a real theme name.
   const MANY = Array.from({ length: 32 }, (_, index) => String(index).padStart(2, '0'));
-  const TOTAL = MANY.length + 1;
   const manyModel = () => modelWith({ themeNames: MANY });
 
   function focusThemeSetting(component) {
@@ -615,7 +608,7 @@ describe('customize panel overflow', () => {
   // The cursor option is visible when the line prints it whole (window or plain
   // form) or, in the compact form, when the value between its arrows is an
   // ellipsized prefix of that same option. It is never another option's value.
-  function cursorVisible(line, label, counter) {
+  function cursorVisible(line, label) {
     if (line.includes(`› ${label}`) || line.includes(`● ${label}`)) return true;
     const at = line.indexOf('‹ ');
     if (at < 0) return false;
@@ -638,9 +631,8 @@ describe('customize panel overflow', () => {
       for (let step = 0; step <= MANY.length; step += 1) {
         const line = lineWith(component, 'Gentle Shell theme', width);
         const label = cursor === 0 ? 'None' : MANY[cursor - 1];
-        const counter = `${cursor + 1}/${TOTAL}`;
         assert.ok(
-          cursorVisible(line, label, counter),
+          cursorVisible(line, label),
           `cursor option ${label} is what the card shows at ${width} columns (cursor ${cursor}): ${line}`,
         );
         assert.equal([...line].length, width, `the line is exactly ${width} columns`);
@@ -820,17 +812,83 @@ describe('customize panel preserved rows', () => {
     );
   });
 
-  test('the disabled theme setting is painted dim and never offered the band', () => {
+  test('a setting the model marks unavailable is never offered, dim or not', () => {
     const model = modelWith({ theme: { ok: true, sync: true, theme: null } });
-    const { component } = open({ model, theme: dimTheme });
+    const { component } = open({ model, theme: bandTheme });
     component.handleInput('down');
     component.handleInput('down');
     component.handleInput('right');
-    const enabled = lineWith(component, 'Theme sync');
-    assert.ok(enabled.includes('['), 'an actionable setting keeps the band');
+    const seen = frame(component).join('\n');
+    assert.equal(seen.includes('Gentle Shell theme'), false, 'no line, no dim role, no note: simply absent');
+    const sync = lineWith(component, 'Theme sync');
+    assert.ok(sync.includes('[▸ Theme sync'), 'the actionable setting keeps the band');
+  });
+});
+
+// Defect 2 (found by using the shipped command): `/herdr-gentle:customize` always
+// offered the theme picker while the sync was on, while the Gentle Shell page
+// hides it — the pinned theme is only available when the sync is off. The panel
+// now behaves the same way: the setting is ABSENT (not dim, not refusing, not a
+// note), and it is back the moment the sync is turned off from the panel that is
+// already open. Everything else about the card is untouched, which the rest of
+// this file guards.
+describe('customize panel theme gate (S3, S7)', () => {
+  const syncState = (sync, theme = 'dracula') => ({ ok: true, sync, theme });
+
+  test('the theme setting is absent while the stored sync is on, and returns without reopening', async () => {
+    const calls = [];
+    const apply = async (request) => {
+      calls.push(request);
+      return { model: modelWith({ theme: syncState(request.optionId === 'on') }) };
+    };
+    const { component, done } = open({ model: modelWith({ theme: syncState(true) }), apply });
     component.handleInput('down');
-    const disabled = lineWith(component, 'Gentle Shell theme');
-    assert.ok(disabled.includes('«'), 'the disabled setting is painted in the dim role');
-    assert.equal(disabled.includes('['), false, 'the disabled setting is never offered the band');
+    component.handleInput('down');
+
+    let seen = frame(component).join('\n');
+    assert.equal(seen.includes('Gentle Shell theme'), false, 'the picker is not offered at all');
+    assert.equal(seen.includes('Turn Theme sync off'), false, 'and it is not explained either: it is absent');
+    assert.ok(seen.includes('Herdr Theme · 1/1'), 'the category holds only the sync switch');
+    assert.equal(frame(component)[1], card(`${TITLE}${' '.repeat(INNER - TITLE.length - 3)}esc`), 'the card chrome is unchanged');
+
+    // Turn the sync off from inside the same panel: the cursor landed on the
+    // stored On, so ← reaches Off and Enter applies it.
+    component.handleInput('right');
+    component.handleInput('left');
+    component.handleInput('enter');
+    await settle(component);
+    assert.deepEqual(calls, [{ categoryId: 'theme', settingId: 'theme-sync', optionId: 'off' }]);
+
+    seen = frame(component).join('\n');
+    assert.ok(seen.includes('Gentle Shell theme'), 'the picker is back without closing and reopening');
+    assert.ok(seen.includes('Herdr Theme · 1/2'), 'and the category counts it again');
+    assert.ok(seen.includes('● dracula'), 'with the pin the store kept');
+    assert.equal(done(), 'pending', 'the panel never closed');
+  });
+
+  test('turning the sync back on removes the setting from the panel that is open', async () => {
+    const calls = [];
+    const apply = async (request) => {
+      calls.push(request);
+      return { model: modelWith({ theme: syncState(request.optionId === 'on') }) };
+    };
+    const { component, done } = open({ model: modelWith({ theme: syncState(false) }), apply });
+    component.handleInput('down');
+    component.handleInput('down');
+    assert.ok(frame(component).join('\n').includes('Gentle Shell theme'), 'the picker starts offered');
+
+    // Theme sync is the category's first setting and the cursor landed on the
+    // stored Off, so → moves to On and Enter applies it.
+    component.handleInput('right');
+    component.handleInput('right');
+    component.handleInput('enter');
+    await settle(component);
+    assert.deepEqual(calls, [{ categoryId: 'theme', settingId: 'theme-sync', optionId: 'on' }]);
+
+    const seen = frame(component).join('\n');
+    assert.equal(seen.includes('Gentle Shell theme'), false, 'the picker is gone from the same panel');
+    assert.equal(seen.includes('Turn Theme sync off to pick a specific theme.'), false, 'nothing explains an absent setting');
+    assert.ok(seen.includes('Herdr Theme · 1/1'));
+    assert.equal(done(), 'pending');
   });
 });

@@ -35,8 +35,10 @@
 
 const { describe, test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
-const { customizePanelModel } = require('../lib/customize-panel.js');
+const { createCustomizePanel, customizePanelModel } = require('../lib/customize-panel.js');
 const {
   customizeRows,
   CUSTOMIZE_ROWS_CATEGORY,
@@ -109,6 +111,63 @@ function linesOf(rows) {
 
 function rowsFor(rows, line) {
   return rows.filter((row) => row.choice.setting === line);
+}
+
+// The panel's own geometry helpers, mirrored here so the panel can be rendered
+// and read back: the point of these tests is what the USER sees on the panel,
+// never a private field of the model.
+const stripAnsi = (value) => String(value).replace(/\x1b\[[0-9;]*m/g, '');
+const stubTui = {
+  visibleWidth: (text) => [...stripAnsi(text)].length,
+  truncateToWidth: (text, width, ellipsis = '…') => {
+    const chars = [...stripAnsi(text)];
+    if (chars.length <= width) return String(text);
+    return chars.slice(0, Math.max(0, width - 1)).join('') + ellipsis;
+  },
+  matchesKey: (key, name) => key === name,
+  isKeyRelease: (key) => key === 'release',
+};
+const PANEL_WIDTH = 100;
+const TALL = () => 24;
+
+// The { title, sample } the PANEL paints for one value of one setting: the
+// rendered `Preview · <value> · <title>` headline and the first sample line
+// below it, with the card border and its padding removed. This is the parity
+// oracle — the page must answer exactly this pair, from the panel's own copy.
+function panelPaintedPreview(model, settingId, optionId) {
+  const categoryAt = model.findIndex((category) => (category.settings || []).some((setting) => setting.id === settingId));
+  assert.ok(categoryAt >= 0, `the panel lists the ${settingId} setting`);
+  const settings = model[categoryAt].settings;
+  const settingAt = settings.findIndex((setting) => setting.id === settingId);
+  const setting = settings[settingAt];
+  const at = setting.options.findIndex((option) => option.id === optionId);
+  assert.ok(at >= 0, `the panel lists ${settingId}/${optionId}`);
+
+  const component = createCustomizePanel({
+    helpers: stubTui,
+    hostTui: { requestRender: () => {} },
+    theme: {},
+    rowsAvailable: TALL,
+    model,
+    apply: async () => ({ model }),
+    done: () => {},
+  });
+  for (let step = 0; step < categoryAt; step += 1) component.handleInput('down');
+  component.handleInput('right');
+  for (let step = 0; step < settingAt; step += 1) component.handleInput('down');
+  const landed = setting.options.findIndex((option) => option.current === true);
+  const from = landed < 0 ? 0 : landed;
+  if (at > from) for (let step = from; step < at; step += 1) component.handleInput('right');
+  if (at < from) for (let step = at; step < from; step += 1) component.handleInput('left');
+
+  const lines = component.render(PANEL_WIDTH).map(stripAnsi);
+  const headlineAt = lines.findIndex((line) => line.includes('Preview · '));
+  assert.ok(headlineAt >= 0, `the panel paints a preview for ${settingId}/${optionId}`);
+  const inner = (line) => line.slice(2, -2).trimEnd();
+  const headline = inner(lines[headlineAt]);
+  const prefix = `Preview · ${setting.options[at].label} · `;
+  assert.ok(headline.startsWith(prefix), `the panel names the highlighted value: ${headline}`);
+  return { title: headline.slice(prefix.length), sample: inner(lines[headlineAt + 1] || '') };
 }
 
 // The cache's TTL is measured with `Date.now()`, so the test drives that real
@@ -516,5 +575,123 @@ describe('customizeRows — no model, no rows', () => {
     assert.deepEqual(customizeRows(), []);
     assert.deepEqual(customizeRows({ model: null, apply: () => undefined }), []);
     assert.deepEqual(customizeRows({ model: () => { throw new Error('unreadable'); }, apply: () => undefined }), []);
+  });
+});
+
+// Defect 1 (parity regression found by using the shipped page): every row of the
+// four S1 settings answers the very title and sample the floating panel paints
+// for that setting and value. The texts are NOT copied here — the page reads them
+// from the model the panel builds (`customizePanelModel`), which owns them — and
+// these tests prove it by rendering the panel and reading its Preview block back.
+describe('customizeRows — the panel\'s own previews on every row (S1/S3)', () => {
+  // One model carries every value of all four settings: `sidebar`/`moshi` both
+  // list On and Off, `theme-sync` both Off and On, and the theme picker lists
+  // the unassign entry plus every installed theme.
+  const ALL_VALUES = () => modelFor({
+    sidebar: 'on',
+    moshi: 'on',
+    sync: 'off',
+    theme: 'Dark',
+    themeNames: ['Dark', 'Light'],
+  });
+
+  test('every value of every setting paints the panel\'s own title and sample', () => {
+    const model = ALL_VALUES();
+    const rows = customizeRows({ model, apply: recorder().apply });
+    const settings = model.flatMap((category) => category.settings);
+    // The page's own line names (S1) for the model's setting ids; the values are
+    // in the model's order, one page row each.
+    const PAGE_LINE = { sidebar: 'Herd agents', moshi: 'Moshi', 'theme-sync': 'Theme sync', theme: 'Select theme' };
+
+    let checked = 0;
+    for (const setting of settings) {
+      const pageRows = rowsFor(rows, PAGE_LINE[setting.id]);
+      assert.equal(pageRows.length, setting.options.length, `one page row per ${setting.id} value`);
+      for (let at = 0; at < setting.options.length; at += 1) {
+        const option = setting.options[at];
+        const row = pageRows[at];
+        assert.equal(typeof row.preview, 'function', `${setting.id}/${option.id} answers a preview`);
+        const preview = row.preview();
+        assert.deepEqual(
+          preview,
+          panelPaintedPreview(model, setting.id, option.id),
+          `${setting.id}/${option.id}: the page paints what the panel paints`,
+        );
+        assert.ok(preview.title.length > 0, 'the title is never empty');
+        assert.ok(preview.sample.length > 0, 'the sample is never empty');
+        checked += 1;
+      }
+    }
+    // The four settings, every value: 2 sidebar + 2 moshi + 2 sync + 3 themes.
+    assert.equal(checked, 9, 'all four settings were checked, on every value');
+  });
+
+  test('the sample follows a changed state without a rebuild', () => {
+    const model = ALL_VALUES();
+    const rows = customizeRows({ model, apply: recorder().apply });
+    const moshiOff = rowsFor(rows, 'Moshi').find((row) => row.choice.value === 'Off');
+    assert.equal(moshiOff.preview().sample, 'silent; no Moshi notification');
+
+    // The state changes underneath the mounted rows (the model the page was built
+    // from is edited in place, exactly like the host's live model): the SAME row
+    // answers the new sample without any rebuild.
+    const moshiSetting = model.flatMap((category) => category.settings).find((setting) => setting.id === 'moshi');
+    moshiSetting.options.find((option) => option.id === 'off').preview = {
+      title: 'static notification sample',
+      sample: 'changed sample',
+    };
+    assert.equal(moshiOff.preview().sample, 'changed sample', 'the mounted row re-reads the live model');
+  });
+
+  test('the page carries no copy of the panel\'s samples: one source of truth', () => {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'lib', 'customize-rows.js'), 'utf8');
+    for (const sample of [
+      '● project   gentle   worker',
+      'native Herdr rows; no managed block',
+      'ask   finished',
+      'silent; no Moshi notification',
+      'Herdr follows the theme active in Pi',
+      'Herdr keeps its last palette',
+      'no theme pinned; Herdr keeps its last palette',
+      'static sidebar sample',
+      'static notification sample',
+      'static sync sample',
+      'static unassigned sample',
+      'source palette',
+    ]) {
+      assert.equal(source.includes(sample), false, `lib/customize-rows.js must not copy ${JSON.stringify(sample)}`);
+    }
+    // And the samples really come from the panel module: its own model is the
+    // only place those strings live.
+    const panel = fs.readFileSync(path.join(__dirname, '..', 'lib', 'customize-panel.js'), 'utf8');
+    for (const sample of ['● project   gentle   worker', 'ask   finished', 'Herdr keeps its last palette']) {
+      assert.equal(panel.includes(sample), true, `lib/customize-panel.js owns ${JSON.stringify(sample)}`);
+    }
+  });
+
+  test('the panel\'s per-setting note is the row\'s hint, and only when it has one', () => {
+    // An unreadable sidebar state is the panel's own note line; the page says the
+    // same thing through `choice.hint` instead of inventing a second wording.
+    const unknown = modelFor({ sidebar: 'unknown', moshi: 'on', sync: 'off', theme: null, themeNames: ['Dark'] });
+    const sidebarNote = unknown.flatMap((category) => category.settings)
+      .find((setting) => setting.id === 'sidebar').note;
+    assert.equal(sidebarNote, 'state unknown; Enter turns the rows on', 'the panel owns the sentence');
+
+    const rows = customizeRows({ model: unknown, apply: recorder().apply });
+    for (const row of rowsFor(rows, 'Herd agents')) assert.equal(row.choice.hint, sidebarNote);
+
+    // The theme picker's own unknown note rides on its rows too.
+    const unreadableTheme = modelFor({ theme: null, readable: false, themeNames: ['Dark'] });
+    const themeNote = unreadableTheme.flatMap((category) => category.settings)
+      .find((setting) => setting.id === 'theme').note;
+    assert.match(themeNote, /state unknown/);
+    for (const row of rowsFor(customizeRows({ model: unreadableTheme, apply: recorder().apply }), 'Select theme')) {
+      assert.equal(row.choice.hint, themeNote);
+    }
+
+    // A state the panel can read carries NO note, so no row carries a hint: a
+    // hint would replace the host's `Preview · …` headline with a needless line.
+    const healthy = customizeRows({ model: ALL_VALUES(), apply: recorder().apply });
+    for (const row of healthy) assert.equal(row.choice.hint, undefined, 'no hint without a panel note');
   });
 });

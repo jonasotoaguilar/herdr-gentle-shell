@@ -1538,9 +1538,12 @@ painted with the host theme, where a theme option shows that theme's own palette
 through the raw SGR the host hands back. Three footer legends (categories,
 option row, panes) are chosen by what the keys do right now and compact instead
 of wrapping. The theme list comes from `ctx.ui.getAllThemes()` in the host's own
-order with `None` first, the `Gentle Shell theme` setting is painted dim and
-refused with `Turn Theme sync off to pick a specific theme.` while the sync is
-on, and a host that exposes no list shows one note instead of an empty picker.
+order with `None` first, the `Gentle Shell theme` setting is absent — never
+dim, never a refusal line — while the sync is on, and it returns on the same
+mounted card the moment the sync is turned off; a theme attempt that still
+arrives (the plain fallback menu, the apply path) writes nothing and is refused
+with `Turn Theme sync off to pick a specific theme.`. A host that exposes no
+list shows one note instead of an empty picker.
 The panel writes nothing itself: it calls the extension's apply path, swaps in
 the model that path re-read, and keeps the cursor by structural option ids.
 
