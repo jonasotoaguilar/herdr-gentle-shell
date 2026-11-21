@@ -292,7 +292,11 @@ export default function (pi) {
           seen.missingTheme = true;
           notify(
             ctx,
-            `The Pi theme "${chosen}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`,
+            // S4 (odd/tasks/herdr-customize-page.md): the pinned theme is offered
+            // on both surfaces — `/herdr-gentle:customize` without the bridge and
+            // the `Herdr` page of Gentle Shell's own customize menu with it — so
+            // the notice names the MENU and is correct on either.
+            `The Pi theme "${chosen}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in the Gentle Shell customize menu.`,
           );
         }
         return;

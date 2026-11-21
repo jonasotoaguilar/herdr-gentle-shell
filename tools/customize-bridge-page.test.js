@@ -1,0 +1,477 @@
+'use strict';
+// The Herdr page of Gentle Shell's own customize menu, as the extension wires it
+// (odd/tasks/herdr-customize-page.md T2/T3; specs S1-S4).
+//
+// What these tests pin, through the two surfaces the user actually gets and
+// nothing else:
+// - S1: when gentle-shell-bridge answers the runtime handshake (the published
+//   object at `Symbol.for("gentle-shell-bridge/api/v1")`, not a package
+//   dependency), the extension registers ONE row provider on the `Herdr` page
+//   and NO `/herdr-gentle:customize` command;
+// - S2: when it does not answer, today's command is registered and no page is
+//   offered — exactly one surface, never both and never neither;
+// - the provider reads the live model on every build, so `current()` is the
+//   stored value and not a copy taken at registration;
+// - S3: a row action runs the command's own apply path — the theme switch writes
+//   `gentle-theme.json`, and a Moshi refusal leaves the flag and settings.json
+//   byte-identical while the refusal reaches the user exactly ONCE;
+// - S4: the refusal names the Gentle Shell customize menu, never the command
+//   the page removes;
+// - the Moshi reload: the exclusion write still lands, and because a row action
+//   has no reload handle the notice asks for a restart instead of claiming a
+//   reload that cannot happen;
+// - the disposer: session shutdown removes the provider, and a second session
+//   replaces it instead of stacking a duplicate.
+//
+// The bridge is a handshake, not an import: the tests publish a frozen object at
+// the documented symbol exactly as `src/api.ts` does, and the extension is never
+// given a package dependency to resolve.
+
+const { describe, test, after, beforeEach } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+const src = path.join(REPO_ROOT, 'extensions', 'gentle-herdr-state.ts');
+const srcText = fs.readFileSync(src, 'utf8');
+assert.ok(
+  !/^import .* from "\.\//m.test(srcText),
+  'state.ts must stay self-contained (no relative imports)',
+);
+const HANDLES_BRIDGE = srcText.includes('gentle-shell-bridge');
+assert.equal(
+  /^import .*gentle-shell-bridge/m.test(srcText),
+  false,
+  'the bridge is a handshake, never an import',
+);
+
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'gentle-bridge-page-'));
+// The copied extension lives outside the repo, so the row builder is loaded from
+// the real lib/ through the documented override.
+process.env.GENTLE_CUSTOMIZE_LIB_DIR = path.join(REPO_ROOT, 'lib');
+const COPY = path.join(ROOT, 'gentle-herdr-state.mjs');
+fs.writeFileSync(COPY, srcText);
+const copyUrl = pathToFileURL(COPY).href;
+
+// The whole surface must work outside a Herdr pane: the pane gate is closed for
+// every test in this file.
+delete process.env.HERDR_ENV;
+delete process.env.HERDR_SOCKET_PATH;
+delete process.env.HERDR_PANE_ID;
+const factoryPromise = import(copyUrl);
+
+const COMMAND = 'herdr-gentle:customize';
+// The bridge's published key, mirrored by hand exactly like `src/api.ts`: this
+// file cannot import it either.
+const BRIDGE_API_KEY = Symbol.for('gentle-shell-bridge/api/v1');
+const PAGE = 'Herdr';
+const THEME_UNASSIGN = 'Off (no theme assigned)';
+
+/* ------------------------------------------------------------ fixtures */
+
+function writeExecutable(file, body) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body, { mode: 0o755 });
+}
+
+function fixture(name) {
+  const dir = path.join(ROOT, name);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// The published bridge object, with the shape gate's members (`schema`,
+// `version`, `registerRows`, `registerSection`, `createStore`) and nothing the
+// extension is allowed to require beyond `registerRows`.
+function fakeBridge() {
+  const rows = new Map();
+  const registrations = [];
+  const disposes = [];
+  const api = {
+    schema: 'gentle-shell-bridge/api',
+    version: 1,
+    VERSION: '0.8.0-test',
+    registerRows(provider) {
+      registrations.push(provider);
+      rows.set(provider.id, provider);
+      return () => {
+        disposes.push(provider.id);
+        if (rows.get(provider.id) === provider) rows.delete(provider.id);
+      };
+    },
+    registerSection() {
+      throw new Error('the page is a row category, never a sidebar section');
+    },
+    createStore() {
+      throw new Error('the page stores nothing through the bridge');
+    },
+  };
+  return {
+    api,
+    rows,
+    registrations,
+    disposes,
+    publish() {
+      globalThis[BRIDGE_API_KEY] = Object.freeze(api);
+    },
+  };
+}
+
+function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
+  const commands = new Map();
+  const handlers = new Map();
+  const notices = [];
+  const reloads = [];
+  const pi = {
+    on(kind, handler) {
+      const list = handlers.get(kind) ?? [];
+      if (typeof handler === 'function') list.push(handler);
+      handlers.set(kind, list);
+      return () => {};
+    },
+    events: { on: () => () => {}, emit: () => {} },
+    registerCommand(name, definition) {
+      commands.set(name, definition);
+    },
+  };
+  const ui = {
+    notify: (message, level) => notices.push([message, level ?? 'info']),
+    select: async () => undefined,
+    // Pi's own theme catalogue, the shape `ctx.ui.getAllThemes()` documents.
+    getAllThemes: () => themes.map((name) => ({ name, path: `/themes/${name}.json` })),
+  };
+  const ctx = { ui, reload: async () => reloads.push(true) };
+  const h = {
+    pi,
+    ctx,
+    commands,
+    notices,
+    reloads,
+    handlers,
+    bridge: bridge ?? null,
+  };
+  h.load = async () => {
+    const mod = await factoryPromise;
+    mod.default(pi);
+    return mod;
+  };
+  // Pi's own order: the factory returns, then session_start arrives.
+  h.start = async () => {
+    for (const handler of handlers.get('session_start') ?? []) {
+      await handler({ reason: 'startup' }, ctx);
+    }
+  };
+  h.shutdown = async () => {
+    for (const handler of handlers.get('session_shutdown') ?? []) {
+      await handler({ reason: 'quit' }, ctx);
+    }
+  };
+  // The one provider the bridge holds for the Herdr page, if any.
+  h.provider = () => {
+    if (!bridge) return undefined;
+    for (const provider of bridge.rows.values()) {
+      if (provider.category === PAGE) return provider;
+    }
+    return undefined;
+  };
+  h.noticeTexts = () => notices.map(([message]) => message);
+  return h;
+}
+
+function setupEnvironment(name, { moshiHooks = false } = {}) {
+  const dir = fixture(name);
+  const stateDir = path.join(dir, 'state');
+  const agentDir = path.join(dir, 'agent');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(agentDir, { recursive: true });
+  if (moshiHooks) {
+    fs.mkdirSync(path.join(agentDir, 'extensions'), { recursive: true });
+    fs.writeFileSync(path.join(agentDir, 'extensions', 'moshi-hooks.ts'), '// moshi hook\n');
+  }
+  process.env.GENTLE_STATUS_STATE_DIR = stateDir;
+  process.env.GENTLE_PI_AGENT_HOME = agentDir;
+  process.env.GENTLE_CUSTOMIZE_LIB_DIR = path.join(REPO_ROOT, 'lib');
+  process.env.GENTLE_HERDR_PLUGIN_ROOT = path.join(REPO_ROOT, 'herdr-plugin');
+  const configPath = path.join(dir, 'config.toml');
+  fs.writeFileSync(configPath, '');
+  process.env.HERDR_CONFIG_PATH = configPath;
+  process.env.HERDR_BIN_PATH = path.join(dir, 'fake-bin', 'herdr');
+  const pathDir = path.join(dir, 'path-bin');
+  fs.mkdirSync(pathDir, { recursive: true });
+  process.env.PATH = pathDir;
+  return {
+    dir,
+    stateDir,
+    agentDir,
+    pathDir,
+    settingsPath: path.join(agentDir, 'settings.json'),
+    flagPath: path.join(stateDir, 'gentle-moshi.json'),
+    themePath: path.join(stateDir, 'gentle-theme.json'),
+  };
+}
+
+// A `moshi-hook` stand-in: `status --json` prints the pairing document the
+// scenario asked for. Nothing else is ever called by the gate.
+function installMoshiHook(pathDir, { paired }) {
+  const statusJson = JSON.stringify({ paired, secretStore: 'keychain', hooks: [] });
+  writeExecutable(
+    path.join(pathDir, 'moshi-hook'),
+    `#!/bin/sh\nif [ "$1" = "status" ]; then printf '%s\\n' '${statusJson}'; exit 0; fi\nexit 1\n`,
+  );
+}
+
+function writeSettings(file, doc) {
+  fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+}
+
+function readSettings(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function readThemeFile(file) {
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+// The row for one value of one line, the way the host finds it: the line's NAME
+// and the value word, never the apply path's structural id.
+function rowFor(rows, line, value) {
+  const row = rows.find((candidate) => candidate.choice && candidate.choice.setting === line && candidate.choice.value === value);
+  assert.ok(row, `no row for ${line} = ${value}; got ${JSON.stringify(rows.map((r) => [r.choice && r.choice.setting, r.choice && r.choice.value]))}`);
+  return row;
+}
+
+const INLINE_HELPERS = {
+  input: async () => undefined,
+  confirm: async () => true,
+  capture: async () => undefined,
+};
+
+beforeEach(() => {
+  // Every test owns its own answer from the bridge.
+  delete globalThis[BRIDGE_API_KEY];
+});
+
+after(() => {
+  delete globalThis[BRIDGE_API_KEY];
+  fs.rmSync(ROOT, { recursive: true, force: true });
+});
+
+/* ------------------------------------------------------------ tests */
+
+describe('the bridge handshake decides the surface (S1, S2)', () => {
+  test('the extension reaches the bridge by symbol, never by import', () => {
+    assert.equal(HANDLES_BRIDGE, true, 'the handshake symbols are inlined in the extension');
+  });
+
+  test('with the bridge present: one Herdr page provider and no command', async () => {
+    const env = setupEnvironment('bridge-present');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    assert.equal(h.commands.has(COMMAND), false, 'the page replaces the command (S1)');
+    assert.equal(bridge.rows.size, 1, 'exactly one provider is registered');
+    assert.deepEqual(bridge.disposes, [], 'the provider is live, not disposed');
+
+    const provider = h.provider();
+    assert.ok(provider, `a provider owns the ${PAGE} page`);
+    assert.equal(typeof provider.rows, 'function');
+    const rows = provider.rows();
+    assert.ok(rows.length > 0, 'the page is not empty');
+    for (const row of rows) assert.equal(row.category, PAGE);
+    const lines = [...new Set(rows.map((row) => row.choice.setting))];
+    assert.deepEqual(lines, ['Herd agents', 'Moshi', 'Theme sync', 'Select theme']);
+    // Every theme in Pi's catalogue plus the unassign entry is on the page.
+    assert.ok(rowFor(rows, 'Select theme', THEME_UNASSIGN));
+    assert.ok(rowFor(rows, 'Select theme', 'Dark'));
+  });
+
+  test('without the bridge: today\'s command and no page (S2)', async () => {
+    const env = setupEnvironment('bridge-absent');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const h = harness();
+    await h.load();
+    await h.start();
+
+    const command = h.commands.get(COMMAND);
+    assert.ok(command, 'the command stays registered outside a Herdr pane');
+    assert.match(command.description, /sidebar agent rows/);
+    assert.match(command.description, /Moshi notifications/);
+    assert.equal(h.provider(), undefined, 'no page is contributed without a bridge');
+
+    // The registered handler is the one that works today: `status` prints one
+    // read-only line and writes nothing.
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    await command.handler('status', h.ctx);
+    assert.deepEqual(h.noticeTexts(), [
+      'customize status: sidebar=off moshi=off theme-sync=off theme=none',
+    ]);
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
+  });
+
+  test('the provider reads the live model on every build', async () => {    const env = setupEnvironment('live-model');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const provider = h.provider();
+    assert.ok(provider);
+
+    const first = provider.rows();
+    assert.equal(rowFor(first, 'Moshi', 'On').choice.current(), false);
+    assert.equal(rowFor(first, 'Moshi', 'Off').choice.current(), true);
+
+    // The stored state changes behind the page: a new build must show it.
+    fs.writeFileSync(env.flagPath, `${JSON.stringify({ enabled: true })}\n`);
+    const second = provider.rows();
+    assert.notEqual(second, first, 'every build is a fresh row set');
+    assert.equal(rowFor(second, 'Moshi', 'On').choice.current(), true);
+    assert.equal(rowFor(second, 'Moshi', 'Off').choice.current(), false);
+  });
+});
+
+describe('the rows apply through the command\'s own path (S3)', () => {
+  test('a row action changes the stored state through the real switch path', async () => {
+    const env = setupEnvironment('row-applies');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const provider = h.provider();
+
+    const on = rowFor(provider.rows(), 'Theme sync', 'On');
+    await on.action(INLINE_HELPERS);
+
+    assert.equal(readThemeFile(env.themePath).sync, true, 'the theme store is the real one');
+    assert.deepEqual(h.noticeTexts(), [
+      "Theme sync on; Herdr's palette follows the theme active in Pi.",
+    ]);
+    assert.deepEqual(h.reloads, [], 'the theme switch needs no Pi reload');
+    // The host repaints after the action, so the live build shows the new value.
+    assert.equal(rowFor(provider.rows(), 'Theme sync', 'On').choice.current(), true);
+  });
+
+  test('a refused row writes nothing and surfaces the refusal once', async () => {
+    const env = setupEnvironment('row-refused');
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const provider = h.provider();
+
+    // No `moshi-hook` on PATH: the prerequisite gate refuses before any write.
+    await rowFor(provider.rows(), 'Moshi', 'On').action(INLINE_HELPERS);
+
+    assert.equal(h.notices.length, 1, 'the refusal is reported exactly once');
+    const [text, level] = h.notices[0];
+    assert.equal(level, 'error');
+    assert.match(text, /Moshi notifications cannot be enabled/);
+    assert.match(text, /`moshi-hook` CLI was not found on PATH/);
+    assert.equal(fs.existsSync(env.flagPath), false, 'no flag file was written');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('the Moshi exclusion write lands and the reload becomes a restart notice', async () => {
+    const env = setupEnvironment('row-moshi-reload', { moshiHooks: true });
+    writeSettings(env.settingsPath, { extensions: [] });
+    installMoshiHook(env.pathDir, { paired: true });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const provider = h.provider();
+
+    await rowFor(provider.rows(), 'Moshi', 'On').action(INLINE_HELPERS);
+
+    // The write the command performs is still performed...
+    assert.equal(JSON.parse(fs.readFileSync(env.flagPath, 'utf8')).enabled, true);
+    assert.deepEqual(readSettings(env.settingsPath).extensions, ['-extensions/moshi-hooks.ts']);
+    // ...and the sentence says what a row can actually do: a row action has no
+    // reload handle, so the user restarts Pi.
+    assert.equal(h.notices.length, 1);
+    const [text] = h.notices[0];
+    assert.match(text, /Moshi notifications enabled\./);
+    assert.match(text, /Restart Pi so the new Moshi hook exclusion takes effect\./);
+    assert.equal(/Reloading now/.test(text), false, 'the page never claims a reload it cannot run');
+    assert.deepEqual(h.reloads, [], 'no reload is attempted from a row');
+    assert.equal(rowFor(provider.rows(), 'Moshi', 'On').choice.current(), true);
+  });
+});
+
+describe('the removed command is never named (S4)', () => {
+  test('page refusals name the Gentle Shell customize menu instead', async () => {
+    const env = setupEnvironment('s4-strings');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const provider = h.provider();
+
+    await rowFor(provider.rows(), 'Moshi', 'On').action(INLINE_HELPERS);
+    const [text] = h.notices[0];
+    assert.equal(text.includes('/herdr-gentle:customize'), false, 'no message sends the user to the removed command');
+    assert.match(text, /the Gentle Shell customize menu/);
+  });
+});
+
+describe('exactly one surface, never two and never none', () => {
+  test('a bridge that refuses the page leaves the command as the only surface', async () => {
+    const env = setupEnvironment('bridge-refuses');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    // The published object is valid, but its bus refuses this provider. Pi has
+    // no command to withdraw, so the honest answer is one surface, not none.
+    bridge.api.registerRows = () => {
+      throw new Error('the page was refused');
+    };
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    assert.equal(bridge.rows.size, 0, 'no page is offered');
+    assert.ok(h.commands.has(COMMAND), 'the command stays the reachable surface');
+  });
+});
+
+describe('the registration is disposable and replaceable', () => {
+  test('session shutdown disposes the provider and a new session replaces it', async () => {
+    const env = setupEnvironment('dispose');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    const firstProvider = h.provider();
+    assert.ok(firstProvider);
+    assert.equal(bridge.rows.size, 1);
+
+    await h.shutdown();
+    assert.deepEqual(bridge.disposes, [firstProvider.id], 'the disposer is kept and called');
+    assert.equal(bridge.rows.size, 0, 'no provider survives the session');
+
+    await h.start();
+    assert.equal(bridge.rows.size, 1, 'a reload replaces the registration instead of stacking one');
+    assert.notEqual(h.provider(), firstProvider);
+    assert.equal(h.commands.has(COMMAND), false, 'the command never appears on the bridge surface');
+  });
+});

@@ -1,0 +1,87 @@
+# Herdr customize page — serve the four options from Gentle Shell's own `/gentle:customize`
+
+When gentle-shell-bridge is present, the four Herdr settings stop living behind a private command and
+become a page the user already opens. Without the bridge everything stays as it is today.
+
+Read this whole document, including `## Log`, before starting a task. Specs are the source of truth;
+tasks are the slices that make them true.
+
+## Specs
+
+- **S1.** With gentle-shell-bridge present (handshake, not package presence), the extension no longer
+  registers `/herdr-gentle:customize`; instead it contributes one page titled `Herdr` to
+  gentle-shell's `/gentle:customize` menu holding exactly the four options:
+  `herd agents`, `moshi`, `theme sync`, `select theme`.
+- **S2.** Without the bridge, today's surface is unchanged: `/herdr-gentle:customize` registered
+  before the pane gate, the floating panel from `lib/customize-panel.js` via `ctx.ui.custom`, the
+  `ctx.ui.select` fallback, and `customize status`.
+- **S3.** Each of the four rows keeps the effect and the refusal semantics of the command it
+  replaces — same apply path, same writes, same "a refusal writes nothing" promise — and nothing
+  else changes: `herd agents` drives the Herdr plugin's `bin/configure.js` (`--check`,
+  `--apply --reload`, `--uninstall --reload`) and re-reads `--check` as proof; `moshi` runs the
+  `moshi-hook` prerequisite gate before enabling and writes nothing on refusal; `theme sync` writes
+  `lib/theme-store.js` and needs no Pi reload; `select theme` lists Pi's own themes plus the
+  `Off (no theme assigned)` entry and is only available while sync is off.
+- **S4.** With the bridge present, no message may point the user at `/herdr-gentle:customize` for
+  something the menu now owns; every user-facing string that named the removed command names the
+  Gentle Shell customize menu instead.
+
+## Bridge contract facts (already established — do not re-explore)
+
+- A customize **page is a row `category`**, not `registerSection`. `registerSection` adds a sidebar
+  card plus a `Sections` toggle and carries no settings rows. Use
+  `registerRows({ id, category: "Herdr", rows: () => [...] })`.
+- A **toggle row** carries `choice: { setting, value, current(), hint?, applyOnMove? }`; one row per
+  value; consecutive rows sharing `choice.setting` render as one line and `←/→` moves the cursor.
+  The bridge forces `applyOnMove: false` on every row it contributes, so **Enter applies**.
+- The row's `action(inline)` runs on Enter/Space. Its only argument is
+  `InlineHelpers = { input, confirm, capture }` — **no host UI handle and no reload**.
+- `preview?: () => { title, sample }` is rendered by the host, so theme swatches survive.
+- `visible?: () => boolean` hides a row (a throw fails closed) — use it instead of an in-panel
+  refusal where hiding is the honest answer.
+- `rows()` runs at every menu build, so `current()` is read live; the host repaints after `action`.
+- A thrown/rejected `action` is reported once through `ui.notify` and recorded in `/bridge-status`;
+  that is the refusal channel.
+- `label` must be one to three plain words with no arrow, colon, dot, pipe, slash or bracket, or the
+  row is refused and reported verbatim. `Keymaps` is the only reserved category.
+- Detection: `Symbol.for("gentle-shell-bridge/api/v1")`, an `isBridgeApi` gate, and
+  `onBridgeApi(handler)` which runs immediately if the API is already published, otherwise
+  subscribes to `BRIDGE_READY_EVENT = "gentle-shell-bridge:ready"`. Worked inline pattern:
+  `examples/bash-card.ts:1214-1234` (+ `:1519-1524`).
+- References, in `gentle-shell-bridge`: `docs/contract.md` §3, §4, §9; `src/types.ts:25-108`;
+  `src/rows.ts:174-178`; `src/api.ts` (published object); `docs/architecture.md:51-59`.
+
+## Tasks
+
+- **T1** — `lib/customize-rows.js`: pure builder from the existing customize model to bridge rows
+  (four settings, values, `current()`, theme preview, sync gating) plus its own test file.
+  Specs: S1, S3. Route: worker. Commit: `feat(customize): build Herdr rows for the Gentle Shell menu`.
+- **T2** — extension wiring: bridge handshake, register the page when the bridge answers, skip the
+  command registration in that case, keep the command path intact otherwise.
+  Specs: S1, S2. Route: worker. Commit: `feat(customize): serve Herdr settings from the Gentle Shell menu`.
+- **T3** — row actions: map each row to the existing apply functions, refusal messages, the Moshi
+  reload question, and the strings that named the removed command.
+  Specs: S3, S4. Route: worker. Commit: `feat(customize): apply Herdr rows through the existing switch paths`.
+- **T4** — docs and tests for both surfaces: the page under the bridge, the untouched command
+  without it.
+  Specs: S1, S2, S3, S4. Route: worker. Commit: `docs(customize): document the Herdr menu page and its fallback`.
+- **T5** — independent verification of the whole diff (Risk item 3: a published command is removed).
+  Specs: S1-S4. Route: `gentle-ai-verify`. Commit: none.
+- **T6** — feature close: reconciliation, Engram mirror, evidence in this document.
+  Specs: all. Route: parent. Commit: none.
+
+## Log
+
+- **L1** (verbatim, user): «Bien, agregemos una nueva feacture y es que si se tiene el plugin
+  /home/jona/dev/projects/gentle-shell-bridge en vez de crear comando /herdr customize lo que hace
+  es agregar a customize de gentle la seccion "Herdr" y ahi pone las 4 opciones, herd agents, moshi,
+  theme sync, select theme. Primero revisa si es viable»
+- **L2** (decision, user, verbatim): «esto es adicional, si no tiene bridge el customize de herdr se
+  mantiene» → the no-bridge surface is explicitly preserved: S2.
+- **L3** (decision, user): chose «Reemplazar: la página Herdr es la única superficie» — with the
+  handshake as the gate, so a bridge that never answers never removes the command.
+- **L4** (evidence, parent): feasibility review found the page is a row `category`, not
+  `registerSection`; the four options map 1:1 onto toggle rows over the model
+  `customizePanelModel(ctx)` already produces (`extensions/gentle-herdr-state.ts:2217`), and the
+  effects already live in `applyCustomizeSwitch` / `applyCustomizePanel` (`~:2735`, `~:2822`),
+  independent of the panel. Only the renderer changes.

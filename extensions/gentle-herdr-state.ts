@@ -2075,6 +2075,11 @@ function lastFinishedLabel(taskMap) {
 // unavailable. The removed `Plugin tools` and `Reset` sections and the
 // cross-extension provider slot are deliberately NOT restored: they switched
 // worktree/ODD/issues surfaces this package no longer contains.
+//
+// With gentle-shell-bridge present this command is not registered at all: the
+// same four options are served as the `Herdr` page of Gentle Shell's own
+// `/gentle:customize` menu (see `registerCustomizeSurface` below), so S1's page
+// and S2's command are mutually exclusive and the apply path is shared.
 // ---------------------------------------------------------------------------
 
 const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
@@ -2108,6 +2113,19 @@ const THEME_LIST_UNAVAILABLE_TEXT =
   "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.";
 const THEME_STORE_UNAVAILABLE_TEXT =
   "Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.";
+
+// S4 (odd/tasks/herdr-customize-page.md): the four options are served on TWO
+// surfaces — this command when no bridge answers, and the `Herdr` page of Gentle
+// Shell's own customize menu when one does — so every message that sends the
+// user back to them names the MENU. One string is then correct on both, and no
+// message points at a command the page removes.
+const CUSTOMIZE_MENU_TEXT = "the Gentle Shell customize menu";
+
+// The Moshi settings entry waits for the next Pi extension load. A customize ROW
+// has no reload handle (the bridge hands `action` only inline helpers), so the
+// page writes the exclusion and asks for a restart instead of promising a reload
+// it cannot perform. The command and the panel keep reloading immediately.
+const MOSHI_RESTART_TEXT = "Restart Pi so the new Moshi hook exclusion takes effect.";
 
 // The former panel's geometry and overlay options, unchanged. The helpers
 // module (@earendil-works/pi-tui) is resolved lazily through the injectable
@@ -2144,6 +2162,18 @@ function customizeLibDir() {
 function customizePanelModule() {
   try {
     return nodeRequire(join(customizeLibDir(), "customize-panel.js"));
+  } catch {
+    return null;
+  }
+}
+
+// The bridge row builder (lib/customize-rows.js, odd/tasks/herdr-customize-page.md
+// T1). Loaded lazily beside the panel module and for the same reason: an
+// installed copy without the sibling library keeps every other surface working
+// and answers no page instead of failing this extension.
+function customizeRowsModule() {
+  try {
+    return nodeRequire(join(customizeLibDir(), "customize-rows.js"));
   } catch {
     return null;
   }
@@ -2532,11 +2562,11 @@ function runMoshiStatus(cliPath) {
 }
 
 function moshiMissingCliText() {
-  return "Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.";
+  return `Moshi notifications cannot be enabled: the \`moshi-hook\` CLI was not found on PATH; install the Moshi CLI, then re-apply On from ${CUSTOMIZE_MENU_TEXT}.`;
 }
 
 function moshiNotPairedText() {
-  return "Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.";
+  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` reports paired:false (this device is not paired); run \`moshi-hook pair --token <pairing-token>\`, then re-apply On from ${CUSTOMIZE_MENU_TEXT}.`;
 }
 
 function moshiStatusFailedText(reason, status) {
@@ -2544,7 +2574,7 @@ function moshiStatusFailedText(reason, status) {
   if (reason === "non-zero-exit") detail = `exited with status ${status ?? "unknown"}`;
   else if (reason === "unparseable") detail = "produced no parseable JSON";
   else if (reason === "missing-field") detail = "reported no paired flag";
-  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from /herdr-gentle:customize.`;
+  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from ${CUSTOMIZE_MENU_TEXT}.`;
 }
 
 function checkMoshiEnablePrereqs() {
@@ -2624,13 +2654,19 @@ async function applyCustomizeSwitch(id, value, ctx, options = {}) {
       ? applyThemeSync(want)
       : applyMoshiNotifications(want);
   const notify = ctx?.ui?.notify;
-  if (typeof notify === "function") {
-    notify(`${result.text}${result.needsReload ? " Reloading now to apply the change." : ""}`, result.level);
-  }
-  // The overlay defers the reload (`deferReload`): reloading while the card is
-  // still mounted restarts Pi behind an open overlay, so the panel closes first
-  // and the caller reloads after `ctx.ui.custom` resolved.
-  if (result.needsReload && options.deferReload !== true && typeof ctx?.reload === "function") await ctx.reload();
+  // The reload sentence is a PROMISE about what happens next, so it is written
+  // from what this surface can actually do. `deferReload` hands the reload to the
+  // caller that mounted the overlay (the card closes first, then it reloads), and
+  // `noReload` is the Gentle Shell customize page, where a row action receives no
+  // ctx and therefore no reload handle: there the only honest sentence is a
+  // restart. Every other combination is the command's own immediate reload.
+  const canReload = options.deferReload !== true && options.noReload !== true
+    && typeof ctx?.reload === "function";
+  const reloadNotice = result.needsReload
+    ? (options.noReload === true ? ` ${MOSHI_RESTART_TEXT}` : " Reloading now to apply the change.")
+    : "";
+  if (typeof notify === "function") notify(`${result.text}${reloadNotice}`, result.level);
+  if (result.needsReload && canReload) await ctx.reload();
   return result;
 }
 
@@ -2814,7 +2850,7 @@ async function applyCustomizeChoice(choice, ctx) {
 // uses, and answers with a freshly read model so the panel shows the real state
 // instead of guessing it. `close` is only true when Pi must reload: the caller
 // closes the overlay first and reloads after it resolved.
-async function applyCustomizePanel(choice, ctx) {
+async function applyCustomizePanel(choice, ctx, options = {}) {
   const model = () => customizePanelModel(ctx);
   if (!isRecord(choice)) return { model: model(), close: false, reload: false };
   const { settingId, optionId } = choice;
@@ -2827,7 +2863,12 @@ async function applyCustomizePanel(choice, ctx) {
   }
   if (!CUSTOMIZE_SWITCH_IDS.includes(settingId)) return { model: model(), close: false, reload: false };
   if (optionId !== "on" && optionId !== "off") return { model: model(), close: false, reload: false };
-  const result = await applyCustomizeSwitch(settingId, optionId, ctx, { deferReload: true });
+  const result = await applyCustomizeSwitch(
+    settingId,
+    optionId,
+    ctx,
+    options.noReload === true ? { noReload: true } : { deferReload: true },
+  );
   const reload = Boolean(result && result.needsReload);
   return { model: model(), close: reload, reload };
 }
@@ -2900,7 +2941,7 @@ async function executeCustomize(rawArgs, ctx) {
   }
   if (head !== "") {
     if (typeof notify === "function") {
-      notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
+      notify(`Unknown option "${raw}". Use ${CUSTOMIZE_MENU_TEXT}, or the status option for a read-only report.`, "error");
     }
     return;
   }
@@ -2964,17 +3005,168 @@ async function executeCustomize(rawArgs, ctx) {
   await runCustomizeFallback(ctx);
 }
 
-export default function (pi) {
-  // Registered before the pane gate on purpose: the switches are local state and
-  // must stay reachable from a plain Pi session outside a Herdr pane.
-  if (typeof pi?.registerCommand === "function") {
+// ---------------------------------------------------------------------------
+// The Gentle Shell customize PAGE (odd/tasks/herdr-customize-page.md T2/T3;
+// specs S1-S4).
+//
+// When gentle-shell-bridge answers, the four switches are a page in Gentle
+// Shell's own `/gentle:customize` menu instead of a private command; when it does
+// not, the command above is registered exactly as before. The bridge is reached
+// as a HANDSHAKE, never a dependency: its object sits at a `Symbol.for` key on
+// `globalThis`, and the key, the schema and the members this file calls are
+// inlined here, so nothing resolves `gentle-shell-bridge` as a module
+// (`examples/bash-card.ts:1214-1234` in that package is the same pattern).
+//
+// WHEN the answer is reliable. The bridge publishes at module load and announces
+// from its extension factory, so a bridge installed as a package has published
+// before any `session_start` handler runs — which makes `session_start` the
+// decision point, never the factory, where the bridge may simply not have loaded
+// yet. Pi offers no way to withdraw a registered command, so the decision is
+// taken once, where it is answerable: a bridge that publishes AFTER this
+// extension's `session_start` (only possible when this extension is installed as
+// a loose global extension while the bridge is a package) keeps today's command
+// rather than leaving a second surface Pi cannot remove. That is the accepted
+// limitation, and it is why no ready-event listener is taken here — a listener
+// could only add a surface it cannot take back.
+//
+// The registrations are kept and dropped on session shutdown, so a reload
+// replaces the page instead of stacking a second one.
+// ---------------------------------------------------------------------------
+const BRIDGE_API_KEY = Symbol.for("gentle-shell-bridge/api/v1");
+const BRIDGE_API_SCHEMA = "gentle-shell-bridge/api";
+const BRIDGE_API_VERSION = 1;
+// The provider's stable id: the bridge replaces a provider registered under the
+// same id in place, so one page is one page however often it is registered.
+const CUSTOMIZE_PAGE_PROVIDER_ID = "herdr-gentle:customize";
+
+// The published object, gated exactly like the bridge's own `isBridgeApi`
+// (`src/api.ts`): identity strings plus the members this file calls. A foreign
+// payload, another major version or a partial object is ABSENT — never an error,
+// never guessed at, never overwritten.
+function publishedBridge() {
+  const slot = globalThis[BRIDGE_API_KEY];
+  if (!isRecord(slot)) return null;
+  if (slot.schema !== BRIDGE_API_SCHEMA || slot.version !== BRIDGE_API_VERSION) return null;
+  if (typeof slot.registerRows !== "function") return null;
+  if (typeof slot.registerSection !== "function" || typeof slot.createStore !== "function") return null;
+  return slot;
+}
+
+// A row's apply path — and it IS the overlay's own path (`applyCustomizePanel`),
+// not a copy: the same `writeThemeChoice` for the pinned theme, the same
+// `applyCustomizeSwitch` for the three switched settings, and therefore the same
+// Moshi prerequisite gate and the same "a refusal writes nothing" promise by
+// construction. It adds the one fact the overlay does not need: a row action
+// receives no ctx, so the page has no reload handle and the shared path reports a
+// restart instead of reloading (see `applyCustomizeSwitch`).
+//
+// A refusal is NOT re-thrown: the shared path reports it through the host's own
+// `ui.notify` and returns, which is one report — the same one the command gives.
+// Throwing on top of that would report it twice (the bridge reports a thrown
+// action again), so only an unexpected exception travels into the bridge's
+// channel.
+async function applyCustomizePageChoice(choice, ctx) {
+  return applyCustomizePanel(choice, ctx, { noReload: true });
+}
+
+// The one provider this extension contributes: the `Herdr` page (a row
+// CATEGORY, never `registerSection`, which is a sidebar card). `rows()` is called
+// on every menu build, so the model — and every `current()`, swatch and sync gate
+// inside it — is read live rather than captured at registration.
+function customizePageProvider(rowsModule, hostCtx) {
+  return {
+    id: CUSTOMIZE_PAGE_PROVIDER_ID,
+    category: rowsModule.CUSTOMIZE_ROWS_CATEGORY,
+    rows() {
+      const ctx = hostCtx();
+      // No session ctx means no theme catalogue and no notify channel; an empty
+      // page is the honest answer, and `customizeRows` answers no rows for a
+      // model it cannot read anyway.
+      if (!ctx) return [];
+      return rowsModule.customizeRows({
+        model: () => customizePanelModel(ctx),
+        apply: (choice) => applyCustomizePageChoice(choice, ctx),
+      });
+    },
+  };
+}
+
+// Exactly one of the two surfaces is ever live. Bound before the `enabled()` pane
+// gate in the factory, exactly where the command used to be: the switches are
+// local state and stay reachable from a plain Pi session outside a Herdr pane.
+function registerCustomizeSurface(pi) {
+  let pageContext = null;
+  let disposePage = null;
+  let commandRegistered = false;
+
+  function clearPage() {
+    const dispose = disposePage;
+    disposePage = null;
+    if (typeof dispose !== "function") return;
+    try {
+      dispose();
+    } catch {
+      // The bridge owns its own bus: a disposer that fails cannot make this file
+      // register a second surface, so the failure is contained here.
+    }
+  }
+
+  // S2: today's command — same description, same handler.
+  function registerCommand() {
+    if (commandRegistered) return;
+    if (typeof pi?.registerCommand !== "function") return;
     pi.registerCommand("herdr-gentle:customize", {
       description: "Customize Herdr Gentle Shell: sidebar agent rows, Moshi notifications and the Herdr theme",
       handler: async (args, ctx) => {
         await executeCustomize(args, ctx);
       },
     });
+    commandRegistered = true;
   }
+
+  pi.on("session_start", (_event, ctx) => {
+    pageContext = isRecord(ctx) ? ctx : null;
+    const bridge = publishedBridge();
+    if (!bridge) {
+      // S2: nothing answered the handshake, so the command is the surface.
+      clearPage();
+      registerCommand();
+      return;
+    }
+    // S1: the bridge answered, so the page is the surface and the command is
+    // never registered in this process.
+    clearPage();
+    const rowsModule = customizeRowsModule();
+    let dispose = null;
+    if (rowsModule) {
+      try {
+        dispose = bridge.registerRows(customizePageProvider(rowsModule, () => pageContext));
+      } catch {
+        dispose = null;
+      }
+    }
+    if (typeof dispose === "function") {
+      disposePage = dispose;
+      return;
+    }
+    // A bridge that answered but cannot host the page (this install has no
+    // lib/customize-rows.js, or the bridge's bus refused the provider) leaves the
+    // command as the only surface: one surface, never none.
+    registerCommand();
+  });
+
+  pi.on("session_shutdown", () => {
+    // The bridge's bus outlives the session, so the registration is dropped here:
+    // the next session registers again instead of stacking a second page.
+    clearPage();
+    pageContext = null;
+  });
+}
+
+export default function (pi) {
+  // Registered before the pane gate on purpose: the switches are local state and
+  // must stay reachable from a plain Pi session outside a Herdr pane.
+  registerCustomizeSurface(pi);
   if (!enabled()) return;
 
   let rootSession = false;
