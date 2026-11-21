@@ -912,3 +912,55 @@ describe('customize panel theme gate — the value column (D2)', () => {
     assert.equal(columnOf(on), columnOf(off), 'the sync values keep their column whether the picker is there or not');
   });
 });
+
+// S2 (independent verification): the column fix must be durable, not a one-frame
+// coincidence. ONE mounted panel, Theme sync cycled Off→On→Off three times, at
+// four card widths: the `Off`/`On` columns of the `Theme sync` line are identical
+// on every cycle whether the picker is offered or withheld, the picker is absent
+// while the sync is on, and it returns when the sync is off. The pinned pairs are
+// the verifier's own measurements of this geometry (zero-based), so a future
+// column change is a deliberate one.
+describe('customize panel theme gate — the column is durable (S2)', () => {
+  test('the Theme sync columns never move across three cycles at four widths', async () => {
+    const SANITY = { 52: [26, 33], 72: [50, 57], 82: [50, 57], 104: [53, 60] };
+    const WIDTHS = Object.keys(SANITY).map(Number);
+
+    let sync = false;
+    const apply = async (request) => {
+      if (request.settingId === 'theme-sync') sync = request.optionId === 'on';
+      return { model: modelWith({ theme: { ...THEME_OFF, sync } }) };
+    };
+    // ONE panel, mounted once: every navigation below happens on this component.
+    const { component } = open({ model: modelWith({ theme: { ...THEME_OFF, sync: false } }), apply });
+    for (const key of ['down', 'down', 'right']) component.handleInput(key);
+
+    const seen = {};
+    const assertOffered = (width, offered) => {
+      const lines = frame(component, width);
+      const hasPicker = lines.some((line) => line.includes('Gentle Shell theme'));
+      assert.equal(hasPicker, offered, `${width}: the picker is ${offered ? 'offered' : 'withheld'}`);
+      const line = lineWith(component, 'Theme sync', width);
+      const columns = [line.indexOf('Off'), line.indexOf('On')];
+      assert.deepEqual(columns, SANITY[width], `${width}: the measured geometry`);
+      if (seen[width]) assert.deepEqual(columns, seen[width], `${width}: the values did not move`);
+      seen[width] = columns;
+    };
+
+    // The mount starts with the sync off, so the picker is offered.
+    for (const width of WIDTHS) assertOffered(width, true);
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      // Cursor landed on the stored Off: → reaches On, Enter turns the sync on.
+      component.handleInput('right');
+      component.handleInput('enter');
+      await settle(component);
+      for (const width of WIDTHS) assertOffered(width, false);
+      // The cursor stayed on On: ← reaches Off, Enter turns the sync off again.
+      component.handleInput('left');
+      component.handleInput('enter');
+      await settle(component);
+      for (const width of WIDTHS) assertOffered(width, true);
+    }
+    assert.deepEqual(Object.keys(seen).map(Number).sort((left, right) => left - right), WIDTHS, 'every width was checked');
+  });
+});

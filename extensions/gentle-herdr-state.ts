@@ -2230,11 +2230,12 @@ function readHostThemeNames(ctx) {
 // throws `Unknown theme color: accent` because `accent` is a FOREGROUND token
 // (`theme-tokens.d.ts`: `accent` has `slot: "foreground"`; only `selectedBg`,
 // `searchMatchBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`,
-// `toolSuccessBg` and `toolErrorBg` are background tokens). Every native theme
-// (`system`, `dark`, `light`, `TokyoNight`) answers `selectedBg`, so those
-// swatches render again; the text side stays on the `text` foreground token,
-// which the same themes answer. A theme that throws for either, or answers a
-// non-string, still throws here and both surfaces paint `Preview unavailable`.
+// `toolSuccessBg` and `toolErrorBg` are background tokens). Pi 1.6.0's built-in
+// catalogue is `system`, `dark` and `light`, and all three answer `selectedBg`,
+// so their swatches render again; the text side stays on the `text` foreground
+// token, which the same themes answer. A theme that throws for either, or
+// answers a non-string, still throws here and both surfaces paint
+// `Preview unavailable`.
 function themePreviewFactory(ctx) {
   const getTheme = ctx?.ui?.getTheme;
   if (typeof getTheme !== "function") return null;
@@ -2254,8 +2255,14 @@ function themePreviewFactory(ctx) {
     if (typeof background !== "string" || typeof text !== "string") {
       throw new Error(`Theme ${name} exposes no palette escapes.`);
     }
-    // The upstream sample: a background block then the sample text.
-    return { title: "source palette", sample: `${background}  \x1b[0m ${text}Aa  sample text\x1b[0m` };
+    // The upstream sample: a background block then the sample text. The words are
+    // painted OVER the theme's own background — no reset between the chip and
+    // them — because that is the pairing every theme is designed to keep
+    // readable. A reset there dropped the words onto the user's AMBIENT terminal
+    // background (the verifier measured 1.62:1 for `light` on a #141414 terminal
+    // and 1.22:1 for `dark` on #fafafa). `system` keeps working: its `selectedBg`
+    // is the terminal's default background and its `text` the default foreground.
+    return { title: "source palette", sample: `${background}  ${text}Aa  sample text\x1b[0m` };
   };
 }
 

@@ -202,6 +202,19 @@ async function settlePanel(component) {
   assert.equal(component.state.busy, false, 'the panel apply settled');
 }
 
+// The last background operation before the swatch's sample words. It must be a
+// PAINTED background (`48;…`), never a reset (`\x1b[0m`) or a default
+// (`\x1b[49m`): those end the theme's background and drop the words onto the
+// user's ambient terminal background, which is the unreadable pairing the
+// verifier measured (light on #141414 = 1.62:1, dark on #fafafa = 1.22:1).
+function backgroundBeforeSample(frame) {
+  const at = frame.indexOf('Aa  sample text');
+  assert.ok(at >= 0, 'the sample words are painted');
+  const marks = [...frame.slice(0, at).matchAll(/\x1b\[(?:0|49|48;[0-9;]*)m/g)];
+  assert.ok(marks.length > 0, 'the sample paints a background before the words');
+  return marks.at(-1)[0];
+}
+
 before(() => {
   // The real artifact the sidebar switch drives, plus a fake `herdr` for the
   // `--reload` leg: the plugin root is the repository checkout, the config is
@@ -1598,8 +1611,14 @@ describe('floating panel theme rows', () => {
     });
     await withThemePanel(h);
     assert.ok(seen.frame.includes('Preview · nord · source palette'), 'the upstream headline');
-    assert.ok(seen.frame.includes('\x1b[48;5;17m'), "the swatch uses that theme's own accent background");
+    assert.ok(seen.frame.includes('\x1b[48;5;17m'), "the swatch uses that theme's own palette");
     assert.ok(seen.frame.includes('Aa  sample text'), 'the upstream sample text');
+    // The words are painted OVER that theme's background, never after a reset.
+    assert.match(
+      backgroundBeforeSample(seen.frame),
+      /^\x1b\[48;/,
+      'the last background before the sample words is the theme background, not a reset',
+    );
   });
 
   test('a theme that cannot be read renders Preview unavailable, never the active theme', async () => {

@@ -830,8 +830,8 @@ describe('every page row paints the panel\'s own preview (defect 1)', () => {
       ],
       'Select theme': [
         { title: 'static unassigned sample', sample: 'no theme pinned; Herdr keeps its last palette' },
-        { title: 'source palette', sample: '\x1b[48;5;17m  \x1b[0m \x1b[38;5;250mAa  sample text\x1b[0m' },
-        { title: 'source palette', sample: '\x1b[48;5;17m  \x1b[0m \x1b[38;5;250mAa  sample text\x1b[0m' },
+        { title: 'source palette', sample: '\x1b[48;5;17m  \x1b[38;5;250mAa  sample text\x1b[0m' },
+        { title: 'source palette', sample: '\x1b[48;5;17m  \x1b[38;5;250mAa  sample text\x1b[0m' },
       ],
     };
     for (const [line, expected] of Object.entries(SAMPLES)) {
@@ -893,7 +893,18 @@ function realPiTheme(name) {
 }
 
 describe('a native Pi theme keeps its swatch (D1)', () => {
-  const SWATCH = '\x1b[48;2;33;59;73m  \x1b[0m \x1b[38;2;222;224;225mAa  sample text\x1b[0m';
+  // The last background operation before the swatch's sample words must be a
+  // PAINTED background (`48;…`), never a reset or a default: those end the theme's
+  // background and drop the words onto the user's ambient terminal background.
+  function backgroundBeforeSample(sample) {
+    const at = sample.indexOf('Aa  sample text');
+    assert.ok(at >= 0, 'the sample words are painted');
+    const marks = [...sample.slice(0, at).matchAll(/\x1b\[(?:0|49|48;[0-9;]*)m/g)];
+    assert.ok(marks.length > 0, 'the sample paints a background before the words');
+    return marks.at(-1)[0];
+  }
+
+  const SWATCH = '\x1b[48;2;33;59;73m  \x1b[38;2;222;224;225mAa  sample text\x1b[0m';
 
   test('the page paints the swatch from the background token the real themes accept', async () => {
     const env = setupEnvironment('native-theme-swatch');
@@ -907,7 +918,11 @@ describe('a native Pi theme keeps its swatch (D1)', () => {
 
     for (const name of ['system', 'dark', 'light']) {
       const row = rowFor(rows, 'Select theme', name);
-      assert.deepEqual(row.preview(), { title: 'source palette', sample: SWATCH }, `${name} keeps its swatch`);
+      const preview = row.preview();
+      // The words sit ON the theme's own background, which is the pairing every
+      // theme is designed to keep readable — never after a reset.
+      assert.match(backgroundBeforeSample(preview.sample), /^\x1b\[48;/, `${name}: the words sit on the theme background`);
+      assert.deepEqual(preview, { title: 'source palette', sample: SWATCH }, `${name} keeps its swatch`);
     }
     // An unreadable theme is still no preview at all, never a crash.
     const broken = harness({
@@ -919,6 +934,28 @@ describe('a native Pi theme keeps its swatch (D1)', () => {
     await broken.load();
     await broken.start();
     assert.equal(rowFor(broken.provider().rows(), 'Select theme', 'dark').preview(), undefined);
+
+    // `system` is the terminal-default theme: its `selectedBg` IS the default
+    // background (`\x1b[49m`) and its `text` the default foreground, and the words
+    // must still sit on that pairing rather than after a full reset.
+    const system = {
+      name: 'system',
+      getBgAnsi: (token) => {
+        if (token !== 'selectedBg') throw new Error(`Unknown theme color: ${token}`);
+        return '\x1b[49m';
+      },
+      getFgAnsi: (token) => {
+        if (token !== 'text') throw new Error(`Unknown theme color: ${token}`);
+        return '\x1b[39m';
+      },
+    };
+    const plain = harness({ bridge: fakeBridge(), themes: ['system'], getTheme: () => system });
+    plain.bridge.publish();
+    await plain.load();
+    await plain.start();
+    const plainSample = rowFor(plain.provider().rows(), 'Select theme', 'system').preview().sample;
+    assert.equal(plainSample, '\x1b[49m  \x1b[39mAa  sample text\x1b[0m', 'the default pairing is kept');
+    assert.equal(backgroundBeforeSample(plainSample), '\x1b[49m', 'the default background, never a reset');
   });
 });
 
