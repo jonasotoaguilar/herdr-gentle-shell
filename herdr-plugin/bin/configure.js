@@ -247,8 +247,10 @@ function backupPathFor(file) {
 
 // Atomic write with backup: temp file in the target directory, then rename.
 // On any failure the original is untouched and the temp is removed.
-// Shared by both managed-block writers (this sidebar block and the theme
-// projection in bin/configure-theme.js) so every failure mode is identical.
+// This serves the sidebar block only: the theme projection that used to share
+// it (bin/configure-theme.js) no longer exists, because Herdr theme sync now
+// runs inside the Pi package (lib/herdr-theme-apply.js) and owns its config
+// write end to end.
 function writeAtomic(file, next, backup) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
@@ -324,9 +326,11 @@ function removeManaged(text) {
 /* ------------------------------------------------------------ reload */
 
 // Reload the running Herdr server after a write. The reporters are injectable
-// so a second caller (bin/configure-theme.js) can keep its own single-result
-// stdout contract without duplicating the spawn, timeout and exit semantics;
-// the defaults are exactly the sidebar CLI's previous behaviour.
+// so a caller can keep its own single-result stdout contract without
+// duplicating the spawn, timeout and exit semantics; the defaults are exactly
+// the sidebar CLI's previous behaviour. There is no second theme writer to
+// inject them for any more: theme sync reloads from the Pi package
+// (lib/herdr-theme-apply.js).
 function reloadConfig(log = (message) => console.log(message), warn = (message) => console.error(message)) {
   const result = spawnSync(herdrBinary(), ['server', 'reload-config'], {
     encoding: 'utf8',
@@ -481,10 +485,11 @@ module.exports = {
   MANAGED_BEGIN,
   MANAGED_END,
   sidebarCell,
-  // Shared primitives for the second managed-block writer
-  // (bin/configure-theme.js): reusing them keeps the config path, the atomic
-  // write with `.bak` backup and the reload semantics from drifting apart
-  // between the two blocks. Exporting them changes no sidebar behaviour.
+  // Primitives for this sidebar block. They were exported for a second
+  // managed-block writer (bin/configure-theme.js), which is gone: Herdr theme
+  // sync now runs in the Pi package and never edits this block or shares these
+  // config, backup or reload semantics. Exporting them is kept as-is and
+  // changes no sidebar behaviour.
   herdrConfigPath,
   herdrBinary,
   readConfig,
