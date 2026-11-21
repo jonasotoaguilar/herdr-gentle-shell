@@ -1012,31 +1012,33 @@ nothing:
 argument, Esc, or a cancelled menu writes nothing. With no argument the
 command opens the floating panel (`lib/customize-panel.js`, painted through its
 own palette) over `ctx.ui.custom` in Gentle Shell's own layout: one left
-`CATEGORIES` list, one right pane headed `<Category> · n/m` with its setting
-rows, each row painting the stored value with `●` and the other with `○`; one
-line above the footer describes the focused setting
-(`<setting> — <what it changes>`), and the footer
-`←/→ or Tab panes · ↑/↓ move · Enter apply · Esc close`. There is no
-`Click` token and no
-`Preview · …` band and no `p profiles` key: this plugin owns no profiles
-concept, so the footer advertises nothing it cannot do — every token in it is a
-key the panel answers to, and a narrow card compacts the legend instead of
-wrapping it. `←/→` or `Tab` moves
-between the category and value panes, `↑/↓` or `j/k` moves the cursor, `Enter`
-applies the focused row and `Esc` closes without a write; a click on a category
-selects it, a click on a row applies it, and a click outside the panes is
-ignored (a press only captures the gesture, so a drag never applies a row).
-Each switch is one row that paints the stored state and carries the opposite
-value. Each category owns exactly one switch: `Herdr Sidebar` shows the single
-`Sidebar agent rows` row and its description names the managed agent rows only,
-while the only Moshi switch is the `Notifications` row under
-`Moshi notifications`, which applies the `gentle-moshi.json` flag through
-`applyMoshiNotifications`. The two channels are never mixed: the sidebar-rows
+`CATEGORIES` list, one right pane headed `<Category> · n/m`, and one line per
+setting with its options inline — `●` the stored option, `›` the cursor while it
+sits elsewhere, `○` the rest. The arrows move the option cursor and only `Enter`
+applies; `Enter` keeps the card open (only a Moshi settings change that needs a
+Pi reload closes it), `Esc` closes without a write, `Tab`
+switches panes and `↑/↓` (or `j/k`) moves between settings. A line whose options
+do not fit scrolls sideways behind muted `‹`/`›` markers with an `n/m` counter,
+falling back to a compact `‹ value ›`; the Preview block below the panes reads
+`Preview · <option> · <title>` plus a sample, and a theme option is painted in
+that theme's own palette; the footer carries one of three legends (categories,
+option row, panes) after the `Click · ` prefix, chosen by what the keys do right
+now and compacted instead of wrapped on a narrow card, with no `p profiles` key
+because this plugin owns no profiles concept. A click on an option applies
+exactly that option, a click on a setting's name only moves the focus, a click
+on a category selects it, and a click outside the panes is ignored (a press only
+captures the gesture, so a drag never applies anything).
+Each category owns its own settings: `Herdr Sidebar` shows the single
+`Sidebar agent rows` setting, the only Moshi switch is the `Notifications`
+setting under `Moshi notifications`, which applies the `gentle-moshi.json` flag
+through `applyMoshiNotifications`, and `Herdr Theme` owns the `Theme sync`
+toggle plus the inline `Gentle Shell theme` list (§12). The two channels are
+never mixed: the sidebar-rows
 switch neither reads nor writes that flag, so disabling the agent rows leaves
 the notification channel exactly as it was.
-An inconclusive sidebar verdict (`unknown`) renders as `● Unknown` with a note
-instead of hiding the row: toggling still attempts the repair and reports the
-apply step's own error, exactly like the menu. The plain
+An inconclusive sidebar verdict (`unknown`) renders with no option marked `●`
+and a note instead of hiding the setting: toggling still attempts the repair and
+reports the apply step's own error, exactly like the menu. The plain
 two-step `ctx.ui.select` menu remains the
 fallback when the TUI helpers or `ctx.ui.custom` are unavailable. The removed
 `Plugin tools` and `Reset` sections and the in-process provider slot
@@ -1255,91 +1257,292 @@ list, not silent.
 ## 12. Theme sync (Pi palette → Herdr theme)
 
 Herdr's palette follows the theme active in Gentle Shell / Pi, or one theme
-pinned while the sync is off (S1–S5). The switch lives with the other two in
+pinned while the sync is off (S1–S7). The switch lives with the other two in
 `/herdr-gentle:customize`; the user-facing reference is
-[docs/theme-sync.md](docs/theme-sync.md). Three modules with three owners, and
-one direction of data:
+[docs/theme-sync.md](docs/theme-sync.md). Six modules with one owner — this Pi
+package — and one direction of data:
 
-| Module | Package | Owns |
-|---|---|---|
-| `lib/theme-store.js` | Pi (`herdr-gentle-shell`) | The one persisted document (`gentle-theme.json`): the state-dir resolution copied verbatim from the sidecar's Moshi flag, a normalised read, and the atomic replace. |
-| `lib/theme-projection.js` | Pi | The pure translation: assignable Herdr theme names, Herdr token order, `HERDR_ROLE_SOURCES`, `projectPalette`, `paletteFingerprint`, and the `null`/`Off` spelling the panel paints. No filesystem, no host import. |
-| `herdr-plugin/lib/gentle-theme-config.js` + `bin/configure-theme.js` | Herdr plugin | Everything that touches `config.toml`: payload validation, the managed block, the refusals, the atomic write with its own `.bak`, and the optional reload. |
+| Module | Owns |
+| --- | --- |
+| `lib/theme-store.js` | The one persisted document (`gentle-theme.json`): the state-dir resolution copied verbatim from the sidecar's Moshi flag, a normalised read, and the atomic replace. |
+| `lib/theme-projection.js` | The pure translation: assignable Herdr theme names, Herdr token order, `HERDR_ROLE_SOURCES`, the `DOTS_FIXED` surface tables, `projectPalette`, `paletteFingerprint`, and the `Off` label the projection exposes. No filesystem, no host import. |
+| `lib/herdr-theme-config.js` | The pure planner — a **line splicer, not a TOML validator**: table-boundary scanning (headers only at real line starts), opaque bytes outside the two theme tables, a strict theme-table grammar, the whole-line `was` marker with byte-exact restoration (the user's latest trailing comment wins), the single regenerated block (`begin` / `begin created` … `end` / `end after a missing line ending`) and the created table it removes again, the ambiguity refusal for a marker-shaped comment above a block being removed or moved, the 1.8.0 marker-pair migration, the BOM, and the enforced splice invariant. |
+| `lib/herdr-theme-apply.js` | The writer: the availability guard matrix, the bounded snapshot, the two compare-and-swap checks, the atomic non-overwriting backup (a regular existing file is accepted as it is), retried temp cleanup that names a survivor and only ever removes a path it created itself, the growth limit, `forceReload`, the exclusive temp + `fchmod` (all mode bits) + `fsync` + `rename`, and the reload. |
+| `extensions/herdr-theme-sync.ts` | The follower: session-start evaluation, 500 ms tick, the two identities, one in-process apply per change, the notices. |
+| `lib/customize-panel.js` + the theme wiring in `extensions/gentle-herdr-state.ts` | The switch and the card: `applyThemeSync`, `writeThemeChoice`, `applyCustomizePanel`, `customize status`, and the setting lines, Preview block, legends and pointer hits. |
 
-Two thin glue layers sit above them and own no state: the follower
-`extensions/herdr-theme-sync.ts` (tick, fingerprint, one spawn per change,
-notices) and the switch in `extensions/gentle-herdr-state.ts` plus
-`lib/customize-panel.js` (`applyThemeSync`, `applyThemeSelection`,
-`customize status`). Pi colours become hex strings in the follower through
-`colorToHex` from `@earendil-works/pi-tui`, which is why the follower is its own
-extension rather than a section of the state sidecar: the sidecar is loaded by
-every suite as a renamed copy with one stubbed host import, and the projection
-needs no host at all.
+**In process, and why that is the fix.** The 1.8.0 follower spawned
+`bin/configure-theme.js` from the *separately installed* Herdr plugin, found
+through `herdr plugin list`, and that writer refused any `[theme]` table outside
+its own marker block. A Pi-only update therefore kept running the old plugin's
+writer — or, on an install that never shipped it, ran no writer at all — while
+the user's real config, which already owns `[theme]`, was never touched. The
+reference implementation
+([gentle-herdr](https://github.com/MarsSall/gentle-herdr), MIT License,
+Copyright (c) MarsSall) applies from Pi itself, so this package does the same:
+`applyHerdrTheme` edits the config inside the running Pi process, and the
+plugin-side `configure-theme.js`, its planner and the
+`# BEGIN herdr-gentle-theme` managed block are gone. The plugin is not involved
+in theme sync and needs no update for it. A config written by 1.8.0 keeps
+working: the planner drops those two marker lines only when they are the nearest
+pair and the pair actually encloses a `[theme]`/`[theme.custom]` table (a stale
+pair around unrelated keys is the user's text and stays, and a pair closing on an
+unterminated last line migrates without changing the file's final-newline state),
+then edits the table between them like any other. Pi colours become hex
+strings in the follower through `colorToHex` from `@earendil-works/pi-tui`,
+which is why the follower is its own extension rather than a section of the
+state sidecar: the sidecar is loaded by every suite as a renamed copy with one
+stubbed host import, and the projection needs no host at all.
+
+**Ownership rule, and the two classes it implies.** Sync is a switch the user
+turns on deliberately, so with the sync on — or a theme pinned — this package
+OWNS the `name` line and every token it projects, and it must be able to give
+them back. Two classes, which is what makes switching Pi themes safe:
+
+- **a value the user already had** is replaced in place and remembered by one
+  comment recording **the whole original line** (minus its indentation, so
+  trailing spaces and an inline comment are part of the record) above it: the
+  first original wins, a later palette change reuses it, and a projection that
+  stops carrying that token — or comes back to the recorded value — **restores
+  the line byte for byte** and drops the comment. The one exception is the
+  **latest edit wins**: if the user changed the line's trailing comment after the
+  planner wrote its value, the restore keeps the recorded key/value and the
+  user's *current* comment. A comment is only a marker when
+  its payload parses as the strict `key = <string> [comment]` line for the key
+  under it, and two markers for one key are refused;
+- **a token the user did not have** is written inside ONE marked block
+  (`# herdr-gentle-shell: begin` … `# herdr-gentle-shell: end`, or
+  `# herdr-gentle-shell: begin created` when the planner also creates the table,
+  and closed with `# herdr-gentle-shell: end after a missing line ending` when
+  placing the block also added the file's missing final line ending, so a later
+  clear takes back only what the planner added)
+  at the end of `[theme.custom]`, regenerated on every plan, and removed entirely
+  when nothing is left to own — so leaving a projection never leaves a stale
+  colour behind. A table the planner created is removed again once its block
+  empties and nothing else lives in it, which is what makes a cycle of
+  projections ending in an empty custom projection return the original
+  `[theme.custom]` byte for byte; only `<token> = "#rrggbb"` lines may sit
+  inside the block, and anything else there is refused rather than deleted.
+  Removing or moving a block is refused
+  (`line <n>: ambiguous herdr-gentle-shell marker above the managed block`) when a
+  marker-shaped comment directly above `begin` would become adjacent to the token
+  key under the block, because the next plan would promote the user's ordinary
+  comment to ownership.
+
+A token the user owns with no marker (`panel_bg`, `blue`, `yellow`, …) is never
+written, merged or repaired, even when the projection stops carrying it: it was
+never ours. A `[theme.custom]` header the **user** wrote stays even when it ends
+up empty, because the planner cannot prove it created that line. Two
+consequences are stated rather than papered over: a tool that rewrites the same
+keys (a desktop-theme sync such as DMS/Niri, for example) overwrites the
+projected values on its next run, and the next palette change here overwrites
+them back; and the revert is per token, not per file — a user-written empty header
+and the `name` marker stay. This is also where
+the port deliberately differs from the reference: it accepts
+`auto_switch = false` untouched — the reference refuses that line outright,
+which is exactly why the user's real config was never written — and it edits
+tables the reference treats as foreign.
 
 **The state file is the only persisted truth.** `gentle-theme.json` holds
 `{sync, theme, updatedAt}` and nothing else is cached, mirrored or inferred: the
-panel and the follower read the same document, so the row, the switch and the
-applied palette can never disagree. Missing is inert (`sync:false`,
+panel and the follower read the same document, so the setting, the switch and
+the applied palette can never disagree. Missing is inert (`sync:false`,
 `theme:null`); a document that cannot be read or parsed is a refusal — `ok:false`,
-painted `Unknown`, follower silent — never a guess, and it is written over only
+no option marked, a `state unknown` note, follower silent — never a guess, and
+it is written over only
 when the user acts. The default install (sync off, no theme) therefore writes
-nothing at all (S7), while a stored pin is carried across a sync toggle so
-turning the sync off restores that choice instead of unassigning it.
+nothing at all (S7), and a stored pin is carried across a sync toggle so turning
+the sync off restores that choice instead of unassigning it.
 
-**Tick and fingerprint.** The host publishes no theme-change event, so the
-palette is a pull-read of `ctx.ui.theme` (or `ctx.ui.getTheme(name)` for a pin):
-one immediate evaluation on `session_start` and then one every 500 ms, on an
-unreferenced timer so an idle follower never keeps Pi alive. Each evaluation
-computes two identities — the requested `[sync, chosen]` and the palette
-fingerprint (`[theme name, sorted token/hex pairs]`) — and acts only when one
-differs from the last one it recorded, so a theme recoloured in place (same
-name, new colours) is noticed without a restart, and the same palette is never
-applied twice. The observation is recorded **before** the spawn, so a failed or
-refused apply is never retried on the next tick and never blocks the next real
-change either. One apply is in flight at a time, each spawn is capped at 60 s,
-and the apply is exactly
-`<plugin>/bin/configure-theme.js --apply --json --reload` with the projection on
-stdin. Nothing on shutdown writes, removes or reloads: Herdr keeps the last
-applied palette (S5). There is deliberately no Herdr pane gate — the config is
-the user's own and outlives any pane — and no automatic repair of a config the
-user also edits.
+**Tick, fingerprint and the follower repairs.** The host publishes no
+theme-change event, so the palette is a pull-read of `ctx.ui.theme` (or
+`ctx.ui.getTheme(name)` for a pin): one immediate evaluation on `session_start`
+and then one every 500 ms, on an unreferenced timer so an idle follower never
+keeps Pi alive, cleared on `session_shutdown` (a shutdown that lands during the
+first evaluation wins: no tick is armed afterwards). Each evaluation computes two
+identities — the requested `[sync, chosen]` and the palette fingerprint
+(`[theme name, sorted token/hex pairs]`) — and acts only when one differs from
+the last one it recorded, so a theme recoloured in place (same name, new
+colours) is noticed without a restart, and the same palette is never applied
+twice. The observation is recorded **before** the apply, so a failed or refused
+write is never retried on the next tick and never blocks the next real change
+either; one apply is in flight at a time. With the sync off and no theme pinned
+the follower asks for nothing at all (no write, no removal) **and forgets what it
+applied**, which is what makes re-enabling the sync always re-apply: without that
+reset the next `On` would look unchanged and a config the user repaired in
+between would never be written (an already-matching config then answers
+`unchanged`). A projection with no concrete token is refused before the writer is
+called — `Herdr theme not applied: <name> has no concrete colours to project.`,
+once per session — because it would otherwise rewrite the theme name and paint
+nothing. Availability is decided once, by `applyHerdrTheme`, so the follower can
+never disagree with the writer about who may write; a subagent child
+(`GENTLE_PI_AGENTS_CHILD=1`) never registers the follower at all, and every
+user-visible outcome is one of the fixed notices in
+[docs/theme-sync.md](docs/theme-sync.md). A `partial/reload` sets an **owed
+reload**: the next apply attempt of the same session is sent with
+`forceReload`, and a success pays the debt off. It is session memory on purpose
+(a tick never reloads while the debt stands), which is why the notice ends with
+`Run 'herdr server reload-config' to apply it.`
 
-**Managed block and refusal policy.** The writer owns a second marker-delimited
-block (`# BEGIN herdr-gentle-theme (managed; do not edit)` …
-`# END herdr-gentle-theme`) holding `[theme] name = "one-dark"` and a
-`[theme.custom]` table, in a fixed token order with lower-cased hex, so the same
-palette is always the same bytes, `current` is a no-op answer, and a refusal can
-never be mistaken for a change. It reuses `bin/configure.js`'s
-`herdrConfigPath`/`readConfig`/`writeAtomic`/`removeBlock`/`appendBlock`/
-`reloadConfig` primitives rather than copying them, so both blocks fail, back up
-and reload identically — but shares no marker bytes and no backup file, because
-two writers that share markers each treat the other's block as their own and the
-last one erases the first. Validation happens before disk: an unknown theme
-name, an unknown token or a non-`#rrggbb` value is a refusal, not a file Herdr
-would reject or silently ignore. A `[theme]` or `[theme.custom]` table outside
-the markers is user config: refuse, never adopt, merge or overwrite. Malformed
-markers (lone begin, lone end, end before begin, a second pair) refuse instead
-of guessing where the block ends. `--remove` on an absent block is `absent` and
-exits 0 even when a foreign table exists, because uninstall must not touch user
-config. Every refusal guarantees no write, no reload and unchanged config bytes;
-exit 1 means a stale `--check` or a reload that failed after a successful write.
+**A splicer, and a strict core.** The writer edits the user's own `[theme]` and
+`[theme.custom]` tables and preserves every byte it does not own: other tables
+and keys, comments, blank lines, ordering, indentation, spacing around `=`, a
+trailing comment on a rewritten line, CRLF or mixed endings, a leading UTF-8 BOM
+and a missing final newline. **Outside those two tables nothing is validated**:
+the planner only tracks the three contexts that can hide a line
+break (multi-line strings, multi-line arrays, inline tables) plus comments, so it
+can find table boundaries — a header-shaped line must parse and a multi-line
+construct must be terminated, or the plan refuses — and it treats the rest of the
+document as opaque bytes: an input that is already invalid TOML there is the
+user's pre-existing breakage (Herdr refuses to load it) and is left exactly as it
+is. Escapes there are never validated (a backslash only consumes the next
+character, in single-line and multi-line strings alike) and a run of three or
+more quotes closes a multi-line string; the scan validates escapes only where it
+must read a value back (a quoted key and a strict theme-table line).
+**Inside the two tables it is strict**: comments, blank lines and
+`key = value [comment]` with a single-line string, boolean, integer or float; a
+key the plan must touch in any other form is refused with its line number, while
+a key it does not touch is kept byte for byte whenever the scanner can find where
+that line ends. It refuses: `auto_switch` with a value other than `false`,
+`dark_name`/`light_name`, a top-level `theme` key, a dotted key extending
+`[theme]` or a Herdr token in `[theme.custom]`, a second `[theme]`/`[theme.custom]`
+table, a third `[theme.*]` table, `[[theme]]` array-of-tables, `name`/
+`auto_switch` repeated in `[theme]`, a token repeated in `[theme.custom]` or in
+both the block and the user's keys, two markers for one key, a touched value that
+is not a strict single-line string (or a multi-line form, refused as "cannot
+record the original value … safely"), a control character, a bare carriage
+return, a malformed block (outside `[theme.custom]`, unterminated, a second
+begin, an end without a begin, any line in it that is not
+`<token> = "#rrggbb"`), the ambiguous marker above a block that is about to be
+removed or moved (`ambiguous herdr-gentle-shell marker above the managed
+block`), and a table header or unterminated multi-line string/array/inline table
+the boundary scan cannot resolve. A malformed
+projection is refused the same way without a line number, because that one is a
+package bug. **The splice invariant is enforced in code**: before `ok: true` the
+planner re-derives the non-theme lines of its own output and compares them with
+the input's (only the 1.8.0 marker lines it wrote may be missing, and only the
+single terminator needed to append a table after an unterminated last line may be
+added); a mismatch returns `internal splice invariant violated; no changes
+proposed.` rather than a document that moved a byte it promised not to touch. The
+file-level refusals belong to the snapshot and the write: a non-absolute or
+non-canonical path, a symlinked parent directory, not a regular single-link
+file, over 256 KiB, invalid UTF-8, a backup path that is not a regular file, a
+planned document past the 256 KiB limit, bytes that changed between the snapshot
+and the replacement (`Herdr config changed before replacement`), a backup temp
+that cannot be removed, a missing config (never bootstrapped), and a failed
+rename. Every refusal writes nothing, backs up nothing and reloads nothing.
+
+**Safe write, and exactly one reload.** The snapshot is one bounded strictly
+decoded read with stat identity checks; a leading BOM is decoded as part of the
+text (`ignoreBOM`) so a changed write keeps it and the backup and the file agree
+on those bytes. The plan is refused **before anything is written** if the
+document would grow past the same 256 KiB limit. The original bytes are re-read
+and compared immediately before the backup and again immediately before the
+swap, so a projection computed from stale bytes is never renamed into place. The new text
+is staged at a path chosen **before the file exists**, so every failure — open,
+write, `fsync`, `fchmod` — leaves the writer able to remove it: exclusive `0600`,
+`fchmod`-ed to the original mode (`0o7777`, so setuid/setgid/sticky survive),
+compared once more, then `rename`d. Temp cleanup is best-effort **and never
+silent**: the unlink is retried once and then force-removed, and a survivor is
+reported instead of hiding — if the **backup's** temp survives, the apply fails
+with `Herdr backup temporary could not be removed: <path>` (so it can never
+answer `requested` with a stray file), and a surviving **staged** temp appends
+`; temporary file left behind: <path>` to the `partial`/`config` error. Cleanup
+only ever removes a path the call created itself: a foreign file at that exact
+temp name makes the exclusive open fail with `EEXIST`, the apply answers
+`partial`/`config` with that text, and the file is left alone (config and backup
+untouched). The
+backup itself is **published atomically and never overwritten**: written to a
+temp name and hard-linked into place, so a crash or a full disk leaves no
+truncated `.bak` that a later run would mistake for "already backed up". A
+regular file already at the backup path — pre-existing or raced — **is** the
+existing backup: accepted as it is, never compared and never overwritten (it may
+be an older original from before the user's last edit), while a non-regular
+entry (directory, symlink, socket) is refused. `unchanged` writes
+nothing and reloads nothing — Herdr already holds that palette, and a reload on
+every tick would make the sidebar flicker for nothing. `forceReload` is the one
+exception, and it exists for the owed-reload repair above: it reloads an
+unchanged plan and answers `requested`. A real write is followed by exactly one
+`herdr server reload-config` through `execFile` with `HERDR_BIN_PATH` (default
+`herdr`), no shell, a 5 s timeout and a 4096-byte output cap; a reload failure is
+reported as partial state because the config is already committed. **CAS limit:**
+an edit that lands between the final compare and the `rename` cannot be detected
+without holding a lock on the config, which this writer deliberately does not
+do — everything earlier (snapshot, plan, backup, staging) is still caught. A
+**pre-existing truncated backup** is a second documented limit: because a regular
+file at that path is accepted as it is and never repaired or compared, a `.bak`
+damaged by an earlier failure or another tool stays damaged.
+
+**The guard matrix.** `applyHerdrTheme` answers `unavailable` with one reason
+before it opens any file: `not-herdr` (no `HERDR_ENV=1` plus a pane id and an
+absolute socket path), `child` (a subagent's Pi must never write the user's
+config), `remote` (an SSH session, where Herdr reads another machine's config),
+and `unsupported` (a `herdr-dev` binary, a non-Linux host, or a non-absolute
+socket/config path). The follower reports `not-herdr`, `remote` and
+`unsupported` as one `info` notice per session and asks again only when the
+palette itself changes.
+
+**The panel.** `/herdr-gentle:customize` reuses Gentle Shell's own card shape:
+one left `CATEGORIES` list, one right pane headed `<Category> · n/m`, one line
+per setting with its options inline (`●` stored, `›` cursor elsewhere, `○` the
+rest). The arrows move the option cursor and only Enter applies; Enter keeps the
+card open (only the Moshi reload closes it), Esc closes without a write, Tab
+switches panes. A line whose options do not fit scrolls sideways behind muted
+`‹`/`›` with an `n/m` counter, falling back to a compact `‹ value ›`. The
+Preview block below the panes is `Preview · <option> · <title>` plus a sample
+painted with the host theme, where a theme option shows that theme's own palette
+through the raw SGR the host hands back. Three footer legends (categories,
+option row, panes) are chosen by what the keys do right now and compact instead
+of wrapping. The theme list comes from `ctx.ui.getAllThemes()` in the host's own
+order with `None` first, the `Gentle Shell theme` setting is painted dim and
+refused with `Turn Theme sync off to pick a specific theme.` while the sync is
+on, and a host that exposes no list shows one note instead of an empty picker.
+The panel writes nothing itself: it calls the extension's apply path, swaps in
+the model that path re-read, and keeps the cursor by structural option ids.
 
 **Limits** (the §10 style, none of them a promise this design makes):
 
 - The 500 ms tick is the whole observation granularity — there is no event to
   subscribe to, so a theme change is noticed within one tick and not sooner.
-- The automated evidence is a stubbed Pi host plus a real CLI stand-in on disk;
-  **no live Pi TUI run is recorded**. `ctx.ui.theme`, `getTheme`,
-  `getAllThemes`, `select` and `notify` are used as documented, and a host
-  missing one degrades to "nothing changed" rather than to a guess.
+- The automated evidence is a stubbed Pi host plus a real binary stand-in on
+  disk; **no live Pi TUI run is recorded**. `ctx.ui.theme`, `getTheme`,
+  `getAllThemes`, `notify` and the host component contract are used as
+  documented, and a host missing one degrades to "nothing changed" rather than
+  to a guess.
+- Remote sessions are inactive: in SSH the Herdr client reads the config of the
+  machine it runs on, so writing the server-side file would change nothing on
+  screen and the guard refuses.
+- Two writers of the same keys fight. The sync owns what it projects, so a
+  desktop-theme sync and this feature overwrite each other on their next run;
+  there is no merge, lock or arbitration, only the `was` comments, the marked
+  block and the one-time backup.
+- The compare-and-swap has one unavoidable window: an edit between the final
+  compare and the rename is undetectable without a config lock, which this
+  writer does not take.
+- The planner is a **splicer, not a validator**: it guarantees table boundaries
+  for terminated multi-line constructs and byte-identical non-theme lines (checked
+  by the splice invariant), and it deliberately checks nothing outside the theme
+  tables — invalid TOML there is left as it is, because Herdr already refuses
+  that file. A theme-table line the plan must touch has to be the strict
+  single-line form; the revert is per token, so a user-written empty
+  `[theme.custom]` header and the `name` marker stay behind (a table the planner
+  created is removed, so a full cycle is byte-identical).
+- A pre-existing truncated backup is kept, not repaired (see above), which is why
+  the `was` comments are the per-value revert path.
+- There is no "full clear" distinct from an empty custom projection: a projection
+  always carries the theme name, so a `name` line the planner inserted stays (an
+  existing name is restored) and a `[theme]` table it created is not removed —
+  only the `[theme.custom]` table it created is, once its block empties.
 - Herdr's surface tokens (`sidebar_bg`, `panel_bg`, `active_row_bg`,
-  `selection_bg`, `surface*`) and `peach` are never written: Pi names
+  `selection_bg`, `surface*`) and `peach` are not projected: Pi names
   foregrounds and accents, not panel backgrounds, so backgrounds and status
-  colours stay with the Herdr base theme.
+  colours stay with the Herdr base theme — except the `DOTS_FIXED` tables for
+  `Gentleman-Cute`, `Gentleman-Sexy` and `Gentle`, which are the surfaces the
+  user's own Herdr profiles already use.
 - One machine: another Herdr client reads its own `config.toml`, so this is a
   local sync and not a fleet setting.
-- Plugin-root resolution goes through `herdr plugin list --json` and fails
-  closed on zero or ambiguous matches; that refusal is reported once per session
-  and retried silently afterwards.
-- The CLI requires Node 18 or newer; an older runtime exits 1 before reading
-  anything.
+- No automatic repair: a `[theme]` table the user or another tool keeps editing
+  is re-projected on the next palette change and never reconciled, and a document
+  whose table boundaries cannot be found (an unterminated multi-line string,
+  array or inline table) stops the writer until it is fixed. A missing
+  `config.toml` is refused, never created.
