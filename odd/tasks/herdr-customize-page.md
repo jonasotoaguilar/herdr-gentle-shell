@@ -78,8 +78,15 @@ tasks are the slices that make them true.
   without it.
   Specs: S1, S2, S3, S4. Route: worker. Commit: `docs(customize): document the Herdr menu page and
   its fallback`.
-- **T5** — independent verification of the whole diff (Risk item 3: a published command is removed).
+- **T5** — independent verification of the whole diff (Risk item 3: the command surface changes).
   Specs: S1-S4. Route: `gentle-ai-verify`. Commit: none.
+- **T7** — policy change decided in L6: the command is registered in the factory again, always, and the
+  page is added on top when the bridge answers. Every string returns to the `865d360` spelling (the
+  command always exists, so nothing needs a surface-dependent wording), the page's own hints keep
+  working unchanged, and the docs describe the additive rule. Replace the exclusivity tests from
+  17ce681 with "always the command, plus the page when the bridge answers" and "a bridge that answers
+  without a host menu changes nothing".
+  Specs: S1, S2, S4. Route: worker (continue). Commit: `feat(customize): keep the command and add the page beside it`.
 - **T6** — feature close: reconciliation, Engram mirror, evidence in this document.
   Specs: all. Route: parent. Commit: none.
 
@@ -111,3 +118,18 @@ tasks are the slices that make them true.
   additive, and every message keeps the `865d360` spelling because the command is always there. T2's
   exclusivity assertions are superseded by T7; the page's own apply path, row building and the
   Moshi restart notice are unchanged.
+- **L7** (close, parent). Branch `feat/herdr-customize-page`, base `865d360`. Where each task landed:
+  T1-T3 `17ce681`; T4 `e4e186a`; the policy change (L6) `a7251ad` + `263cf54`; mounted-row refresh
+  `418ec53`; vanished theme, notice pins and the documented limits `1570943`; guard scoped to the
+  page `c953d7a`; gate ordering and the panel's catalogue cases `ab16dc0`. Feature document is inside
+  `17ce681` and `a7251ad`.
+  Verification: five independent passes, each finding something real. 1) zero/duplicate surfaces and
+  a non-parity command (fixed by L6's additive policy); 2) frozen mounted rows (fixed in `418ec53`);
+  3) a shared guard that broke the command's fallback for five catalogue changes (scoped in
+  `c953d7a`); 4) a misleading not-installed notice for an unreadable catalogue (own honest message
+  in `c953d7a`); 5) the catalogue check answering before the sync gate (`ab16dc0`). Final suite:
+  1233 tests, 213 suites, all passing. Accepted, documented limitations: no upper freshness bound
+  while the menu is idle, and the host clamping focus after an external hide. Recorded risks: a
+  swallowed `registerRows` failure leaves only the command, and the synchronous root discovery plus
+  `configure.js --check` have per-process timeouts but no end-to-end UI latency bound.
+  Delivery shape is the human's decision and is not taken here.
