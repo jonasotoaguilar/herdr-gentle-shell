@@ -537,7 +537,7 @@ describe('a mounted theme row never writes a theme that no longer exists (T10)',
     assert.deepEqual(h.reloads, []);
   });
 
-  test('an unreadable catalogue at apply time refuses instead of writing an unverified name', async () => {
+  test('an unreadable catalogue at apply time refuses with its own honest sentence', async () => {
     const env = setupEnvironment('theme-catalogue-gone');
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
@@ -548,11 +548,13 @@ describe('a mounted theme row never writes a theme that no longer exists (T10)',
     const dark = rowFor(h.provider().rows(), 'Select theme', 'Dark');
 
     // The host can no longer answer the catalogue: existence cannot be proven,
-    // so nothing is written and the surface says exactly that.
+    // so nothing is written and the page says exactly that — in its own words,
+    // never the command's "this host exposes no getAllThemes()" sentence, which
+    // describes a different fact (the accessor existed a moment ago).
     h.ctx.ui.getAllThemes = () => { throw new Error('catalogue gone'); };
     await dark.action(INLINE_HELPERS);
     assert.deepEqual(h.notices, [[
-      "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.",
+      "Could not read Pi's theme list at apply time; nothing was changed.",
       'warning',
     ]]);
     assert.equal(fs.existsSync(env.themePath), false, 'nothing was written');

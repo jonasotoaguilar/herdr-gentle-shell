@@ -2111,6 +2111,12 @@ const THEME_SYNC_OFF_TEXT = "Theme sync off; Herdr keeps the palette it was last
 const THEME_SYNC_REFUSED_TEXT = "Turn Theme sync off to pick a specific theme.";
 const THEME_LIST_UNAVAILABLE_TEXT =
   "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.";
+// The page's OWN apply-time notice, for a catalogue it could read when it built
+// its rows and cannot read now. It deliberately does not reuse the sentence
+// above: that one says the host exposes no `getAllThemes()`, which is a
+// different fact and stays untouched for the command and the panel (S2).
+const THEME_LIST_UNREADABLE_AT_APPLY_TEXT =
+  "Could not read Pi's theme list at apply time; nothing was changed.";
 const THEME_STORE_UNAVAILABLE_TEXT =
   "Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.";
 
@@ -2747,37 +2753,36 @@ function themeSelectionOptions(names) {
   return { options: [...names, unassign], unassign };
 }
 
-// T10 (odd/tasks/herdr-customize-page.md): a surface that holds its rows can
-// outlive the catalogue it built them from. The Herdr page keeps one row per
-// theme for as long as Gentle Shell shows the menu, and the inline panel keeps
-// its rows while it is open, so a theme can be uninstalled between the build and
-// the Enter that pins it. The command's own picker cannot do this — it lists
-// `getAllThemes()` when it prompts — so the check below is a no-op on that path
-// and the refusal only ever fires for a mounted row.
+// T10 (odd/tasks/herdr-customize-page.md): a surface that holds its own rows can
+// outlive the catalogue it built them from. Only the Herdr PAGE does: it keeps
+// one row per theme for as long as Gentle Shell shows the menu, while the
+// command's picker reads `getAllThemes()` when it prompts and the mounted panel
+// keeps the 865d360 write. The guard therefore lives on the page's apply path (`applyCustomizePageChoice`), never in the write the command and the
+// panel share (S2).
 //
 // The wording is the notice the theme sync already gives for a stored name this
 // install does not have (`extensions/herdr-theme-sync.ts`, S4): one sentence for
-// one fact, spelled once. A catalogue that cannot be read at all is this
-// surface's own "could not read the theme list" refusal, because a name nothing
-// verified is never written.
+// one fact, spelled once. A catalogue that cannot be read at all gets the page's
+// own apply-time sentence, because a name nothing verified is never written.
 function themeNotInstalledText(name) {
   return `The Pi theme "${name}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`;
 }
 
-// A FRESH read, never the page's row cache and never the model the panel
-// captured when it opened: `readHostThemeNames` calls the host accessor again on
-// every call, so the answer describes the install as it is at APPLY time.
+// A FRESH read, never the page's row cache: `readHostThemeNames` calls the host
+// accessor again on every call, so the answer describes the install as it is at
+// APPLY time.
 function themeStillInstalled(ctx, name) {
   const names = readHostThemeNames(ctx);
-  if (names === null) return { ok: false, text: THEME_LIST_UNAVAILABLE_TEXT };
+  if (names === null) return { ok: false, text: THEME_LIST_UNREADABLE_AT_APPLY_TEXT };
   return names.includes(name) ? { ok: true, text: null } : { ok: false, text: themeNotInstalledText(name) };
 }
 
 // One write for the pinned theme, shared by the inline panel setting, the Herdr
-// page rows and the `ctx.ui.select` fallback: the refusal, the missing store, a
-// theme that is no longer installed and a failure all write NOTHING, so the
-// stored document only ever changes to a value the user actually picked and this
-// install still has (S7, T10).
+// page rows and the `ctx.ui.select` fallback: the refusal, the missing store and
+// a failure all write NOTHING, so the stored document only ever changes to a
+// value the user actually picked (S7). No catalogue check lives here: the
+// command's picker cannot outlive its catalogue, and the page's own guard runs
+// before this call (T10), so neither surface can inherit a new refusal.
 function writeThemeChoice(ctx, name) {
   const notify = ctx?.ui?.notify;
   const store = themeStoreModule();
@@ -2788,16 +2793,6 @@ function writeThemeChoice(ctx, name) {
   if (readCustomizeThemeState().sync === true) {
     if (typeof notify === "function") notify(THEME_SYNC_REFUSED_TEXT, "warning");
     return false;
-  }
-  if (name !== null) {
-    // T10: the name is checked against the catalogue as it is NOW, so a row built
-    // before a theme was removed refuses instead of writing a name nobody can
-    // apply (and instead of reporting a success the user cannot see).
-    const installed = themeStillInstalled(ctx, name);
-    if (!installed.ok) {
-      if (typeof notify === "function") notify(installed.text, "warning");
-      return false;
-    }
   }
   try {
     store.writeThemeState(process.env, { sync: false, theme: name });
@@ -3100,9 +3095,17 @@ function publishedBridge() {
 // not a copy: the same `writeThemeChoice` for the pinned theme, the same
 // `applyCustomizeSwitch` for the three switched settings, and therefore the same
 // Moshi prerequisite gate and the same "a refusal writes nothing" promise by
-// construction. It adds the one fact the overlay does not need: a row action
+// construction. It adds the two facts the overlay does not need: a row action
 // receives no ctx, so the page has no reload handle and the shared path reports a
-// restart instead of reloading (see `applyCustomizeSwitch`).
+// restart instead of reloading (see `applyCustomizeSwitch`), and the page's rows
+// outlive the theme catalogue they were built from (T10).
+//
+// The catalogue guard lives HERE, on the page's own call site, and not in the
+// shared write: the command's picker and the mounted panel keep the 865d360
+// behavior byte for byte (S2), and no other surface can be affected by
+// construction. A name removed after the build is refused with the not-installed
+// notice and writes nothing; a catalogue that cannot be read at apply time gets
+// the page's own honest sentence and also writes nothing.
 //
 // A refusal is NOT re-thrown: the shared path reports it through the host's own
 // `ui.notify` and returns, which is one report — the same one the command gives.
@@ -3110,6 +3113,17 @@ function publishedBridge() {
 // action again), so only an unexpected exception travels into the bridge's
 // channel.
 async function applyCustomizePageChoice(choice, ctx) {
+  if (isRecord(choice) && choice.settingId === CUSTOMIZE_THEME_SETTING_ID) {
+    const optionId = choice.optionId;
+    if (typeof optionId === "string" && optionId.startsWith(CUSTOMIZE_THEME_OPTION_PREFIX)) {
+      const installed = themeStillInstalled(ctx, optionId.slice(CUSTOMIZE_THEME_OPTION_PREFIX.length));
+      if (!installed.ok) {
+        const notify = ctx?.ui?.notify;
+        if (typeof notify === "function") notify(installed.text, "warning");
+        return { model: customizePanelModel(ctx), close: false, reload: false };
+      }
+    }
+  }
   return applyCustomizePanel(choice, ctx, { noReload: true });
 }
 

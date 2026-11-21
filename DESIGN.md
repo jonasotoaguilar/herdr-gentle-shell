@@ -1559,25 +1559,28 @@ The page's row set is FIXED for the life of the menu, and the cache in
 burst (one synchronous `configure.js --check`, not one per callback), dropped
 after an `apply` settles and after a one-second TTL. Two properties follow and
 are accepted rather than promised away. First, an external write while the menu
-is idle is shown on the NEXT render: the cache expires on the next read and
-never asks the host to repaint, so the displayed state has no upper freshness
-bound — a change nobody typed here is visible at the next keystroke or rebuild.
-Second, when an external write hides the row the user had focused (the theme
+is idle becomes visible on the first read after the cache expires, or on a
+rebuild: the cache never asks the host to repaint, so a repaint that lands
+before expiry redraws the previous model and the displayed state has no upper
+freshness bound. Second, when an external write hides the row the user had
+focused (the theme
 picker, with the sync turned on elsewhere), the host clamps the focus to the
 neighbouring row, so Enter can act on that one; the clamp itself writes nothing.
 The fixed row set is also why a theme applied from a row is checked against a
 fresh `ctx.ui.getAllThemes()` read at apply time: a theme removed after the
 build refuses and writes nothing instead of pinning a name this install no
-longer has.
+longer has. That check lives on the page's own apply path, so the command's
+picker and the mounted panel keep the `865d360` write (S2).
 
 **Limits** (the §10 style, none of them a promise this design makes):
 
 - The 500 ms tick is the whole observation granularity — there is no event to
   subscribe to, so a theme change is noticed within one tick and not sooner.
 - The page's displayed state has **no upper freshness bound**: its row cache
-  expires on the next read and never requests a repaint, so a write from another
-  process while the menu is idle appears at the next keystroke or rebuild, not
-  when it lands.
+  never requests a repaint, so a write from another process while the menu is
+  idle appears on the first read after the cache expires, or on a rebuild, not
+  when it lands; a repaint that lands before expiry redraws the previous model,
+  and on a menu nobody touches the write is not shown at all.
 - The page cannot keep the cursor on a row an external write hid: the host clamps
   the focus to the neighbouring row, so the next Enter can act on that neighbour.
   The clamp writes nothing; it only moves the cursor.

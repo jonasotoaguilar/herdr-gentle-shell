@@ -749,15 +749,20 @@ same fixed strings, and the sync needs no Pi reload on either surface.
 
 The page's rows are FIXED for as long as the menu is open, which is why its
 theme rows cost one model read per paint burst instead of one per row. Two
-consequences are accepted: an external write while the menu is idle is shown on
-the next render (the cache expires on the next read and never asks the host to
-repaint, so the display has no upper freshness bound), and an external write
-that hides the focused row leaves the host to clamp the cursor to the
-neighbouring row, so `Enter` can act on that one — the clamp itself writes
-nothing. Because a row can outlive the catalogue it was built from, applying a
-theme re-reads `ctx.ui.getAllThemes()` first: a theme removed after the build is
-refused with the sync's own not-installed notice
-(`The Pi theme "<name>" is not installed, …`) and the store is left untouched.
+consequences are accepted: an external write while the menu is idle becomes
+visible on the first read after the cache expires, or on a rebuild (the cache
+never asks the host to repaint, so a repaint that lands before expiry redraws
+the previous model and the display has no upper freshness bound), and an
+external write that hides the focused row leaves the host to clamp the cursor to
+the neighbouring row, so `Enter` can act on that one — the clamp itself writes
+nothing. Because a row can outlive the catalogue it was built from, the page's
+own apply path re-reads `ctx.ui.getAllThemes()` before it writes: a theme
+removed after the build is refused with the sync's own not-installed notice
+(`The Pi theme "<name>" is not installed, …`) and the store is left untouched,
+and a catalogue that cannot be read at apply time is refused with
+`Could not read Pi's theme list at apply time; nothing was changed.` The
+command's own picker and the mounted panel do not run that check, so both keep
+the `865d360` behavior byte for byte (S2).
 
 ## Implementation
 

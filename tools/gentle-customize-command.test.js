@@ -78,13 +78,6 @@ const MISSING_CLI_TEXT =
   'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.';
 const NOT_PAIRED_TEXT =
   'Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.';
-// T10: the package's ONE wording for "that theme is not installed" — the notice
-// the theme-sync surface already gives for a stored name this install does not
-// have (`extensions/herdr-theme-sync.ts`, S4). A theme row that outlived the
-// catalogue it was built from reuses it instead of inventing a second spelling.
-const THEME_NOT_INSTALLED = (name) =>
-  `The Pi theme "${name}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`;
-
 const COMMAND = 'herdr-gentle:customize';
 
 // The theme picker's "no theme assigned" entry. It is deliberately distinct from
@@ -869,6 +862,79 @@ describe('theme selection', () => {
     assert.equal(fs.readFileSync(themePath(env), 'utf8'), before);
     assert.deepEqual(h.reloads, []);
   });
+
+  // S2: this fallback picker lists the catalogue WHEN IT PROMPTS and then awaits
+  // the answer, so the catalogue can change while the prompt is open. 865d360
+  // and 418ec53 both saved the choice the picker had already offered, whatever
+  // happened to the catalogue afterwards; the command must not grow the page's
+  // fixed-row refusal.
+  async function pickWhileCatalogueChanges(name, changeCatalogue) {
+    const env = setupEnvironment(name);
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const catalog = [{ name: 'Dark' }, { name: 'Light' }];
+    const h = harness({ themes: catalog });
+    const prompts = [];
+    h.ctx.ui.select = async (title, options) => {
+      prompts.push([title, options]);
+      if (prompts.length === 1) return 'Gentle Shell theme';
+      // The picker has already been given both themes; the catalogue changes
+      // before the answer arrives, exactly as another process can change it.
+      changeCatalogue(h, catalog);
+      return 'Dark';
+    };
+    await run(h, '');
+    return { env, h, prompts };
+  }
+
+  function assertOfferedChoiceSaved(env, h, prompts) {
+    assert.deepEqual(
+      prompts[1],
+      ['Gentle Shell theme', ['Dark', 'Light', THEME_UNASSIGN]],
+      'the picker offered the catalogue it was given',
+    );
+    const doc = readThemeFile(env);
+    assert.deepEqual([doc.sync, doc.theme], [false, 'Dark'], 'the offered choice is saved');
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to Dark.', 'info']], 'the 865d360 notice and level');
+    assert.deepEqual(h.reloads, [], 'a theme pin never reloads Pi');
+  }
+
+  test('a theme removed while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-removed', (_h, catalog) => {
+      catalog.splice(catalog.findIndex((entry) => entry.name === 'Dark'), 1);
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('an emptied catalogue while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-empty', (_h, catalog) => {
+      catalog.length = 0;
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('a catalogue that starts throwing while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-throws', (host) => {
+      host.ctx.ui.getAllThemes = () => {
+        throw new Error('catalogue gone');
+      };
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('a host that loses getAllThemes while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-missing', (host) => {
+      delete host.ctx.ui.getAllThemes;
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('a malformed catalogue while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-malformed', (host) => {
+      host.ctx.ui.getAllThemes = () => 42;
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
 });
 
 /* ------------------------------------------------ restored floating panel */
@@ -1337,15 +1403,15 @@ describe('floating panel theme rows', () => {
     assert.equal(fs.existsSync(env.flagPath), false);
   });
 
-  // T10: the card keeps its rows while it is open (`createCustomizePanel`
-  // captures the model once and only swaps it after an apply), so the catalogue
-  // can change under the cursor. Enter on a theme that is gone refuses and
-  // writes nothing instead of pinning a name this install no longer has.
-  test('Enter on a theme removed while the panel is open refuses and writes nothing', async () => {
+  // S2: the card is part of the command's surface too, and 865d360 saved the
+  // theme the card offered even when the catalogue changed under the cursor.
+  // The fixed-row refusal belongs to the Gentle Shell page only (its apply path
+  // checks the catalogue; tools/customize-bridge-page.test.js pins it), so the
+  // mounted panel keeps the baseline write.
+  test('Enter on a theme removed while the panel is open still saves the offered theme', async () => {
     const env = setupEnvironment('overlay-theme-vanished');
     fs.writeFileSync(env.configPath, '');
     writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
-    const before = fs.readFileSync(themePath(env), 'utf8');
     const catalog = [{ name: 'nord' }, { name: 'dracula' }];
     const h = harness({
       themes: catalog,
@@ -1368,8 +1434,8 @@ describe('floating panel theme rows', () => {
       },
     });
     await withThemePanel(h);
-    assert.deepEqual(h.notices, [[THEME_NOT_INSTALLED('dracula'), 'warning']]);
-    assert.equal(fs.readFileSync(themePath(env), 'utf8'), before, 'the refusal writes nothing');
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to dracula.', 'info']]);
+    assert.equal(readThemeFile(env).theme, 'dracula', 'the offered theme is saved');
     assert.equal(fs.existsSync(env.flagPath), false);
     assert.deepEqual(h.reloads, []);
   });
