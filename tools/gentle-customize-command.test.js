@@ -676,10 +676,32 @@ test('customize menu offers both switches, the theme rows and On/Off', async () 
   await run(h, '');
   assert.deepEqual(offered.map(([, options]) => options), [
     MENU_OPTIONS,
-    ['On', 'Off'],
+    ['Off', 'On'],
   ]);
   assert.equal(offered[0][0], 'Customize · Herdr Gentle Shell');
   assert.equal(offered[1][0], 'Moshi notifications (currently off)');
+});
+
+// The fallback is a surface like any other: its second prompt offers Off first
+// and On second, for every switch. The menu entry keeps its own order, and the
+// prompt title (with `(currently …)`) is untouched by this change.
+test('the fallback second prompt offers Off then On for every switch', async () => {
+  for (const label of ['Sidebar agent rows', 'Moshi notifications', 'Theme sync']) {
+    const h = harness();
+    const offered = [];
+    const queueNext = h.ctx.ui.select;
+    h.ctx.ui.select = async (title, options) => {
+      offered.push([title, options]);
+      return queueNext();
+    };
+    // The menu pick is consumed; the second prompt is cancelled, so nothing is
+    // applied and this observes the offer alone.
+    h.selections.push(label);
+    await run(h, '');
+    assert.deepEqual(offered.map(([, options]) => options), [MENU_OPTIONS, ['Off', 'On']], label);
+    assert.match(offered[1][0], new RegExp(`^${label} \\(currently .+\\)$`), `${label}: the prompt title keeps its shape`);
+    assert.deepEqual(noticeTexts(h), [], `${label}: cancelling the second prompt writes nothing and says nothing`);
+  }
 });
 
 describe('theme sync switch', () => {

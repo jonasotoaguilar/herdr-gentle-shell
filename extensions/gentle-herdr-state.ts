@@ -2962,7 +2962,7 @@ async function runCustomizeFallback(ctx) {
       : (moshiFlagEnabled(moshiFlagPath()) ? "on" : "off");
   let choice = null;
   try {
-    choice = await select(`${picked} (currently ${current})`, [CUSTOMIZE_ON, CUSTOMIZE_OFF]);
+    choice = await select(`${picked} (currently ${current})`, [CUSTOMIZE_OFF, CUSTOMIZE_ON]);
   } catch {
     choice = undefined;
   }
