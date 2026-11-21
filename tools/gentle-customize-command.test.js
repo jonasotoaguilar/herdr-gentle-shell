@@ -1100,8 +1100,9 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('right');
         assert.ok(component.render(100).join('\n').includes('▸ Sidebar agent rows'));
-        // The cursor lands on the stored option: one step left is the other one.
-        component.handleInput('left');
+        // The cursor lands on the stored option (Off, the first one): one step
+        // right is the other one.
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         assert.equal(done(), 'pending', 'the panel stays open after an apply');
@@ -1135,7 +1136,7 @@ describe('floating customize panel', () => {
         const seen = component.render(100).join('\n');
         assert.ok(seen.includes('▸ Sidebar agent rows'));
         assert.equal(seen.includes('Notifications'), false, 'the category carries no Moshi switch');
-        component.handleInput('left');
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         component.handleInput('escape');
@@ -1161,8 +1162,8 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        // The stored Off is the second option, so ← is the way to On.
-        component.handleInput('left');
+        // The stored Off is the first option, so → is the way to On.
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         return done();
@@ -1190,7 +1191,7 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('left');
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         return done();
@@ -1230,8 +1231,8 @@ describe('floating customize panel', () => {
         const { component, done } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        // The stored On is the first option; the second one is Off.
-        component.handleInput('right');
+        // The stored On is the second option; ← reaches Off.
+        component.handleInput('left');
         component.handleInput('enter');
         await settlePanel(component);
         return done();
@@ -1769,7 +1770,7 @@ describe('floating panel theme rows', () => {
         const { component } = openPanel(factory, makeHostTui().tui);
         component.handleInput('down');
         component.handleInput('right');
-        component.handleInput('left');
+        component.handleInput('right');
         component.handleInput('enter');
         await settlePanel(component);
         // The panel closed itself (close:true) so the host can reload.

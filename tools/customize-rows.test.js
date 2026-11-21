@@ -20,7 +20,7 @@
 //   `select theme` — in that order, on the `Herdr` page, never on `Keymaps`;
 // - S3: one row per value with the model's structural option ids (`on`, `off`,
 //   `none`, `theme:<name>`), so each row drives the same apply path the panel
-//   (and the removed command) drives;
+//   (and the removed command) drives; every switch reads Off then On;
 // - the live reads: one model run per synchronous burst, with a cache that is
 //   dropped when an `apply` settles — so the SAME row objects the host repaints
 //   report the applied state without a rebuild — and a TTL that bounds a repaint
@@ -199,7 +199,7 @@ describe('customizeRows — the Herdr page (S1)', () => {
     assert.deepEqual(linesOf(rows), S1_LINES);
 
     // The apply path each line drives is the panel's own setting id, which is
-    // never a row name: `sidebar  ● On  ○ Off` would not read as a name.
+    // never a row name: `sidebar  ○ Off  ● On` would not read as a name.
     const settings = [];
     for (const row of rows) settings.push((await rec.choiceOf(row)).settingId);
     assert.deepEqual([...new Set(settings)], ['sidebar', 'moshi', 'theme-sync', 'theme']);
@@ -213,8 +213,8 @@ describe('customizeRows — the Herdr page (S1)', () => {
     });
 
     const ids = (line) => rowsFor(rows, line).map((row) => row.choice.value);
-    assert.deepEqual(ids('Herd agents'), ['On', 'Off']);
-    assert.deepEqual(ids('Moshi'), ['On', 'Off']);
+    assert.deepEqual(ids('Herd agents'), ['Off', 'On']);
+    assert.deepEqual(ids('Moshi'), ['Off', 'On']);
     // The panel's own order for this switch, unchanged: Off first.
     assert.deepEqual(ids('Theme sync'), ['Off', 'On']);
     assert.deepEqual(ids('Select theme'), [UNASSIGN_TEXT, 'Dark', 'Light']);
@@ -224,8 +224,8 @@ describe('customizeRows — the Herdr page (S1)', () => {
       for (const row of rowsFor(rows, line)) out.push((await rec.choiceOf(row)).optionId);
       return out;
     };
-    assert.deepEqual(await optionIds('Herd agents'), ['on', 'off']);
-    assert.deepEqual(await optionIds('Moshi'), ['on', 'off']);
+    assert.deepEqual(await optionIds('Herd agents'), ['off', 'on']);
+    assert.deepEqual(await optionIds('Moshi'), ['off', 'on']);
     assert.deepEqual(await optionIds('Theme sync'), ['off', 'on']);
     assert.deepEqual(await optionIds('Select theme'), ['none', 'theme:Dark', 'theme:Light']);
 
@@ -717,5 +717,36 @@ describe('customizeRows — the panel\'s own previews on every row (S1/S3)', () 
     const sidebarSetting = unknown.flatMap((category) => category.settings).find((setting) => setting.id === 'sidebar');
     delete sidebarSetting.note;
     assert.equal(mountedSidebar.preview().title, 'static sidebar sample', 'the note is gone from the same row');
+  });
+});
+
+// The human's report, on the page: the same three switches, one order. The page
+// builds its rows from the panel's model, so this observes the rows the host
+// walks and the `current()` bullet the host lands on.
+describe('customizeRows — every switch reads Off then On', () => {
+  const STATES = [
+    { sidebar: 'on', moshi: 'on' },
+    { sidebar: 'on', moshi: 'off' },
+    { sidebar: 'off', moshi: 'on' },
+    { sidebar: 'off', moshi: 'off' },
+  ];
+  const LINES = [['Herd agents', 'sidebar'], ['Moshi', 'moshi'], ['Theme sync', 'theme-sync']];
+  const word = (value) => (value === 'on' ? 'On' : 'Off');
+
+  test('the rows are Off then On for every state, and current() marks the stored value', () => {
+    for (const state of STATES) {
+      for (const sync of ['on', 'off']) {
+        const rows = customizeRows({ model: modelFor({ ...state, sync }), apply: recorder().apply });
+        for (const [line, id] of LINES) {
+          const lineRows = rowsFor(rows, line);
+          assert.deepEqual(lineRows.map((row) => row.choice.value), ['Off', 'On'], `${id} reads Off then On`);
+          const stored = id === 'theme-sync' ? sync : state[id];
+          const current = lineRows.filter((row) => row.choice.current()).map((row) => row.choice.value);
+          // The host lands the cursor on the row whose `current()` is true, so
+          // this is where the cursor starts — never on the first row by position.
+          assert.deepEqual(current, [word(stored)], `${id}: ${stored} is the current row`);
+        }
+      }
+    }
   });
 });

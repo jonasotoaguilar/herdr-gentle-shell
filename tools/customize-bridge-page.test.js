@@ -817,12 +817,12 @@ describe('every page row paints the panel\'s own preview (defect 1)', () => {
     // one of these pairs, never `Preview unavailable`.
     const SAMPLES = {
       'Herd agents': [
-        { title: 'static sidebar sample', sample: '● project   gentle   worker' },
         { title: 'static sidebar sample', sample: 'native Herdr rows; no managed block' },
+        { title: 'static sidebar sample', sample: '● project   gentle   worker' },
       ],
       Moshi: [
-        { title: 'static notification sample', sample: 'ask   finished' },
         { title: 'static notification sample', sample: 'silent; no Moshi notification' },
+        { title: 'static notification sample', sample: 'ask   finished' },
       ],
       'Theme sync': [
         { title: 'static sync sample', sample: 'Herdr keeps its last palette' },
