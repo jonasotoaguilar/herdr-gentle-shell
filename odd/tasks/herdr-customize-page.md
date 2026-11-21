@@ -8,13 +8,23 @@ tasks are the slices that make them true.
 
 ## Specs
 
-- **S1.** With gentle-shell-bridge present (handshake, not package presence), the extension no longer
-  registers `/herdr-gentle:customize`; instead it contributes one page titled `Herdr` to
-  gentle-shell's `/gentle:customize` menu holding exactly the four options:
-  `herd agents`, `moshi`, `theme sync`, `select theme`.
-- **S2.** Without the bridge, today's surface is unchanged: `/herdr-gentle:customize` registered
-  before the pane gate, the floating panel from `lib/customize-panel.js` via `ctx.ui.custom`, the
-  `ctx.ui.select` fallback, and `customize status`.
+When gentle-shell-bridge is present, the four Herdr settings also appear on a page the user already
+opens, next to the command that keeps working. Without the bridge everything stays exactly as it was.
+
+Read this whole document, including `## Log`, before starting a task. Specs are the source of truth;
+tasks are the slices that make them true.
+
+## Specs
+
+- **S1.** `/herdr-gentle:customize` is ALWAYS registered, at factory time, exactly as on `865d360`.
+  When gentle-shell-bridge answers its handshake (handshake, not package presence), the extension
+  ALSO contributes one page titled `Herdr` to gentle-shell's `/gentle:customize` menu holding exactly
+  the four options: `herd agents`, `moshi`, `theme sync`, `select theme`. Two surfaces coexisting is
+  by design: the page never replaces the command, and no user can ever end up with none.
+- **S2.** Without the bridge, today's surface is unchanged and byte-identical to `865d360`:
+  `/herdr-gentle:customize` registered in the factory, the floating panel from
+  `lib/customize-panel.js` via `ctx.ui.custom`, the `ctx.ui.select` fallback, `customize status`, and
+  every message spelling untouched.
 - **S3.** Each of the four rows keeps the effect and the refusal semantics of the command it
   replaces — same apply path, same writes, same "a refusal writes nothing" promise — and nothing
   else changes: `herd agents` drives the Herdr plugin's `bin/configure.js` (`--check`,
@@ -22,10 +32,9 @@ tasks are the slices that make them true.
   `moshi-hook` prerequisite gate before enabling and writes nothing on refusal; `theme sync` writes
   `lib/theme-store.js` and needs no Pi reload; `select theme` lists Pi's own themes plus the
   `Off (no theme assigned)` entry and is only available while sync is off.
-- **S4.** With the bridge present, no message may point the user at `/herdr-gentle:customize` for
-  something the menu now owns; every user-facing string that named the removed command names the
-  Gentle Shell customize menu instead.
-
+- **S4.** No message may point at a surface that may be absent. `/herdr-gentle:customize` always
+  exists, so every user-facing string keeps naming it, byte-identical to `865d360`, with no
+  surface-dependent wording.
 ## Bridge contract facts (already established — do not re-explore)
 
 - A customize **page is a row `category`**, not `registerSection`. `registerSection` adds a sidebar
@@ -94,3 +103,11 @@ tasks are the slices that make them true.
   `lib/` module with no shipped referrer, and by S1 needing the rows and the command gate in the same
   tree: an intermediate commit would either be red or leave a bridge user with no surface at all.
   Delivery shape for publishing (single PR vs. stacked) is decided at publication, not here.
+- **L6** (requirement change, user): «Comando siempre + página cuando el bridge responde». Chosen after
+  the independent verification showed that Pi's extension load order cannot guarantee both "the page
+  always appears" and "the command is always gone": the strict rule produced processes with zero
+  surfaces (bridge answered, host menu absent) and processes with two (late bridge answer, second
+  session_start). Consequences: S1, S2 and S4 rewritten — the command is unconditional, the page is
+  additive, and every message keeps the `865d360` spelling because the command is always there. T2's
+  exclusivity assertions are superseded by T7; the page's own apply path, row building and the
+  Moshi restart notice are unchanged.
