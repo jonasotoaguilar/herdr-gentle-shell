@@ -18,8 +18,14 @@ plugin-side planner and no 1.8.0 managed block.
 
 ## The switch
 
-`/herdr-gentle:customize` → `Herdr Theme` holds two settings, laid out like the
-rest of the card (see [Panel](#panel)):
+The whole feature is two settings: `Theme sync` and `Select theme`. They are
+served on `/herdr-gentle:customize` → `Herdr Theme` always, and — when
+gentle-shell-bridge answers its handshake (its `gentle-shell-bridge/api/v1`
+object is published on `globalThis`) — also on the `Herdr` page of Gentle Shell's
+own `/gentle:customize` menu, laid out like the rest of the card (see
+[Panel](#panel)). The command always exists and the page is additive; the page's
+rows come from the same model and the same apply path, so everything below holds
+on both:
 
 - `Theme sync` is **OFF by default**. `On` makes Herdr's palette the palette of
   the theme Pi is showing, and it follows a change of the active theme while Pi
@@ -47,12 +53,14 @@ The notices are fixed strings:
 | Toggle already in that state | `Theme sync already on/off; nothing was changed.` |
 | Theme setting while the sync is on | `Turn Theme sync off to pick a specific theme.` |
 | Theme assigned | `Gentle Shell theme set to <name>.` |
-| Pin cleared | `Gentle Shell theme set to Off; Herdr keeps the palette it was last given.` (the stored value stays `null` and the inline list marks `None`; only this notice — and the fallback menu's `Off (no theme assigned)` entry — spell it `Off`) |
+| Pin cleared | `Gentle Shell theme set to Off; Herdr keeps the palette it was last given.` (the stored value stays `null` and the inline list marks `None`; only this notice — and the `Off (no theme assigned)` entry of the fallback menu and of the Gentle Shell page — spell it `Off`) |
 | Host exposes no theme list | `Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.` |
 | Theme store missing | `Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.` |
 | State file not writable | `Could not write the theme store: <detail>; nothing was changed.` |
 
-`/herdr-gentle:customize status` prints one read-only line and writes nothing:
+`/herdr-gentle:customize status` prints one read-only line and writes nothing.
+The subcommand belongs to the command; the menu page offers no `status`
+operation:
 
 ```text
 customize status: sidebar=<on|off|unknown> moshi=<on|off> theme-sync=<on|off|unknown> theme=<name|none|unknown>
@@ -543,7 +551,12 @@ no-op, and every user-visible outcome is a fixed string:
 - **Pinned theme not installed**: `The Pi theme "<name>" is not installed, so
   Herdr's palette was left unchanged; pick an installed theme in
   /herdr-gentle:customize.` — once per session; a later install of that exact
-  theme is picked up without a restart.
+  theme is picked up without a restart. The notice names the command, which
+  always exists, byte-identical to the pre-page build. The customize surfaces
+  reuse the same sentence when a theme row outlives the catalogue it was built
+  from: applying a theme re-reads `ctx.ui.getAllThemes()` first, and a name that
+  is gone refuses as a `warning` write-nothing instead of pinning a theme this
+  install no longer has.
 - **Nothing to project**: `Herdr theme not applied: <theme name> has no concrete
   colours to project.` (`the active theme` replaces the name when the active
   theme exposes none) — once per session, `warning`. A palette with no concrete
@@ -690,10 +703,12 @@ Tests and isolated runs:
 
 ## Panel
 
-`/herdr-gentle:customize` with no argument opens the card. It behaves like
-Gentle Shell's own: one left `CATEGORIES` list and one right pane headed
-`<Category> · n/m`, with one line per setting and its options inline —
-`●` the stored option, `›` the cursor while it sits elsewhere, `○` the rest.
+`/herdr-gentle:customize` with no argument opens the card — the surface that
+always exists, whether or not the bridge adds its page. It behaves like Gentle
+Shell's own: one left `CATEGORIES` list and one
+right pane headed `<Category> · n/m`, with one line per setting and its options
+inline — `●` the stored option, `›` the cursor while it sits elsewhere, `○`
+the rest.
 
 - The arrows move the option cursor and **only Enter applies**; Enter keeps the
   card open (only a Moshi settings change that needs a Pi reload closes it),
@@ -724,6 +739,31 @@ Gentle Shell's own: one left `CATEGORIES` list and one right pane headed
   note (`Themes unavailable; use Pi /settings`) instead of an empty picker, and
   an unreadable store adds `state unknown; Enter pins a theme`.
 
+When gentle-shell-bridge answers, this card is still there and the same two
+settings are ALSO the `Theme sync` and `Select theme` rows of the `Herdr` page in
+Gentle Shell's own menu, painted by that host. One row per value, walked with
+the arrows and applied with `Enter` (the bridge never applies on a cursor move),
+the theme row keeps its own swatch, and the theme rows are simply not shown
+while the sync is on instead of being refused in place. The notices are the
+same fixed strings, and the sync needs no Pi reload on either surface.
+
+The page's rows are FIXED for as long as the menu is open, which is why its
+theme rows cost one model read per paint burst instead of one per row. Two
+consequences are accepted: an external write while the menu is idle becomes
+visible on the first read after the cache expires, or on a rebuild (the cache
+never asks the host to repaint, so a repaint that lands before expiry redraws
+the previous model and the display has no upper freshness bound), and an
+external write that hides the focused row leaves the host to clamp the cursor to
+the neighbouring row, so `Enter` can act on that one — the clamp itself writes
+nothing. Because a row can outlive the catalogue it was built from, the page's
+own apply path re-reads `ctx.ui.getAllThemes()` before it writes: a theme
+removed after the build is refused with the sync's own not-installed notice
+(`The Pi theme "<name>" is not installed, …`) and the store is left untouched,
+and a catalogue that cannot be read at apply time is refused with
+`Could not read Pi's theme list at apply time; nothing was changed.` The
+command's own picker and the mounted panel do not run that check, so both keep
+the `865d360` behavior byte for byte (S2).
+
 ## Implementation
 
 | File | Role |
@@ -733,5 +773,6 @@ Gentle Shell's own: one left `CATEGORIES` list and one right pane headed
 | `lib/herdr-theme-config.js` | The pure planner — a **line splicer**, not a TOML validator: table-boundary scanning, opaque bytes outside the two theme tables, a strict theme-table grammar, the whole-line `was` marker with byte-exact restoration (the user's latest trailing comment wins), the one regenerated block (`begin` / `begin created` … `end` / `end after a missing line ending`), the ambiguity refusal above a block being removed or moved, the 1.8.0 marker-pair migration, the BOM and the enforced splice invariant. |
 | `lib/herdr-theme-apply.js` | The writer: availability guards, bounded snapshot, compare-and-swap, atomic non-overwriting backup (a regular existing file is accepted as is), retried temp cleanup that reports a survivor and never deletes a temp it did not create, growth limit, `forceReload`, reload. |
 | `extensions/herdr-theme-sync.ts` | The follower: session-start evaluation, 500 ms tick, fingerprint, owed-reload repair, the notices. |
-| `extensions/gentle-herdr-state.ts` | The switch: `applyThemeSync`, `writeThemeChoice`, `applyCustomizePanel`, `customize status`. |
+| `extensions/gentle-herdr-state.ts` | The switch: `applyThemeSync`, `writeThemeChoice`, `applyCustomizePanel`, `customize status`, and the page registration beside the always-registered command (`registerCustomizePage`). |
 | `lib/customize-panel.js` | The card: categories, option lines, sideways window, Preview block, legends, pointer hits. |
+| `lib/customize-rows.js` | The page: the same model and settings translated into the four `Herdr` row lines Gentle Shell renders. |

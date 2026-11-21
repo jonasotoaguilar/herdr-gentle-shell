@@ -2075,6 +2075,11 @@ function lastFinishedLabel(taskMap) {
 // unavailable. The removed `Plugin tools` and `Reset` sections and the
 // cross-extension provider slot are deliberately NOT restored: they switched
 // worktree/ODD/issues surfaces this package no longer contains.
+//
+// With gentle-shell-bridge present the same four options are ALSO served as the
+// `Herdr` page of Gentle Shell's own `/gentle:customize` menu (see
+// `registerCustomizePage` below). The page is additive: this command is
+// registered unconditionally, exactly as before, and the apply path is shared.
 // ---------------------------------------------------------------------------
 
 const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
@@ -2106,8 +2111,26 @@ const THEME_SYNC_OFF_TEXT = "Theme sync off; Herdr keeps the palette it was last
 const THEME_SYNC_REFUSED_TEXT = "Turn Theme sync off to pick a specific theme.";
 const THEME_LIST_UNAVAILABLE_TEXT =
   "Could not read Pi's theme list (this host exposes no getAllThemes()); nothing was changed.";
+// The page's OWN apply-time notice, for a catalogue it could read when it built
+// its rows and cannot read now. It deliberately does not reuse the sentence
+// above: that one says the host exposes no `getAllThemes()`, which is a
+// different fact and stays untouched for the command and the panel (S2).
+const THEME_LIST_UNREADABLE_AT_APPLY_TEXT =
+  "Could not read Pi's theme list at apply time; nothing was changed.";
 const THEME_STORE_UNAVAILABLE_TEXT =
   "Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.";
+
+// S4 (odd/tasks/herdr-customize-page.md): `/herdr-gentle:customize` is registered
+// unconditionally (S1), so it always exists and every message that sends the user
+// back to the four options names it — byte for byte the text `865d360` shipped.
+// No string is surface-dependent: the page added beside the command changes no
+// wording, and a message never points at a menu that may be absent.
+
+// The Moshi settings entry waits for the next Pi extension load. A customize ROW
+// has no reload handle (the bridge hands `action` only inline helpers), so the
+// page writes the exclusion and asks for a restart instead of promising a reload
+// it cannot perform. The command and the panel keep reloading immediately.
+const MOSHI_RESTART_TEXT = "Restart Pi so the new Moshi hook exclusion takes effect.";
 
 // The former panel's geometry and overlay options, unchanged. The helpers
 // module (@earendil-works/pi-tui) is resolved lazily through the injectable
@@ -2144,6 +2167,18 @@ function customizeLibDir() {
 function customizePanelModule() {
   try {
     return nodeRequire(join(customizeLibDir(), "customize-panel.js"));
+  } catch {
+    return null;
+  }
+}
+
+// The bridge row builder (lib/customize-rows.js, odd/tasks/herdr-customize-page.md
+// T1). Loaded lazily beside the panel module and for the same reason: an
+// installed copy without the sibling library keeps every other surface working
+// and answers no page instead of failing this extension.
+function customizeRowsModule() {
+  try {
+    return nodeRequire(join(customizeLibDir(), "customize-rows.js"));
   } catch {
     return null;
   }
@@ -2624,13 +2659,19 @@ async function applyCustomizeSwitch(id, value, ctx, options = {}) {
       ? applyThemeSync(want)
       : applyMoshiNotifications(want);
   const notify = ctx?.ui?.notify;
-  if (typeof notify === "function") {
-    notify(`${result.text}${result.needsReload ? " Reloading now to apply the change." : ""}`, result.level);
-  }
-  // The overlay defers the reload (`deferReload`): reloading while the card is
-  // still mounted restarts Pi behind an open overlay, so the panel closes first
-  // and the caller reloads after `ctx.ui.custom` resolved.
-  if (result.needsReload && options.deferReload !== true && typeof ctx?.reload === "function") await ctx.reload();
+  // The reload sentence is a PROMISE about what happens next, so it is written
+  // from what this surface can actually do. `deferReload` hands the reload to the
+  // caller that mounted the overlay (the card closes first, then it reloads), and
+  // `noReload` is the Gentle Shell customize page, where a row action receives no
+  // ctx and therefore no reload handle: there the only honest sentence is a
+  // restart. Every other combination is the command's own immediate reload.
+  const canReload = options.deferReload !== true && options.noReload !== true
+    && typeof ctx?.reload === "function";
+  const reloadNotice = result.needsReload
+    ? (options.noReload === true ? ` ${MOSHI_RESTART_TEXT}` : " Reloading now to apply the change.")
+    : "";
+  if (typeof notify === "function") notify(`${result.text}${reloadNotice}`, result.level);
+  if (result.needsReload && canReload) await ctx.reload();
   return result;
 }
 
@@ -2712,10 +2753,36 @@ function themeSelectionOptions(names) {
   return { options: [...names, unassign], unassign };
 }
 
-// One write for the pinned theme, shared by the inline panel setting and the
-// `ctx.ui.select` fallback: the refusal, the missing store and a failure all
-// write NOTHING, so the stored document only ever changes to a value the user
-// actually picked (S7).
+// T10 (odd/tasks/herdr-customize-page.md): a surface that holds its own rows can
+// outlive the catalogue it built them from. Only the Herdr PAGE does: it keeps
+// one row per theme for as long as Gentle Shell shows the menu, while the
+// command's picker reads `getAllThemes()` when it prompts and the mounted panel
+// keeps the 865d360 write. The guard therefore lives on the page's apply path (`applyCustomizePageChoice`), never in the write the command and the
+// panel share (S2).
+//
+// The wording is the notice the theme sync already gives for a stored name this
+// install does not have (`extensions/herdr-theme-sync.ts`, S4): one sentence for
+// one fact, spelled once. A catalogue that cannot be read at all gets the page's
+// own apply-time sentence, because a name nothing verified is never written.
+function themeNotInstalledText(name) {
+  return `The Pi theme "${name}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`;
+}
+
+// A FRESH read, never the page's row cache: `readHostThemeNames` calls the host
+// accessor again on every call, so the answer describes the install as it is at
+// APPLY time.
+function themeStillInstalled(ctx, name) {
+  const names = readHostThemeNames(ctx);
+  if (names === null) return { ok: false, text: THEME_LIST_UNREADABLE_AT_APPLY_TEXT };
+  return names.includes(name) ? { ok: true, text: null } : { ok: false, text: themeNotInstalledText(name) };
+}
+
+// One write for the pinned theme, shared by the inline panel setting, the Herdr
+// page rows and the `ctx.ui.select` fallback: the refusal, the missing store and
+// a failure all write NOTHING, so the stored document only ever changes to a
+// value the user actually picked (S7). No catalogue check lives here: the
+// command's picker cannot outlive its catalogue, and the page's own guard runs
+// before this call (T10), so neither surface can inherit a new refusal.
 function writeThemeChoice(ctx, name) {
   const notify = ctx?.ui?.notify;
   const store = themeStoreModule();
@@ -2814,7 +2881,7 @@ async function applyCustomizeChoice(choice, ctx) {
 // uses, and answers with a freshly read model so the panel shows the real state
 // instead of guessing it. `close` is only true when Pi must reload: the caller
 // closes the overlay first and reloads after it resolved.
-async function applyCustomizePanel(choice, ctx) {
+async function applyCustomizePanel(choice, ctx, options = {}) {
   const model = () => customizePanelModel(ctx);
   if (!isRecord(choice)) return { model: model(), close: false, reload: false };
   const { settingId, optionId } = choice;
@@ -2827,7 +2894,12 @@ async function applyCustomizePanel(choice, ctx) {
   }
   if (!CUSTOMIZE_SWITCH_IDS.includes(settingId)) return { model: model(), close: false, reload: false };
   if (optionId !== "on" && optionId !== "off") return { model: model(), close: false, reload: false };
-  const result = await applyCustomizeSwitch(settingId, optionId, ctx, { deferReload: true });
+  const result = await applyCustomizeSwitch(
+    settingId,
+    optionId,
+    ctx,
+    options.noReload === true ? { noReload: true } : { deferReload: true },
+  );
   const reload = Boolean(result && result.needsReload);
   return { model: model(), close: reload, reload };
 }
@@ -2964,9 +3036,200 @@ async function executeCustomize(rawArgs, ctx) {
   await runCustomizeFallback(ctx);
 }
 
+// ---------------------------------------------------------------------------
+// The Gentle Shell customize PAGE (odd/tasks/herdr-customize-page.md T7;
+// specs S1, S2, S4).
+//
+// `/herdr-gentle:customize` is registered in the FACTORY, unconditionally, exactly
+// as on `865d360`. This section ADDS a second surface on top of it: when
+// gentle-shell-bridge answers its handshake, the same four switches also appear as
+// the `Herdr` page of Gentle Shell's own `/gentle:customize` menu. The page never
+// replaces the command — two surfaces coexisting is by design, because Pi gives an
+// extension no way to withdraw a registered command and a bridge with no host menu
+// must never leave the user with none.
+//
+// The bridge is reached as a HANDSHAKE, never a dependency: its object sits at a
+// `Symbol.for` key on `globalThis`, and the key, the schema and the members this
+// file calls are inlined here, so nothing resolves `gentle-shell-bridge` as a
+// module (`examples/bash-card.ts:1214-1244` in that package is the same pattern).
+//
+// WHEN the page appears. `session_start` asks the symbol; when it is absent the
+// page cannot be built yet, so the factory has already subscribed to
+// `BRIDGE_READY_EVENT` and the announce asks again. That covers Pi's load order,
+// which does not guarantee that a configured package's module publishes before a
+// global extension's `session_start`: a late bridge still produces the page. The
+// announce is a notification, never a registry — the symbol stays the authority,
+// so a copy that publishes an incompatible slot announces nothing usable and the
+// gate below answers ABSENT.
+//
+// ONE provider, never two. Registration is guarded by the live provider itself, so
+// a second `session_start`, an announce after a start and a repeated announce all
+// leave exactly one registration; the bridge's bus is never asked twice. The
+// provider is session-scoped and the command is not: only the provider is disposed
+// on session shutdown.
+// ---------------------------------------------------------------------------
+const BRIDGE_API_KEY = Symbol.for("gentle-shell-bridge/api/v1");
+const BRIDGE_API_SCHEMA = "gentle-shell-bridge/api";
+const BRIDGE_API_VERSION = 1;
+// The channel the bridge announces itself on. The string MIRRORS `src/api.ts`:
+// this file cannot import it, so the two are kept in sync by hand.
+const BRIDGE_READY_EVENT = "gentle-shell-bridge:ready";
+// The provider's stable id: the bridge replaces a provider registered under the
+// same id in place, so one page is one page however often it is registered.
+const CUSTOMIZE_PAGE_PROVIDER_ID = "herdr-gentle:customize";
+
+// The published object, gated exactly like the bridge's own `isBridgeApi`
+// (`src/api.ts`): identity strings plus the members this file calls. A foreign
+// payload, another major version or a partial object is ABSENT — never an error,
+// never guessed at, never overwritten.
+function publishedBridge() {
+  const slot = globalThis[BRIDGE_API_KEY];
+  if (!isRecord(slot)) return null;
+  if (slot.schema !== BRIDGE_API_SCHEMA || slot.version !== BRIDGE_API_VERSION) return null;
+  if (typeof slot.registerRows !== "function") return null;
+  if (typeof slot.registerSection !== "function" || typeof slot.createStore !== "function") return null;
+  return slot;
+}
+
+// A row's apply path — and it IS the overlay's own path (`applyCustomizePanel`),
+// not a copy: the same `writeThemeChoice` for the pinned theme, the same
+// `applyCustomizeSwitch` for the three switched settings, and therefore the same
+// Moshi prerequisite gate and the same "a refusal writes nothing" promise by
+// construction. It adds the two facts the overlay does not need: a row action
+// receives no ctx, so the page has no reload handle and the shared path reports a
+// restart instead of reloading (see `applyCustomizeSwitch`), and the page's rows
+// outlive the theme catalogue they were built from (T10).
+//
+// The catalogue guard lives HERE, on the page's own call site, and not in the
+// shared write: the command's picker and the mounted panel keep the 865d360
+// behavior byte for byte (S2), and no other surface can be affected by
+// construction. A name removed after the build is refused with the not-installed
+// notice and writes nothing; a catalogue that cannot be read at apply time gets
+// the page's own honest sentence and also writes nothing.
+//
+// A refusal is NOT re-thrown: the shared path reports it through the host's own
+// `ui.notify` and returns, which is one report — the same one the command gives.
+// Throwing on top of that would report it twice (the bridge reports a thrown
+// action again), so only an unexpected exception travels into the bridge's
+// channel.
+async function applyCustomizePageChoice(choice, ctx) {
+  if (isRecord(choice) && choice.settingId === CUSTOMIZE_THEME_SETTING_ID) {
+    const optionId = choice.optionId;
+    // The sync gate answers FIRST, exactly as it does on every other surface.
+    // While sync is on the pinned theme is not available at all, so asking the
+    // catalogue whether the theme still exists would answer a question the row
+    // cannot act on and would bury the one thing the user has to do first.
+    const syncOn = readCustomizeThemeState().sync === true;
+    if (!syncOn && typeof optionId === "string" && optionId.startsWith(CUSTOMIZE_THEME_OPTION_PREFIX)) {
+      const installed = themeStillInstalled(ctx, optionId.slice(CUSTOMIZE_THEME_OPTION_PREFIX.length));
+      if (!installed.ok) {
+        const notify = ctx?.ui?.notify;
+        if (typeof notify === "function") notify(installed.text, "warning");
+        return { model: customizePanelModel(ctx), close: false, reload: false };
+      }
+    }
+  }
+  return applyCustomizePanel(choice, ctx, { noReload: true });
+}
+
+// The one provider this extension contributes: the `Herdr` page (a row
+// CATEGORY, never `registerSection`, which is a sidebar card). `rows()` is called
+// on every menu build, so the model — and every `current()`, swatch and sync gate
+// inside it — is read live rather than captured at registration.
+function customizePageProvider(rowsModule, hostCtx) {
+  return {
+    id: CUSTOMIZE_PAGE_PROVIDER_ID,
+    category: rowsModule.CUSTOMIZE_ROWS_CATEGORY,
+    rows() {
+      const ctx = hostCtx();
+      // No session ctx means no theme catalogue and no notify channel; an empty
+      // page is the honest answer, and `customizeRows` answers no rows for a
+      // model it cannot read anyway.
+      if (!ctx) return [];
+      return rowsModule.customizeRows({
+        model: () => customizePanelModel(ctx),
+        apply: (choice) => applyCustomizePageChoice(choice, ctx),
+      });
+    },
+  };
+}
+
+// The Gentle Shell customize page as a REGISTRATION LIFECYCLE, bound by the
+// factory beside the command (which is registered there too, unconditionally).
+// Additive by construction: nothing here can unregister or shadow the command.
+function registerCustomizePage(pi) {
+  let pageContext = null;
+  let disposePage = null;
+
+  function clearPage() {
+    const dispose = disposePage;
+    disposePage = null;
+    if (typeof dispose !== "function") return;
+    try {
+      dispose();
+    } catch {
+      // The bridge owns its own bus: a disposer that fails cannot make this file
+      // host a second page, so the failure is contained here.
+    }
+  }
+
+  // The one registration path `session_start` and the announce both use, so an
+  // announce and a later session cannot both register and a repeated announce
+  // cannot stack a second provider. A live provider IS the guard: re-registering
+  // would only ask the bus to replace an identical entry.
+  function registerPage() {
+    if (disposePage !== null) return;
+    // No session yet: `session_start` asks again once there is a ctx to build the
+    // model from.
+    if (!pageContext) return;
+    const bridge = publishedBridge();
+    // S2: nothing answered the handshake, so today's command stands alone.
+    if (!bridge) return;
+    const rowsModule = customizeRowsModule();
+    // An install without the sibling lib/ has no page to offer; the command and
+    // every other surface keep working.
+    if (!rowsModule) return;
+    let dispose = null;
+    try {
+      dispose = bridge.registerRows(customizePageProvider(rowsModule, () => pageContext));
+    } catch {
+      // A bus that refuses the provider (a host with no customize menu asks for
+      // nothing else): the command is already registered, so no surface is lost.
+      dispose = null;
+    }
+    if (typeof dispose === "function") disposePage = dispose;
+  }
+
+  // The symbol first: when the bridge is already published there is nothing to
+  // wait for and no listener is taken. Otherwise the announce is the only way a
+  // bridge that loads AFTER this extension is ever heard.
+  const events = pi?.events;
+  if (events && typeof events.on === "function" && !publishedBridge()) {
+    try {
+      events.on(BRIDGE_READY_EVENT, registerPage);
+    } catch {
+      // No bus and no ready event: `session_start` still tries the symbol.
+    }
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    pageContext = isRecord(ctx) ? ctx : null;
+    registerPage();
+  });
+
+  pi.on("session_shutdown", () => {
+    // The bridge's bus outlives the session, so only the provider is dropped:
+    // the command stays as registered, and the next session adds one page again
+    // instead of stacking a second one.
+    clearPage();
+    pageContext = null;
+  });
+}
+
 export default function (pi) {
   // Registered before the pane gate on purpose: the switches are local state and
-  // must stay reachable from a plain Pi session outside a Herdr pane.
+  // must stay reachable from a plain Pi session outside a Herdr pane. S1: this is
+  // unconditional — the page below is additive, never a replacement.
   if (typeof pi?.registerCommand === "function") {
     pi.registerCommand("herdr-gentle:customize", {
       description: "Customize Herdr Gentle Shell: sidebar agent rows, Moshi notifications and the Herdr theme",
@@ -2975,6 +3238,7 @@ export default function (pi) {
       },
     });
   }
+  registerCustomizePage(pi);
   if (!enabled()) return;
 
   let rootSession = false;

@@ -70,11 +70,14 @@ const MANAGED_END = '# END herdr-gentle-agents';
 // fixture as current instead of assuming a hand-written shape.
 const MANAGED_BLOCK = require('../herdr-plugin/bin/configure.js').MANAGED_BLOCK;
 const MOSHI_ENTRY = '-extensions/moshi-hooks.ts';
+// S2 (odd/tasks/herdr-customize-page.md): with no bridge the command IS the
+// surface, so its refusals name `/herdr-gentle:customize` — byte for byte the
+// text 865d360 shipped. The page's own wording is pinned in
+// tools/customize-bridge-page.test.js.
 const MISSING_CLI_TEXT =
   'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.';
 const NOT_PAIRED_TEXT =
   'Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.';
-
 const COMMAND = 'herdr-gentle:customize';
 
 // The theme picker's "no theme assigned" entry. It is deliberately distinct from
@@ -107,8 +110,15 @@ function harness({ customImpl, themes, getTheme } = {}) {
   const customs = [];
   const reloads = [];
   const handlerKinds = [];
+  const handlers = new Map();
   const pi = {
-    on: (kind) => handlerKinds.push(kind),
+    on: (kind, handler) => {
+      handlerKinds.push(kind);
+      const list = handlers.get(kind) ?? [];
+      if (typeof handler === 'function') list.push(handler);
+      handlers.set(kind, list);
+      return () => {};
+    },
     events: { on: () => {}, emit: () => {} },
     registerCommand: (name, definition) => commands.set(name, definition),
   };
@@ -130,7 +140,16 @@ function harness({ customImpl, themes, getTheme } = {}) {
     };
   }
   const ctx = { ui, reload: async () => reloads.push(true) };
-  return { pi, ctx, commands, notices, selections, customs, reloads, handlerKinds };
+  const h = { pi, ctx, commands, notices, selections, customs, reloads, handlerKinds, handlers };
+  // Pi's own order: the factory returns, then `session_start` arrives. The
+  // command is registered by the factory itself (S1/S2); the session only adds
+  // the Gentle Shell page when the bridge answers the handshake.
+  h.start = async () => {
+    for (const handler of handlers.get('session_start') ?? []) {
+      await handler({ reason: 'startup' }, ctx);
+    }
+  };
+  return h;
 }
 
 let moduleCache = null;
@@ -142,6 +161,7 @@ async function loadExtension(h) {
 
 async function run(h, args) {
   await loadExtension(h);
+  await h.start();
   const command = h.commands.get(COMMAND);
   assert.ok(command, `${COMMAND} was not registered`);
   await command.handler(args, h.ctx);
@@ -276,15 +296,49 @@ function readThemeFile(env) {
 /* ------------------------------------------------------------ tests */
 
 describe('registration', () => {
-  test('registers the command before the enabled() pane gate', async () => {
+  test('registers the command in the factory, before the pane gate and before any session event', async () => {
     const h = harness();
     await loadExtension(h);
-    assert.ok(h.commands.has(COMMAND), 'the command must register outside a Herdr pane');
-    // The pane gate is closed in this process, so the factory must have
-    // returned right after registration: no producer handlers were bound.
-    assert.deepEqual(h.handlerKinds, []);
+    // S1/S2: the command exists before `session_start` arrives — exactly as on
+    // 865d360. Nothing about the bridge, the page or a session can remove it.
+    assert.ok(h.commands.has(COMMAND), 'the command must register at factory time, outside a Herdr pane');
     assert.match(h.commands.get(COMMAND).description, /sidebar agent rows/);
     assert.match(h.commands.get(COMMAND).description, /Moshi notifications/);
+
+    await h.start();
+    assert.ok(h.commands.has(COMMAND), 'and a session never removes it');
+    // The pane gate is closed in this process, so the factory must have returned
+    // after binding the customize page's own events: no producer handler was bound.
+    assert.deepEqual(h.handlerKinds, ['session_start', 'session_shutdown']);
+  });
+
+  test('registers the command even when a bridge answers the handshake', async () => {
+    // S1: the page is ADDITIVE. The handshake, not a package dependency, is a
+    // frozen object at the bridge's published key, and it changes nothing about
+    // the command (tools/customize-bridge-page.test.js owns the page itself).
+    const providers = [];
+    const published = {
+      schema: 'gentle-shell-bridge/api',
+      version: 1,
+      registerRows: (provider) => {
+        providers.push(provider);
+        return () => {};
+      },
+      registerSection: () => {},
+      createStore: () => {},
+    };
+    const key = Symbol.for('gentle-shell-bridge/api/v1');
+    globalThis[key] = Object.freeze(published);
+    try {
+      const h = harness();
+      await loadExtension(h);
+      assert.ok(h.commands.has(COMMAND), 'the command registers at factory time');
+      await h.start();
+      assert.equal(h.commands.has(COMMAND), true, 'the page never replaces it');
+      assert.equal(providers.length, 1, 'and the page is contributed beside it');
+    } finally {
+      delete globalThis[key];
+    }
   });
 });
 
@@ -380,11 +434,78 @@ describe('refusals', () => {
     const h = harness();
     h.selections.push('Moshi notifications', 'On');
     await run(h, '');
-    assert.deepEqual(noticeTexts(h), [
+    // T9: the WHOLE pair — the refusal's text and its level — never just a
+    // substring, so neither the wording nor the severity can drift silently.
+    assert.deepEqual(h.notices, [[
       'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (produced no parseable JSON); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
-    ]);
+      'error',
+    ]]);
     assert.equal(fs.existsSync(env.flagPath), false);
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  // T9: the gate's other two unreachable-by-happy-path answers. `runMoshiStatus`
+  // reports a non-zero exit and a document without a literal `paired: true`, and
+  // each one is a REFUSAL with its own sentence — the exit status is quoted, and
+  // a document that carries no pairing flag is named as such.
+  test('a status CLI that exits non-zero quotes its exit status and writes nothing', async () => {
+    const env = setupEnvironment('moshi-status-exit');
+    writeExecutable(
+      path.join(env.pathDir, 'moshi-hook'),
+      `#!/bin/sh\nprintf '%s\\n' '{"paired":true}'\nexit 7\n`,
+    );
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness();
+    h.selections.push('Moshi notifications', 'On');
+    await run(h, '');
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (exited with status 7); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes no flag');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore, 'and no settings entry');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('a status document without a paired flag refuses and writes nothing', async () => {
+    const env = setupEnvironment('moshi-status-unpaired-field');
+    writeExecutable(
+      path.join(env.pathDir, 'moshi-hook'),
+      `#!/bin/sh\nprintf '%s\\n' '{"secretStore":"keychain","hooks":[]}'\nexit 0\n`,
+    );
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness();
+    h.selections.push('Moshi notifications', 'On');
+    await run(h, '');
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (reported no paired flag); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes no flag');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore, 'and no settings entry');
+    assert.deepEqual(h.reloads, []);
+  });
+
+  test('a paired flag that is not literally true is the same missing-flag refusal', async () => {
+    const env = setupEnvironment('moshi-status-paired-not-bool');
+    writeExecutable(
+      path.join(env.pathDir, 'moshi-hook'),
+      `#!/bin/sh\nprintf '%s\\n' '{"paired":"yes"}'\nexit 0\n`,
+    );
+    writeSettings(env.settingsPath, { extensions: ['keep-me'] });
+    const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
+    const h = harness();
+    h.selections.push('Moshi notifications', 'On');
+    await run(h, '');
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (reported no paired flag); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes no flag');
+    assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore, 'and no settings entry');
     assert.deepEqual(h.reloads, []);
   });
 });
@@ -412,7 +533,7 @@ describe('moshi switch', () => {
     const h = harness();
     h.selections.push('Moshi notifications', 'On');
     await run(h, '');
-    assert.deepEqual(noticeTexts(h), [NOT_PAIRED_TEXT]);
+    assert.deepEqual(h.notices, [[NOT_PAIRED_TEXT, 'error']]);
     assert.equal(fs.existsSync(env.flagPath), false);
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
     assert.deepEqual(h.reloads, []);
@@ -740,6 +861,79 @@ describe('theme selection', () => {
     assert.deepEqual(h.notices.map(([, level]) => level), ['warning']);
     assert.equal(fs.readFileSync(themePath(env), 'utf8'), before);
     assert.deepEqual(h.reloads, []);
+  });
+
+  // S2: this fallback picker lists the catalogue WHEN IT PROMPTS and then awaits
+  // the answer, so the catalogue can change while the prompt is open. 865d360
+  // and 418ec53 both saved the choice the picker had already offered, whatever
+  // happened to the catalogue afterwards; the command must not grow the page's
+  // fixed-row refusal.
+  async function pickWhileCatalogueChanges(name, changeCatalogue) {
+    const env = setupEnvironment(name);
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const catalog = [{ name: 'Dark' }, { name: 'Light' }];
+    const h = harness({ themes: catalog });
+    const prompts = [];
+    h.ctx.ui.select = async (title, options) => {
+      prompts.push([title, options]);
+      if (prompts.length === 1) return 'Gentle Shell theme';
+      // The picker has already been given both themes; the catalogue changes
+      // before the answer arrives, exactly as another process can change it.
+      changeCatalogue(h, catalog);
+      return 'Dark';
+    };
+    await run(h, '');
+    return { env, h, prompts };
+  }
+
+  function assertOfferedChoiceSaved(env, h, prompts) {
+    assert.deepEqual(
+      prompts[1],
+      ['Gentle Shell theme', ['Dark', 'Light', THEME_UNASSIGN]],
+      'the picker offered the catalogue it was given',
+    );
+    const doc = readThemeFile(env);
+    assert.deepEqual([doc.sync, doc.theme], [false, 'Dark'], 'the offered choice is saved');
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to Dark.', 'info']], 'the 865d360 notice and level');
+    assert.deepEqual(h.reloads, [], 'a theme pin never reloads Pi');
+  }
+
+  test('a theme removed while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-removed', (_h, catalog) => {
+      catalog.splice(catalog.findIndex((entry) => entry.name === 'Dark'), 1);
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('an emptied catalogue while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-empty', (_h, catalog) => {
+      catalog.length = 0;
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('a catalogue that starts throwing while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-throws', (host) => {
+      host.ctx.ui.getAllThemes = () => {
+        throw new Error('catalogue gone');
+      };
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('a host that loses getAllThemes while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-missing', (host) => {
+      delete host.ctx.ui.getAllThemes;
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
+  });
+
+  test('a malformed catalogue while the picker is open is still saved', async () => {
+    const { env, h, prompts } = await pickWhileCatalogueChanges('theme-select-catalogue-malformed', (host) => {
+      host.ctx.ui.getAllThemes = () => 42;
+    });
+    assertOfferedChoiceSaved(env, h, prompts);
   });
 });
 
@@ -1207,6 +1401,118 @@ describe('floating panel theme rows', () => {
     assert.equal(doc.theme, 'nord');
     assert.deepEqual(h.reloads, []);
     assert.equal(fs.existsSync(env.flagPath), false);
+  });
+
+  // S2: the card is part of the command's surface too, and 865d360 saved the
+  // theme the card offered even when the catalogue changed under the cursor.
+  // The fixed-row refusal belongs to the Gentle Shell page only (its apply path
+  // checks the catalogue; tools/customize-bridge-page.test.js pins it), so the
+  // mounted panel keeps the baseline write.
+  test('Enter on a theme removed while the panel is open still saves the offered theme', async () => {
+    const env = setupEnvironment('overlay-theme-vanished');
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const catalog = [{ name: 'nord' }, { name: 'dracula' }];
+    const h = harness({
+      themes: catalog,
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        // None -> nord -> dracula.
+        component.handleInput('right');
+        component.handleInput('right');
+        assert.ok(component.render(100).join('\n').includes('● None'), 'the stored value is still None');
+        // The theme is uninstalled with the card open.
+        catalog.splice(1, 1);
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to dracula.', 'info']]);
+    assert.equal(readThemeFile(env).theme, 'dracula', 'the offered theme is saved');
+    assert.equal(fs.existsSync(env.flagPath), false);
+    assert.deepEqual(h.reloads, []);
+  });
+
+  // S2: the card lists Pi's themes when it builds its model and then waits for a
+  // key, so the catalogue can change while it is open — exactly like the command's
+  // own `ctx.ui.select` picker. 865d360 saved the theme the card had already
+  // offered, whatever happened to the catalogue afterwards; the fixed-row
+  // catalogue refusal belongs to the Gentle Shell page only
+  // (tools/customize-bridge-page.test.js pins it there). These four cases are the
+  // shapes "the catalogue changed" can take.
+  async function enterDarkAfterCatalogueChanges(name, changeCatalogue) {
+    const env = setupEnvironment(name);
+    fs.writeFileSync(env.configPath, '');
+    writeThemeFile(env, { sync: false, theme: null, updatedAt: '2024-01-01T00:00:00.000Z' });
+    const h = harness({
+      themes: [{ name: 'Dark' }, { name: 'Light' }],
+      customImpl: async (factory) => {
+        const { component, done } = openPanel(factory, makeHostTui().tui);
+        // Herdr Theme -> the theme setting -> `Dark` (the first offered theme).
+        component.handleInput('down');
+        component.handleInput('down');
+        component.handleInput('right');
+        component.handleInput('down');
+        component.handleInput('right');
+        const painted = component.render(100).join('\n');
+        assert.ok(painted.includes('▸ Gentle Shell theme'), 'the cursor is on the theme setting');
+        assert.ok(painted.includes('● None'), 'the stored value is still None');
+        // The catalogue changes with the card open, then Enter confirms the
+        // theme the card had already offered.
+        changeCatalogue(h);
+        component.handleInput('enter');
+        await settlePanel(component);
+        component.handleInput('escape');
+        return done();
+      },
+    });
+    await withThemePanel(h);
+    return { env, h };
+  }
+
+  function assertOfferedThemeSaved(env, h) {
+    const doc = readThemeFile(env);
+    assert.deepEqual([doc.sync, doc.theme], [false, 'Dark'], 'the offered theme is saved');
+    assert.deepEqual(h.notices, [['Gentle Shell theme set to Dark.', 'info']], 'the baseline notice and level');
+    assert.deepEqual(h.reloads, [], 'a theme pin never reloads Pi');
+  }
+
+  test('an emptied catalogue while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-emptied', (host) => {
+      const catalog = host.ctx.ui.getAllThemes();
+      catalog.length = 0;
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
+  test('a catalogue that starts throwing while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-throws', (host) => {
+      host.ctx.ui.getAllThemes = () => {
+        throw new Error('catalogue gone');
+      };
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
+  test('a host that loses getAllThemes while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-missing', (host) => {
+      delete host.ctx.ui.getAllThemes;
+    });
+    assertOfferedThemeSaved(env, h);
+  });
+
+  test('a malformed catalogue while the panel is open still saves the offered theme', async () => {
+    const { env, h } = await enterDarkAfterCatalogueChanges('overlay-theme-catalogue-malformed', (host) => {
+      host.ctx.ui.getAllThemes = () => 42;
+    });
+    assertOfferedThemeSaved(env, h);
   });
 
   test('Enter on None writes an unassigned theme', async () => {

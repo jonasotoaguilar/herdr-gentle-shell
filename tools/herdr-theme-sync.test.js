@@ -599,8 +599,14 @@ describe('sync off with an assigned theme (S4)', () => {
     assert.equal(fx.bytes(), userConfig(), 'a name this install does not have applies nothing');
     assert.deepEqual(fx.calls(), []);
     assert.equal(notices.length, 1, 'a tick must never nag');
-    assert.equal(notices[0][1], 'warning');
-    assert.match(notices[0][0], /"ghost" is not installed/);
+    // The WHOLE notice, destination included: `/herdr-gentle:customize` is
+    // registered unconditionally (odd/tasks/herdr-customize-page.md S4), so it is
+    // the only surface this test's setup can name — and the bytes are 865d360's.
+    assert.deepEqual(notices, [[
+      "The Pi theme \"ghost\" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.",
+      'warning',
+    ]]);
+    assert.equal(notices[0][0].includes('customize menu'), false, 'no message names a menu that may be absent');
   });
 });
 

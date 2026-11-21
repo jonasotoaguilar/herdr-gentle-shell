@@ -1008,6 +1008,45 @@ nothing:
   settings entry actually changed, because that entry is the only part that
   waits for the next Pi extension load.
 
+The command always exists and the page is additive.
+`/herdr-gentle:customize` is registered in the extension factory, unconditionally
+and before the pane gate, exactly as it always was; when gentle-shell-bridge
+answers its handshake — the `gentle-shell-bridge/api/v1` object published on
+`globalThis`, gated exactly like the bridge's own `isBridgeApi` — the extension
+ALSO registers one row provider (`registerRows`, a row `category`, never
+`registerSection`) on the `Herdr` page of Gentle Shell's own `/gentle:customize`
+menu, holding exactly the four options S1 names: `Herd agents`, `Moshi`,
+`Theme sync`, `Select theme`. Two surfaces coexisting is by design: Pi gives an
+extension no way to withdraw a registered command, and a bridge with no host
+menu must never leave the user with none. The page is asked for at
+`session_start` and again on the bridge's `gentle-shell-bridge:ready` announce,
+so a bridge that publishes after this extension or after the session start still
+produces it; the live provider is its own guard, so a second `session_start` or a
+repeated announce never stacks a second page, and only the provider is disposed
+at `session_shutdown` while the command stays as registered.
+
+Each row is that switch and nothing else: its action calls the same
+`applyCustomizePanel` the panel calls, so the writes, the `moshi-hook`
+prerequisite gate and the "a refusal writes nothing" promise are identical by
+construction, and the model is re-read on every menu build so `current()` is the
+stored value rather than a copy taken at registration. The page's four lines are
+the same four switches under their row names — `Herd agents` for
+`Sidebar agent rows`, `Moshi` for `Moshi notifications`, `Theme sync` and
+`Select theme` for the two `Herdr Theme` settings — one row per value, applied
+with `Enter` (the bridge stages `applyOnMove: false` on every row it
+contributes), with the theme rows hidden while the sync is on instead of
+refused in place. One accepted limitation: a row action receives only the
+inline helpers (`input`, `confirm`, `capture`), so it has no reload handle —
+the Moshi toggle still writes the settings exclusion and then asks for a
+restart (`Restart Pi so the new Moshi hook exclusion takes effect.`) where the
+command and the panel reload immediately (`Reloading now to apply the change.`).
+Every string that sends the user back to these switches names
+`/herdr-gentle:customize`, byte-identical to the pre-page build: the command
+always exists, so no message needs a surface-dependent wording — the Moshi gate
+refusals end `… re-apply On from /herdr-gentle:customize.` and the follower's
+missing-theme notice says `… pick an installed theme in
+/herdr-gentle:customize.`
+
 `/herdr-gentle:customize status` prints one read-only line; an unknown
 argument, Esc, or a cancelled menu writes nothing. With no argument the
 command opens the floating panel (`lib/customize-panel.js`, painted through its
@@ -1162,10 +1201,12 @@ exactly one mechanism writes each piece of state.
   `worktree_close` / `worktree_session_open` / `worktree_warp`), the warp
   panel, the ODD and Issues readers, and the `Plugin tools` toggles no longer
   ship. This package publishes the Herdr producer sidecar and the Moshi channel
-  only; `bin/gentle-sidebar.js` is its one CLI and `/herdr-gentle:customize`
-  its one in-Pi command, carrying just the sidebar-rows, Moshi and theme-sync
-  switches. Its provider slot `globalThis[Symbol.for("herdr-gentle.customize.v1")]`
-  stays removed, so no other extension renders those switches.
+  only; `bin/gentle-sidebar.js` is its one CLI and the customize switches are
+  reached two ways, additively: `/herdr-gentle:customize`, always, and — when
+  gentle-shell-bridge answers its handshake — the `Herdr` page of Gentle Shell's
+  own `/gentle:customize` menu as well (§7). The former
+  in-process provider slot `globalThis[Symbol.for("herdr-gentle.customize.v1")]`
+  stays removed.
 - Rollback: disable this plugin → producer stops writing; consumer sweeps
   only `gentle_*` tokens + labels it set (O5); pi-tree re-enable restores
   `↳N` behavior with zero data migration.
@@ -1257,8 +1298,10 @@ list, not silent.
 ## 12. Theme sync (Pi palette → Herdr theme)
 
 Herdr's palette follows the theme active in Gentle Shell / Pi, or one theme
-pinned while the sync is off (S1–S7). The switch lives with the other two in
-`/herdr-gentle:customize`; the user-facing reference is
+pinned while the sync is off (S1–S7). The switch lives with the other two on
+`/herdr-gentle:customize` and, beside it, on the `Herdr` page of Gentle Shell's
+own customize menu whenever the bridge answers the handshake (§7), where it is
+the `Theme sync` and `Select theme` rows; the user-facing reference is
 [docs/theme-sync.md](docs/theme-sync.md). Six modules with one owner — this Pi
 package — and one direction of data:
 
@@ -1482,7 +1525,8 @@ socket/config path). The follower reports `not-herdr`, `remote` and
 `unsupported` as one `info` notice per session and asks again only when the
 palette itself changes.
 
-**The panel.** `/herdr-gentle:customize` reuses Gentle Shell's own card shape:
+**The panel.** `/herdr-gentle:customize` — the surface that always exists (§7) —
+reuses Gentle Shell's own card shape:
 one left `CATEGORIES` list, one right pane headed `<Category> · n/m`, one line
 per setting with its options inline (`●` stored, `›` cursor elsewhere, `○` the
 rest). The arrows move the option cursor and only Enter applies; Enter keeps the
@@ -1500,10 +1544,46 @@ on, and a host that exposes no list shows one note instead of an empty picker.
 The panel writes nothing itself: it calls the extension's apply path, swaps in
 the model that path re-read, and keeps the cursor by structural option ids.
 
+**The page.** The `Herdr` page of Gentle Shell's own customize menu (§7) is not
+this card: Gentle Shell paints its own rows and enters their actions. The
+switch side is the same — two rows, `Theme sync` and `Select theme`, built from
+the same model by `lib/customize-rows.js`, applied through the same
+`applyCustomizePanel` — so the notices above are the same strings, a theme row
+keeps its swatch, and the theme rows are hidden while the sync is on rather
+than refused in place. The sync never needs a Pi reload on either surface; the
+one surface-specific difference in this feature is Moshi's, which asks for a
+restart on the page because a row action has no reload handle (§7).
+
+The page's row set is FIXED for the life of the menu, and the cache in
+`lib/customize-rows.js` is what makes that affordable: one model read per paint
+burst (one synchronous `configure.js --check`, not one per callback), dropped
+after an `apply` settles and after a one-second TTL. Two properties follow and
+are accepted rather than promised away. First, an external write while the menu
+is idle becomes visible on the first read after the cache expires, or on a
+rebuild: the cache never asks the host to repaint, so a repaint that lands
+before expiry redraws the previous model and the displayed state has no upper
+freshness bound. Second, when an external write hides the row the user had
+focused (the theme
+picker, with the sync turned on elsewhere), the host clamps the focus to the
+neighbouring row, so Enter can act on that one; the clamp itself writes nothing.
+The fixed row set is also why a theme applied from a row is checked against a
+fresh `ctx.ui.getAllThemes()` read at apply time: a theme removed after the
+build refuses and writes nothing instead of pinning a name this install no
+longer has. That check lives on the page's own apply path, so the command's
+picker and the mounted panel keep the `865d360` write (S2).
+
 **Limits** (the §10 style, none of them a promise this design makes):
 
 - The 500 ms tick is the whole observation granularity — there is no event to
   subscribe to, so a theme change is noticed within one tick and not sooner.
+- The page's displayed state has **no upper freshness bound**: its row cache
+  never requests a repaint, so a write from another process while the menu is
+  idle appears on the first read after the cache expires, or on a rebuild, not
+  when it lands; a repaint that lands before expiry redraws the previous model,
+  and on a menu nobody touches the write is not shown at all.
+- The page cannot keep the cursor on a row an external write hid: the host clamps
+  the focus to the neighbouring row, so the next Enter can act on that neighbour.
+  The clamp writes nothing; it only moves the cursor.
 - The automated evidence is a stubbed Pi host plus a real binary stand-in on
   disk; **no live Pi TUI run is recorded**. `ctx.ui.theme`, `getTheme`,
   `getAllThemes`, `notify` and the host component contract are used as

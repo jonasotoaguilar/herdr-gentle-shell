@@ -292,6 +292,10 @@ export default function (pi) {
           seen.missingTheme = true;
           notify(
             ctx,
+            // S4 (odd/tasks/herdr-customize-page.md): `/herdr-gentle:customize`
+            // is registered unconditionally, so it is the one surface this notice
+            // can name — the Herdr page of Gentle Shell's customize menu sits
+            // beside it, never instead of it.
             `The Pi theme "${chosen}" is not installed, so Herdr's palette was left unchanged; pick an installed theme in /herdr-gentle:customize.`,
           );
         }
