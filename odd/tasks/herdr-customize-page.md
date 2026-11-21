@@ -55,16 +55,20 @@ tasks are the slices that make them true.
 
 - **T1** — `lib/customize-rows.js`: pure builder from the existing customize model to bridge rows
   (four settings, values, `current()`, theme preview, sync gating) plus its own test file.
-  Specs: S1, S3. Route: worker. Commit: `feat(customize): build Herdr rows for the Gentle Shell menu`.
+  Specs: S1, S3. Route: worker. Commit: 17ce681 (folded into T2's commit: the shipped-surface
+  invariant stays red until the extension references the new module, so T1 alone has no green
+  commit).
 - **T2** — extension wiring: bridge handshake, register the page when the bridge answers, skip the
   command registration in that case, keep the command path intact otherwise.
-  Specs: S1, S2. Route: worker. Commit: `feat(customize): serve Herdr settings from the Gentle Shell menu`.
+  Specs: S1, S2. Route: worker. Commit: `feat(customize): serve the Herdr settings from the Gentle
+  Shell menu` = 17ce681.
 - **T3** — row actions: map each row to the existing apply functions, refusal messages, the Moshi
   reload question, and the strings that named the removed command.
-  Specs: S3, S4. Route: worker. Commit: `feat(customize): apply Herdr rows through the existing switch paths`.
+  Specs: S3, S4. Route: worker. Commit: 17ce681 (same unit as T2 — one behavior, one slice).
 - **T4** — docs and tests for both surfaces: the page under the bridge, the untouched command
   without it.
-  Specs: S1, S2, S3, S4. Route: worker. Commit: `docs(customize): document the Herdr menu page and its fallback`.
+  Specs: S1, S2, S3, S4. Route: worker. Commit: `docs(customize): document the Herdr menu page and
+  its fallback`.
 - **T5** — independent verification of the whole diff (Risk item 3: a published command is removed).
   Specs: S1-S4. Route: `gentle-ai-verify`. Commit: none.
 - **T6** — feature close: reconciliation, Engram mirror, evidence in this document.
@@ -85,3 +89,8 @@ tasks are the slices that make them true.
   `customizePanelModel(ctx)` already produces (`extensions/gentle-herdr-state.ts:2217`), and the
   effects already live in `applyCustomizeSwitch` / `applyCustomizePanel` (`~:2735`, `~:2822`),
   independent of the panel. Only the renderer changes.
+- **L5** (slice boundary, parent): T1-T3 landed as one commit, `17ce681` — 1423 insertions, past the
+  ~400-line slice. The split is forced by `tools/herdr-packaged-surface.test.js`, which refuses a
+  `lib/` module with no shipped referrer, and by S1 needing the rows and the command gate in the same
+  tree: an intermediate commit would either be red or leave a bridge user with no surface at all.
+  Delivery shape for publishing (single PR vs. stacked) is decided at publication, not here.
