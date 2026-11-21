@@ -4,24 +4,30 @@
 //
 // What these tests pin, through the two surfaces the user actually gets and
 // nothing else:
-// - S1: when gentle-shell-bridge answers the runtime handshake (the published
-//   object at `Symbol.for("gentle-shell-bridge/api/v1")`, not a package
-//   dependency), the extension registers ONE row provider on the `Herdr` page
-//   and NO `/herdr-gentle:customize` command;
-// - S2: when it does not answer, today's command is registered and no page is
-//   offered — exactly one surface, never both and never neither;
+// - S1/S2: `/herdr-gentle:customize` is registered in the FACTORY, before any
+//   session event and before the pane gate, exactly as on `865d360`; when
+//   gentle-shell-bridge answers the runtime handshake (the published object at
+//   `Symbol.for("gentle-shell-bridge/api/v1")`, not a package dependency) the
+//   extension ADDS one row provider on the `Herdr` page beside it. The page is
+//   additive: no user can end up with none, and the command never goes away;
+// - the page is idempotent: a late `gentle-shell-bridge:ready` announce still
+//   produces it, and a second `session_start` or a repeated announce leaves
+//   exactly ONE provider, never two;
+// - a bridge that answers with no host menu changes nothing for the command: the
+//   provider is either refused (and the command keeps working) or harmless;
 // - the provider reads the live model on every build, so `current()` is the
 //   stored value and not a copy taken at registration;
 // - S3: a row action runs the command's own apply path — the theme switch writes
 //   `gentle-theme.json`, and a Moshi refusal leaves the flag and settings.json
 //   byte-identical while the refusal reaches the user exactly ONCE;
-// - S4: the refusal names the Gentle Shell customize menu, never the command
-//   the page removes;
+// - S4: every refusal still names `/herdr-gentle:customize`, byte for byte the
+//   text `865d360` shipped: the command always exists, so no message needs a
+//   surface-dependent wording;
 // - the Moshi reload: the exclusion write still lands, and because a row action
 //   has no reload handle the notice asks for a restart instead of claiming a
 //   reload that cannot happen;
-// - the disposer: session shutdown removes the provider, and a second session
-//   replaces it instead of stacking a duplicate.
+// - the disposer: session shutdown removes the provider only — the command stays
+//   as registered — and a second session adds one provider again.
 //
 // The bridge is a handshake, not an import: the tests publish a frozen object at
 // the documented symbol exactly as `src/api.ts` does, and the extension is never
@@ -123,6 +129,7 @@ function fakeBridge() {
 function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
   const commands = new Map();
   const handlers = new Map();
+  const listeners = new Map();
   const notices = [];
   const reloads = [];
   const pi = {
@@ -132,7 +139,17 @@ function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
       handlers.set(kind, list);
       return () => {};
     },
-    events: { on: () => () => {}, emit: () => {} },
+    // Pi's event bus, as the bridge's own `onBridgeApi` uses it: the announce is
+    // a notification, never a registry.
+    events: {
+      on(name, handler) {
+        const list = listeners.get(name) ?? [];
+        if (typeof handler === 'function') list.push(handler);
+        listeners.set(name, list);
+        return () => {};
+      },
+      emit: () => {},
+    },
     registerCommand(name, definition) {
       commands.set(name, definition);
     },
@@ -151,6 +168,7 @@ function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
     notices,
     reloads,
     handlers,
+    listeners,
     bridge: bridge ?? null,
   };
   h.load = async () => {
@@ -176,6 +194,11 @@ function harness({ bridge, themes = ['Dark', 'Light'] } = {}) {
       if (provider.category === PAGE) return provider;
     }
     return undefined;
+  };
+  // The bridge announces itself on its own channel; the symbol stays the
+  // authority, so an announce after the publish is all a late bridge needs.
+  h.announce = () => {
+    for (const handler of listeners.get('gentle-shell-bridge:ready') ?? []) handler({});
   };
   h.noticeTexts = () => notices.map(([message]) => message);
   return h;
@@ -261,21 +284,24 @@ after(() => {
 
 /* ------------------------------------------------------------ tests */
 
-describe('the bridge handshake decides the surface (S1, S2)', () => {
+describe('the command always exists and the page is added beside it (S1, S2)', () => {
   test('the extension reaches the bridge by symbol, never by import', () => {
     assert.equal(HANDLES_BRIDGE, true, 'the handshake symbols are inlined in the extension');
   });
 
-  test('with the bridge present: one Herdr page provider and no command', async () => {
+  test('with the bridge present: the command AND one Herdr page provider', async () => {
     const env = setupEnvironment('bridge-present');
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
     bridge.publish();
     const h = harness({ bridge });
     await h.load();
+    // S1/S2: the command is there before any session event, exactly as on
+    // 865d360 — the page never replaces it.
+    assert.ok(h.commands.has(COMMAND), 'the command is registered in the factory');
     await h.start();
 
-    assert.equal(h.commands.has(COMMAND), false, 'the page replaces the command (S1)');
+    assert.equal(h.commands.has(COMMAND), true, 'a session never removes the command');
     assert.equal(bridge.rows.size, 1, 'exactly one provider is registered');
     assert.deepEqual(bridge.disposes, [], 'the provider is live, not disposed');
 
@@ -292,11 +318,12 @@ describe('the bridge handshake decides the surface (S1, S2)', () => {
     assert.ok(rowFor(rows, 'Select theme', 'Dark'));
   });
 
-  test('without the bridge: today\'s command and no page (S2)', async () => {
+  test('without the bridge: today\'s command works and no page is contributed (S2)', async () => {
     const env = setupEnvironment('bridge-absent');
     writeSettings(env.settingsPath, { extensions: [] });
     const h = harness();
     await h.load();
+    assert.ok(h.commands.has(COMMAND), 'the command is registered at factory time');
     await h.start();
 
     const command = h.commands.get(COMMAND);
@@ -413,8 +440,8 @@ describe('the rows apply through the command\'s own path (S3)', () => {
   });
 });
 
-describe('the removed command is never named (S4)', () => {
-  test('page refusals name the Gentle Shell customize menu instead', async () => {
+describe('every message names the command that always exists (S4)', () => {
+  test('a page refusal keeps the 865d360 spelling', async () => {
     const env = setupEnvironment('s4-strings');
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
@@ -426,18 +453,45 @@ describe('the removed command is never named (S4)', () => {
 
     await rowFor(provider.rows(), 'Moshi', 'On').action(INLINE_HELPERS);
     const [text] = h.notices[0];
-    assert.equal(text.includes('/herdr-gentle:customize'), false, 'no message sends the user to the removed command');
-    assert.match(text, /the Gentle Shell customize menu/);
+    // S4: the command is always registered, so no string needs a
+    // surface-dependent wording and the page's refusals are byte for byte the
+    // ones the command gives (tools/gentle-customize-command.test.js pins the
+    // same bytes on the command's own path).
+    assert.equal(
+      text,
+      'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.',
+    );
+    assert.equal(text.includes('customize menu'), false, 'no message names a menu that may be absent');
+  });
+
+  test('the unpaired refusal keeps it too, in its own sentence', async () => {
+    const env = setupEnvironment('s4-not-paired');
+    writeSettings(env.settingsPath, { extensions: [] });
+    installMoshiHook(env.pathDir, { paired: false });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    await rowFor(h.provider().rows(), 'Moshi', 'On').action(INLINE_HELPERS);
+
+    assert.deepEqual(h.notices, [[
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.',
+      'error',
+    ]]);
+    assert.equal(fs.existsSync(env.flagPath), false, 'the refusal writes nothing');
   });
 });
 
-describe('exactly one surface, never two and never none', () => {
-  test('a bridge that refuses the page leaves the command as the only surface', async () => {
-    const env = setupEnvironment('bridge-refuses');
+describe('the page is additive, never a replacement (S1, S2)', () => {
+  test('a bridge that answers with no host menu leaves the command working', async () => {
+    const env = setupEnvironment('no-host-menu');
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
-    // The published object is valid, but its bus refuses this provider. Pi has
-    // no command to withdraw, so the honest answer is one surface, not none.
+    // The published object is valid, but there is no host menu to add a page to:
+    // its bus refuses this provider. The verifier's "zero surfaces" defect must
+    // never come back — the command is registered before this is even asked.
     bridge.api.registerRows = () => {
       throw new Error('the page was refused');
     };
@@ -447,12 +501,61 @@ describe('exactly one surface, never two and never none', () => {
     await h.start();
 
     assert.equal(bridge.rows.size, 0, 'no page is offered');
-    assert.ok(h.commands.has(COMMAND), 'the command stays the reachable surface');
+    const command = h.commands.get(COMMAND);
+    assert.ok(command, 'the command is the reachable surface');
+    await command.handler('status', h.ctx);
+    assert.deepEqual(h.noticeTexts(), [
+      'customize status: sidebar=off moshi=off theme-sync=off theme=none',
+    ]);
+  });
+
+  test('a provider that exists beside the command is harmless', async () => {
+    const env = setupEnvironment('page-beside-command');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    assert.equal(bridge.rows.size, 1, 'the page exists');
+    const command = h.commands.get(COMMAND);
+    assert.ok(command, 'and so does the command');
+    await command.handler('status', h.ctx);
+    assert.deepEqual(h.noticeTexts(), [
+      'customize status: sidebar=off moshi=off theme-sync=off theme=none',
+    ]);
   });
 });
 
-describe('the registration is disposable and replaceable', () => {
-  test('session shutdown disposes the provider and a new session replaces it', async () => {
+describe('exactly one provider, never two', () => {
+  test('a late bridge announce still produces the page', async () => {
+    const env = setupEnvironment('late-announce');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    // The bridge is NOT published yet: this is the load order the verifier
+    // found, where a global extension sees `session_start` before a configured
+    // package's module publishes.
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    assert.ok(h.commands.has(COMMAND), 'the command is there from the factory');
+    assert.equal(bridge.rows.size, 0, 'no page before the bridge answers');
+
+    bridge.publish();
+    h.announce();
+    assert.equal(bridge.rows.size, 1, 'the page appears anyway');
+    assert.equal(h.commands.has(COMMAND), true, 'and the command stays');
+
+    // A repeated announce and a second session start: still exactly one.
+    h.announce();
+    await h.start();
+    assert.equal(bridge.rows.size, 1, 'one provider, never two');
+    assert.equal(bridge.registrations.length, 1, 'and the provider was registered once');
+  });
+
+  test('session shutdown drops the provider and keeps the command', async () => {
     const env = setupEnvironment('dispose');
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
@@ -466,12 +569,13 @@ describe('the registration is disposable and replaceable', () => {
     assert.equal(bridge.rows.size, 1);
 
     await h.shutdown();
-    assert.deepEqual(bridge.disposes, [firstProvider.id], 'the disposer is kept and called');
+    assert.deepEqual(bridge.disposes, [firstProvider.id], 'the provider is disposed');
     assert.equal(bridge.rows.size, 0, 'no provider survives the session');
+    assert.ok(h.commands.has(COMMAND), 'the command survives it: only the page is session-scoped');
 
     await h.start();
-    assert.equal(bridge.rows.size, 1, 'a reload replaces the registration instead of stacking one');
+    assert.equal(bridge.rows.size, 1, 'the next session adds one provider again');
     assert.notEqual(h.provider(), firstProvider);
-    assert.equal(h.commands.has(COMMAND), false, 'the command never appears on the bridge surface');
+    assert.equal(h.commands.has(COMMAND), true, 'and still one command');
   });
 });

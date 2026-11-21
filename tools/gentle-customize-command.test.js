@@ -70,10 +70,14 @@ const MANAGED_END = '# END herdr-gentle-agents';
 // fixture as current instead of assuming a hand-written shape.
 const MANAGED_BLOCK = require('../herdr-plugin/bin/configure.js').MANAGED_BLOCK;
 const MOSHI_ENTRY = '-extensions/moshi-hooks.ts';
+// S2 (odd/tasks/herdr-customize-page.md): with no bridge the command IS the
+// surface, so its refusals name `/herdr-gentle:customize` — byte for byte the
+// text 865d360 shipped. The page's own wording is pinned in
+// tools/customize-bridge-page.test.js.
 const MISSING_CLI_TEXT =
-  'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from the Gentle Shell customize menu.';
+  'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.';
 const NOT_PAIRED_TEXT =
-  'Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from the Gentle Shell customize menu.';
+  'Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.';
 
 const COMMAND = 'herdr-gentle:customize';
 
@@ -138,10 +142,9 @@ function harness({ customImpl, themes, getTheme } = {}) {
   }
   const ctx = { ui, reload: async () => reloads.push(true) };
   const h = { pi, ctx, commands, notices, selections, customs, reloads, handlerKinds, handlers };
-  // Pi's own order: the factory returns, then `session_start` arrives. That is
-  // where the customize surface is decided (no bridge → the command; bridge →
-  // the `Herdr` page of Gentle Shell's own customize menu), so every test that
-  // wants the command starts the session first.
+  // Pi's own order: the factory returns, then `session_start` arrives. The
+  // command is registered by the factory itself (S1/S2); the session only adds
+  // the Gentle Shell page when the bridge answers the handshake.
   h.start = async () => {
     for (const handler of handlers.get('session_start') ?? []) {
       await handler({ reason: 'startup' }, ctx);
@@ -294,32 +297,46 @@ function readThemeFile(env) {
 /* ------------------------------------------------------------ tests */
 
 describe('registration', () => {
-  test('registers the command before the enabled() pane gate', async () => {
+  test('registers the command in the factory, before the pane gate and before any session event', async () => {
     const h = harness();
     await loadExtension(h);
-    await h.start();
-    assert.ok(h.commands.has(COMMAND), 'the command must register outside a Herdr pane');
-    // The pane gate is closed in this process, so the factory must have returned
-    // after binding the customize surface: the only handlers it took are that
-    // surface's own, and no producer handler was bound.
-    assert.deepEqual(h.handlerKinds, ['session_start', 'session_shutdown']);
+    // S1/S2: the command exists before `session_start` arrives — exactly as on
+    // 865d360. Nothing about the bridge, the page or a session can remove it.
+    assert.ok(h.commands.has(COMMAND), 'the command must register at factory time, outside a Herdr pane');
     assert.match(h.commands.get(COMMAND).description, /sidebar agent rows/);
     assert.match(h.commands.get(COMMAND).description, /Moshi notifications/);
+
+    await h.start();
+    assert.ok(h.commands.has(COMMAND), 'and a session never removes it');
+    // The pane gate is closed in this process, so the factory must have returned
+    // after binding the customize page's own events: no producer handler was bound.
+    assert.deepEqual(h.handlerKinds, ['session_start', 'session_shutdown']);
   });
 
-  test('registers no command when a bridge answers the handshake', async () => {
-    // The handshake, not a package dependency: a frozen object at the bridge's
-    // published key. S1 makes the page the only surface, so this command is not
-    // registered at all (tools/customize-bridge-page.test.js owns the page).
-    const published = { schema: 'gentle-shell-bridge/api', version: 1, registerRows: () => () => {} };
-    Object.assign(published, { registerSection: () => {}, createStore: () => {} });
+  test('registers the command even when a bridge answers the handshake', async () => {
+    // S1: the page is ADDITIVE. The handshake, not a package dependency, is a
+    // frozen object at the bridge's published key, and it changes nothing about
+    // the command (tools/customize-bridge-page.test.js owns the page itself).
+    const providers = [];
+    const published = {
+      schema: 'gentle-shell-bridge/api',
+      version: 1,
+      registerRows: (provider) => {
+        providers.push(provider);
+        return () => {};
+      },
+      registerSection: () => {},
+      createStore: () => {},
+    };
     const key = Symbol.for('gentle-shell-bridge/api/v1');
     globalThis[key] = Object.freeze(published);
     try {
       const h = harness();
       await loadExtension(h);
+      assert.ok(h.commands.has(COMMAND), 'the command registers at factory time');
       await h.start();
-      assert.equal(h.commands.has(COMMAND), false, 'the page replaces the command');
+      assert.equal(h.commands.has(COMMAND), true, 'the page never replaces it');
+      assert.equal(providers.length, 1, 'and the page is contributed beside it');
     } finally {
       delete globalThis[key];
     }
@@ -383,7 +400,7 @@ describe('refusals', () => {
     h.selections.push('Moshi notifications');
     await run(h, 'bogus');
     assert.deepEqual(noticeTexts(h), [
-      'Unknown option "bogus". Use the Gentle Shell customize menu, or the status option for a read-only report.',
+      'Unknown option "bogus". Use /herdr-gentle:customize or /herdr-gentle:customize status.',
     ]);
     assert.deepEqual(h.notices.map(([, level]) => level), ['error']);
     assert.equal(fs.existsSync(env.flagPath), false);
@@ -419,7 +436,7 @@ describe('refusals', () => {
     h.selections.push('Moshi notifications', 'On');
     await run(h, '');
     assert.deepEqual(noticeTexts(h), [
-      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (produced no parseable JSON); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from the Gentle Shell customize menu.',
+      'Moshi notifications cannot be enabled: `moshi-hook status --json` did not confirm pairing (produced no parseable JSON); make sure the Moshi CLI is installed and paired (`moshi-hook pair --token <pairing-token>`), then re-apply On from /herdr-gentle:customize.',
     ]);
     assert.equal(fs.existsSync(env.flagPath), false);
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);

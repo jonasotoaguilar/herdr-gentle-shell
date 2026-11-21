@@ -2076,10 +2076,10 @@ function lastFinishedLabel(taskMap) {
 // cross-extension provider slot are deliberately NOT restored: they switched
 // worktree/ODD/issues surfaces this package no longer contains.
 //
-// With gentle-shell-bridge present this command is not registered at all: the
-// same four options are served as the `Herdr` page of Gentle Shell's own
-// `/gentle:customize` menu (see `registerCustomizeSurface` below), so S1's page
-// and S2's command are mutually exclusive and the apply path is shared.
+// With gentle-shell-bridge present the same four options are ALSO served as the
+// `Herdr` page of Gentle Shell's own `/gentle:customize` menu (see
+// `registerCustomizePage` below). The page is additive: this command is
+// registered unconditionally, exactly as before, and the apply path is shared.
 // ---------------------------------------------------------------------------
 
 const CUSTOMIZE_TITLE = "Customize · Herdr Gentle Shell";
@@ -2114,12 +2114,11 @@ const THEME_LIST_UNAVAILABLE_TEXT =
 const THEME_STORE_UNAVAILABLE_TEXT =
   "Could not reach the theme store (lib/theme-store.js is unavailable); nothing was changed.";
 
-// S4 (odd/tasks/herdr-customize-page.md): the four options are served on TWO
-// surfaces — this command when no bridge answers, and the `Herdr` page of Gentle
-// Shell's own customize menu when one does — so every message that sends the
-// user back to them names the MENU. One string is then correct on both, and no
-// message points at a command the page removes.
-const CUSTOMIZE_MENU_TEXT = "the Gentle Shell customize menu";
+// S4 (odd/tasks/herdr-customize-page.md): `/herdr-gentle:customize` is registered
+// unconditionally (S1), so it always exists and every message that sends the user
+// back to the four options names it — byte for byte the text `865d360` shipped.
+// No string is surface-dependent: the page added beside the command changes no
+// wording, and a message never points at a menu that may be absent.
 
 // The Moshi settings entry waits for the next Pi extension load. A customize ROW
 // has no reload handle (the bridge hands `action` only inline helpers), so the
@@ -2562,11 +2561,11 @@ function runMoshiStatus(cliPath) {
 }
 
 function moshiMissingCliText() {
-  return `Moshi notifications cannot be enabled: the \`moshi-hook\` CLI was not found on PATH; install the Moshi CLI, then re-apply On from ${CUSTOMIZE_MENU_TEXT}.`;
+  return "Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.";
 }
 
 function moshiNotPairedText() {
-  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` reports paired:false (this device is not paired); run \`moshi-hook pair --token <pairing-token>\`, then re-apply On from ${CUSTOMIZE_MENU_TEXT}.`;
+  return "Moshi notifications cannot be enabled: `moshi-hook status --json` reports paired:false (this device is not paired); run `moshi-hook pair --token <pairing-token>`, then re-apply On from /herdr-gentle:customize.";
 }
 
 function moshiStatusFailedText(reason, status) {
@@ -2574,7 +2573,7 @@ function moshiStatusFailedText(reason, status) {
   if (reason === "non-zero-exit") detail = `exited with status ${status ?? "unknown"}`;
   else if (reason === "unparseable") detail = "produced no parseable JSON";
   else if (reason === "missing-field") detail = "reported no paired flag";
-  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from ${CUSTOMIZE_MENU_TEXT}.`;
+  return `Moshi notifications cannot be enabled: \`moshi-hook status --json\` did not confirm pairing (${detail}); make sure the Moshi CLI is installed and paired (\`moshi-hook pair --token <pairing-token>\`), then re-apply On from /herdr-gentle:customize.`;
 }
 
 function checkMoshiEnablePrereqs() {
@@ -2941,7 +2940,7 @@ async function executeCustomize(rawArgs, ctx) {
   }
   if (head !== "") {
     if (typeof notify === "function") {
-      notify(`Unknown option "${raw}". Use ${CUSTOMIZE_MENU_TEXT}, or the status option for a read-only report.`, "error");
+      notify(`Unknown option "${raw}". Use /herdr-gentle:customize or /herdr-gentle:customize status.`, "error");
     }
     return;
   }
@@ -3006,35 +3005,43 @@ async function executeCustomize(rawArgs, ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// The Gentle Shell customize PAGE (odd/tasks/herdr-customize-page.md T2/T3;
-// specs S1-S4).
+// The Gentle Shell customize PAGE (odd/tasks/herdr-customize-page.md T7;
+// specs S1, S2, S4).
 //
-// When gentle-shell-bridge answers, the four switches are a page in Gentle
-// Shell's own `/gentle:customize` menu instead of a private command; when it does
-// not, the command above is registered exactly as before. The bridge is reached
-// as a HANDSHAKE, never a dependency: its object sits at a `Symbol.for` key on
-// `globalThis`, and the key, the schema and the members this file calls are
-// inlined here, so nothing resolves `gentle-shell-bridge` as a module
-// (`examples/bash-card.ts:1214-1234` in that package is the same pattern).
+// `/herdr-gentle:customize` is registered in the FACTORY, unconditionally, exactly
+// as on `865d360`. This section ADDS a second surface on top of it: when
+// gentle-shell-bridge answers its handshake, the same four switches also appear as
+// the `Herdr` page of Gentle Shell's own `/gentle:customize` menu. The page never
+// replaces the command — two surfaces coexisting is by design, because Pi gives an
+// extension no way to withdraw a registered command and a bridge with no host menu
+// must never leave the user with none.
 //
-// WHEN the answer is reliable. The bridge publishes at module load and announces
-// from its extension factory, so a bridge installed as a package has published
-// before any `session_start` handler runs — which makes `session_start` the
-// decision point, never the factory, where the bridge may simply not have loaded
-// yet. Pi offers no way to withdraw a registered command, so the decision is
-// taken once, where it is answerable: a bridge that publishes AFTER this
-// extension's `session_start` (only possible when this extension is installed as
-// a loose global extension while the bridge is a package) keeps today's command
-// rather than leaving a second surface Pi cannot remove. That is the accepted
-// limitation, and it is why no ready-event listener is taken here — a listener
-// could only add a surface it cannot take back.
+// The bridge is reached as a HANDSHAKE, never a dependency: its object sits at a
+// `Symbol.for` key on `globalThis`, and the key, the schema and the members this
+// file calls are inlined here, so nothing resolves `gentle-shell-bridge` as a
+// module (`examples/bash-card.ts:1214-1244` in that package is the same pattern).
 //
-// The registrations are kept and dropped on session shutdown, so a reload
-// replaces the page instead of stacking a second one.
+// WHEN the page appears. `session_start` asks the symbol; when it is absent the
+// page cannot be built yet, so the factory has already subscribed to
+// `BRIDGE_READY_EVENT` and the announce asks again. That covers Pi's load order,
+// which does not guarantee that a configured package's module publishes before a
+// global extension's `session_start`: a late bridge still produces the page. The
+// announce is a notification, never a registry — the symbol stays the authority,
+// so a copy that publishes an incompatible slot announces nothing usable and the
+// gate below answers ABSENT.
+//
+// ONE provider, never two. Registration is guarded by the live provider itself, so
+// a second `session_start`, an announce after a start and a repeated announce all
+// leave exactly one registration; the bridge's bus is never asked twice. The
+// provider is session-scoped and the command is not: only the provider is disposed
+// on session shutdown.
 // ---------------------------------------------------------------------------
 const BRIDGE_API_KEY = Symbol.for("gentle-shell-bridge/api/v1");
 const BRIDGE_API_SCHEMA = "gentle-shell-bridge/api";
 const BRIDGE_API_VERSION = 1;
+// The channel the bridge announces itself on. The string MIRRORS `src/api.ts`:
+// this file cannot import it, so the two are kept in sync by hand.
+const BRIDGE_READY_EVENT = "gentle-shell-bridge:ready";
 // The provider's stable id: the bridge replaces a provider registered under the
 // same id in place, so one page is one page however often it is registered.
 const CUSTOMIZE_PAGE_PROVIDER_ID = "herdr-gentle:customize";
@@ -3091,13 +3098,12 @@ function customizePageProvider(rowsModule, hostCtx) {
   };
 }
 
-// Exactly one of the two surfaces is ever live. Bound before the `enabled()` pane
-// gate in the factory, exactly where the command used to be: the switches are
-// local state and stay reachable from a plain Pi session outside a Herdr pane.
-function registerCustomizeSurface(pi) {
+// The Gentle Shell customize page as a REGISTRATION LIFECYCLE, bound by the
+// factory beside the command (which is registered there too, unconditionally).
+// Additive by construction: nothing here can unregister or shadow the command.
+function registerCustomizePage(pi) {
   let pageContext = null;
   let disposePage = null;
-  let commandRegistered = false;
 
   function clearPage() {
     const dispose = disposePage;
@@ -3107,57 +3113,58 @@ function registerCustomizeSurface(pi) {
       dispose();
     } catch {
       // The bridge owns its own bus: a disposer that fails cannot make this file
-      // register a second surface, so the failure is contained here.
+      // host a second page, so the failure is contained here.
     }
   }
 
-  // S2: today's command — same description, same handler.
-  function registerCommand() {
-    if (commandRegistered) return;
-    if (typeof pi?.registerCommand !== "function") return;
-    pi.registerCommand("herdr-gentle:customize", {
-      description: "Customize Herdr Gentle Shell: sidebar agent rows, Moshi notifications and the Herdr theme",
-      handler: async (args, ctx) => {
-        await executeCustomize(args, ctx);
-      },
-    });
-    commandRegistered = true;
+  // The one registration path `session_start` and the announce both use, so an
+  // announce and a later session cannot both register and a repeated announce
+  // cannot stack a second provider. A live provider IS the guard: re-registering
+  // would only ask the bus to replace an identical entry.
+  function registerPage() {
+    if (disposePage !== null) return;
+    // No session yet: `session_start` asks again once there is a ctx to build the
+    // model from.
+    if (!pageContext) return;
+    const bridge = publishedBridge();
+    // S2: nothing answered the handshake, so today's command stands alone.
+    if (!bridge) return;
+    const rowsModule = customizeRowsModule();
+    // An install without the sibling lib/ has no page to offer; the command and
+    // every other surface keep working.
+    if (!rowsModule) return;
+    let dispose = null;
+    try {
+      dispose = bridge.registerRows(customizePageProvider(rowsModule, () => pageContext));
+    } catch {
+      // A bus that refuses the provider (a host with no customize menu asks for
+      // nothing else): the command is already registered, so no surface is lost.
+      dispose = null;
+    }
+    if (typeof dispose === "function") disposePage = dispose;
+  }
+
+  // The symbol first: when the bridge is already published there is nothing to
+  // wait for and no listener is taken. Otherwise the announce is the only way a
+  // bridge that loads AFTER this extension is ever heard.
+  const events = pi?.events;
+  if (events && typeof events.on === "function" && !publishedBridge()) {
+    try {
+      events.on(BRIDGE_READY_EVENT, registerPage);
+    } catch {
+      // No bus and no ready event: `session_start` still tries the symbol.
+    }
   }
 
   pi.on("session_start", (_event, ctx) => {
     pageContext = isRecord(ctx) ? ctx : null;
-    const bridge = publishedBridge();
-    if (!bridge) {
-      // S2: nothing answered the handshake, so the command is the surface.
-      clearPage();
-      registerCommand();
-      return;
-    }
-    // S1: the bridge answered, so the page is the surface and the command is
-    // never registered in this process.
-    clearPage();
-    const rowsModule = customizeRowsModule();
-    let dispose = null;
-    if (rowsModule) {
-      try {
-        dispose = bridge.registerRows(customizePageProvider(rowsModule, () => pageContext));
-      } catch {
-        dispose = null;
-      }
-    }
-    if (typeof dispose === "function") {
-      disposePage = dispose;
-      return;
-    }
-    // A bridge that answered but cannot host the page (this install has no
-    // lib/customize-rows.js, or the bridge's bus refused the provider) leaves the
-    // command as the only surface: one surface, never none.
-    registerCommand();
+    registerPage();
   });
 
   pi.on("session_shutdown", () => {
-    // The bridge's bus outlives the session, so the registration is dropped here:
-    // the next session registers again instead of stacking a second page.
+    // The bridge's bus outlives the session, so only the provider is dropped:
+    // the command stays as registered, and the next session adds one page again
+    // instead of stacking a second one.
     clearPage();
     pageContext = null;
   });
@@ -3165,8 +3172,17 @@ function registerCustomizeSurface(pi) {
 
 export default function (pi) {
   // Registered before the pane gate on purpose: the switches are local state and
-  // must stay reachable from a plain Pi session outside a Herdr pane.
-  registerCustomizeSurface(pi);
+  // must stay reachable from a plain Pi session outside a Herdr pane. S1: this is
+  // unconditional — the page below is additive, never a replacement.
+  if (typeof pi?.registerCommand === "function") {
+    pi.registerCommand("herdr-gentle:customize", {
+      description: "Customize Herdr Gentle Shell: sidebar agent rows, Moshi notifications and the Herdr theme",
+      handler: async (args, ctx) => {
+        await executeCustomize(args, ctx);
+      },
+    });
+  }
+  registerCustomizePage(pi);
   if (!enabled()) return;
 
   let rootSession = false;

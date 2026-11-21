@@ -484,21 +484,24 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   managed Herdr rows and records the owned native-extension exclusion;
   `disable` removes only our owned rows and exclusion, never a user table.
   See [docs/sidebar-control.md](docs/sidebar-control.md).
-- In-Pi switches (the `Herdr` page of Gentle Shell's customize menu when
-  gentle-shell-bridge answers, else `/herdr-gentle:customize`): three switches,
-  all local state and all reachable from a plain Pi session outside a Herdr
-  pane, served by exactly ONE surface per session. The choice is a handshake,
-  never a package dependency: when gentle-shell-bridge answers — its
-  `gentle-shell-bridge/api/v1` object is published on `globalThis` — the
-  extension contributes one `Herdr` page to Gentle Shell's own
-  `/gentle:customize` menu with exactly the four options `Herd agents`,
-  `Moshi`, `Theme sync` and `Select theme`, and does not register
-  `/herdr-gentle:customize` at all; when nothing answers, the command is
-  registered exactly as before and no page is offered. The page is dropped on
-  session shutdown, so `/reload` replaces it instead of stacking a second one,
-  and a bridge that answers yet refuses the page (no `lib/customize-rows.js`, a
-  provider its bus rejects) leaves the command as the only surface: one
-  surface, never both and never none. Each row is that same switch through the
+- In-Pi switches (`/herdr-gentle:customize`, plus the `Herdr` page of Gentle
+  Shell's customize menu when gentle-shell-bridge answers): three switches, all
+  local state and all reachable from a plain Pi session outside a Herdr pane.
+  The command is registered in the extension factory and always exists; the page
+  is ADDITIVE. The second surface is a handshake, never a package dependency:
+  when gentle-shell-bridge answers — its `gentle-shell-bridge/api/v1` object is
+  published on `globalThis` — the extension also contributes one `Herdr` page to
+  Gentle Shell's own `/gentle:customize` menu with exactly the four options
+  `Herd agents`, `Moshi`, `Theme sync` and `Select theme`, and contributes no
+  page when nothing answers. The page is asked for at session start and again on
+  the bridge's announce (`gentle-shell-bridge:ready`), so a bridge that loads
+  late still produces it; the live provider is its own guard, so a second
+  session start or a repeated announce never stacks a second page, and only the
+  page is dropped on session shutdown (`/reload` replaces it) while the command
+  stays registered. Two surfaces coexisting is by design — no user can end up
+  with none — and a bridge that answers yet refuses the page (no
+  `lib/customize-rows.js`, a provider its bus rejects) simply leaves the command
+  working. Each row is that same switch through the
   same apply path — `Herd agents` drives `bin/configure.js` exactly as
   `Sidebar agent rows` does, `Moshi` writes the flag and the settings exclusion
   exactly as `Moshi notifications` does, and `Theme sync` and `Select theme`
@@ -555,9 +558,10 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   exclusion and asks for a restart (`Restart Pi so the new Moshi hook exclusion
   takes effect.`) where the command and the panel reload immediately
   (`Reloading now to apply the change.`). Every message that points back at
-  these switches names the Gentle Shell customize menu instead of the command
-  (`… re-apply On from the Gentle Shell customize menu.`), because one string
-  has to be right on both surfaces. `/herdr-gentle:customize status` prints
+  these switches names `/herdr-gentle:customize`
+  (`… re-apply On from /herdr-gentle:customize.`), byte-identical to the
+  pre-page build, because the command always exists and no string needs a
+  surface-dependent wording. `/herdr-gentle:customize status` prints
   one read-only line
   (`customize status: sidebar=<on|off|unknown> moshi=<on|off>
   theme-sync=<on|off|unknown> theme=<name|none|unknown>`); an unknown
@@ -627,15 +631,16 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   row), while every other Herdr failure still aborts and opens nothing. The
   other worktree tools and the ODD and issues panels live
   in `odd-worktree` now; the sidebar and Moshi switches stayed here and are
-  reached through the Gentle Shell customize menu's `Herdr` page, or through
-  `/herdr-gentle:customize` when gentle-shell-bridge is absent. See
+  reached through `/herdr-gentle:customize` and, when gentle-shell-bridge
+  answers, also through the Gentle Shell customize menu's `Herdr` page. See
   [docs/herdr-session-open.md](docs/herdr-session-open.md).
 
 ### Theme sync (Herdr palette follows Pi)
 
-`Theme sync` and `Select theme` on the customize menu's `Herdr` page — the
-`Herdr Theme` settings of `/herdr-gentle:customize` when no bridge answers —
-are one switch and one pinned theme.
+`Theme sync` and `Select theme` — the `Herdr Theme` settings of
+`/herdr-gentle:customize`, and the `Theme sync` and `Select theme` rows of the
+Gentle Shell customize menu's `Herdr` page when the bridge answers — are one
+switch and one pinned theme.
 `Theme sync` is **OFF by default**: while it is on, Herdr's palette is the
 palette of the theme Pi is showing, and it follows a theme change while Pi keeps
 running. While it is off, `Gentle Shell theme` pins one Gentle Shell / Pi theme

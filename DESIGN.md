@@ -1008,20 +1008,22 @@ nothing:
   settings entry actually changed, because that entry is the only part that
   waits for the next Pi extension load.
 
-The customize settings are served on one of two surfaces, never both.
-`/herdr-gentle:customize` is the surface when nothing answers the bridge
-handshake; when gentle-shell-bridge does — the `gentle-shell-bridge/api/v1`
-object published on `globalThis`, gated exactly like the bridge's own
-`isBridgeApi` — the extension instead registers one row provider
-(`registerRows`, a row `category`, never `registerSection`) on the `Herdr` page
-of Gentle Shell's own `/gentle:customize` menu, holding exactly the four options
-S1 names: `Herd agents`, `Moshi`, `Theme sync`, `Select theme`. In that case no
-command is registered at all. The decision is taken at `session_start` and the
-provider is disposed at `session_shutdown`, so a reload replaces the page
-instead of stacking a second one, and a bridge that answers yet cannot host the
-page (an install without `lib/customize-rows.js`, or a bus that rejects the
-provider) falls back to the command, because a surface the extension cannot take
-back must not be replaced by none.
+The command always exists and the page is additive.
+`/herdr-gentle:customize` is registered in the extension factory, unconditionally
+and before the pane gate, exactly as it always was; when gentle-shell-bridge
+answers its handshake — the `gentle-shell-bridge/api/v1` object published on
+`globalThis`, gated exactly like the bridge's own `isBridgeApi` — the extension
+ALSO registers one row provider (`registerRows`, a row `category`, never
+`registerSection`) on the `Herdr` page of Gentle Shell's own `/gentle:customize`
+menu, holding exactly the four options S1 names: `Herd agents`, `Moshi`,
+`Theme sync`, `Select theme`. Two surfaces coexisting is by design: Pi gives an
+extension no way to withdraw a registered command, and a bridge with no host
+menu must never leave the user with none. The page is asked for at
+`session_start` and again on the bridge's `gentle-shell-bridge:ready` announce,
+so a bridge that publishes after this extension or after the session start still
+produces it; the live provider is its own guard, so a second `session_start` or a
+repeated announce never stacks a second page, and only the provider is disposed
+at `session_shutdown` while the command stays as registered.
 
 Each row is that switch and nothing else: its action calls the same
 `applyCustomizePanel` the panel calls, so the writes, the `moshi-hook`
@@ -1038,11 +1040,12 @@ inline helpers (`input`, `confirm`, `capture`), so it has no reload handle —
 the Moshi toggle still writes the settings exclusion and then asks for a
 restart (`Restart Pi so the new Moshi hook exclusion takes effect.`) where the
 command and the panel reload immediately (`Reloading now to apply the change.`).
-No string that sends the user back to these switches names the command any more:
-the shared text is `the Gentle Shell customize menu`, so the Moshi gate refusals
-end `… re-apply On from the Gentle Shell customize menu.` and the follower's
-missing-theme notice says `… pick an installed theme in the Gentle Shell
-customize menu.` on either surface.
+Every string that sends the user back to these switches names
+`/herdr-gentle:customize`, byte-identical to the pre-page build: the command
+always exists, so no message needs a surface-dependent wording — the Moshi gate
+refusals end `… re-apply On from /herdr-gentle:customize.` and the follower's
+missing-theme notice says `… pick an installed theme in
+/herdr-gentle:customize.`
 
 `/herdr-gentle:customize status` prints one read-only line; an unknown
 argument, Esc, or a cancelled menu writes nothing. With no argument the
@@ -1199,9 +1202,9 @@ exactly one mechanism writes each piece of state.
   panel, the ODD and Issues readers, and the `Plugin tools` toggles no longer
   ship. This package publishes the Herdr producer sidecar and the Moshi channel
   only; `bin/gentle-sidebar.js` is its one CLI and the customize switches are
-  its one in-Pi surface, carried by `/herdr-gentle:customize` when nothing
-  answers the bridge handshake and by the `Herdr` page of Gentle Shell's own
-  `/gentle:customize` menu when gentle-shell-bridge does (§7). The former
+  its one in-Pi surface, carried by `/herdr-gentle:customize` always and, when
+  gentle-shell-bridge answers its handshake, also by the `Herdr` page of Gentle
+  Shell's own `/gentle:customize` menu (§7). The former
   in-process provider slot `globalThis[Symbol.for("herdr-gentle.customize.v1")]`
   stays removed.
 - Rollback: disable this plugin → producer stops writing; consumer sweeps
@@ -1296,9 +1299,9 @@ list, not silent.
 
 Herdr's palette follows the theme active in Gentle Shell / Pi, or one theme
 pinned while the sync is off (S1–S7). The switch lives with the other two on
-whichever customize surface is live (§7) — `/herdr-gentle:customize` without a
-bridge, the `Herdr` page of Gentle Shell's own menu with one, where it is the
-`Theme sync` and `Select theme` rows; the user-facing reference is
+`/herdr-gentle:customize` and, beside it, on the `Herdr` page of Gentle Shell's
+own customize menu whenever the bridge answers the handshake (§7), where it is
+the `Theme sync` and `Select theme` rows; the user-facing reference is
 [docs/theme-sync.md](docs/theme-sync.md). Six modules with one owner — this Pi
 package — and one direction of data:
 
@@ -1522,8 +1525,8 @@ socket/config path). The follower reports `not-herdr`, `remote` and
 `unsupported` as one `info` notice per session and asks again only when the
 palette itself changes.
 
-**The panel.** `/herdr-gentle:customize` — the no-bridge surface (§7) — reuses
-Gentle Shell's own card shape:
+**The panel.** `/herdr-gentle:customize` — the surface that always exists (§7) —
+reuses Gentle Shell's own card shape:
 one left `CATEGORIES` list, one right pane headed `<Category> · n/m`, one line
 per setting with its options inline (`●` stored, `›` cursor elsewhere, `○` the
 rest). The arrows move the option cursor and only Enter applies; Enter keeps the

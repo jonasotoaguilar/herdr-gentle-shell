@@ -19,13 +19,13 @@ plugin-side planner and no 1.8.0 managed block.
 ## The switch
 
 The whole feature is two settings: `Theme sync` and `Select theme`. They are
-served on whichever customize surface is live for the session — one surface,
-never both: on the `Herdr` page of Gentle Shell's own `/gentle:customize` menu
-when gentle-shell-bridge answers its handshake (its
-`gentle-shell-bridge/api/v1` object is published on `globalThis`), and in
-`/herdr-gentle:customize` → `Herdr Theme` when it does not, laid out like the
-rest of the card (see [Panel](#panel)). The page's rows come from the same
-model and the same apply path, so everything below holds on either:
+served on `/herdr-gentle:customize` → `Herdr Theme` always, and — when
+gentle-shell-bridge answers its handshake (its `gentle-shell-bridge/api/v1`
+object is published on `globalThis`) — also on the `Herdr` page of Gentle Shell's
+own `/gentle:customize` menu, laid out like the rest of the card (see
+[Panel](#panel)). The command always exists and the page is additive; the page's
+rows come from the same model and the same apply path, so everything below holds
+on both:
 
 - `Theme sync` is **OFF by default**. `On` makes Herdr's palette the palette of
   the theme Pi is showing, and it follows a change of the active theme while Pi
@@ -59,8 +59,8 @@ The notices are fixed strings:
 | State file not writable | `Could not write the theme store: <detail>; nothing was changed.` |
 
 `/herdr-gentle:customize status` prints one read-only line and writes nothing.
-The subcommand belongs to the command — the surface without the bridge; the
-menu page offers no `status` operation:
+The subcommand belongs to the command; the menu page offers no `status`
+operation:
 
 ```text
 customize status: sidebar=<on|off|unknown> moshi=<on|off> theme-sync=<on|off|unknown> theme=<name|none|unknown>
@@ -549,10 +549,10 @@ no-op, and every user-visible outcome is a fixed string:
   this is a remote session and Herdr reads its config on another machine.`, or
   `Herdr theme sync is not supported in this environment.`
 - **Pinned theme not installed**: `The Pi theme "<name>" is not installed, so
-  Herdr's palette was left unchanged; pick an installed theme in the Gentle
-  Shell customize menu.` — once per session; a later install of that exact
-  theme is picked up without a restart. The notice names the menu, not the
-  command, because the pinned theme is offered on both surfaces.
+  Herdr's palette was left unchanged; pick an installed theme in
+  /herdr-gentle:customize.` — once per session; a later install of that exact
+  theme is picked up without a restart. The notice names the command, which
+  always exists, byte-identical to the pre-page build.
 - **Nothing to project**: `Herdr theme not applied: <theme name> has no concrete
   colours to project.` (`the active theme` replaces the name when the active
   theme exposes none) — once per session, `warning`. A palette with no concrete
@@ -699,9 +699,9 @@ Tests and isolated runs:
 
 ## Panel
 
-`/herdr-gentle:customize` with no argument opens the card — the command's own
-surface, since the page replaces the command only when gentle-shell-bridge
-answers. It behaves like Gentle Shell's own: one left `CATEGORIES` list and one
+`/herdr-gentle:customize` with no argument opens the card — the surface that
+always exists, whether or not the bridge adds its page. It behaves like Gentle
+Shell's own: one left `CATEGORIES` list and one
 right pane headed `<Category> · n/m`, with one line per setting and its options
 inline — `●` the stored option, `›` the cursor while it sits elsewhere, `○`
 the rest.
@@ -735,8 +735,8 @@ the rest.
   note (`Themes unavailable; use Pi /settings`) instead of an empty picker, and
   an unreadable store adds `state unknown; Enter pins a theme`.
 
-When gentle-shell-bridge answers, this card is not registered at all: the same
-two settings are the `Theme sync` and `Select theme` rows of the `Herdr` page in
+When gentle-shell-bridge answers, this card is still there and the same two
+settings are ALSO the `Theme sync` and `Select theme` rows of the `Herdr` page in
 Gentle Shell's own menu, painted by that host. One row per value, walked with
 the arrows and applied with `Enter` (the bridge never applies on a cursor move),
 the theme row keeps its own swatch, and the theme rows are simply not shown

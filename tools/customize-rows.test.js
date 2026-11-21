@@ -21,9 +21,12 @@
 // - S3: one row per value with the model's structural option ids (`on`, `off`,
 //   `none`, `theme:<name>`), so each row drives the same apply path the panel
 //   (and the removed command) drives;
-// - the live reads: `current()` follows a changed model, the theme rows are
-//   hidden while the stored sync is on, and a throwing preview factory leaves
-//   the row usable;
+// - the live reads: one model read per build (the model runs a subprocess), so
+//   `current()`, `visible()` and `preview()` answer from that snapshot and a
+//   REBUILD follows the changed model; the theme rows are hidden while the
+//   stored sync is on, and a throwing preview factory leaves the row usable;
+// - the unassign entry never collides with an installed theme's value word, and
+//   every row still applies its own option id;
 // - the row-name shape: every label is one to three plain words, marks become
 //   word breaks, and the theme's EXACT name survives in its option id;
 // - the refusal channel: `action` awaits `apply`, passes it nothing but the
@@ -172,44 +175,79 @@ describe('customizeRows — the Herdr page (S1)', () => {
 });
 
 describe('customizeRows — live reads (S3)', () => {
-  test('current() follows a changed model instead of a captured value', () => {
-    let model = modelFor({ sidebar: 'off', moshi: 'on', sync: 'off', theme: 'Dark' });
-    const rows = customizeRows({ model: () => model, apply: recorder().apply });
+  test('ONE model read per build, and a second build sees the changed model', () => {
+    // The extension's model runs a synchronous `configure.js --check` subprocess,
+    // so a read per callback is unbounded work while the menu opens (the
+    // verifier measured 41 checks for the build plus 68 for the values). The
+    // build takes one snapshot; live-ness is across BUILDS, which is what the
+    // host does after every action (`rows()` calls `customizeRows` again).
+    let reads = 0;
+    let sidebar = 'off';
+    const model = () => {
+      reads += 1;
+      return modelFor({
+        sidebar,
+        moshi: 'on',
+        sync: 'off',
+        theme: 'Dark',
+        themeNames: Array.from({ length: 30 }, (_, at) => `Theme ${at + 1}`),
+      });
+    };
+
+    const rows = customizeRows({ model, apply: recorder().apply });
+    assert.equal(reads, 1, 'the build reads the model once, never once per row');
+    assert.ok(rows.length > 30, 'the page is built from that one read');
+
     const on = rowsFor(rows, 'Herd agents').find((row) => row.choice.value === 'On');
     const off = rowsFor(rows, 'Herd agents').find((row) => row.choice.value === 'Off');
-    assert.equal(on.choice.current(), false);
+    assert.equal(off.choice.current(), true);
+    // Every value's bullet, every gate and every swatch answers from the
+    // snapshot: reading them re-runs nothing.
+    for (const row of rows) {
+      assert.equal(typeof row.choice.current(), 'boolean');
+      if (typeof row.visible === 'function') assert.equal(typeof row.visible(), 'boolean');
+      if (typeof row.preview === 'function') row.preview();
+    }
+    assert.equal(reads, 1, 'current(), visible() and preview() never re-run the model');
+
+    // The stored state changes behind the page: the NEXT build is a new read and
+    // shows it, while the rows already built keep answering what they were built
+    // from (the host replaces them, it never re-reads through them).
+    sidebar = 'on';
+    const rebuilt = customizeRows({ model, apply: recorder().apply });
+    assert.equal(reads, 2, 'one read per build');
+    assert.equal(rowsFor(rebuilt, 'Herd agents').find((row) => row.choice.value === 'On').choice.current(), true);
+    assert.equal(rowsFor(rebuilt, 'Herd agents').find((row) => row.choice.value === 'Off').choice.current(), false);
+    assert.equal(on.choice.current(), false, 'the earlier build is unchanged');
     assert.equal(off.choice.current(), true);
 
-    // A new model: the same rows now read the other bullet.
-    model = modelFor({ sidebar: 'on', moshi: 'on', sync: 'off', theme: 'Dark' });
-    assert.equal(on.choice.current(), true);
-    assert.equal(off.choice.current(), false);
-
-    // An edit landed in the SAME array is read too, so nothing was captured.
+    // An edit landing in the SAME option object is read, because the snapshot is
+    // the model's own array and not a copy of it.
     const shared = modelFor({ sidebar: 'off', theme: 'Dark' });
     const staticRows = customizeRows({ model: shared, apply: recorder().apply });
     const staticOn = rowsFor(staticRows, 'Herd agents').find((row) => row.choice.value === 'On');
     assert.equal(staticOn.choice.current(), false);
-    const sidebar = shared[0].settings[0].options;
-    for (const option of sidebar) option.current = option.id === 'on';
+    for (const option of shared[0].settings[0].options) option.current = option.id === 'on';
     assert.equal(staticOn.choice.current(), true);
   });
 
   test('the theme rows are hidden while the stored sync is on and present while it is off', () => {
-    let model = modelFor({ sync: 'on', themeNames: ['Dark'] });
-    const rows = customizeRows({ model: () => model, apply: recorder().apply });
-    const themeRows = rowsFor(rows, 'Select theme');
+    // One build per model state: the gate is read from the snapshot of that
+    // build (see the one-read test above), and the host rebuilds after an apply.
+    const build = (state) => rowsFor(customizeRows({ model: modelFor(state), apply: recorder().apply }), 'Select theme');
+    const themeRows = build({ sync: 'on', themeNames: ['Dark'] });
     assert.equal(themeRows.length, 2, 'the unassign entry plus the host theme');
     for (const row of themeRows) assert.equal(row.visible(), false);
 
-    model = modelFor({ sync: 'off', themeNames: ['Dark'] });
-    for (const row of themeRows) assert.equal(row.visible(), true);
+    for (const row of build({ sync: 'off', themeNames: ['Dark'] })) assert.equal(row.visible(), true);
 
     // An unreadable store is not "sync on": the picker stays reachable.
-    model = modelFor({ readable: false, sync: 'on', themeNames: ['Dark'] });
-    for (const row of themeRows) assert.equal(row.visible(), true, 'an unknown sync hides nothing');
+    for (const row of build({ readable: false, sync: 'on', themeNames: ['Dark'] })) {
+      assert.equal(row.visible(), true, 'an unknown sync hides nothing');
+    }
 
     // Only the theme setting is gated; the three switches are always there.
+    const rows = customizeRows({ model: modelFor({ sync: 'on', themeNames: ['Dark'] }), apply: recorder().apply });
     for (const line of ['Herd agents', 'Moshi', 'Theme sync']) {
       for (const row of rowsFor(rows, line)) assert.equal(row.visible, undefined);
     }
@@ -292,6 +330,36 @@ describe('customizeRows — the apply path and its refusal (S3)', () => {
 });
 
 describe('customizeRows — the theme list and its sentinel (S3)', () => {
+  // An installed theme may be named anything, including the sentinel's own text.
+  // Two rows whose value word is identical are indistinguishable on the page
+  // while their option ids differ — one pins that theme, the other clears the
+  // pin — so the baseline picker's rule (`themeSelectionOptions` in
+  // extensions/gentle-herdr-state.ts: the UNASSIGN entry moves, the theme keeps
+  // the name it is) is reproduced for the rows.
+  test('an installed theme named like the unassign entry never shares its value word', async () => {
+    const rec = recorder();
+    const rows = customizeRows({ model: modelFor({ theme: null, themeNames: [UNASSIGN_TEXT, 'Dark'] }), apply: rec.apply });
+    const themeRows = rowsFor(rows, 'Select theme');
+    const values = themeRows.map((row) => row.choice.value);
+    assert.equal(values.length, 3);
+    assert.equal(new Set(values).size, values.length, 'no two rows print the same value word');
+    assert.deepEqual(values, [`${UNASSIGN_TEXT} 2`, UNASSIGN_TEXT, 'Dark']);
+
+    // The ids are untouched: the unassign row still clears the pin, and the row
+    // that shows the theme's own name still pins exactly that theme.
+    assert.deepEqual(await rec.choiceOf(themeRows[0]), { settingId: 'theme', optionId: 'none' });
+    const colliding = themeRows.find((row) => row.choice.value === UNASSIGN_TEXT);
+    assert.deepEqual(await rec.choiceOf(colliding), { settingId: 'theme', optionId: `theme:${UNASSIGN_TEXT}` });
+  });
+
+  test('a chain of colliding names keeps every value word distinct', () => {
+    const names = [UNASSIGN_TEXT, `${UNASSIGN_TEXT} 2`, 'Dark'];
+    const rows = customizeRows({ model: modelFor({ theme: names[1], themeNames: names }), apply: recorder().apply });
+    const values = rowsFor(rows, 'Select theme').map((row) => row.choice.value);
+    assert.deepEqual(values, [`${UNASSIGN_TEXT} 3`, ...names]);
+    assert.equal(new Set(values).size, values.length);
+  });
+
   test('the unassign entry keeps its own text and the structural none id', async () => {
     const rec = recorder();
     const rows = customizeRows({ model: modelFor({ theme: null, themeNames: ['Off', 'Dark'] }), apply: rec.apply });
