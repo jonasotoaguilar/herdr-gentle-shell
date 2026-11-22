@@ -3094,6 +3094,13 @@ const BRIDGE_READY_EVENT = "gentle-shell-bridge:ready";
 // The provider's stable id: the bridge replaces a provider registered under the
 // same id in place, so one page is one page however often it is registered.
 const CUSTOMIZE_PAGE_PROVIDER_ID = "herdr-gentle:customize";
+// The host page the Herdr page has to FOLLOW — never an index. The menu's pages are the first
+// appearance of each category in the rows the host maps (`visual-customize-view`), so a page nobody
+// ordered opens after every host page, i.e. after `Reset`, which is where this page used to land.
+// `Editor` is the host's own page name: naming a page instead of a position is what keeps this
+// honest when the host adds or reorders its own pages. A bridge that predates `categoryPlacement`
+// ignores the field and the page opens at the end again, exactly as before — degraded, never broken.
+const CUSTOMIZE_PAGE_AFTER_CATEGORY = "Editor";
 
 // The published object, gated exactly like the bridge's own `isBridgeApi`
 // (`src/api.ts`): identity strings plus the members this file calls. A foreign
@@ -3157,6 +3164,8 @@ function customizePageProvider(rowsModule, hostCtx) {
   return {
     id: CUSTOMIZE_PAGE_PROVIDER_ID,
     category: rowsModule.CUSTOMIZE_ROWS_CATEGORY,
+    // The page sits between the host's `Editor` and `History` pages, the position the user named.
+    categoryPlacement: { after: CUSTOMIZE_PAGE_AFTER_CATEGORY },
     rows() {
       const ctx = hostCtx();
       // No session ctx means no theme catalogue and no notify channel; an empty
