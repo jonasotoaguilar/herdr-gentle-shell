@@ -2272,6 +2272,9 @@ function customizePanelModel(ctx) {
   return panel.customizePanelModel({
     sidebar: sidebarRowsState().state,
     moshi: moshiFlagEnabled(moshiFlagPath()) ? "on" : "off",
+    // The cheap, subprocess-free probe: both customize surfaces are built from this model on every
+    // menu build, so "installed" has to answer from the PATH scan and never from `moshi-hook status`.
+    moshiInstalled: resolveMoshiHook() !== null,
     theme: readCustomizeThemeState(),
     themeNames: readHostThemeNames(ctx),
     themePreview: themePreviewFactory(ctx),

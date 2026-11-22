@@ -87,6 +87,7 @@ function recorder(settle = () => Promise.resolve('applied')) {
 function modelFor({
   sidebar = 'on',
   moshi = 'off',
+  moshiInstalled,
   sync = 'off',
   theme = null,
   readable = true,
@@ -96,6 +97,7 @@ function modelFor({
   return customizePanelModel({
     sidebar,
     moshi,
+    moshiInstalled,
     theme: { ok: readable, sync: sync === 'on', theme },
     themeNames,
     themePreview,
@@ -203,6 +205,14 @@ describe('customizeRows — the Herdr page (S1)', () => {
     const settings = [];
     for (const row of rows) settings.push((await rec.choiceOf(row)).settingId);
     assert.deepEqual([...new Set(settings)], ['sidebar', 'moshi', 'theme-sync', 'theme']);
+  });
+
+  test('without the moshi-hook CLI the Moshi line carries no On row', () => {
+    // The page derives one row per model option, so a missing CLI must leave the
+    // line without an `On` value at all: there is nothing to enable, and nothing
+    // the user can press and be refused after the fact.
+    const rows = customizeRows({ model: modelFor({ moshiInstalled: false }), apply: recorder().apply });
+    assert.deepEqual(rowsFor(rows, 'Moshi').map((row) => row.choice.value), ['Off']);
   });
 
   test('one row per value, carrying the model option ids and their value words', async () => {

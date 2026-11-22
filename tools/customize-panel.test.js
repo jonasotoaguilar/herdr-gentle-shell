@@ -167,6 +167,15 @@ async function settle(component) {
 }
 
 describe('customize panel model', () => {
+  test('without the moshi-hook CLI the Moshi row keeps Off and offers no On', () => {
+    // Enabling stays impossible rather than refused later: a row with no `On`
+    // option has nothing to select, and the note says why the CLI is the thing
+    // that decides. `Off` stays, so the row still reads as a real setting.
+    const moshi = modelWith({ moshiInstalled: false })[1].settings[0];
+    assert.deepEqual(moshi.options.map((option) => option.label), ['Off']);
+    assert.match(moshi.note, /moshi-hook/);
+  });
+
   test('categories carry settings that carry inline options', () => {
     const model = modelWith();
     assert.deepEqual(model.map((category) => category.id), ['sidebar', 'moshi', 'theme']);
