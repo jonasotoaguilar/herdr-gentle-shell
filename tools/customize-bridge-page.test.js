@@ -327,6 +327,28 @@ describe('the command always exists and the page is added beside it (S1, S2)', (
     assert.ok(rowFor(rows, 'Select theme', 'Dark'));
   });
 
+  test('the page asks to open right after the host\'s Editor page (S21)', async () => {
+    const env = setupEnvironment('page-anchor');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+
+    const provider = h.provider();
+    assert.ok(provider, `a provider owns the ${PAGE} page`);
+    // The request is ASSERTED, not observed here: the host derives its page list
+    // from the first appearance of each category, so where the page really lands
+    // is the bridge's own test to prove. This one holds the plugin to asking for
+    // the page after `Editor`, which is the position the user named.
+    assert.deepEqual(
+      provider.categoryPlacement,
+      { after: 'Editor' },
+      'the Herdr page opens between the host\'s Editor and History pages',
+    );
+  });
+
   test('without the bridge: today\'s command works and no page is contributed (S2)', async () => {
     const env = setupEnvironment('bridge-absent');
     writeSettings(env.settingsPath, { extensions: [] });
