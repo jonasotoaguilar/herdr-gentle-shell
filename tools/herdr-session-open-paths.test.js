@@ -115,7 +115,6 @@ function makeHerdrStub() {
       'if [ "$1" = "workspace" ] && [ "$2" = "create" ]; then cat "$HERDR_STUB_WORKSPACE_CREATE"; exit 0; fi',
       'if [ "$1" = "pane" ] && [ "$2" = "list" ]; then cat "$HERDR_STUB_PANE_LIST"; exit 0; fi',
       'if [ "$1" = "agent" ] && [ "$2" = "start" ]; then echo "{}"; exit 0; fi',
-      'if [ "$1" = "agent" ] && [ "$2" = "get" ]; then cat "$HERDR_STUB_AGENT_GET_LAST"; exit 0; fi',
       'echo "herdr stub: unexpected argv $*" >&2; exit 1',
       '',
     ].join('\n'),
@@ -159,8 +158,6 @@ function worldEnv({ herdr, worktreeList, worktreeOpen, workspaceCreate, paneList
     HERDR_STUB_WORKTREE_OPEN: writeJson(dir, 'worktree-open.json', worktreeOpen || {}),
     HERDR_STUB_WORKSPACE_CREATE: writeJson(dir, 'workspace-create.json', workspaceCreate || {}),
     HERDR_STUB_PANE_LIST: writeJson(dir, 'pane-list.json', paneList || { result: { panes: [] } }),
-    HERDR_STUB_AGENT_GET_LAST: writeJson(dir, 'agent.json', { result: { agent: { agent: 'pi', agent_status: 'idle' } } }),
-    GENTLE_HERDR_SESSION_WATCH_INTERVAL_MS: '3600000',
   };
 }
 
@@ -219,7 +216,7 @@ describe('herdr_session_open symlinked paths', () => {
     setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w1', 'w1:p1', real) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: link, notify: false }, makeCtx(path.dirname(link)));
+      const result = await callOpen(tools, { path: link }, makeCtx(path.dirname(link)));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.kind, 'generic');
       assert.equal(result.details.path, real, 'details carry the canonical identity');
@@ -246,7 +243,7 @@ describe('herdr_session_open symlinked paths', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: link, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: link }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.kind, 'worktree');
       assert.equal(result.details.path, target);
@@ -273,7 +270,7 @@ describe('herdr_session_open symlinked paths', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: link, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: link }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.workspaceId, 'w3');
       const argv = shimArgv(herdr.log);
@@ -294,7 +291,7 @@ describe('herdr_session_open symlinked paths', () => {
     setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w4', 'w4:p1', root) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: link, notify: false }, makeCtx(path.dirname(link)));
+      const result = await callOpen(tools, { path: link }, makeCtx(path.dirname(link)));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.kind, 'primary');
       assert.equal(result.details.path, root);
@@ -320,7 +317,7 @@ describe('herdr_session_open separate-git-dir checkouts', () => {
     setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w5', 'w5:p1', root) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: root, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: root }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.kind, 'primary', 'a separate git dir is still the primary checkout');
       const argv = shimArgv(herdr.log);
@@ -342,7 +339,7 @@ describe('herdr_session_open separate-git-dir checkouts', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, undefined, `expected success, got: ${resultText(result)}`);
       assert.equal(result.details.kind, 'worktree');
       assert.equal(shimArgv(herdr.log)[1], worktreeOpenArgv(target));
@@ -378,7 +375,7 @@ describe('herdr_session_open identity is proven before any panel', () => {
     setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w7', 'w7:p1', outside) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: link, notify: false }, makeCtx(path.dirname(link)));
+      const result = await callOpen(tools, { path: link }, makeCtx(path.dirname(link)));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /outside/);
       const argv = shimArgv(herdr.log);
