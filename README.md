@@ -619,19 +619,22 @@ See [DESIGN.md](DESIGN.md) §4 (producer) and §5 (consumer), and
   Pi session at a path. A linked Git worktree opens as a **worktree panel**
   (reusing the workspace Herdr already has for that checkout); a repository's
   primary checkout, a subdirectory or any generic directory opens as a
-  **normal panel**. Panel kind is decided from git, the pane Herdr names is
+  **normal panel**. Panel kind is decided from git, and the pane Herdr names is
   verified to belong to its workspace and to sit in the requested path before
-  Pi starts, and (unless `notify: false`) the caller is woken when that session
-  really finishes. A worktree panel passes the target as both `--path` and
-  `--cwd`, because Herdr resolves the owning repository from `--cwd` rather
-  than from the process directory, so a worktree of another repository opens
-  too; and when Herdr still answers `worktree_not_found` for a path git proves
-  is a linked worktree, the panel opens as a normal one at the same path and
-  the result says which kind it opened (`panel: normal` plus a `fallback:`
-  row), while every other Herdr failure still aborts and opens nothing. The
-  other worktree tools and the ODD and issues panels live
-  in `odd-worktree` now; the sidebar and Moshi switches stayed here and are
-  reached through `/herdr-gentle:customize` and, when gentle-shell-bridge
+  Pi starts. Opening is the whole job: the tool starts the session and returns,
+  the success text carries `path`, `branch` and `session` only, and the caller
+  reads real state itself with `orchestrator_list` or the herdr CLI — no
+  subscribe, no watcher, and no finish claim pushed back, because a "never
+  started" message about a working delegate is worse than no message. A
+  worktree panel passes the target as both `--path` and `--cwd`, because Herdr
+  resolves the owning repository from `--cwd` rather than from the process
+  directory, so a worktree of another repository opens too; and when Herdr
+  still answers `worktree_not_found` for a path git proves is a linked
+  worktree, the panel opens as a normal one at the same path and the result
+  says so with a `fallback:` row, while every other Herdr failure still aborts
+  and opens nothing. The other worktree tools and the ODD and issues panels
+  live in `odd-worktree` now; the sidebar and Moshi switches stayed here and
+  are reached through `/herdr-gentle:customize` and, when gentle-shell-bridge
   answers, also through the Gentle Shell customize menu's `Herdr` page. See
   [docs/herdr-session-open.md](docs/herdr-session-open.md).
 

@@ -55,14 +55,6 @@ function openLib() {
   return libRequire("herdr-session-open.js");
 }
 
-function notifyLib() {
-  try {
-    return libRequire("herdr-session-notifications.js");
-  } catch {
-    return null;
-  }
-}
-
 // The herdr binary. Resolving it can THROW on purpose: under a test harness a
 // possible live binary is refused instead of being spawned (the guard lives in
 // lib/herdr-session-open.js, so no fallback here may re-decide it).
@@ -92,7 +84,7 @@ function errorResult(text, details) {
 
 // Core of the tool. Exported so a test can drive it with a live-shaped context;
 // the registered tool calls it with the Pi context it was given.
-async function executeSessionOpen(params, ctx, watcherOptions) {
+async function executeSessionOpen(params, ctx) {
   const lib = openLib();
   const cwd = toolCwd(ctx);
 
@@ -107,7 +99,6 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
   const rawName = nameProvided
     ? typeof params.name === "string" ? params.name : String(params.name)
     : undefined;
-  const notify = !(params && params.notify === false);
   if (typeof rawPath !== "string" || rawPath.length === 0) {
     return errorResult(
       "herdr_session_open requires a path: pass an existing directory (a Git worktree, a repository checkout, or any directory)",
@@ -368,7 +359,7 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
   const details = {
     path: target, kind: openedKind, branch,
     ...(fallbackCode === null ? {} : { fallback: fallbackCode }),
-    paneId, workspaceId, sessionId, resumed, agentName, notify,
+    paneId, workspaceId, sessionId, resumed, agentName,
   };
   if (started.status !== 0) {
     const createdNote = openedHere
@@ -379,35 +370,18 @@ async function executeSessionOpen(params, ctx, watcherOptions) {
       details,
     );
   }
-  const result = textResult(lib.sessionOpenRows(details).join("\n"), details, false);
-  // Subscribing IS opening with `notify !== false`: one watcher for the pane
-  // just opened, `notify: false` starts none. The watcher needs the host message
-  // route; without it nothing is watched.
-  const notifications = notifyLib();
-  if (notify && notifications && typeof notifications.startAgentSessionWatcher === "function") {
-    try {
-      notifications.startAgentSessionWatcher(
-        {
-          paneId, path: target, kind: openedKind, branch, sessionId,
-          agentName, workspaceId, repoRoot: target,
-        },
-        watcherOptions,
-      );
-    } catch {}
-  }
-  return result;
+  return textResult(lib.sessionOpenRows(details).join("\n"), details, false);
 }
 
 const sessionOpenTool = defineTool({
   name: TOOL_NAME,
   label: "Herdr Session Open",
   exposure: "codemode",
-  description: "Open a Herdr panel running a Pi session at a path: a linked Git worktree opens as a worktree panel, a repository's primary checkout or any other directory opens as a normal panel. Pass an optional session id to resume; a new session id is minted when resuming is not asked. Unless notify:false is passed, the creator is notified when that session really finishes.",
+  description: "Open a Herdr panel running a Pi session at a path: a linked Git worktree opens as a worktree panel, a repository's primary checkout or any other directory opens as a normal panel. Pass an optional session id to resume; a new session id is minted when resuming is not asked. Opening is the whole job: read the session's state with orchestrator_list or the herdr CLI.",
   parameters: Type.Object({
     path: Type.String({ description: "Directory to open the panel in (absolute, or relative to the session cwd): a Git worktree, a repository checkout, or any other directory" }),
     session: opt(Type.String({ description: "Pi session id to resume; absent means a new session" })),
     name: opt(Type.String({ description: "Agent/pane name; defaults to a name derived from the path (lowercase letters, digits, dash, underscore)" })),
-    notify: opt(Type.Boolean({ description: "Subscribe the creator to the delegate finish notification (default true)" })),
   }),
   async execute(toolCallId, params, signal, onUpdate, ctx) {
     try {
@@ -424,23 +398,7 @@ const sessionOpenTool = defineTool({
 });
 
 export default function (pi) {
-  // The delivery route for the finish subscription started by the tool.
-  const notifications = notifyLib();
-  if (notifications && typeof notifications.setSessionNotifier === "function") {
-    try {
-      notifications.setSessionNotifier(pi);
-    } catch {}
-  }
   pi.registerTool(sessionOpenTool);
 }
 
-export { executeSessionOpen, sessionOpenTool, clearSessionWatchers };
-
-// Stop every finish watcher this process started: the test seam for the
-// pane-keyed registry, and the shutdown path for a host that wants one.
-function clearSessionWatchers() {
-  const notifications = notifyLib();
-  if (notifications && typeof notifications.clearSessionWatchers === "function") {
-    notifications.clearSessionWatchers();
-  }
-}
+export { executeSessionOpen, sessionOpenTool };

@@ -35,7 +35,7 @@ canonical path.
 
 Extension: `extensions/herdr-session-open.ts`
 Libraries: `lib/herdr-session-open.js` (path classification, herdr argv,
-reply parsers), `lib/herdr-session-notifications.js` (finish subscription)
+reply parsers)
 
 ## What it does, step by step
 
@@ -72,16 +72,23 @@ reply parsers), `lib/herdr-session-notifications.js` (finish subscription)
    --timeout 120000 -- --name <name> --session-id <uuid>` — or `--session <id>`
    when a session id is passed to resume. No `--session-dir` is needed: the
    pane's cwd is already the requested path.
-6. **Subscribe to the finish** unless `notify: false` was passed.
+6. **Return the result.** Opening is the whole job: the tool starts the
+   session and returns. It registers no watcher, polls nothing, and sends no
+   follow-up message — read the session's state with `orchestrator_list` or the
+   herdr CLI itself.
 
-The result is compact, ordered `label: value` rows — `outcome`, `path`,
-`panel` (`worktree` or `normal`, naming the kind really opened), `fallback`
-(only when a worktree open fell back: `normal panel after herdr reported
-worktree_not_found`), `branch` (only for a Git checkout), `session`,
-`workspace`, `pane`, `agent` — and the same facts ride in `details` as `path`,
-`kind` (`worktree` / `primary` / `generic` / `normal` after a fallback),
-`branch`, `fallback` (only when it happened), `paneId`, `workspaceId`,
-`sessionId`, `resumed`, `agentName`, `notify`.
+The result is compact, ordered `label: value` rows and nothing else: `path`,
+`fallback` (only when a worktree open fell back: `normal panel after herdr
+reported worktree_not_found`), `branch` (only for a Git checkout) and
+`session` — each row only when it has a value. A success needs no `outcome`
+row (it succeeded, so it is open), and a workspace, pane or agent name is
+routing detail the caller never reads, so the success text carries none of
+them. The same facts ride in `details` as `path`, `kind` (`worktree` /
+`primary` / `generic` / `normal` after a fallback), `branch`, `fallback` (only
+when it happened), `paneId`, `workspaceId`, `sessionId`, `resumed` and
+`agentName`: `details` is the machine view, not the text. Refusals are the
+opposite — every error names the pane and/or workspace id that failed,
+because an error without the id that failed is useless.
 
 ## Parameters
 
@@ -90,36 +97,21 @@ worktree_not_found`), `branch` (only for a Git checkout), `session`,
 | `path` (required) | Directory to open the panel in: a Git worktree, a repository checkout, or any other directory |
 | `session` | Pi session id to resume; absent mints a new id |
 | `name` | Agent/pane name; defaults to the branch for a worktree panel and to the directory name otherwise, sanitized into Herdr's shape |
-| `notify` | Subscribe the caller to the finish notification (default `true`) |
 
 Agent names must match Herdr's documented shape — lowercase letters, digits,
 dash and underscore, starting with a letter, at most 32 characters
 (`^[a-z][a-z0-9_-]{0,31}$`). A name Herdr would reject is refused here, because
 the alternative is a launch that fails after a panel already exists.
 
-## The finish notification
+## No finish subscription
 
-With `notify` left on, the opener starts **one** watcher for the pane it just
-opened and polls `herdr agent get <paneId>` on a bounded interval:
-
-- **finished** — `agent_status` reads `idle` *after* that same pane was observed
-  `working` at least once;
-- **never-started** — the pane went idle without ever reporting `working`;
-- **vanished** — the agent is gone (`agent_not_found`);
-- **timed-out** — nothing conclusive before the maximum wait (four hours by
-  default).
-
-Only `finished` claims a finish. `blocked` means the delegate is waiting for
-input and never counts as `working`. A pane bound to a *different* Pi session is
-never reported as ours, and a launch grace window keeps the delegate's idle
-state right after `agent start` from being read as a finish.
-
-The delivery route is the host's own message channel —
-`pi.sendMessage({ customType: "herdr-agent-sessions.finished", display: true,
-content, details }, { deliverAs: "followUp", triggerTurn: true })` — so the
-orchestrator is woken with the outcome instead of having to poll. A send that
-throws or rejects is retried, not swallowed; a send that never settles stops the
-watcher at the maximum wait.
+The opener has none. There is no watcher, no polling interval, no environment
+knob and no follow-up message: opening a session opens a session, and the
+caller reads real state with `orchestrator_list` or the herdr CLI itself. A
+subscription the opener published used to report `herdr session never
+started` about a delegate that was working — the published state is another
+process's view, so "never started" and "never reported anything" are
+indistinguishable — and a claim that can be wrong is worse than no claim.
 
 ## Safety checks
 
@@ -127,10 +119,11 @@ watcher at the maximum wait.
   path or an agent name can never become a command.
 - **Closed herdr allowlist.** `herdrArgv` accepts only the operations this tool
   uses (`worktree list`, `worktree open`, `workspace create`, `pane list`,
-  `agent start`, `agent get`) and, per operation, only the flags it passes.
+  `agent start`) and, per operation, only the flags it passes.
   Unknown operations and flags throw. `--trust-repository` is on no allowlist —
   trusting a repository is a human decision this tool never takes — and
-  `--focus` is not either: panels open with `--no-focus`.
+  `--focus` is not either: panels open with `--no-focus`. A read operation is
+  on no allowlist either: nothing reads a session back.
 - **No unsafe guesses.** A missing path, a file instead of a directory, an
   unparseable reply, two workspaces claiming one checkout, a pane that belongs
   to another workspace, a pane whose cwd left the path, a reply that names no
@@ -146,9 +139,9 @@ watcher at the maximum wait.
   directory), or when the test opts in with
   `GENTLE_HERDR_ALLOW_LIVE_HERDR=1`. Any other inherited path is refused
   instead of spawned.
-- **Non-blocking.** Every herdr call and every `agent get` poll runs off the
-  event loop with a bounded timeout that reaps the child, so a slow or hung
-  daemon cannot freeze the session that opened the panel.
+- **Non-blocking.** Every herdr call runs off the event loop with a bounded
+  timeout that reaps the child, so a slow or hung daemon cannot freeze the
+  session that opened the panel.
 
 ## Relation to the rest of the package
 
@@ -162,7 +155,8 @@ code with `odd-worktree` — it needs only a path.
 `node --test tools/herdr-session-open.test.js` covers the three path classes
 (linked worktree, primary checkout, generic directory including a subdirectory
 and a relative path), workspace reuse, the panel verification refusals, the
-herdr failures, the finish subscription, the binary-allowlist refusal and the
+herdr failures, the create-only contract (no agent read, no follow-up message,
+no subscription flag in `details`), the binary-allowlist refusal and the
 agent-name rules. `node --test tools/herdr-session-open-paths.test.js` covers
 symlinked generic/worktree/primary paths (including worktree reuse through a
 symlink), `git init --separate-git-dir` checkouts, and the refuse-before-panel

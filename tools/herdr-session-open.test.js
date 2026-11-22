@@ -98,8 +98,9 @@ function writeJson(dir, name, doc) {
   return file;
 }
 
-// Stub `herdr`: logs every argv line, answers each leg from a fixture file,
-// and counts `agent get` polls so a watcher's polling is observable.
+// Stub `herdr`: logs every argv line and answers each leg from a fixture file.
+// The opener is create-only, so the only agent leg it has is `agent start`:
+// anything else is an unexpected argv and fails instead of being answered.
 function makeHerdrStub() {
   const dir = tmp('hs-path-herdr-');
   const bin = path.join(dir, 'herdr');
@@ -139,13 +140,6 @@ function makeHerdrStub() {
       '  if [ "${HERDR_SHIM_AGENT_START_EXIT:-0}" != "0" ]; then echo "shim agent start failure" >&2; exit 1; fi',
       '  echo "{}"; exit 0',
       'fi',
-      'if [ "$1" = "agent" ] && [ "$2" = "get" ]; then',
-      '  n=$(cat "$HERDR_STUB_AGENT_GET_COUNT" 2>/dev/null || echo 0)',
-      '  n=$((n + 1)); echo "$n" > "$HERDR_STUB_AGENT_GET_COUNT"',
-      '  f="$HERDR_STUB_AGENT_GET_DIR/$n.json"',
-      '  if [ -f "$f" ]; then cat "$f"; exit 0; fi',
-      '  cat "$HERDR_STUB_AGENT_GET_LAST"; exit 0',
-      'fi',
       'echo "herdr stub: unexpected argv $*" >&2; exit 1',
       '',
     ].join('\n'),
@@ -161,20 +155,6 @@ function shimArgv(log) {
   } catch {
     return [];
   }
-}
-
-function agentSequence(docs) {
-  const dir = tmp('hs-path-agentseq-');
-  docs.forEach((doc, index) => writeJson(dir, `${index + 1}.json`, doc));
-  const last = path.join(dir, 'last.json');
-  fs.writeFileSync(last, `${JSON.stringify(docs[docs.length - 1])}\n`);
-  const count = path.join(dir, 'count');
-  fs.writeFileSync(count, '0\n');
-  return { dir, last, count };
-}
-
-function agentDoc(status, paneId) {
-  return { result: { agent: { agent: 'pi', agent_status: status, pane_id: paneId } } };
 }
 
 function worktreeListDoc(entries) {
@@ -205,10 +185,10 @@ function restoreEnv() {
   for (const [key, value] of Object.entries(savedEnv)) process.env[key] = value;
 }
 
-// The world a test hands the extension: the stub binary, the fixtures each
-// herdr leg answers from, and a fast watcher clock. `listSequence` overrides
-// `worktree list` per invocation (1.json, 2.json, …).
-function worldEnv({ herdr, worktreeList, worktreeOpen, worktreeOpenError, workspaceCreate, paneList, seq, listSequence, extra }) {
+// The world a test hands the extension: the stub binary and the fixtures each
+// herdr leg answers from. `listSequence` overrides `worktree list` per
+// invocation (1.json, 2.json, …).
+function worldEnv({ herdr, worktreeList, worktreeOpen, worktreeOpenError, workspaceCreate, paneList, listSequence, extra }) {
   const dir = tmp('hs-path-fixtures-');
   const listDir = listSequence ? tmp('hs-path-listseq-') : null;
   if (listDir) {
@@ -232,12 +212,6 @@ function worldEnv({ herdr, worktreeList, worktreeOpen, worktreeOpenError, worksp
       : writeJson(dir, 'worktree-open-error.json', worktreeOpenError),
     HERDR_STUB_WORKSPACE_CREATE: write('workspace-create.json', workspaceCreate, {}),
     HERDR_STUB_PANE_LIST: write('pane-list.json', paneList, paneListDoc([])),
-    HERDR_STUB_AGENT_GET_DIR: seq.dir,
-    HERDR_STUB_AGENT_GET_COUNT: seq.count,
-    HERDR_STUB_AGENT_GET_LAST: seq.last,
-    GENTLE_HERDR_SESSION_WATCH_INTERVAL_MS: '15',
-    GENTLE_HERDR_SESSION_WATCH_GRACE_MS: '20',
-    GENTLE_HERDR_SESSION_WATCH_MAX_MS: '900',
     ...(extra || {}),
   };
 }
@@ -274,14 +248,13 @@ function resultText(result) {
   return (result.content || []).map((part) => part.text || '').join('\n');
 }
 
-function openRows({ outcome = 'opened', target, panel, fallback, branch, session, workspace, pane, agent }) {
-  const rows = [`outcome: ${outcome}`, `path: ${target}`, `panel: ${panel}`];
+// The success text: exactly the three rows a caller can act on, each only when
+// it has a value (S2). `fallback` is the one extra fact — what was opened.
+function openRows({ target, fallback, branch, session }) {
+  const rows = [`path: ${target}`];
   if (fallback) rows.push(`fallback: normal panel after herdr reported ${fallback}`);
   if (branch) rows.push(`branch: ${branch}`);
-  rows.push(`session: ${session}`);
-  if (workspace) rows.push(`workspace: ${workspace}`);
-  if (pane) rows.push(`pane: ${pane}`);
-  if (agent) rows.push(`agent: ${agent}`);
+  if (session) rows.push(`session: ${session}`);
   return rows;
 }
 
@@ -303,34 +276,31 @@ async function callOpen(tools, params, ctx) {
   return openTool(tools).execute('call-1', params, undefined, undefined, ctx);
 }
 
-async function waitUntil(predicate, timeoutMs, what) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    if (predicate()) return;
-    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
 describe('herdr_session_open registration', () => {
-  test('is the only tool the extension registers, with path/session/name/notify', async () => {
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
+  test('is the only tool the extension registers, with path/session/name', async () => {
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq }));
+    setEnv(worldEnv({ herdr }));
     try {
       const { tools } = await loadExtension();
       assert.deepEqual([...tools.keys()], ['herdr_session_open']);
       const params = openTool(tools).parameters;
-      assert.deepEqual(Object.keys(params.properties).sort(), ['name', 'notify', 'path', 'session']);
+      // Opening a session takes a path, an optional session and an optional
+      // name. Nothing else: the finish subscription is gone (S1), so no
+      // parameters may promise it.
+      assert.deepEqual(Object.keys(params.properties).sort(), ['name', 'path', 'session']);
       assert.equal(params.properties.path.type, 'string');
       assert.equal(params.properties.session.type, 'string');
       assert.equal(params.properties.name.type, 'string');
-      assert.equal(params.properties.notify.type, 'boolean');
-      assert.equal(params.properties.notify.optional, true);
+      assert.equal('notify' in params.properties, false, 'the removed parameter must not come back');
       assert.equal(params.properties.path.optional, undefined, 'path is required');
       assert.equal(openTool(tools).label, 'Herdr Session Open');
       assert.match(openTool(tools).description, /worktree panel/);
       assert.match(openTool(tools).description, /panel/);
+      assert.equal(
+        /notif/i.test(openTool(tools).description),
+        false,
+        `the description promises no notification: ${openTool(tools).description}`,
+      );
     } finally {
       restoreEnv();
     }
@@ -350,31 +320,25 @@ describe('herdr_session_open panel classes', () => {
   test('a linked Git worktree opens as a worktree panel', async () => {
     const root = makeRepo('worktree');
     const target = addWorktree(root, 'feat/panel');
-    const seq = agentSequence([agentDoc('idle', 'w9:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/panel' }]),
       worktreeOpen: openReplyDoc('w9', 'w9:p1', target),
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, undefined, resultText(result));
       const sessionId = result.details.sessionId;
       assert.match(sessionId, /^[0-9a-f-]{36}$/);
       assert.deepEqual(resultText(result).split('\n'), openRows({
         target,
-        panel: 'worktree',
         branch: 'feat/panel',
         session: sessionId,
-        workspace: 'w9',
-        pane: 'w9:p1',
-        agent: 'feat-panel',
       }));
       assert.deepEqual(Object.keys(result.details), [
-        'path', 'kind', 'branch', 'paneId', 'workspaceId', 'sessionId', 'resumed', 'agentName', 'notify',
+        'path', 'kind', 'branch', 'paneId', 'workspaceId', 'sessionId', 'resumed', 'agentName',
       ]);
       assert.equal(result.details.kind, 'worktree');
       assert.equal(result.details.path, target);
@@ -401,11 +365,9 @@ describe('herdr_session_open panel classes', () => {
   test('a worktree already open in Herdr reuses its workspace and opens no second panel', async () => {
     const root = makeRepo('reuse');
     const target = addWorktree(root, 'feat/reuse');
-    const seq = agentSequence([agentDoc('idle', 'w2:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/reuse', open_workspace_id: 'w2' }]),
       paneList: paneListDoc([
         { pane_id: 'w2:p2', cwd: target },
@@ -414,7 +376,7 @@ describe('herdr_session_open panel classes', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.paneId, 'w2:p1', 'the root pane is the lowest index');
       const argv = shimArgv(herdr.log);
@@ -429,12 +391,11 @@ describe('herdr_session_open panel classes', () => {
   test('the primary checkout of a repository opens as a normal panel', async () => {
     const root = makeRepo('primary');
     addWorktree(root, 'feat/other');
-    const seq = agentSequence([agentDoc('idle', 'w3:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w3', 'w3:p1', root) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w3', 'w3:p1', root) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: root, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: root }, makeCtx(root));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.kind, 'primary');
       assert.equal('fallback' in result.details, false, 'a primary checkout reports no fallback');
@@ -442,12 +403,8 @@ describe('herdr_session_open panel classes', () => {
       assert.ok(typeof branch === 'string' && branch.length > 0, `reports the branch: ${branch}`);
       assert.deepEqual(resultText(result).split('\n'), openRows({
         target: root,
-        panel: 'normal',
         branch,
         session: result.details.sessionId,
-        workspace: 'w3',
-        pane: 'w3:p1',
-        agent: derivedName(root),
       }));
       assert.deepEqual(shimArgv(herdr.log), [
         `workspace create --cwd ${root} --no-focus`,
@@ -460,21 +417,16 @@ describe('herdr_session_open panel classes', () => {
 
   test('a generic directory opens as a normal panel', async () => {
     const dir = makeDir('scratch area');
-    const seq = agentSequence([agentDoc('idle', 'w4:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w4', 'w4:p1', dir) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w4', 'w4:p1', dir) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(path.dirname(dir)));
+      const result = await callOpen(tools, { path: dir }, makeCtx(path.dirname(dir)));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.kind, 'generic');
       assert.deepEqual(resultText(result).split('\n'), openRows({
         target: dir,
-        panel: 'normal',
         session: result.details.sessionId,
-        workspace: 'w4',
-        pane: 'w4:p1',
-        agent: 'scratch-area',
       }));
       assert.equal(result.details.branch, null);
       assert.deepEqual(shimArgv(herdr.log), [
@@ -488,12 +440,11 @@ describe('herdr_session_open panel classes', () => {
 
   test('a relative path resolves against the session cwd', async () => {
     const dir = makeDir('relative target');
-    const seq = agentSequence([agentDoc('idle', 'w5:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w5', 'w5:p1', dir) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w5', 'w5:p1', dir) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: 'relative target', notify: false }, makeCtx(path.dirname(dir)));
+      const result = await callOpen(tools, { path: 'relative target' }, makeCtx(path.dirname(dir)));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.path, dir);
       assert.deepEqual(shimArgv(herdr.log), [
@@ -509,12 +460,11 @@ describe('herdr_session_open panel classes', () => {
     const root = makeRepo('subdir');
     const child = track(path.join(root, 'packages', 'app'));
     fs.mkdirSync(child, { recursive: true });
-    const seq = agentSequence([agentDoc('idle', 'w6:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w6', 'w6:p1', child) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w6', 'w6:p1', child) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: child, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: child }, makeCtx(root));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.kind, 'generic');
       assert.equal(result.details.path, child);
@@ -526,23 +476,17 @@ describe('herdr_session_open panel classes', () => {
 
   test('a resume passes --session and never mints a session id', async () => {
     const dir = makeDir('resume target');
-    const seq = agentSequence([agentDoc('idle', 'w7:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w7', 'w7:p1', dir) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w7', 'w7:p1', dir) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, session: 'abc123', notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir, session: 'abc123' }, makeCtx(dir));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.sessionId, 'abc123');
       assert.equal(result.details.resumed, true);
       assert.deepEqual(resultText(result).split('\n'), openRows({
-        outcome: 'resumed',
         target: dir,
-        panel: 'normal',
         session: 'abc123',
-        workspace: 'w7',
-        pane: 'w7:p1',
-        agent: 'resume-target',
       }));
       const argv = shimArgv(herdr.log);
       assert.equal(argv.filter((line) => line.includes('--session-id')).length, 0);
@@ -554,12 +498,11 @@ describe('herdr_session_open panel classes', () => {
 
   test('an explicit agent name is used as given', async () => {
     const dir = makeDir('named target');
-    const seq = agentSequence([agentDoc('idle', 'w8:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w8', 'w8:p1', dir) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w8', 'w8:p1', dir) }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, name: 'reviewer', notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir, name: 'reviewer' }, makeCtx(dir));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.agentName, 'reviewer');
       assert.match(shimArgv(herdr.log)[1], /^agent start reviewer --kind pi /);
@@ -577,28 +520,22 @@ describe('herdr_session_open worktrees of another repository', () => {
     addWorktree(focused, 'feat/focused-only');
     const other = makeRepo('cross-other');
     const target = addWorktree(other, 'feat/cross');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/cross' }]),
       worktreeOpen: openReplyDoc('w1', 'w1:p1', target),
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(focused));
+      const result = await callOpen(tools, { path: target }, makeCtx(focused));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.kind, 'worktree');
       assert.equal('fallback' in result.details, false);
       assert.deepEqual(resultText(result).split('\n'), openRows({
         target,
-        panel: 'worktree',
         branch: 'feat/cross',
         session: result.details.sessionId,
-        workspace: 'w1',
-        pane: 'w1:p1',
-        agent: 'feat-cross',
       }));
       const openArgv = shimArgv(herdr.log).find((line) => line.startsWith('worktree open'));
       assert.equal(openArgv, `worktree open --path ${target} --cwd ${target} --no-focus`);
@@ -614,11 +551,9 @@ describe('herdr_session_open worktrees of another repository', () => {
     const focused = makeRepo('cross-fallback-focused');
     const other = makeRepo('cross-fallback-other');
     const target = addWorktree(other, 'feat/fallback');
-    const seq = agentSequence([agentDoc('idle', 'w2:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/fallback' }]),
       worktreeOpenError: { error: { code: 'worktree_not_found', message: 'worktree path not found' } },
       workspaceCreate: openReplyDoc('w2', 'w2:p1', target),
@@ -626,24 +561,20 @@ describe('herdr_session_open worktrees of another repository', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(focused));
+      const result = await callOpen(tools, { path: target }, makeCtx(focused));
       assert.equal(result.isError, undefined, resultText(result));
       // The panel that was really opened is a NORMAL one, and both the rows and
       // the details say so instead of claiming a worktree panel.
       assert.equal(result.details.kind, 'normal');
       assert.equal(result.details.fallback, 'worktree_not_found');
       assert.deepEqual(Object.keys(result.details), [
-        'path', 'kind', 'branch', 'fallback', 'paneId', 'workspaceId', 'sessionId', 'resumed', 'agentName', 'notify',
+        'path', 'kind', 'branch', 'fallback', 'paneId', 'workspaceId', 'sessionId', 'resumed', 'agentName',
       ]);
       assert.deepEqual(resultText(result).split('\n'), openRows({
         target,
-        panel: 'normal',
         fallback: 'worktree_not_found',
         branch: 'feat/fallback',
         session: result.details.sessionId,
-        workspace: 'w2',
-        pane: 'w2:p1',
-        agent: 'feat-fallback',
       }));
       assert.deepEqual(shimArgv(herdr.log), [
         `worktree list --cwd ${target}`,
@@ -661,11 +592,9 @@ describe('herdr_session_open worktrees of another repository', () => {
     const focused = makeRepo('cross-other-error-focused');
     const other = makeRepo('cross-other-error');
     const target = addWorktree(other, 'feat/other-error');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/other-error' }]),
       worktreeOpenError: { error: { code: 'invalid_argument', message: 'unexpected flag' } },
       workspaceCreate: openReplyDoc('w2', 'w2:p1', target),
@@ -673,7 +602,7 @@ describe('herdr_session_open worktrees of another repository', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(focused));
+      const result = await callOpen(tools, { path: target }, makeCtx(focused));
       assert.equal(result.isError, true);
       assert.match(
         resultText(result),
@@ -699,11 +628,9 @@ describe('herdr_session_open worktrees of another repository', () => {
     const other = makeRepo('cross-stale-other');
     const target = addWorktree(other, 'feat/stale');
     const errorDoc = { error: { code: 'worktree_not_found', message: 'worktree path not found' } };
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/stale' }]),
       worktreeOpenError: errorDoc,
       workspaceCreate: openReplyDoc('w2', 'w2:p1', target),
@@ -715,7 +642,7 @@ describe('herdr_session_open worktrees of another repository', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(focused));
+      const result = await callOpen(tools, { path: target }, makeCtx(focused));
       assert.equal(fs.existsSync(target), false, 'fixture: the worktree is gone before the fallback check');
       assert.equal(result.isError, true);
       assert.equal(
@@ -748,11 +675,9 @@ describe('herdr_session_open worktrees of another repository', () => {
     git(outer, ['worktree', 'add', '-b', 'feat/recreated-inner', target, 'HEAD']);
     const inner = fs.realpathSync(target);
     const errorDoc = { error: { code: 'worktree_not_found', message: 'worktree path not found' } };
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: inner, branch: 'feat/recreated-inner' }]),
       worktreeOpenError: errorDoc,
       workspaceCreate: openReplyDoc('w2', 'w2:p1', inner),
@@ -765,7 +690,7 @@ describe('herdr_session_open worktrees of another repository', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: inner, notify: false }, makeCtx(focused));
+      const result = await callOpen(tools, { path: inner }, makeCtx(focused));
       // Fixture: the directory exists again but is no longer a checkout — git
       // resolves it to the ENCLOSING linked worktree, which is the trap.
       assert.equal(fs.existsSync(inner), true, 'fixture: the directory was recreated');
@@ -789,9 +714,8 @@ describe('herdr_session_open worktrees of another repository', () => {
 
 describe('herdr_session_open path refusals', () => {
   test('a missing path is refused', async () => {
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq }));
+    setEnv(worldEnv({ herdr }));
     try {
       const { tools } = await loadExtension();
       const result = await callOpen(tools, {}, makeCtx(os.tmpdir()));
@@ -809,9 +733,8 @@ describe('herdr_session_open path refusals', () => {
   test('a path that does not exist is refused', async () => {
     const dir = tmp('hs-path-missing-');
     const ghost = path.join(dir, 'nope');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq }));
+    setEnv(worldEnv({ herdr }));
     try {
       const { tools } = await loadExtension();
       const result = await callOpen(tools, { path: ghost }, makeCtx(dir));
@@ -827,9 +750,8 @@ describe('herdr_session_open path refusals', () => {
     const dir = tmp('hs-path-file-');
     const file = path.join(dir, 'note.txt');
     fs.writeFileSync(file, 'x\n');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq }));
+    setEnv(worldEnv({ herdr }));
     try {
       const { tools } = await loadExtension();
       const result = await callOpen(tools, { path: file }, makeCtx(dir));
@@ -843,13 +765,12 @@ describe('herdr_session_open path refusals', () => {
 
   test('an agent name Herdr would reject is refused, starting nothing', async () => {
     const dir = makeDir('bad name target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
     try {
       const { tools } = await loadExtension();
       for (const name of ['-help', 'Bad Name', 'UPPER', '', 'a'.repeat(33)]) {
-        const result = await callOpen(tools, { path: dir, name, notify: false }, makeCtx(dir));
+        const result = await callOpen(tools, { path: dir, name }, makeCtx(dir));
         assert.equal(result.isError, true, `expected refusal for ${JSON.stringify(name)}`);
         assert.match(resultText(result), /invalid agent name/);
       }
@@ -863,16 +784,14 @@ describe('herdr_session_open path refusals', () => {
 describe('herdr_session_open panel verification', () => {
   test('a root pane whose shell left the path is refused and starts nothing', async () => {
     const dir = makeDir('cwd target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       workspaceCreate: openReplyDoc('w1', 'w1:p1', path.dirname(dir)),
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /outside/);
       assert.deepEqual(Object.keys(result.details), ['path', 'kind', 'branch', 'paneId', 'workspaceId']);
@@ -886,16 +805,14 @@ describe('herdr_session_open panel verification', () => {
 
   test('an open reply naming a pane of another workspace is refused', async () => {
     const dir = makeDir('foreign pane target');
-    const seq = agentSequence([agentDoc('idle', 'w2:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       workspaceCreate: openReplyDoc('w1', 'w2:p1', dir),
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /does not belong to it/);
       assert.equal(shimArgv(herdr.log).filter((line) => line.startsWith('agent start')).length, 0);
@@ -906,11 +823,9 @@ describe('herdr_session_open panel verification', () => {
 
   test('a root pane reporting another workspace is refused', async () => {
     const dir = makeDir('pane workspace target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       workspaceCreate: {
         result: {
           workspace: { workspace_id: 'w1' },
@@ -920,7 +835,7 @@ describe('herdr_session_open panel verification', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /root pane reports workspace 'w9'/);
       assert.equal(shimArgv(herdr.log).filter((line) => line.startsWith('agent start')).length, 0);
@@ -931,12 +846,11 @@ describe('herdr_session_open panel verification', () => {
 
   test('an open reply that names no workspace or pane is refused', async () => {
     const dir = makeDir('empty reply target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: { result: {} } }));
+    setEnv(worldEnv({ herdr, workspaceCreate: { result: {} } }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /succeeded but its output named no workspace\/pane/);
       assert.equal(shimArgv(herdr.log).filter((line) => line.startsWith('agent start')).length, 0);
@@ -948,11 +862,9 @@ describe('herdr_session_open panel verification', () => {
   test('a pane of another workspace is never chosen in the reuse path', async () => {
     const root = makeRepo('foreign-pane');
     const target = addWorktree(root, 'feat/foreign-pane');
-    const seq = agentSequence([agentDoc('idle', 'w7:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/foreign-pane', open_workspace_id: 'w7' }]),
       paneList: paneListDoc([
         { pane_id: 'w8:p1', cwd: target },
@@ -961,7 +873,7 @@ describe('herdr_session_open panel verification', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, undefined, resultText(result));
       assert.equal(result.details.paneId, 'w7:p1');
       assert.ok(!shimArgv(herdr.log).some((line) => line.includes('w8')));
@@ -973,11 +885,9 @@ describe('herdr_session_open panel verification', () => {
   test('two workspaces claiming one worktree fail closed and start nothing', async () => {
     const root = makeRepo('conflict');
     const target = addWorktree(root, 'feat/conflict');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([
         { path: target, branch: 'feat/conflict', open_workspace_id: 'w1' },
         { path: target, branch: 'feat/conflict', open_workspace_id: 'w2' },
@@ -985,7 +895,7 @@ describe('herdr_session_open panel verification', () => {
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /names 2 different workspaces/);
       assert.deepEqual(shimArgv(herdr.log), [`worktree list --cwd ${target}`]);
@@ -999,12 +909,11 @@ describe('herdr_session_open herdr failures', () => {
   test('a failing worktree list names the call and its exit', async () => {
     const root = makeRepo('list-fail');
     const target = addWorktree(root, 'feat/list-fail');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, extra: { HERDR_SHIM_WORKTREE_LIST_EXIT: '1' } }));
+    setEnv(worldEnv({ herdr, extra: { HERDR_SHIM_WORKTREE_LIST_EXIT: '1' } }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /'herdr worktree list' exited 1 \(shim worktree list failure\)/);
       assert.match(resultText(result), /no session was opened/);
@@ -1016,17 +925,15 @@ describe('herdr_session_open herdr failures', () => {
   test('a failing worktree open names the call and the path', async () => {
     const root = makeRepo('open-fail');
     const target = addWorktree(root, 'feat/open-fail');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       worktreeList: worktreeListDoc([{ path: target, branch: 'feat/open-fail' }]),
       extra: { HERDR_SHIM_OPEN_EXIT: '1' },
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: target, notify: false }, makeCtx(root));
+      const result = await callOpen(tools, { path: target }, makeCtx(root));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /'herdr worktree open' exited 1 \(shim worktree open failure\)/);
       assert.ok(resultText(result).includes(target));
@@ -1038,12 +945,11 @@ describe('herdr_session_open herdr failures', () => {
 
   test('a failing workspace create names the call and its exit', async () => {
     const dir = makeDir('create-fail target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, extra: { HERDR_SHIM_WORKSPACE_CREATE_EXIT: '1' } }));
+    setEnv(worldEnv({ herdr, extra: { HERDR_SHIM_WORKSPACE_CREATE_EXIT: '1' } }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /'herdr workspace create' exited 1 \(shim workspace create failure\)/);
       assert.equal(shimArgv(herdr.log).filter((line) => line.startsWith('agent start')).length, 0);
@@ -1054,17 +960,15 @@ describe('herdr_session_open herdr failures', () => {
 
   test('a failing agent start names the call, the agent and the pane', async () => {
     const dir = makeDir('start-fail target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       workspaceCreate: openReplyDoc('w1', 'w1:p1', dir),
       extra: { HERDR_SHIM_AGENT_START_EXIT: '1' },
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /'herdr agent start' exited 1 \(shim agent start failure\) for agent 'start-fail-target' in pane 'w1:p1'/);
     } finally {
@@ -1073,77 +977,69 @@ describe('herdr_session_open herdr failures', () => {
   });
 });
 
-describe('herdr_session_open finish subscription', () => {
-  test('idle after working delivers exactly one finished follow-up', async () => {
-    const dir = makeDir('watch target');
-    const seq = agentSequence([agentDoc('working', 'w1:p1'), agentDoc('idle', 'w1:p1')]);
+describe('herdr_session_open is create only', () => {
+  // S1/L1: the finish subscription reported "never started" about a delegate
+  // that was working, so the mechanism is gone. Opening a session opens a
+  // session; the caller reads real state with orchestrator_list / the herdr CLI
+  // itself.
+  test('opening opens and returns: no agent read, no follow-up message, no notify', async () => {
+    const dir = makeDir('create only target');
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
-    let mod;
-    try {
-      const loaded = await loadExtension();
-      mod = loaded.mod;
-      const { tools, sent } = loaded;
-      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
-      assert.equal(result.isError, undefined, resultText(result));
-      assert.equal(result.details.notify, true);
-      await waitUntil(() => sent.length >= 1, 3000, 'the finished notification');
-      assert.equal(sent.length, 1);
-      const [message, options] = sent[0];
-      assert.equal(message.customType, 'herdr-agent-sessions.finished');
-      assert.equal(message.display, true);
-      assert.deepEqual(options, { deliverAs: 'followUp', triggerTurn: true });
-      assert.match(message.content, /finished/);
-      assert.ok(message.content.includes(dir));
-      assert.ok(message.content.includes('w1:p1'));
-      assert.equal(message.details.outcome, 'finished');
-      assert.equal(message.details.path, dir);
-      const polls = shimArgv(herdr.log).filter((line) => line.startsWith('agent get'));
-      for (const line of polls) assert.equal(line, 'agent get w1:p1');
-    } finally {
-      try {
-        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
-      } catch {}
-      restoreEnv();
-    }
-  });
-
-  test('notify:false starts no watcher at all', async () => {
-    const dir = makeDir('no watch target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
-    const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
     try {
       const { tools, sent } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, undefined, resultText(result));
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // S2: exactly the rows a caller can act on, each only when it has a
+      // value — here the directory is not a checkout, so there is no branch.
+      assert.deepEqual(resultText(result).split('\n'), openRows({
+        target: dir,
+        session: result.details.sessionId,
+      }));
+      // No routing id and no `outcome`: a success IS opened.
+      assert.equal(/^(outcome|panel|workspace|pane|agent):/m.test(resultText(result)), false, resultText(result));
+      // S4: `details` keeps the machine facts and no subscription flag.
+      assert.equal('notify' in result.details, false, 'details carries no notify');
+      assert.deepEqual(Object.keys(result.details), [
+        'path', 'kind', 'branch', 'paneId', 'workspaceId', 'sessionId', 'resumed', 'agentName',
+      ]);
+      // Nothing polls the session it just opened: the only agent argv is the
+      // launch, so no read-back line is ever produced.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const argv = shimArgv(herdr.log);
+      assert.deepEqual(argv, [
+        `workspace create --cwd ${dir} --no-focus`,
+        `agent start create-only-target --kind pi --pane w1:p1 --timeout 120000 -- --name create-only-target --session-id ${result.details.sessionId}`,
+      ]);
+      assert.deepEqual(
+        argv.filter((line) => line.startsWith('agent ') && !line.startsWith('agent start ')),
+        [],
+        'no agent read is ever spawned',
+      );
+      // And the host is never woken with a finish claim.
       assert.deepEqual(sent, []);
-      assert.equal(shimArgv(herdr.log).filter((line) => line.startsWith('agent get')).length, 0);
     } finally {
       restoreEnv();
     }
   });
 
-  test('a vanished pane is reported as vanished, never as a finish', async () => {
-    const dir = makeDir('vanish target');
-    const seq = agentSequence([{ error: { code: 'agent_not_found', message: 'agent target w1:p1 not found' } }]);
+  test('a host whose message channel throws is never touched', async () => {
+    const dir = makeDir('create only silent target');
     const herdr = makeHerdrStub();
-    setEnv(worldEnv({ herdr, seq, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
-    let mod;
+    setEnv(worldEnv({ herdr, workspaceCreate: openReplyDoc('w1', 'w1:p1', dir) }));
+    const calls = [];
     try {
-      const loaded = await loadExtension();
-      mod = loaded.mod;
-      const { tools, sent } = loaded;
+      const { tools } = await loadExtension({
+        sendMessage: async (...args) => {
+          calls.push(args);
+          throw new Error('the opener must never deliver a follow-up');
+        },
+      });
       const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, undefined, resultText(result));
-      await waitUntil(() => sent.length >= 1, 3000, 'the vanished notification');
-      assert.equal(sent[0][0].details.outcome, 'vanished');
-      assert.ok(!/^worktree session finished:/.test(sent[0][0].content), sent[0][0].content);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.deepEqual(calls, []);
     } finally {
-      try {
-        if (mod && typeof mod.clearSessionWatchers === 'function') mod.clearSessionWatchers();
-      } catch {}
       restoreEnv();
     }
   });
@@ -1152,17 +1048,15 @@ describe('herdr_session_open finish subscription', () => {
 describe('herdr_session_open safety seams', () => {
   test('the harness refuses a possible live herdr instead of running it', async () => {
     const dir = makeDir('live refusal target');
-    const seq = agentSequence([agentDoc('idle', 'w1:p1')]);
     const herdr = makeHerdrStub();
     setEnv(worldEnv({
       herdr,
-      seq,
       workspaceCreate: openReplyDoc('w1', 'w1:p1', dir),
       extra: { HERDR_BIN_PATH: '/usr/bin/false' },
     }));
     try {
       const { tools } = await loadExtension();
-      const result = await callOpen(tools, { path: dir, notify: false }, makeCtx(dir));
+      const result = await callOpen(tools, { path: dir }, makeCtx(dir));
       assert.equal(result.isError, true);
       assert.match(resultText(result), /refusing to run live herdr/);
       assert.equal(result.details.herdrRefused, true);
@@ -1174,7 +1068,6 @@ describe('herdr_session_open safety seams', () => {
 
   test('the argv builder is a closed allowlist: no trust bypass, no focus, no worktree branch', () => {
     const lib = require('../lib/herdr-session-open.js');
-    assert.deepEqual(lib.herdrArgv('agent-get', { target: 'w1:p1' }), ['agent', 'get', 'w1:p1']);
     assert.deepEqual(lib.herdrArgv('open', { path: '/p', noFocus: true }), [
       'worktree', 'open', '--path', '/p', '--no-focus',
     ]);
