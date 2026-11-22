@@ -373,7 +373,11 @@ describe('the command always exists and the page is added beside it (S1, S2)', (
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
   });
 
-  test('the provider reads the live model on every build', async () => {    const env = setupEnvironment('live-model');
+  test('the provider reads the live model on every build', async () => {
+    const env = setupEnvironment('live-model');
+    // This scenario is about a live model, so Moshi exists: without the CLI the
+    // Moshi row offers `Off` alone by design (the missing-tool rule).
+    installMoshiHook(env.pathDir, { paired: true });
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
     bridge.publish();
@@ -419,8 +423,12 @@ describe('the rows apply through the command\'s own path (S3)', () => {
     assert.equal(rowFor(provider.rows(), 'Theme sync', 'On').choice.current(), true);
   });
 
-  test('a refused row writes nothing and surfaces the refusal once', async () => {
+  test('an unpaired row writes nothing and surfaces the refusal once', async () => {
     const env = setupEnvironment('row-refused');
+    // Installed but not paired: `On` exists, and the apply gate is what refuses.
+    // A machine WITHOUT the CLI never gets this far — the row itself offers `Off`
+    // alone (see the missing-tool case below), so there is nothing to press.
+    installMoshiHook(env.pathDir, { paired: false });
     writeSettings(env.settingsPath, { extensions: ['keep-me'] });
     const settingsBefore = fs.readFileSync(env.settingsPath, 'utf8');
     const bridge = fakeBridge();
@@ -430,17 +438,32 @@ describe('the rows apply through the command\'s own path (S3)', () => {
     await h.start();
     const provider = h.provider();
 
-    // No `moshi-hook` on PATH: the prerequisite gate refuses before any write.
     await rowFor(provider.rows(), 'Moshi', 'On').action(INLINE_HELPERS);
 
     assert.equal(h.notices.length, 1, 'the refusal is reported exactly once');
     const [text, level] = h.notices[0];
     assert.equal(level, 'error');
     assert.match(text, /Moshi notifications cannot be enabled/);
-    assert.match(text, /`moshi-hook` CLI was not found on PATH/);
+    assert.match(text, /paired:false/);
     assert.equal(fs.existsSync(env.flagPath), false, 'no flag file was written');
     assert.equal(fs.readFileSync(env.settingsPath, 'utf8'), settingsBefore);
     assert.deepEqual(h.reloads, []);
+  });
+
+  test('without the CLI the page offers Off alone, so nothing can be turned on', async () => {
+    const env = setupEnvironment('row-no-cli');
+    writeSettings(env.settingsPath, { extensions: [] });
+    const bridge = fakeBridge();
+    bridge.publish();
+    const h = harness({ bridge });
+    await h.load();
+    await h.start();
+    const provider = h.provider();
+
+    const values = provider.rows()
+      .filter((row) => row.choice && row.choice.setting === 'Moshi')
+      .map((row) => row.choice.value);
+    assert.deepEqual(values, ['Off'], 'the On value is absent, not refused after the fact');
   });
 
   test('the Moshi exclusion write lands and the reload becomes a restart notice', async () => {
@@ -670,7 +693,7 @@ describe('the sync gate answers before the catalogue check (S3)', () => {
 });
 
 describe('every message names the command that always exists (S4)', () => {
-  test('a page refusal keeps the 865d360 spelling', async () => {
+  test('the missing CLI is no longer a page refusal: the option is absent and the row says why', async () => {
     const env = setupEnvironment('s4-strings');
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
@@ -680,17 +703,15 @@ describe('every message names the command that always exists (S4)', () => {
     await h.start();
     const provider = h.provider();
 
-    await rowFor(provider.rows(), 'Moshi', 'On').action(INLINE_HELPERS);
-    const [text] = h.notices[0];
-    // S4: the command is always registered, so no string needs a
-    // surface-dependent wording and the page's refusals are byte for byte the
-    // ones the command gives (tools/gentle-customize-command.test.js pins the
-    // same bytes on the command's own path).
-    assert.equal(
-      text,
-      'Moshi notifications cannot be enabled: the `moshi-hook` CLI was not found on PATH; install the Moshi CLI, then re-apply On from /herdr-gentle:customize.',
-    );
-    assert.equal(text.includes('customize menu'), false, 'no message names a menu that may be absent');
+    const line = provider.rows().filter((row) => row.choice && row.choice.setting === 'Moshi');
+    assert.deepEqual(line.map((row) => row.choice.value), ['Off']);
+    // S4's wording guarantee still holds wherever a refusal is REACHABLE — the
+    // unpaired case below pins it, and tools/gentle-customize-command.test.js pins
+    // the command's own bytes. Nothing is reachable here, so nothing is refused:
+    // the surviving row explains itself instead, through the model's note riding
+    // the live preview title.
+    assert.match(line[0].preview().title, /moshi-hook/);
+    assert.equal(h.notices.length, 0, 'nothing was reported because nothing could be pressed');
   });
 
   test('the unpaired refusal keeps it too, in its own sentence', async () => {
@@ -827,6 +848,9 @@ describe('every page row paints the panel\'s own preview (defect 1)', () => {
 
   test('the four settings answer the panel\'s title and sample', async () => {
     const env = setupEnvironment('page-previews');
+    // Four settings with their pairs needs Moshi on the machine: without the CLI
+    // the Moshi line offers `Off` alone, which is a different, covered scenario.
+    installMoshiHook(env.pathDir, { paired: true });
     writeSettings(env.settingsPath, { extensions: [] });
     const bridge = fakeBridge();
     bridge.publish();
